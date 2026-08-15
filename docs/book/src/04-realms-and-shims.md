@@ -93,18 +93,64 @@ module remembering to be careful. The full path is documented in
 **That is the complete list.** Read the next section before drawing
 conclusions from it.
 
+One prerequisite, because it decides whether any of the above happens at all:
+the namespace set is built from an **unprivileged** `CLONE_NEWUSER`, so the
+host has to let such a namespace carry its capabilities. Where a host permits
+the `unshare` and then strips them, `vitrind --isolation=default` refuses to
+start rather than running a weaker session — see
+[the limits page](limits.md) for the requirement, the one measurement behind
+it, and what is tracked to make the grant routine.
+
+Since P2.6.3 there is a **second** such prerequisite, and it is a different
+condition with a different remedy: the kernel must actually have Landlock —
+**≥ 5.13**, built with `CONFIG_SECURITY_LANDLOCK=y`, and with `landlock` in the
+active LSM list (`/sys/kernel/security/lsm`) — **and, since 2026-08-15, an ABI
+at or above this build's declared floor** (`build.landlock_min_abi` from
+`vitrind --print-floor`, **7** here). The ruleset below is part of the
+confinement floor, so without all four the core refuses to start rather than
+confining a realm one mechanism less than its own journal claims. The fourth is
+the one a correctly configured kernel can still fail, and its remedy is a newer
+kernel rather than any knob. The refusal
+names the mechanism it could not get — `namespaces` for the paragraph above,
+`landlock` for this one — and that word is the diagnosis: the two remedies do
+not substitute for each other. `vitrind --print-isolation` answers both,
+without spawning anything.
+
 ## What does *not* confine a realm
 
 > **The sandbox is half-built.** Decisions D9, D-020, D-036. The shim and its
-> app run in six namespaces with an identity uid/gid map, zero capabilities and
-> a private mount table — but with **no seccomp filter and no Landlock
-> ruleset**, so the realm is path-confined and not syscall-confined. At
-> `--isolation=off` none of it applies and the paragraph below holds in full.
+> app run in six namespaces with an identity uid/gid map, zero capabilities, a
+> private mount table and — since P2.6.3 — a **Landlock ruleset** enforced
+> before the shim's `execve`, whose read set is enumerated rather than granted
+> at the realm root and whose write set reaches eight hierarchies (the four
+> writable mounts in full, plus `WRITE_FILE` alone on `/proc`, `/dev`,
+> `/dev/pts` and each render node — eight with one render node bound, one more
+> for each additional one). What that ruleset requires of a kernel is published
+> as a generated, CI-held table — [the Landlock ABI matrix](isolation-matrix.md)
+> — but P2.6.3 is **still not finished**: that table measures no kernel, the
+> per-kernel one its criteria ask for is not built, and the ABI floor narrowed
+> the task rather than closing it.
+> But there is still **no seccomp filter**, so the realm is
+> filesystem-confined and not syscall-confined. At `--isolation=off` none of it
+> applies and the paragraph below holds in full; `--landlock=off` turns off the
+> ruleset alone, and both say so in every journal entry.
 
 An application that ignores `WAYLAND_DISPLAY` and connects directly to a
 path it already knows is not stopped by anything in this MVP.
 
-Two specifics worth naming rather than leaving to be discovered:
+**And an app's *own* sandbox no longer confines anything here.** A Landlock
+domain denies every mount-topology change to a realm's app and its
+descendants, unconditionally — mounting is not an access right, so no rule
+grants it and widening the ruleset cannot restore it. A nested sandbox
+therefore cannot be built inside a realm, and an app that decodes images in
+one (GTK → `glycin` → `bwrap`) decodes them **unsandboxed** instead. A realm
+additionally refuses nested user namespaces outright, which takes no
+capability away — a namespace that cannot mount was already useless — and
+turns that into the conventional refusal such libraries already handle rather
+than an unexpected `mount(2)` failure. The measurement, and what it costs, are
+on [the limits page](limits.md).
+
+Two further specifics worth naming rather than leaving to be discovered:
 
 **The session D-Bus is reachable.** The core advertises no
 `DBUS_SESSION_BUS_ADDRESS` and redirects `XDG_RUNTIME_DIR`, so a

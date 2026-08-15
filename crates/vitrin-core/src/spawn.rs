@@ -353,17 +353,37 @@
 //! is a *confinement of the well-behaved*, not a containment of the hostile,
 //! and the session warns about it every sixty seconds for its whole life.
 //!
-//! ### `--isolation=default`: namespaces, and only namespaces
+//! ### `--isolation=default`: namespaces and Landlock, and not seccomp
 //!
 //! The realm gets its own user, mount, PID, IPC, UTS and network namespaces,
 //! an identity uid/gid map, zero capabilities, `no_new_privs`, a read-only
 //! root whose entire writable set is `{/run/vitrin, /vitrin/home, /tmp,
-//! /dev/shm}`, and an enumerated `/dev` with no `/dev/input` in it. PRD Doc 2
-//! §4.1 describes the child as spawned "in an unprivileged sandbox
-//! (namespaces/seccomp)"; **this build does the namespace third of that.**
-//! Landlock is P2.6.3 (#187) and seccomp is P2.6.4 (#188), and the journal
-//! says `applied_profile=namespaces-only` rather than any tier name for
-//! exactly that reason.
+//! /dev/shm}`, and an enumerated `/dev` with no `/dev/input` in it. Since
+//! P2.6.3 (#187) it also gets a **Landlock ruleset**, enforced by
+//! `vitrin-realm-init` immediately before the shim's `execve` and therefore
+//! inherited by every descendant including the app the shim forks: the four
+//! writable hierarchies above, an *enumerated* read+exec set for the
+//! read-only runtime paths, and nothing else.
+//!
+//! PRD Doc 2 §4.1 describes the child as spawned "in an unprivileged sandbox
+//! (namespaces/seccomp)"; **this build does two thirds of that.** Seccomp is
+//! P2.6.4 (#188), so the journal says `applied_profile=namespaces+landlock-abiN`
+//! rather than any tier name -- `intra-user` is *defined* as all three.
+//!
+//! **The `N` is the rung the realm obtained, not the rung it asked for**, so a
+//! ladder that fell from 9 to 1 is visible in the field named for what was
+//! applied rather than only inside a JSON blob. [`warn_on_landlock_shortfall`]
+//! additionally logs a WARN per spawn whenever the obtained rung is below the
+//! request or below the kernel's own ABI, naming both numbers and the rights
+//! that moved between them.
+//!
+//! The rung the ruleset was built at is journaled beside the ABI the kernel
+//! reported, both **child-asserted**: there is no `/proc` file naming a
+//! process's Landlock domain, so unlike the namespace inodes the parent
+//! cannot corroborate them. What cannot be forged is the realm's behaviour,
+//! which `tests/integration/test_real_confinement.py` measures from inside --
+//! it drives one probe the mount table leaves reachable and the ruleset
+//! denies, with `--landlock=off` in the same run as the positive control.
 //!
 //! Three residuals travel with it, published rather than papered over:
 //!
@@ -446,8 +466,9 @@ use rustix::fs::{FileType, Mode, OFlags};
 use vitrin_ipc::paths;
 use vitrin_ipc::{Connection, TransportError};
 use vitrin_realm_init::{
-    Config as RealmInitConfig, Frame, Stage, TmpfsCaps, CONFIG_MAX, HELPER_DEADLINE, IN_REALM_HOME,
-    IN_REALM_RUNTIME_DIR, IN_REALM_SHIM, IN_REALM_WAYLAND_SOCKET, MOUNT_FINGERPRINT_ALG,
+    landlock_audit_requested, Config as RealmInitConfig, Frame, LandlockRequest, Stage, TmpfsCaps,
+    CONFIG_MAX, HELPER_DEADLINE, IN_REALM_HOME, IN_REALM_RUNTIME_DIR, IN_REALM_SHIM,
+    IN_REALM_WAYLAND_SOCKET, LANDLOCK_AUDIT_ENV, MOUNT_FINGERPRINT_ALG,
 };
 
 use crate::grants::{GrantId, RealmId};
@@ -556,6 +577,14 @@ pub(crate) struct Confinement {
     /// The `size=` caps for the realm's four tmpfs mounts. A field rather
     /// than a constant read at the mount site so a test can shrink them.
     pub tmpfs: TmpfsCaps,
+    /// Which Landlock rung this session's `--landlock` flag allows the helper
+    /// to build (P2.6.3, #187).
+    ///
+    /// Session-wide, like `--isolation` and for the same reason (D-036(7)):
+    /// whether a realm is confined -- and how far -- is not per-app
+    /// information, so it does not live in `realm.toml` where a copied
+    /// `[[realm]]` block could weaken one realm silently.
+    pub landlock: LandlockRequest,
 }
 
 impl SpawnPaths {
@@ -802,9 +831,15 @@ pub(crate) enum WritableSet {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct IsolationFacts {
     // --- parent-observed -------------------------------------------------
-    /// `namespaces-only` or `none`. Never a tier name: `intra-user` is
-    /// *defined* as namespaces plus Landlock plus seccomp, and this build
-    /// applies the namespace third.
+    /// `namespaces+landlock-abiN` for the rung the realm **obtained**,
+    /// `namespaces-only` (rung 0, i.e. `--landlock=off`), or `none` (at
+    /// `--isolation=off`). **Never a tier name**: `intra-user` is *defined*
+    /// as namespaces plus Landlock plus seccomp, and the filter is #188's.
+    ///
+    /// The rung in it is the one PID 1 reported, never the one the session
+    /// asked for -- otherwise a ladder that fell from rung 9 to rung 1 would
+    /// journal the same string as one that did not. `landlock.requested`
+    /// carries the ask.
     pub applied_profile: &'static str,
     /// The namespace kinds whose `/proc/<pid>/ns/*` inode the core read and
     /// found different from its own. Empty at `--isolation=off`.
@@ -869,10 +904,41 @@ pub(crate) struct IsolationFacts {
     /// routine `/usr/bin` -> `/usr/local/bin` move a hard failure for no
     /// security gain, since the data was always this operator's.
     pub storage_reused: bool,
+    /// The session's `--landlock` selection, which is a **parent** fact: it
+    /// is what this core asked for, not what the realm got. `None` at
+    /// `--isolation=off`, where nothing was asked for at all.
+    pub landlock_requested: Option<LandlockRequest>,
+    /// The kernel reported an ABI **above this build's own ladder**, so the
+    /// request was cut down to `LANDLOCK_BUILD_MAX_RUNG` by the build rather
+    /// than by the kernel or the operator (P2.6.3, #187).
+    ///
+    /// Derived here, from `vitrin_realm_init::plan_rung`, over the ABI the
+    /// child reported and this build's own constant -- so it is a *parent*
+    /// conclusion about a child-asserted number, which is why it sits in this
+    /// half of the struct. `None` when nothing measured the ABI, which is
+    /// only `--landlock=off` and `--isolation=off`.
+    ///
+    /// It is reported rather than merely computed: a build confining a newer
+    /// kernel at an older rung has a confinement claim one rung narrower than
+    /// its kernel would allow, and `vitrind --print-floor` prints the
+    /// constant it was measured against.
+    pub landlock_clamped_by_build: Option<bool>,
     // --- child-asserted --------------------------------------------------
     /// What the PID-1 child's own post-pivot `/proc/self/mountinfo` said.
     pub mount_count: Option<u32>,
     pub mount_fingerprint: Option<u64>,
+    /// The ABI rung the ruleset was actually built at, as reported by the
+    /// child that built it. `Some(0)` means "the session asked for none".
+    ///
+    /// Journaled beside [`Self::landlock_kernel_abi`] rather than alone,
+    /// because one number cannot distinguish a session pinned low by
+    /// `--landlock=abi:2` from a session on a kernel that offers no more. Two
+    /// numbers can, and an auditor should not have to read the command line
+    /// to tell those apart.
+    pub landlock_rung: Option<u32>,
+    /// What `landlock_create_ruleset(NULL, 0,
+    /// LANDLOCK_CREATE_RULESET_VERSION)` answered *inside the realm*.
+    pub landlock_kernel_abi: Option<u32>,
 }
 
 impl IsolationFacts {
@@ -899,8 +965,12 @@ impl IsolationFacts {
             writable: WritableSet::Unconfined,
             stdio: "inherited",
             storage_reused: false,
+            landlock_requested: None,
+            landlock_clamped_by_build: None,
             mount_count: None,
             mount_fingerprint: None,
+            landlock_rung: None,
+            landlock_kernel_abi: None,
         }
     }
 
@@ -1143,6 +1213,18 @@ pub(crate) enum ConfinementFault {
     RootView,
     /// The shim's `execve` inside the realm failed.
     ExecShim,
+    /// The Landlock ruleset could not be built, granted or enforced inside
+    /// the realm (P2.6.3, #187) -- or the helper reported enforcing none on a
+    /// session that asked for one.
+    ///
+    /// Its own class rather than folded into [`ConfinementFault::MountTable`]
+    /// or the generic protocol fault, because the operator's remedy is
+    /// specific: a kernel without `CONFIG_SECURITY_LANDLOCK`, or with
+    /// `landlock` missing from the active LSM list, answers here and nowhere
+    /// else. The startup preflight normally catches that before any realm
+    /// exists; this class is what catches the case where the *realm's* view
+    /// differs from the core's.
+    Landlock,
 }
 
 impl ConfinementFault {
@@ -1165,6 +1247,7 @@ impl ConfinementFault {
             ConfinementFault::PivotRoot => "pivot_root",
             ConfinementFault::RootView => "root_view",
             ConfinementFault::ExecShim => "exec_shim",
+            ConfinementFault::Landlock => "landlock",
         }
     }
 }
@@ -1889,6 +1972,7 @@ where
         binds,
         argv,
         caps: conf.tmpfs,
+        landlock: conf.landlock,
     };
     let blob = Frame::Config(Box::new(config)).encode().map_err(|e| {
         refuse(
@@ -1898,6 +1982,10 @@ where
     })?;
 
     // P9. The helper, not the shim, is what the core execs now.
+    //
+    // Read before `child_env` consumes `lookup`. See [`landlock_audit_env`]
+    // for why the diagnostic is added here and not inside that function.
+    let landlock_audit = landlock_audit_env(&lookup);
     let mut cmd = Command::new(&conf.realm_init);
     cmd.env_clear();
     cmd.envs(
@@ -1911,6 +1999,9 @@ where
         .iter()
         .map(|(k, v)| (k.as_os_str(), v.as_os_str())),
     );
+    if let Some((name, value)) = &landlock_audit {
+        cmd.env(name, value);
+    }
     cmd.current_dir(&runtime_dir);
     cmd.stdin(Stdio::from(cfg_child));
     cmd.stdout(Stdio::from(log));
@@ -2015,8 +2106,33 @@ where
     // They now carry what the check *returned*: a boolean that cannot be
     // produced without running the comparison is a boolean a deleted
     // comparison cannot forge.
+    // **What the ladder actually landed on, compared with what was asked for
+    // and with what this kernel offers** (P2.6.3, #187). Three numbers, and
+    // the comparison between them is the thing #187 forbids masking: a realm
+    // that fell from rung 9 to rung 1 has no `TRUNCATE`, no `IOCTL_DEV` and
+    // no scoping, and must be distinguishable without diffing a per-realm
+    // JSON blob.
+    //
+    // The plan is recomputed through the SAME pure function the helper
+    // planned with (`vitrin_realm_init::plan_rung`), rather than by a second
+    // copy of the arithmetic here: two opinions about one session is exactly
+    // the shape this warning exists to catch.
+    let plan = vitrin_realm_init::plan_rung(handshake.landlock_kernel_abi, conf.landlock);
+    warn_on_landlock_shortfall(
+        realm_id,
+        conf.landlock,
+        handshake.landlock_rung,
+        handshake.landlock_kernel_abi,
+        plan,
+    );
+
     let isolation = IsolationFacts {
-        applied_profile: "namespaces-only",
+        // **The rung OBTAINED, never the rung requested.** The field is named
+        // `applied_profile`; deriving it from `conf.landlock` rendered
+        // `--landlock=abi:9` on an ABI-3 kernel as `namespaces+landlock-abi9`
+        // and rendered `--landlock=highest` identically at rung 1 and rung 9.
+        // The request is journaled separately as `landlock.requested`.
+        applied_profile: isolation::profile_for(Isolation::Default, handshake.landlock_rung),
         namespaces_verified: handshake.namespaces_verified,
         root_dev_differs: Some(handshake.root_view.root_dev_differs),
         canaries_probed: handshake.root_view.canaries_probed,
@@ -2034,8 +2150,18 @@ where
         writable: handshake.root_view.writable,
         stdio: "per-realm log file",
         storage_reused,
+        landlock_requested: Some(conf.landlock),
+        // `0` is the helper's "not measured", which happens on exactly one
+        // path: `--landlock=off`, where nothing asked the kernel anything.
+        // Rendered `null` rather than as rung 0, because 0 is not an ABI
+        // version.
+        landlock_clamped_by_build: (handshake.landlock_kernel_abi > 0)
+            .then_some(plan.clamped_by_build),
         mount_count: Some(handshake.mount_count),
         mount_fingerprint: Some(handshake.mount_fingerprint),
+        landlock_rung: Some(handshake.landlock_rung),
+        landlock_kernel_abi: (handshake.landlock_kernel_abi > 0)
+            .then_some(handshake.landlock_kernel_abi),
     };
 
     Ok(SpawnedRealm {
@@ -2126,6 +2252,132 @@ fn sanitise_for_terminal(text: &str) -> String {
     out
 }
 
+/// **The ladder fallback, said out loud** (P2.6.3, #187).
+///
+/// `create_ruleset` walks 9 -> 8 -> ... -> 1 on `EINVAL`/`E2BIG`, and the
+/// core accepts any rung at or above 1. Without this, a realm that fell from
+/// rung 9 to rung 1 -- no `TRUNCATE`, no `IOCTL_DEV`, no scoping, no
+/// `RESOLVE_UNIX` -- was indistinguishable from a full-strength one unless
+/// somebody diffed two numbers inside a per-realm JSON blob. #187's rule is
+/// "never mask the fallback", and a rung that only a JSON reader can see is
+/// masked in every sense that matters.
+///
+/// Two different shortfalls, warned separately because their causes and
+/// remedies are different:
+///
+/// 1. **Below the request.** The helper asked for the planned rung and the
+///    kernel refused it. Nobody chose this, and it is the one that means
+///    something is wrong with the kernel or with the build's idea of it.
+/// 2. **Below the kernel's own ABI.** The operator's `--landlock=abi:N`, or
+///    this build's own ladder being shorter than the kernel's, cut it down.
+///    Both are choices, and both still leave a realm confined less than this
+///    machine could confine it.
+fn warn_on_landlock_shortfall(
+    realm_id: &str,
+    requested: LandlockRequest,
+    obtained: u32,
+    kernel: u32,
+    plan: vitrin_realm_init::Plan,
+) {
+    if requested == LandlockRequest::Off {
+        // Rung 0 by the operator's own instruction, warned about once per
+        // session at startup rather than once per realm. Nothing here is a
+        // shortfall against a request.
+        return;
+    }
+    if obtained < plan.rung {
+        tracing::warn!(
+            realm = realm_id,
+            obtained_rung = obtained,
+            requested_rung = plan.rung,
+            kernel_abi = kernel,
+            "LANDLOCK LADDER FELL BELOW THE REQUEST: this realm's ruleset was built at rung \
+             {obtained} after the kernel refused rung {requested}, on a kernel that reports \
+             ABI {kernel}. Nobody selected this. What a rung-{obtained} domain does not \
+             police, that rung {requested} would: {lost}",
+            requested = plan.rung,
+            lost = landlock_rights_between(obtained, plan.rung),
+        );
+    }
+    if obtained < kernel {
+        let max = vitrin_realm_init::LANDLOCK_BUILD_MAX_RUNG;
+        let cause = if obtained < plan.rung {
+            "the ladder fell below the request; see the warning above".to_string()
+        } else if requested.cap().is_some() {
+            format!("the session's own `--landlock={requested}`")
+        } else if plan.clamped_by_build {
+            format!(
+                "this BUILD's ladder stops at rung {max} (`vitrind --print-floor`, row \
+                 `build.landlock_max_rung`)"
+            )
+        } else {
+            "unaccounted for -- the request, the build's ladder and the kernel all allow more \
+             than this realm obtained, which should be impossible"
+                .to_string()
+        };
+        tracing::warn!(
+            realm = realm_id,
+            obtained_rung = obtained,
+            kernel_abi = kernel,
+            requested = %requested,
+            clamped_by_build = plan.clamped_by_build,
+            "LANDLOCK IS BELOW THIS KERNEL: this realm's ruleset is at rung {obtained} on a \
+             kernel that offers ABI {kernel}. Cause: {cause}. What this machine could police \
+             and this realm does not: {lost}",
+            lost = landlock_rights_between(obtained, kernel),
+        );
+    }
+}
+
+/// The access rights a domain at `obtained` does not police that a domain at
+/// `target` would, named rather than left as two numbers.
+///
+/// **Rung 2 is called out as a loosening, not a tightening**, because it is
+/// one: a domain that does not handle `REFER` denies reparenting outright, so
+/// rung 1 is *stricter* about `rename(2)` across directories than every rung
+/// above it. A message that listed it beside `TRUNCATE` as a thing "lost"
+/// would be this build describing its own confinement wrongly.
+fn landlock_rights_between(obtained: u32, target: u32) -> String {
+    let mut lost: Vec<&str> = Vec::new();
+    for (rung, what) in [
+        (
+            2u32,
+            "rung 2 REFER -- and this one goes the OTHER way: a rung-1 domain forbids \
+             rename/link across directories entirely, even inside the realm's own writable \
+             storage, so the lower rung is STRICTER here and apps that write by \
+             rename-into-place (GTK, Firefox) break",
+        ),
+        (
+            3,
+            "rung 3 TRUNCATE -- without it a payload that cannot write a file can still \
+             destroy it (truncate(2), creat(2), O_TRUNC are ungated)",
+        ),
+        (
+            5,
+            "rung 5 IOCTL_DEV -- without it every device node the realm can open accepts \
+             every ioctl",
+        ),
+        (
+            6,
+            "rung 6 scoping -- without it the domain does not scope abstract UNIX sockets or \
+             signals (the realm's namespaces still do)",
+        ),
+        (
+            9,
+            "rung 9 RESOLVE_UNIX -- without it connect(2) to pathname UNIX sockets is ungated",
+        ),
+    ] {
+        if obtained < rung && rung <= target {
+            lost.push(what);
+        }
+    }
+    if lost.is_empty() {
+        "nothing -- no access right this build requests moves between those rungs".to_string()
+    } else {
+        lost.join("; ")
+    }
+}
+
 /// What the handshake established, all of it read by this process.
 struct Handshake {
     namespaces_verified: Vec<&'static str>,
@@ -2141,6 +2393,14 @@ struct Handshake {
     root_view: RootView,
     mount_count: u32,
     mount_fingerprint: u64,
+    /// The Landlock rung PID 1 said it enforced, and the ABI the kernel
+    /// reported to it. **Child-asserted, both of them** -- there is no
+    /// `/proc` file naming a process's Landlock domain, so unlike the
+    /// namespace inodes the parent cannot corroborate this pair. What cannot
+    /// be forged is the realm's *behaviour*, which is what
+    /// `tests/integration/test_real_confinement.py` measures from inside.
+    landlock_rung: u32,
+    landlock_kernel_abi: u32,
     elapsed: Duration,
 }
 
@@ -2313,9 +2573,48 @@ fn handshake(
     // *error* -- so `ECONNRESET`, `ENOMEM` or `EFAULT` read as "the execve
     // succeeded". That is the one fail-open shape this whole handshake exists
     // to avoid, and the codec now keeps the two apart at the type level.
-    match recv_frame_or_eof(cfg, deadline)? {
-        None => {}
-        Some(frame) => return Err(unexpected(frame)),
+    // P21b. **One frame may arrive between `PROCEED` and the EOF**, and only
+    // one: PID 1 reports the Landlock rung it enforced (P2.6.3, #187) just
+    // before its `execve`, because after the `execve` there is nobody left to
+    // report it -- the channel's closing *is* the success signal.
+    //
+    // It is expected rather than optional, and the loop below refuses a spawn
+    // that skipped it. A session that asked for a ruleset and got an EOF with
+    // no rung reported is a session with no evidence that a ruleset was ever
+    // built, and "no evidence" is not the same as "it worked": that is the
+    // silent degradation the whole floor exists to forbid. At
+    // `--landlock=off` the helper still sends the frame, carrying rung 0.
+    let mut landlock: Option<(u32, u32)> = None;
+    loop {
+        match recv_frame_or_eof(cfg, deadline)? {
+            None => break,
+            Some(Frame::Landlocked { rung, kernel_abi }) if landlock.is_none() => {
+                landlock = Some((rung, kernel_abi));
+            }
+            Some(frame) => return Err(unexpected(frame)),
+        }
+    }
+    let (landlock_rung, landlock_kernel_abi) = landlock.ok_or_else(|| {
+        refuse(
+            ConfinementFault::HelperProtocol,
+            "the confinement helper exec'd the shim without reporting which Landlock rung it \
+             enforced. The rung is child-asserted and is not what licenses the spawn, but its \
+             ABSENCE is this core's only signal that the helper never reached K12b at all -- \
+             and a realm whose ruleset may not exist is refused rather than journaled as \
+             confined",
+        )
+    })?;
+    if conf.landlock != LandlockRequest::Off && landlock_rung == 0 {
+        return Err(refuse(
+            ConfinementFault::Landlock,
+            format!(
+                "this session selected `--landlock={}` and the helper reported that it \
+                 enforced no ruleset at all (rung 0). The spawn is refused rather than \
+                 started: the difference between the confinement a session asked for and the \
+                 confinement it got is exactly what D-020(6) forbids leaving to a log line",
+                conf.landlock
+            ),
+        ));
     }
 
     // The last thing that binds the *verified* pid to the process that
@@ -2336,6 +2635,8 @@ fn handshake(
         root_view,
         mount_count,
         mount_fingerprint,
+        landlock_rung,
+        landlock_kernel_abi,
         elapsed: started.elapsed(),
     })
 }
@@ -2526,6 +2827,23 @@ fn from_helper_stage(stage: Stage, errno: i32) -> SpawnError {
         Stage::Internal => refuse(
             ConfinementFault::HelperProtocol,
             format!("the confinement helper refused at an internal step ({os})"),
+        ),
+        // Reached only when the *realm's* answer differs from the core's own
+        // preflight, which measured the same three syscalls before any realm
+        // existed. That gap is worth its own sentence rather than a shrug: it
+        // means something changed between startup and this spawn, or the
+        // helper is not the binary the preflight described.
+        Stage::Landlock => refuse(
+            ConfinementFault::Landlock,
+            format!(
+                "the realm's Landlock ruleset could not be built, granted or enforced ({os}). \
+                 A session that reaches this stage asked for a ruleset -- `--landlock=off` \
+                 returns from the helper's K12b before any syscall -- and its startup \
+                 preflight already found Landlock available, so the two answers disagree: \
+                 check `vitrind --print-isolation` against the same kernel, and note that a \
+                 grant on an in-realm path the mount table did not create fails here as \
+                 ENOENT rather than as a mount-table error"
+            ),
         ),
     }
 }
@@ -3056,6 +3374,22 @@ where
         .inherited_env(lookup)
         .into_iter()
         .filter(|(name, _)| !is_reserved_env(name))
+        // The Landlock audit diagnostic is **not** a realm's variable to
+        // allow-list. It is filtered here rather than added to `RESERVED_ENV`
+        // because those six names are *decided by the core* -- the core
+        // supplies a value for each -- while this one is decided by the
+        // operator's own environment and consumed by the helper, never by the
+        // app. Allow-listing it in `realm.toml` could not escalate anything
+        // (only the core's own environment can carry the value, and only the
+        // helper acts on it), but it would put a second route to an
+        // instrument's switch inside a realm's configuration, and one route is
+        // the number that stays reviewable. See [`landlock_audit_env`].
+        //
+        // What this does not claim: that the name is invisible inside a realm
+        // when the diagnostic IS on. It rides the helper's own environment
+        // through `execve`, so the shim and the app can read it there. It
+        // authorises nothing -- the domain is already enforced by then.
+        .filter(|(name, _)| name != LANDLOCK_AUDIT_ENV)
         .map(|(name, value)| (OsString::from(name), OsString::from(value)))
         .collect();
     // The confinement itself: an absolute path, so libwayland connects to
@@ -3078,6 +3412,32 @@ where
 
 fn is_reserved_env(name: &str) -> bool {
     RESERVED_ENV.iter().any(|(reserved, _)| *reserved == name)
+}
+
+/// The one name the **confined** path adds on top of [`child_env`], and only
+/// when the core's own environment asked for it: the Landlock audit-log
+/// diagnostic (P2.6.3 follow-up, `vitrin_realm_init::LANDLOCK_AUDIT_ENV`).
+///
+/// It is deliberately **not** part of [`child_env`]. That function composes
+/// the realm's environment, which is a confinement surface with a
+/// default-deny rule and an allowlist; this is an instrument the operator
+/// running a measurement turns on for the *helper*, and folding it in would
+/// mean the unconfined path -- which has no helper and no ruleset -- also
+/// carried a variable that could not possibly do anything there.
+///
+/// The value forwarded is the literal `"1"` rather than whatever the core's
+/// own environment held, so there is exactly one spelling of "on" anywhere in
+/// the system and the helper's own
+/// [`vitrin_realm_init::landlock_audit_requested`] cannot be handed a second
+/// one. Every other value -- including `"0"`, `"true"` and the empty string --
+/// forwards nothing at all, so an inherited variable cannot switch a realm's
+/// audit logging on by accident.
+fn landlock_audit_env<F>(lookup: F) -> Option<(OsString, OsString)>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    landlock_audit_requested(lookup(LANDLOCK_AUDIT_ENV).as_deref())
+        .then(|| (OsString::from(LANDLOCK_AUDIT_ENV), OsString::from("1")))
 }
 
 /// Refuse a spawn whose allowlist names a variable the core decides. The
@@ -3498,6 +3858,195 @@ pub(crate) mod tests {
     /// operations on a loaded CI runner, not a latency assertion.
     pub(crate) const DEADLINE: Duration = Duration::from_secs(10);
 
+    /// Capture the log lines a block emits, on this thread only.
+    ///
+    /// `session.rs`'s own capture is private to its test module and this one
+    /// is deliberately not shared with it: the thing under test here is a
+    /// sentence a human reads in a log, and a sentence is only asserted by
+    /// reading what was emitted. Thread-local
+    /// ([`tracing::subscriber::set_default`]) rather than global, because
+    /// `main.rs`'s auto-approve banner test owns the one `set_global_default`
+    /// this binary may install.
+    struct LogCapture {
+        lines: std::sync::Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>,
+        _guard: tracing::subscriber::DefaultGuard,
+    }
+
+    impl LogCapture {
+        fn install() -> Self {
+            use tracing_subscriber::layer::SubscriberExt;
+            let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let subscriber =
+                tracing_subscriber::registry().with(CaptureLayer(std::sync::Arc::clone(&lines)));
+            let guard = tracing::subscriber::set_default(subscriber);
+            LogCapture {
+                lines,
+                _guard: guard,
+            }
+        }
+
+        fn take(&self) -> Vec<(tracing::Level, String)> {
+            std::mem::take(&mut *self.lines.lock().unwrap_or_else(|e| e.into_inner()))
+        }
+    }
+
+    struct CaptureLayer(std::sync::Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut message = MessageField(String::new());
+            event.record(&mut message);
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((*event.metadata().level(), message.0));
+        }
+    }
+
+    struct MessageField(String);
+
+    impl tracing::field::Visit for MessageField {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = format!("{value:?}");
+            }
+        }
+    }
+
+    /// **The ladder fallback is never masked** (P2.6.3, #187).
+    ///
+    /// The core accepts any rung at or above 1, so before this warning a realm
+    /// that fell from rung 9 to rung 1 -- no `TRUNCATE`, no `IOCTL_DEV`, no
+    /// scoping, no `RESOLVE_UNIX` -- looked exactly like a full-strength one
+    /// unless somebody read two numbers inside a per-realm JSON blob.
+    ///
+    /// Driven with constructed numbers rather than by finding a kernel that
+    /// falls back: the fallback is a kernel behaviour this box does not
+    /// exhibit, and waiting for a machine that does is how a warning ships
+    /// untested.
+    #[test]
+    fn a_landlock_rung_below_the_request_or_below_the_kernel_is_warned_about() {
+        let plan_for = |kernel, request| vitrin_realm_init::plan_rung(kernel, request);
+
+        // 1. The ladder fell: asked for 9 (the kernel offers 9), got 1.
+        let capture = LogCapture::install();
+        warn_on_landlock_shortfall(
+            "realm-0",
+            LandlockRequest::Highest,
+            1,
+            9,
+            plan_for(9, LandlockRequest::Highest),
+        );
+        let lines = capture.take();
+        let fell = lines
+            .iter()
+            .find(|(_, m)| m.contains("FELL BELOW THE REQUEST"))
+            .unwrap_or_else(|| panic!("no fallback warning was emitted; lines were {lines:?}"));
+        assert_eq!(fell.0, tracing::Level::WARN, "the fallback is not an INFO");
+        for needle in [
+            "rung 1",
+            "rung 9",
+            "ABI 9",
+            // What was lost, named. Two numbers alone are what this warning
+            // exists to replace.
+            "TRUNCATE",
+            "IOCTL_DEV",
+            "RESOLVE_UNIX",
+            "scoping",
+        ] {
+            assert!(fell.1.contains(needle), "missing {needle:?} in {}", fell.1);
+        }
+        // And REFER is named as the rung that goes the OTHER way, because a
+        // message listing it beside TRUNCATE as a thing "lost" would be this
+        // build describing its own confinement wrongly.
+        assert!(fell.1.contains("REFER"), "{}", fell.1);
+        assert!(fell.1.contains("STRICTER"), "{}", fell.1);
+        // The same run also warns that the realm is below the kernel, and the
+        // second warning points at the first rather than inventing a cause.
+        assert!(
+            lines
+                .iter()
+                .any(|(_, m)| m.contains("BELOW THIS KERNEL") && m.contains("see the warning")),
+            "{lines:?}"
+        );
+
+        // 2. The operator's cap: the request was honoured, and the realm is
+        //    still below the kernel. One warning, naming the flag.
+        let capture = LogCapture::install();
+        warn_on_landlock_shortfall(
+            "realm-0",
+            LandlockRequest::CappedAt(2),
+            2,
+            9,
+            plan_for(9, LandlockRequest::CappedAt(2)),
+        );
+        let lines = capture.take();
+        assert!(
+            !lines
+                .iter()
+                .any(|(_, m)| m.contains("FELL BELOW THE REQUEST")),
+            "a cap that was honoured is not a fallback: {lines:?}"
+        );
+        let capped = lines
+            .iter()
+            .find(|(_, m)| m.contains("BELOW THIS KERNEL"))
+            .unwrap_or_else(|| panic!("a pinned realm was not warned about: {lines:?}"));
+        assert!(capped.1.contains("--landlock=abi:2"), "{}", capped.1);
+
+        // 3. This build's ladder is shorter than the kernel's -- the clamp,
+        //    driven by a CONSTRUCTED ABI rather than by waiting for such a
+        //    kernel to exist.
+        let over = vitrin_realm_init::LANDLOCK_BUILD_MAX_RUNG + 3;
+        let plan = plan_for(over, LandlockRequest::Highest);
+        assert!(plan.clamped_by_build, "the fixture must be a clamp");
+        let capture = LogCapture::install();
+        warn_on_landlock_shortfall("realm-0", LandlockRequest::Highest, plan.rung, over, plan);
+        let lines = capture.take();
+        let clamped = lines
+            .iter()
+            .find(|(_, m)| m.contains("BELOW THIS KERNEL"))
+            .unwrap_or_else(|| panic!("a build-clamped realm was not warned about: {lines:?}"));
+        assert!(
+            clamped.1.contains("build.landlock_max_rung"),
+            "{}",
+            clamped.1
+        );
+
+        // 4. **Non-vacuity**: the case that must say nothing. A realm that got
+        //    exactly what the kernel offers and what the session asked for is
+        //    silent, or every session warns and the warning means nothing.
+        let capture = LogCapture::install();
+        warn_on_landlock_shortfall(
+            "realm-0",
+            LandlockRequest::Highest,
+            9,
+            9,
+            plan_for(9, LandlockRequest::Highest),
+        );
+        assert!(
+            capture.take().is_empty(),
+            "a full-strength realm warned; a warning that fires always is a warning nobody reads"
+        );
+        // And `--landlock=off` is not a shortfall: it is the operator's own
+        // instruction, warned about once at startup rather than once a realm.
+        let capture = LogCapture::install();
+        warn_on_landlock_shortfall(
+            "realm-0",
+            LandlockRequest::Off,
+            0,
+            0,
+            plan_for(0, LandlockRequest::Off),
+        );
+        assert!(
+            capture.take().is_empty(),
+            "--landlock=off is not a fallback"
+        );
+    }
+
     /// A private scratch tree standing in for `$XDG_RUNTIME_DIR`.
     pub(crate) fn scratch() -> PathBuf {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -3884,6 +4433,12 @@ pub(crate) mod tests {
                     shm: 4 * 1024 * 1024,
                     tmp: 4 * 1024 * 1024,
                 },
+                // The shipped default, so a component test exercises the
+                // rung the operator gets rather than a weaker one nobody
+                // runs. The per-rung measurements live in
+                // `vitrin-realm-init`'s own suite, where a forked child can
+                // enforce a capped domain without confining this binary.
+                landlock: LandlockRequest::Highest,
             }
         }
 
@@ -5145,10 +5700,50 @@ pub(crate) mod tests {
             .expect("realm_spawned");
         let line = format!("{entry:?}");
         assert!(line.contains("\"applied_profile\": \"none\"") || line.contains("none"));
+        // The Landlock object is written with every field null rather than
+        // omitted -- this file's rule that absent information is an explicit
+        // value. Until #187 the same statement was the fixed string
+        // "not-applied (P2.6.3)"; a null `requested` now says the same thing
+        // more precisely, because at `--isolation=off` no helper runs and
+        // nothing was asked for OR obtained.
+        //
+        // Asserted against the PARSED entry rather than by substring. A
+        // `line.contains("landlock")` stood here briefly and could not fail:
+        // `write_isolation` emits that key unconditionally on every path, so
+        // the assertion held whatever the object contained -- including a
+        // rung. `Json::at` panics on a missing member, so dropping the object
+        // or any field turns these red, and `is_null` turns them red if a
+        // number appears where "nothing was measured" is the only honest
+        // answer.
+        for field in [
+            "requested",
+            "obtained_rung",
+            "kernel_abi",
+            "clamped_by_build",
+        ] {
+            assert!(
+                entry.is_null(&format!("isolation.landlock.{field}")),
+                "at --isolation=off no helper runs, so isolation.landlock.{field} must be \
+                 null rather than a value: {line}"
+            );
+        }
+        // And the provenance label goes null with them. It used to read
+        // `child-asserted` here, which is a claim about numbers made where
+        // there are none -- no helper ran at `--isolation=off`, so no child
+        // asserted anything. The key is still written (this recorder's rule:
+        // absent information is an explicit value), only its value moves.
         assert!(
-            line.contains("not-applied (P2.6.3)"),
-            "the entry must say Landlock was not applied rather than omit it: {line}"
+            entry.is_null("isolation.landlock.rung_evidence"),
+            "at --isolation=off nothing was asked and nothing was measured, so the object \
+             may not label an absence with the provenance of a number: {line}"
         );
+        assert!(
+            line.contains("rung_evidence"),
+            "the key must still be present, null rather than omitted: {line}"
+        );
+        assert_eq!(facts.landlock_requested, None);
+        assert_eq!(facts.landlock_rung, None, "nothing enforced it, so no rung");
+        assert_eq!(facts.landlock_kernel_abi, None, "and nothing read the ABI");
     }
 
     /// The confined bring-up, end to end, against the **real**
@@ -5189,7 +5784,45 @@ pub(crate) mod tests {
         .expect("the confined spawn must succeed on a kernel that grants the namespaces");
 
         let facts = spawned.isolation().clone();
-        assert_eq!(facts.applied_profile, "namespaces-only");
+        // The rung is what the helper reported, and it is at least the floor:
+        // rung 0 is `--landlock=off`, which this spawn did not select.
+        assert_eq!(facts.landlock_requested, Some(LandlockRequest::Highest));
+        let rung = facts
+            .landlock_rung
+            .expect("a confined spawn reports its rung");
+        assert!(
+            rung >= 1,
+            "the helper enforced no ruleset on a spawn that asked for the highest rung"
+        );
+        let kernel_abi = facts
+            .landlock_kernel_abi
+            .expect("and the kernel's own ABI beside it");
+        assert!(
+            rung <= kernel_abi,
+            "the reported rung is above the ABI the same child read from the same kernel"
+        );
+        // **The profile is the rung that was OBTAINED**, so it moves with the
+        // ladder. Derived here from the number the helper reported, which is
+        // the whole assertion: a profile computed from the *request* would
+        // read `namespaces+landlock` on a kernel that granted rung 1.
+        assert_eq!(
+            facts.applied_profile,
+            isolation::profile_for(Isolation::Default, rung)
+        );
+        assert!(
+            facts.applied_profile.ends_with(&format!("abi{rung}")),
+            "the obtained rung must be in the profile: {}",
+            facts.applied_profile
+        );
+        // The build clamp, reported rather than merely computed. This box's
+        // kernel is inside the build's ladder, so `false` is the measured
+        // answer; the constructed-probe assertion lives in
+        // `vitrin-realm-init`'s own suite, which does not need such a kernel
+        // to exist.
+        assert_eq!(
+            facts.landlock_clamped_by_build,
+            Some(kernel_abi > vitrin_realm_init::LANDLOCK_BUILD_MAX_RUNG)
+        );
         assert_eq!(
             facts.namespaces_verified,
             ["user", "mnt", "ipc", "uts", "net"],
@@ -5270,17 +5903,37 @@ pub(crate) mod tests {
         for needle in [
             "parent_observed",
             "child_asserted",
-            "namespaces-only",
+            "namespaces+landlock",
             "mount_fingerprint",
             "fnv1a-64",
+            // P2.6.3's pair, and both halves are needed: one number cannot
+            // separate a session pinned low by `--landlock=abi:N` from a
+            // session on a kernel that offers no more.
+            "obtained_rung",
+            "kernel_abi",
+            // The third: whether this BUILD's ladder, rather than the kernel
+            // or the operator, is what held the rung down. Computed for every
+            // realm since #187 and, until this needle, read by nobody.
+            "clamped_by_build",
+            // The label that keeps the pair out of the parent's column.
+            "child-asserted",
         ] {
             assert!(line.contains(needle), "missing {needle} in {line}");
         }
-        // The claim the entry may never make.
+        // The claim the entry may never make. Still true at #187: the tier
+        // means namespaces plus Landlock plus SECCOMP, and the filter is
+        // #188's.
         assert!(
             !line.contains("intra-user"),
-            "a build that applies namespaces only may not journal a tier that means \
-             namespaces plus Landlock plus seccomp: {line}"
+            "a build that applies namespaces and Landlock may not journal a tier that also \
+             means seccomp: {line}"
+        );
+        // And the rung is a number that was reported, never a hopeful
+        // default: rung 0 is what `--landlock=off` journals, and this spawn
+        // did not ask for that.
+        assert!(
+            !line.contains("\"obtained_rung\":0"),
+            "a confined spawn journaled rung 0, which is the `--landlock=off` value: {line}"
         );
     }
 
@@ -5308,6 +5961,101 @@ pub(crate) mod tests {
         f(facts.shim_host_pid.expect("the shim's host pid"), &facts);
         h.reap(spawned);
         let _ = fs::remove_file(&canary);
+    }
+
+    /// The `--landlock` cap, end to end: core -> config blob -> helper ->
+    /// ladder -> journal (P2.6.3, #187).
+    ///
+    /// **The point is that the cap is a shipped flag rather than a build
+    /// feature**, so this test drives the same binary an operator runs. What
+    /// it proves is narrow and specific: the rung the helper enforced is the
+    /// rung this core asked for, and the journal carries both it and the
+    /// kernel's own ABI so a pinned-low session cannot be mistaken for a
+    /// full-strength one. What each rung *buys* is measured in
+    /// `vitrin-realm-init`'s own suite, where a forked child can enforce a
+    /// capped domain without confining this test binary for good.
+    #[test]
+    fn a_capped_session_enforces_the_rung_it_asked_for_and_journals_both_numbers() {
+        // This one spawns a REAL confined realm, so it needs the same guard the
+        // other nine confinement tests carry: a host that refuses the mount
+        // inside a user namespace (Ubuntu 24.04+'s AppArmor default, and the
+        // GitHub runner) cannot run it at all. CI takes the sysctl remedy in
+        // the `rust` job so this runs there rather than skipping.
+        if !namespaces_available() {
+            return;
+        }
+        let mut h = Harness::new("landlock-cap");
+        let mut confinement = h.confinement();
+        confinement.landlock = LandlockRequest::CappedAt(2);
+        let canary = confinement.canaries[0].clone();
+        let bin = mock_shim_bin();
+        let realm = realm_with_spawn("realm-0", &bin, &["--serve".to_string()], &[]);
+        let paths = h.paths().confined(confinement);
+        let spawned = spawn_realm_with_env(
+            &realm,
+            &paths,
+            &mut h.recorder,
+            SpawnOrigin::Startup,
+            |_| None,
+        )
+        .expect("a capped session still spawns");
+        let facts = spawned.isolation().clone();
+        h.reap(spawned);
+        let _ = fs::remove_file(&canary);
+
+        let kernel = facts.landlock_kernel_abi.expect("the realm read the ABI");
+        if kernel < 2 {
+            eprintln!(
+                "SKIP the cap assertion: this kernel reports Landlock ABI {kernel}, so rung 2 \
+                 is not below it and the cap could not have weakened anything."
+            );
+            return;
+        }
+        assert_eq!(
+            facts.landlock_rung,
+            Some(2),
+            "the helper enforced a rung other than the one the core capped it to"
+        );
+        assert!(
+            facts.landlock_rung < facts.landlock_kernel_abi,
+            "on a kernel that offers more, a capped session must journal a rung BELOW the \
+             kernel's own -- that inequality is the whole signal that the session is pinned"
+        );
+        assert_eq!(
+            facts.applied_profile, "namespaces+landlock-abi2",
+            "a capped session must not render like the default one"
+        );
+
+        // Non-vacuity, in the same run: the uncapped spawn on this machine
+        // reaches the kernel's own rung, so the numbers above are the cap's
+        // doing and not a ceiling this box happens to have.
+        let mut h = Harness::new("landlock-uncapped");
+        let confinement = h.confinement();
+        let canary = confinement.canaries[0].clone();
+        let realm = realm_with_spawn("realm-0", &bin, &["--serve".to_string()], &[]);
+        let paths = h.paths().confined(confinement);
+        let spawned = spawn_realm_with_env(
+            &realm,
+            &paths,
+            &mut h.recorder,
+            SpawnOrigin::Startup,
+            |_| None,
+        )
+        .expect("the uncapped control spawns");
+        let control = spawned.isolation().clone();
+        h.reap(spawned);
+        let _ = fs::remove_file(&canary);
+        assert_eq!(
+            control.landlock_rung,
+            Some(kernel.min(vitrin_realm_init::LANDLOCK_BUILD_MAX_RUNG)),
+            "the uncapped control did not reach this kernel's rung, so the capped run above \
+             proves nothing about the cap"
+        );
+        assert_ne!(
+            control.applied_profile, facts.applied_profile,
+            "the capped and uncapped runs journal the same profile string, so a reader \
+             greping the journal cannot tell them apart"
+        );
     }
 
     /// One field of `/proc/<pid>/status`, or `None`.
@@ -6160,5 +6908,61 @@ pub(crate) mod tests {
             |_| None,
         );
         assert!(homeless.iter().all(|(k, _)| k != "HOME"));
+    }
+
+    /// The Landlock audit diagnostic is forwarded **only** when the core's own
+    /// environment asked for it, and it is never part of a realm's composed
+    /// environment.
+    ///
+    /// Two properties, and the second is the one a reviewer should look for.
+    /// It is not in [`child_env`] at all -- a realm's environment is a
+    /// default-deny allowlist and this is an operator's instrument, so it goes
+    /// on the helper's `Command` at the confined call site and nowhere else.
+    /// And no `realm.toml` allowlist can conjure it: `child_env` copies
+    /// `env_allow` names out of the core's environment, so the negative half
+    /// below runs with the name *present in the core's environment* and a
+    /// realm that explicitly allow-lists it, and still asserts that
+    /// `child_env` does not carry it.
+    #[test]
+    fn the_landlock_audit_diagnostic_is_forwarded_only_when_the_core_was_asked() {
+        assert_eq!(
+            landlock_audit_env(|name| (name == LANDLOCK_AUDIT_ENV).then(|| "1".to_string())),
+            Some((OsString::from(LANDLOCK_AUDIT_ENV), OsString::from("1"))),
+        );
+        // Anything else is nothing forwarded. The helper would refuse these
+        // too, but the core must not hand a second spelling down to be parsed.
+        for value in ["", "0", "true", "yes", "on", "2"] {
+            assert_eq!(
+                landlock_audit_env(|name| (name == LANDLOCK_AUDIT_ENV).then(|| value.to_string())),
+                None,
+                "{value:?} in the core's environment forwarded the diagnostic into a realm"
+            );
+        }
+        assert_eq!(
+            landlock_audit_env(|_| None),
+            None,
+            "the shipped path: unset in the core's environment, unset in the helper's"
+        );
+
+        // And the composed realm environment never carries it, even when the
+        // core has it set AND the realm allow-lists the name.
+        let spawn_config = crate::realm::tests::spawn_config_with(
+            Path::new("/usr/bin/true"),
+            &[],
+            &[LANDLOCK_AUDIT_ENV.to_string()],
+        );
+        let env = child_env(
+            &spawn_config,
+            Path::new(IN_REALM_WAYLAND_SOCKET),
+            Path::new(IN_REALM_RUNTIME_DIR),
+            Some(Path::new(IN_REALM_HOME)),
+            |name| (name == LANDLOCK_AUDIT_ENV).then(|| "1".to_string()),
+        );
+        assert!(
+            env.iter().all(|(k, _)| k != LANDLOCK_AUDIT_ENV),
+            "the diagnostic reached a realm's composed environment through `env_allow`; it \
+             belongs to the helper's Command at the confined call site, and nowhere a \
+             realm's own configuration can name"
+        );
     }
 }

@@ -57,6 +57,8 @@ use vitrin_realm_init::{
     IN_REALM_SHIM, PRE_EXEC_EXIT,
 };
 
+mod landlock;
+
 extern "C" {
     /// The environment this process was `execve`'d with -- exactly what
     /// `vitrin_core::spawn::child_env` composed after an `env_clear`. Read,
@@ -623,7 +625,7 @@ fn pid_one(
         _ => return Err(Fail::with(Stage::Internal, libc::EPROTO)),
     }
 
-    exec_shim(config)
+    exec_shim(chan, config)
 }
 
 // ---------------------------------------------------------------------------
@@ -904,6 +906,34 @@ enum CompatEntry {
 const COMPAT_NAMES: [&str; 6] = ["bin", "sbin", "lib", "lib64", "lib32", "libx32"];
 const DEV_NODES: [&str; 6] = ["null", "zero", "full", "random", "urandom", "tty"];
 
+/// Does this `binds` entry name a **file** rather than a directory?
+///
+/// `realm.toml` accepts either (`examples/realm.toml`: "a regular file or
+/// directory"), and the two answers are not interchangeable in either of the
+/// two places this binary acts on a bind:
+///
+/// - [`open_sources`] must decide `O_DIRECTORY` or not, and [`bind`] must
+///   decide `mkdir` or `touch` for the target;
+/// - [`landlock::grants`] must decide whether the rule may name
+///   `LANDLOCK_ACCESS_FS_READ_DIR`, which on a regular file is not an unused
+///   right but an **`EINVAL` from `landlock_add_rule`**.
+///
+/// **One predicate, both call sites**, because two would be two chances to
+/// disagree -- and a disagreement here is a realm whose mount table binds a
+/// file while its ruleset describes a directory. The two run at different
+/// moments and on different trees (this one before `pivot_root` on the host's
+/// path, the ruleset's after it on the in-realm path of the same name), and
+/// they still agree by construction: the target [`bind`] created is a file
+/// exactly when this answered `true` for the source.
+///
+/// A path that does not resolve answers `true`, which is deliberate: `is_dir`
+/// cannot distinguish "absent" from "not a directory", and the caller that
+/// then opens it reports the absence with its own errno rather than having it
+/// guessed at here.
+fn bind_is_file(path: &Path) -> bool {
+    !path.is_dir()
+}
+
 fn open_sources(config: &Config) -> Result<Sources, Fail> {
     let mut compat = Vec::new();
     for name in COMPAT_NAMES {
@@ -957,8 +987,7 @@ fn open_sources(config: &Config) -> Result<Sources, Fail> {
         let target = strip_leading_slash(&extra.to_string_lossy()).to_string();
         // A file bind for a file, a directory bind for a directory: the core
         // already established which it is when it audited the source.
-        let is_file = !extra.is_dir();
-        binds.push((target, Source::open(extra, is_file)?));
+        binds.push((target, Source::open(extra, bind_is_file(extra))?));
     }
 
     Ok(Sources {
@@ -1038,6 +1067,16 @@ fn build_mount_table(config: &Config, stage_dev: u64) -> Result<(), Fail> {
     // channels it carries are real and unaddressed here -- a published cost
     // of binding the node at all, which is the price of not silently
     // disabling every accelerated app in every realm.
+    //
+    // **P2.6.3's Landlock ruleset does not change that, and the reason
+    // belongs beside the mount rather than only in the ladder.** Rung 5 buys
+    // `LANDLOCK_ACCESS_FS_IOCTL_DEV`, which is one all-or-nothing bit per
+    // granted hierarchy -- there is no "these ioctl commands but not those".
+    // An app that cannot `ioctl` its render node cannot render, so
+    // `landlock::grants` **grants** `IOCTL_DEV` here. What that rung narrows
+    // is every *other* device node in this table (`/dev/null`, `/dev/zero`,
+    // `/dev/full`, `/dev/random`, `/dev/urandom`, `/dev/tty`), which lose
+    // `ioctl` entirely. The published limit above survives the rung intact.
     for (target, source) in &sources.render_nodes {
         bind(source, target, DEV_BIND)?;
     }
@@ -1299,7 +1338,14 @@ fn pivot(here: &CStr) -> Result<(), Fail> {
 // K10-K14: the last steps before the shim
 // ---------------------------------------------------------------------------
 
-fn exec_shim(config: &Config) -> Result<std::convert::Infallible, Fail> {
+fn exec_shim(chan: &Chan, config: &Config) -> Result<std::convert::Infallible, Fail> {
+    // K9b. **The realm refuses to create user namespaces inside itself.**
+    //
+    // Before K10, because writing this file needs `CAP_SYS_RESOURCE` in the
+    // realm's own user namespace and K10 is where every capability goes; and
+    // after K8, because `/proc` has to be the realm's own procfs by then.
+    deny_nested_user_namespaces()?;
+
     // K10. With an identity map the app would leave `execve` with an empty
     // permitted set anyway -- there is no valid `make_kuid(ns, 0)`, so
     // `cap_bprm_creds_from_file`'s root special case never fires -- but the
@@ -1357,6 +1403,28 @@ fn exec_shim(config: &Config) -> Result<std::convert::Infallible, Fail> {
     check(unsafe { libc::dup3(null_fd, 0, 0) }, Stage::Internal)?;
     unsafe { libc::close(null_fd) };
 
+    // K12b. **The Landlock ruleset** (P2.6.3, #187), and its position in this
+    // sequence is forced from both sides.
+    //
+    // It must come after K10's `PR_SET_NO_NEW_PRIVS` (`landlock_restrict_self`
+    // refuses without it) and after the `pivot_root`, because every path it
+    // names is an in-realm absolute path. It must come *before* K13 below,
+    // because each rule is an `O_PATH` descriptor and `close_range` only
+    // MARKS descriptors close-on-exec -- a rule fd opened after it would
+    // reach the app unmarked. And everything after it -- the `chdir`, the
+    // argv assembly, the `execve` -- must fall inside the granted set, which
+    // is why `/vitrin/shim` and `/run/vitrin` are grants rather than
+    // afterthoughts.
+    //
+    // The frame is sent *here*, before `execve`, because after it there is no
+    // sender: the channel is `FD_CLOEXEC` and its closing is the success
+    // signal. Child-asserted, like `MOUNTED`, and journaled as such.
+    let enforced = landlock::apply(config)?;
+    chan.send(&Frame::Landlocked {
+        rung: enforced.rung,
+        kernel_abi: enforced.kernel_abi,
+    })?;
+
     // K13. Not a convention, a syscall. A surviving `O_DIRECTORY` descriptor
     // on the old root is a **complete pivot escape** -- `openat(fd, "../..")`
     // and `fchdir(fd)` both work through it -- and after the `MNT_DETACH`
@@ -1407,6 +1475,87 @@ fn exec_shim(config: &Config) -> Result<std::convert::Infallible, Fail> {
     // *successful* `execve` -- the same trick std uses to report its own exec
     // failures, and the reason no `READY` frame exists in this protocol.
     Err(Fail::at(Stage::Exec))
+}
+
+/// The per-user-namespace ucount limit on how many user namespaces may be
+/// created *inside* this one.
+///
+/// A per-namespace file, not a global one, and that is the whole mechanism:
+/// `kernel/ucount.c`'s `set_lookup` returns `current_user_ns()->set`, so the
+/// value this process writes is the realm's own and the host's stays untouched.
+/// Descendants inherit the refusal because `create_user_ns` charges the new
+/// namespace up the whole parent chain and refuses at the first level whose
+/// limit is exceeded.
+const MAX_USER_NAMESPACES: &str = "/proc/sys/user/max_user_namespaces";
+
+/// K9b. **A realm may not create user namespaces inside itself.**
+///
+/// # Why this is a hardening and not a workaround for one app
+///
+/// It removes no capability the app had. **A Landlock filesystem domain
+/// forbids `mount(2)` unconditionally** -- measured on this repo's box (Arch,
+/// kernel `7.1.8-arch1-3`, Landlock ABI 9, 2026-08-15) with a probe holding the
+/// granted rights constant at "everything on `/`" and varying only the handled
+/// mask: with `handled_access_fs = 0` (scoped only) the `MS_REC|MS_SLAVE`
+/// remount of `/` returns 0; with `EXECUTE` alone handled it returns `EPERM`;
+/// with the full rung-9 mask handled *and every one of those rights granted on
+/// `/`* it still returns `EPERM`. So mounting is not an access right, no rule
+/// can grant it back, and a nested user namespace inside a realm can create no
+/// mounts. It was already useless; this makes it unavailable.
+///
+/// What changes is **which error a nested sandbox receives**, and that turns
+/// out to matter more than the capability did. Without this step a sandbox
+/// library gets an opaque `EPERM` from a `mount(2)` deep inside its own setup,
+/// long after it decided a sandbox was available. With it, the refusal arrives
+/// at `unshare(CLONE_NEWUSER)` -- the conventional, decades-old "this host does
+/// not allow unprivileged user namespaces" answer that every such library
+/// already has a branch for. Measured consequence on this box: `bwrap` prints
+/// `Creating new namespace failed`, which is on `glycin`'s known-string list,
+/// so `glycin` takes the graceful fallback it already ships instead of dying
+/// sandboxed and taking a GTK app's `g_error` down with it.
+///
+/// **It does not make nested sandboxes work.** They remain structurally
+/// impossible inside a realm, for the mount reason above. What it buys is that
+/// an app which asks for one now degrades instead of aborting.
+///
+/// And it removes real attack surface on its own terms: nested user-namespace
+/// creation is a recurring source of kernel privilege-escalation CVEs, and a
+/// realm -- whose entire mount table is composed by the core before the fork --
+/// has no legitimate use for one.
+///
+/// # Fail closed
+///
+/// A write that silently did nothing would leave this file describing a
+/// property the realm does not have, so the value is read back and a refusal is
+/// a refusal. There is no kernel this can legitimately fail on: the file is
+/// registered for every user namespace when `CONFIG_USER_NS` is on, and this
+/// process is running inside one it just created.
+fn deny_nested_user_namespaces() -> Result<(), Fail> {
+    // `CAP_SYS_RESOURCE` in the owning user namespace is what makes this file
+    // writable at all (`kernel/ucount.c`'s `set_permissions`); everyone else
+    // gets read-only. K10 is the step that ends this window, which is why this
+    // one comes first.
+    if let Err(e) = std::fs::write(MAX_USER_NAMESPACES, b"0\n") {
+        eprintln!("vitrin-realm-init: write {MAX_USER_NAMESPACES}=0: {e}");
+        return Err(Fail::with(Stage::Internal, e.raw_os_error().unwrap_or(0)));
+    }
+    // Read back, because "the write returned 0" and "the limit is 0" are two
+    // claims and only the second one is the property.
+    let back = match std::fs::read_to_string(MAX_USER_NAMESPACES) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("vitrin-realm-init: read back {MAX_USER_NAMESPACES}: {e}");
+            return Err(Fail::with(Stage::Internal, e.raw_os_error().unwrap_or(0)));
+        }
+    };
+    if back.trim() != "0" {
+        eprintln!(
+            "vitrin-realm-init: {MAX_USER_NAMESPACES} read back as {:?}, not 0",
+            back.trim()
+        );
+        return Err(Fail::with(Stage::Internal, libc::EPERM));
+    }
+    Ok(())
 }
 
 /// K10. Bounding set, then the three id sets, then ambient.
@@ -1478,4 +1627,817 @@ fn drop_all_capabilities() -> Result<(), Fail> {
         return Err(Fail::at(Stage::Internal));
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+/// The Landlock half of this binary, measured rather than described
+/// (P2.6.3, issue #187).
+///
+/// # Why these fork, and what the fork is allowed to touch
+///
+/// `landlock_restrict_self` is **irreversible**: a process that enforces a
+/// domain keeps it until it dies. A test that applied one in-process would
+/// confine the whole test binary and every test after it, so each measurement
+/// runs in a forked child that enforces, measures one syscall and `_exit`s.
+///
+/// The cargo test harness is multi-threaded, so the child may call nothing
+/// that allocates or locks. That is why [`landlock::create_ruleset`],
+/// [`landlock::add_path_rule`] and [`landlock::restrict_self`] are
+/// allocation-free and take a `&CStr` the parent built: the split is for this
+/// caller, not for tidiness.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStrExt;
+    use vitrin_realm_init::{plan_rung, LandlockRequest, TmpfsCaps, LANDLOCK_BUILD_MAX_RUNG};
+
+    /// Exit codes the forked bodies below use for their own failures, chosen
+    /// above every errno so a setup failure can never be read as a kernel
+    /// answer.
+    const SETUP_FAILED: i32 = 200;
+
+    fn fork_and_measure(body: impl Fn() -> i32) -> i32 {
+        // SAFETY: the child reaches `_exit` through syscalls only -- no
+        // allocation, no locking, no destructor -- which is the contract every
+        // `body` below honors.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            let code = body();
+            unsafe { libc::_exit(code.clamp(0, 255)) };
+        }
+        let mut status: libc::c_int = 0;
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(waited, pid, "the measurement child was not reaped");
+        assert!(
+            libc::WIFEXITED(status),
+            "the measurement child did not exit normally"
+        );
+        libc::WEXITSTATUS(status)
+    }
+
+    /// A directory of this test's own, plus one 100-byte file in it.
+    struct Scratch {
+        dir: PathBuf,
+    }
+
+    impl Scratch {
+        fn new(name: &str) -> Scratch {
+            let dir =
+                std::env::temp_dir().join(format!("vitrin-landlock-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("scratch directory");
+            Scratch { dir }
+        }
+
+        fn file(&self, name: &str, len: usize) -> PathBuf {
+            let path = self.dir.join(name);
+            std::fs::write(&path, vec![b'x'; len]).expect("scratch file");
+            path
+        }
+
+        fn c(path: &Path) -> CString {
+            CString::new(path.as_os_str().as_bytes()).expect("a path with no NUL")
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn kernel_abi_or_skip(minimum: u32, what: &str) -> Option<u32> {
+        match landlock::kernel_abi() {
+            Ok(abi) if abi >= minimum => Some(abi),
+            Ok(abi) => {
+                eprintln!(
+                    "SKIP {what}: this kernel reports Landlock ABI {abi}, and the measurement \
+                     needs {minimum}. A skip, loudly, rather than a pass: a test that cannot \
+                     run has measured nothing."
+                );
+                None
+            }
+            Err(fail) => {
+                eprintln!(
+                    "SKIP {what}: this kernel answered errno {} to the Landlock ABI query, so \
+                     no ruleset can be built here at all.",
+                    fail.errno
+                );
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn a_kernel_newer_than_this_build_is_clamped_and_the_clamp_is_visible() {
+        // Constructed, never waited for: ABI 10 is already in mainline and
+        // absent from this build's headers, so "a kernel this build does not
+        // know" is a present-tense fact rather than a future one.
+        let plan = plan_rung(42, LandlockRequest::Highest);
+        assert_eq!(
+            plan.rung, LANDLOCK_BUILD_MAX_RUNG,
+            "a kernel above this build's ladder must be clamped down to it"
+        );
+        assert!(
+            plan.clamped_by_build,
+            "the clamp happened and was not reported; a build confining a newer kernel at an \
+             older rung must say so rather than leave two numbers to be diffed"
+        );
+        // And the clamp is not claimed where it did not happen.
+        let exact = plan_rung(LANDLOCK_BUILD_MAX_RUNG, LandlockRequest::Highest);
+        assert_eq!(exact.rung, LANDLOCK_BUILD_MAX_RUNG);
+        assert!(!exact.clamped_by_build);
+        let older = plan_rung(3, LandlockRequest::Highest);
+        assert_eq!(older.rung, 3);
+        assert!(!older.clamped_by_build);
+    }
+
+    #[test]
+    fn the_cap_never_raises_the_rung_above_the_kernel_or_the_build() {
+        // **This is the whole of what the cap guarantees, and the name says
+        // so.** It replaces a test called `the_cap_can_only_weaken_and_never_
+        // raise`, whose second half this still asserts and whose first half
+        // was false: see `rung_one_forbids_reparenting_that_the_rung_above_
+        // permits` below, which measures rung 1 being STRICTER than rung 2.
+        // Comparing rung NUMBERS can never catch that, so the claim moved to
+        // a test that compares behaviour and this one stopped making it.
+        assert_eq!(plan_rung(9, LandlockRequest::CappedAt(3)).rung, 3);
+        assert_eq!(plan_rung(1, LandlockRequest::CappedAt(9)).rung, 1);
+        assert_eq!(plan_rung(3, LandlockRequest::CappedAt(3)).rung, 3);
+        // A capped session on a kernel above the build's ladder is capped by
+        // the operator AND clamped by the build; both are true and the flags
+        // do not cancel.
+        let both = plan_rung(42, LandlockRequest::CappedAt(2));
+        assert_eq!(both.rung, 2);
+        assert!(both.clamped_by_build);
+        // Exhaustively, over every pair this build can be asked for: the
+        // planned rung is never above the kernel's, never above the build's
+        // ladder, and never above the cap. Three separate ceilings, each of
+        // which has to hold on its own.
+        for kernel in 0..=12 {
+            for request in [LandlockRequest::Highest]
+                .into_iter()
+                .chain((1..=LANDLOCK_BUILD_MAX_RUNG).map(LandlockRequest::CappedAt))
+            {
+                let plan = plan_rung(kernel, request);
+                assert!(plan.rung <= kernel, "{request} on kernel {kernel}");
+                assert!(
+                    plan.rung <= LANDLOCK_BUILD_MAX_RUNG,
+                    "{request} on kernel {kernel}"
+                );
+                if let Some(cap) = request.cap() {
+                    assert!(plan.rung <= cap, "{request} on kernel {kernel}");
+                }
+            }
+        }
+    }
+
+    /// **The invariant this build actually has**, measured rather than
+    /// asserted, and the reason "the cap can only ever weaken" was struck
+    /// from every page that said it.
+    ///
+    /// A Landlock domain denies reparenting -- `rename(2)` and `link(2)`
+    /// across directories -- whenever its ruleset does not *handle* `REFER`,
+    /// which no ruleset below ABI 2 can. So a realm capped at rung 1 cannot
+    /// move a file between two directories **inside its own writable
+    /// storage**, and a realm at rung 2 or above can. Climbing the ladder
+    /// loosens the domain here; the cap is a dial, not a one-way weakening.
+    #[test]
+    fn rung_one_forbids_reparenting_that_the_rung_above_permits() {
+        let Some(_abi) = kernel_abi_or_skip(2, "the REFER rung") else {
+            return;
+        };
+        let scratch = Scratch::new("refer");
+        let from_dir = scratch.dir.join("a");
+        let to_dir = scratch.dir.join("b");
+        std::fs::create_dir_all(&from_dir).expect("source directory");
+        std::fs::create_dir_all(&to_dir).expect("destination directory");
+        let dir_c = Scratch::c(&scratch.dir);
+        let source = Scratch::c(&from_dir.join("f"));
+        let across = Scratch::c(&to_dir.join("f"));
+        let within = Scratch::c(&from_dir.join("g"));
+
+        // The realm's own writable-hierarchy rights, spelled by bit so this
+        // measurement does not move when the grant table does. `REFER` is in
+        // the set: the point is that GRANTING it is not enough below rung 2,
+        // because the mask the ruleset HANDLES is what decides.
+        const WRITE_TREE: u64 = (1 << 1)
+            | (1 << 2)
+            | (1 << 3)
+            | (1 << 4)
+            | (1 << 5)
+            | (1 << 7)
+            | (1 << 8)
+            | (1 << 13)
+            | (1 << 14);
+
+        let measure = |rung: u32, rights: u64, to: &CString| -> i32 {
+            let _ = std::fs::remove_file(from_dir.join("f"));
+            let _ = std::fs::remove_file(to_dir.join("f"));
+            let _ = std::fs::remove_file(from_dir.join("g"));
+            std::fs::write(from_dir.join("f"), b"x").expect("the file to move");
+            // Masked by the rung, exactly as `landlock::apply` masks every
+            // grant: a rule naming a bit the ruleset does not handle is
+            // `EINVAL`. Doing it here rather than writing two rights
+            // constants is what keeps this a measurement of the RUNG with
+            // one grant table, which is the comparison being made.
+            let rights = rights & landlock::handled_access_fs_for_test(rung);
+            fork_and_measure(|| {
+                if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } < 0 {
+                    return SETUP_FAILED;
+                }
+                let Ok((ruleset, got)) = landlock::create_ruleset(rung) else {
+                    return SETUP_FAILED + 1;
+                };
+                if got != rung {
+                    return SETUP_FAILED + 2;
+                }
+                if landlock::add_path_rule(ruleset, &dir_c, rights).is_err() {
+                    return SETUP_FAILED + 3;
+                }
+                if landlock::restrict_self(ruleset, 0).is_err() {
+                    return SETUP_FAILED + 4;
+                }
+                if unsafe { libc::rename(source.as_ptr(), to.as_ptr()) } < 0 {
+                    return errno();
+                }
+                0
+            })
+        };
+
+        // Rung 1: the domain cannot handle `REFER`, so it denies reparenting
+        // outright. `EXDEV` and not `EACCES` -- the kernel reports it as a
+        // cross-device link so that a caller falls back to copy+unlink rather
+        // than treating it as a permission problem.
+        assert_eq!(
+            measure(1, WRITE_TREE, &across),
+            libc::EXDEV,
+            "a rung-1 domain must REFUSE a cross-directory rename inside its own granted \
+             hierarchy. If this passed, the published claim that `--landlock=abi:1` \
+             reproduces an ABI-1 kernel is wrong in the direction that matters"
+        );
+        // And the denial is reparenting *specifically*, not renaming: the
+        // same rung renames within one directory. Without this the assertion
+        // above would also pass for a domain that had denied every write.
+        assert_eq!(
+            measure(1, WRITE_TREE, &within),
+            0,
+            "a rung-1 domain renamed nothing at all, so the cross-directory denial above is \
+             not about reparenting"
+        );
+        // Rung 2: the same grants, one rung up, and the domain now PERMITS
+        // what rung 1 forbade. This is the direction that makes "the cap can
+        // only weaken" false.
+        assert_eq!(
+            measure(2, WRITE_TREE, &across),
+            0,
+            "rung 2 handles REFER and the hierarchy grants it, so the reparenting rung 1 \
+             denied must succeed -- that inequality IS the corrected invariant"
+        );
+        // Handled but not granted is still a denial, so the rung is not a
+        // blanket permission either.
+        assert_eq!(
+            measure(2, WRITE_TREE & !(1 << 13), &across),
+            libc::EXDEV,
+            "rung 2 with REFER withheld from the hierarchy must still deny; if it does not, \
+             rung 2's permission above came from the RUNG rather than from the grant"
+        );
+    }
+
+    #[test]
+    fn asking_for_no_ruleset_asks_the_kernel_nothing() {
+        // The defect this pins: `apply` queried the ABI before reading the
+        // request, and `kernel_abi` reports `ENOSYS` as a failure -- so on a
+        // kernel with no Landlock at all, EVERY realm spawn died, including
+        // the ones that had asked for no ruleset. `--landlock=off` is exactly
+        // the flag for such a machine (`spawn/isolation.rs`'s `admit` waives
+        // the floor for it), so the flag was documented, refused by the code,
+        // and the operator's only remaining move was `--isolation=off` --
+        // which drops the namespaces too.
+        //
+        // The probe answers `ENOSYS` *and records being asked*, because on
+        // every machine this suite runs the real query succeeds: without the
+        // second half, moving the short-circuit back below the query would
+        // leave this test green.
+        let asked = Cell::new(false);
+        let probe = || {
+            asked.set(true);
+            Err(Fail::with(Stage::Landlock, libc::ENOSYS))
+        };
+
+        let mut config = landlock_test_config();
+        config.landlock = LandlockRequest::Off;
+        let enforced = landlock::apply_with(&config, probe).expect(
+            "a session that asked for NO ruleset must not be refused by a kernel that has no \
+             Landlock to give it",
+        );
+        assert_eq!(enforced.rung, 0);
+        assert_eq!(
+            enforced.kernel_abi, 0,
+            "nothing measured the ABI, so the field is `not measured` and not a rung"
+        );
+        assert!(
+            !asked.get(),
+            "`--landlock=off` consulted the kernel. On a kernel without Landlock that \
+             consultation is a refusal, and the whole realm spawn dies for a ruleset nobody \
+             asked for"
+        );
+
+        // Non-vacuity, in the same test: a session that DID ask for a ruleset
+        // still fails on the same probe, so the arm above is a short-circuit
+        // rather than a swallowed error.
+        let asked = Cell::new(false);
+        let probe = || {
+            asked.set(true);
+            Err(Fail::with(Stage::Landlock, libc::ENOSYS))
+        };
+        let mut config = landlock_test_config();
+        config.landlock = LandlockRequest::Highest;
+        let fail = landlock::apply_with(&config, probe)
+            .expect_err("a session that asked for a ruleset must fail closed");
+        assert_eq!(fail.errno, libc::ENOSYS);
+        assert!(asked.get(), "the request path must consult the kernel");
+    }
+
+    /// A `Config` whose only interesting fields are `landlock` and `binds`.
+    ///
+    /// Every path in it is deliberately absurd. For the short-circuit tests
+    /// that is the assertion: reaching the grant table at all would mean the
+    /// short-circuit under test did not happen. For
+    /// `a_bind_naming_a_file_gets_rights_the_kernel_accepts`, which builds the
+    /// table on purpose, the absurdity is merely harmless -- `grants` composes
+    /// strings and `stat`s the `binds` entries, and opens nothing.
+    fn landlock_test_config() -> Config {
+        Config {
+            schema_version: "test".to_string(),
+            realm_id: "realm-0".to_string(),
+            inner_uid: 1000,
+            inner_gid: 1000,
+            runtime_dir: PathBuf::from("/nonexistent/run"),
+            storage_dir: PathBuf::from("/nonexistent/storage"),
+            shim_source: PathBuf::from("/nonexistent/shim"),
+            app_dir: None,
+            render_nodes: Vec::new(),
+            binds: Vec::new(),
+            argv: vec![OsString::from("/nonexistent/shim")],
+            caps: TmpfsCaps::DEFAULT,
+            landlock: LandlockRequest::Off,
+        }
+    }
+
+    /// **A `binds` entry naming a FILE must not be granted `READ_DIR`**, and
+    /// the reason is not tidiness: the rule is refused.
+    ///
+    /// `examples/realm.toml` documents a `binds` source as "a regular file or
+    /// directory", so a file bind is a shipped configuration. The first
+    /// version of `landlock::grants` handed every entry `READ_FILE|READ_DIR|
+    /// EXECUTE`, with a comment claiming `READ_DIR` on a file "is simply never
+    /// checked". The right is indeed never checked -- but the **rule addition**
+    /// is `EINVAL`, every bind is `required`, and `apply` fails closed, so one
+    /// file bind in `realm.toml` took every realm on the box down at the
+    /// shipped default. A crash, from a documented configuration, on the
+    /// default path.
+    ///
+    /// The fix is a branch, and `landlock::grants` takes it from
+    /// [`bind_is_file`] -- the **same** predicate the mount table used to
+    /// decide `mkdir` or `touch` for the target, so the ruleset cannot describe
+    /// a directory where the mount built a file.
+    ///
+    /// Four assertions, and the last is the one that cannot be argued with: a
+    /// directory bind carries read+list+execute, a file bind carries
+    /// read+execute with **no** `READ_DIR`, the kernel **accepts** both of
+    /// those, and the kernel **refuses** with `EINVAL` exactly what the broken
+    /// table produced for a file. That last one is the defect, re-measured on
+    /// every run rather than described in a comment; without it the others
+    /// would still pass on a kernel that had quietly started tolerating
+    /// `READ_DIR` on files.
+    ///
+    /// No fork: `landlock_create_ruleset` and `landlock_add_rule` confine
+    /// nothing. Only `restrict_self` does, and this test never calls it.
+    #[test]
+    fn a_bind_naming_a_file_gets_rights_the_kernel_accepts() {
+        let Some(_abi) = kernel_abi_or_skip(1, "the file-bind grant") else {
+            return;
+        };
+        let scratch = Scratch::new("file-bind");
+        let dir_bind = scratch.dir.join("vendor-tree");
+        std::fs::create_dir_all(&dir_bind).expect("the directory bind source");
+        let file_bind = scratch.file("vendor.so", 64);
+
+        // Spelled by bit, so this measurement does not move when the grant
+        // table's named constants do.
+        const EXECUTE: u64 = 1 << 0;
+        const READ_FILE: u64 = 1 << 2;
+        const READ_DIR: u64 = 1 << 3;
+
+        let mut config = landlock_test_config();
+        config.binds = vec![dir_bind.clone(), file_bind.clone()];
+        // A render node, because it is the THIRD file row and the one that was
+        // missed: a bound render node is a character device, `READ_DIR` on a
+        // non-directory is `EINVAL` from `landlock_add_rule`, and the rule is
+        // required -- so granting it the directory rights took every realm on
+        // the box down at the shipped default (measured 2026-08-15, found by
+        // `tests/integration/test_real_confinement.py` refusing to boot). The
+        // path is composed, never opened, so this needs no GPU on the machine.
+        config.render_nodes = vec![PathBuf::from("/dev/dri/renderD128")];
+        let table = landlock::grants_for_test(&config).expect("the grant table builds");
+        let rights_of = |path: &Path| -> u64 {
+            let want = Scratch::c(path);
+            table
+                .iter()
+                .find(|(got, _)| *got == want)
+                .unwrap_or_else(|| panic!("no grant for the bind {}", path.display()))
+                .1
+        };
+        assert_eq!(
+            rights_of(&dir_bind),
+            READ_FILE | READ_DIR | EXECUTE,
+            "a DIRECTORY bind carries read, list and execute"
+        );
+        assert_eq!(
+            rights_of(&file_bind),
+            READ_FILE | EXECUTE,
+            "a FILE bind carries read and execute and crucially NOT READ_DIR, which is \
+             what the kernel refuses on a regular file"
+        );
+        // The regression guard, stated over every `binds` entry rather than only
+        // the two constructed above: an operator's bind may name a regular file,
+        // so the branch has to be taken per entry and not once for the loop.
+        // Deliberately NOT stated over the whole table -- `/usr`, `/etc` and the
+        // writable hierarchies carry `READ_DIR` because they are directories by
+        // construction; only `binds` and the shim file may not.
+        for bind in &config.binds {
+            let rights = rights_of(bind);
+            if bind_is_file(bind) {
+                assert_eq!(
+                    rights & READ_DIR,
+                    0,
+                    "the `binds` grant for the regular file {} carries READ_DIR ({rights:#x}); \
+                     the kernel refuses that rule and every bind is required, so this is every \
+                     realm on the box refusing to start",
+                    bind.display()
+                );
+            } else {
+                assert_eq!(
+                    rights & READ_DIR,
+                    READ_DIR,
+                    "the `binds` grant for the directory {} lost READ_DIR ({rights:#x}), so the \
+                     realm cannot list a hierarchy the operator asked for",
+                    bind.display()
+                );
+            }
+        }
+        // The shim binary is the second file rule, and it is the one whose loss
+        // is a realm that will not start at all.
+        assert_eq!(
+            rights_of(Path::new(IN_REALM_SHIM)),
+            READ_FILE | EXECUTE,
+            "the shim binary is a FILE bind: read and execute, never READ_DIR"
+        );
+        // The third: a render node. Asserted as "no READ_DIR" rather than as an
+        // exact rights word, because which write and ioctl bits it carries is
+        // the render-node policy's business and is argued in `landlock::grants`
+        // -- what may never come back is the directory bit.
+        let node = rights_of(Path::new("/dev/dri/renderD128"));
+        assert_eq!(
+            node & READ_DIR,
+            0,
+            "a render node is a character device and its rule may never name READ_DIR; it \
+             carries {node:#x}, and `landlock_add_rule` answers EINVAL for that -- a refused \
+             realm, not an ignored bit"
+        );
+        assert_eq!(
+            node & READ_FILE,
+            READ_FILE,
+            "the render node lost READ_FILE, so the app cannot open the node at all"
+        );
+        // And there is NO rule on the realm root. That absence is what makes
+        // `/vitrin` and the `$HOME` stub answer EACCES inside a real realm
+        // (`tests/integration/test_real_confinement.py`), so a widening that
+        // added one fails here rather than in an integration gate.
+        assert!(
+            !table.iter().any(|(path, _)| path.as_c_str()
+                == CString::new("/").expect("a NUL-free literal").as_c_str()),
+            "the grant table has a rule on the realm root. A READ_DIR rule on `/` covers every \
+             directory beneath it, which takes the $HOME canary and the /vitrin denial in \
+             tests/integration/test_real_confinement.py red -- measured 2026-08-15, and it buys \
+             no app compatibility (see landlock::grants)"
+        );
+
+        // The kernel's own verdict on both, which is what makes the pinning
+        // above a measurement rather than a restatement of the code.
+        let (ruleset, rung) = landlock::create_ruleset(1).expect("a rung-1 ruleset");
+        assert_eq!(rung, 1);
+        let dir_c = Scratch::c(&dir_bind);
+        let file_c = Scratch::c(&file_bind);
+        let added = |path: &CString, rights: u64| landlock::add_path_rule(ruleset, path, rights);
+        assert!(
+            added(&dir_c, rights_of(&dir_bind)).is_ok(),
+            "the kernel refused the directory bind's rights"
+        );
+        assert!(
+            added(&file_c, rights_of(&file_bind)).is_ok(),
+            "the kernel refused the file bind's rights, so `apply` would refuse the realm"
+        );
+        // The defect itself: the rights the old table produced for a file.
+        let fail = added(&file_c, READ_FILE | READ_DIR | EXECUTE)
+            .expect_err("READ_DIR on a REGULAR FILE must be refused by landlock_add_rule");
+        assert_eq!(
+            fail.errno,
+            libc::EINVAL,
+            "the refusal must be EINVAL -- if this kernel accepts READ_DIR on a file, the \
+             two assertions above are measuring nothing"
+        );
+        // SAFETY: this test's own descriptor, used nowhere else.
+        unsafe { libc::close(ruleset) };
+    }
+
+    /// The audit-log diagnostic (P2.6.3 follow-up): **off unless asked for,
+    /// and a flags word the kernel actually takes when it is**.
+    ///
+    /// Landlock's default is to stop auditing a domain's denials at `execve`,
+    /// which is the wrong side of the boundary for this project: the denials
+    /// worth measuring are the *app's*. `LANDLOCK_RESTRICT_SELF_LOG_NEW_EXEC_ON`
+    /// moves them back into view.
+    ///
+    /// Two halves. The table half pins that nothing but an explicit request at
+    /// a rung that supports the flag can produce a nonzero flags word -- an
+    /// instrument that could switch itself on is not an instrument. The kernel
+    /// half runs in a forked child, because it is the one place in this file
+    /// that must actually call `restrict_self`, and it measures both
+    /// directions: the flag is accepted, and a bit the kernel does *not* define
+    /// is refused `EINVAL`. Without the second, "accepted" would be consistent
+    /// with a kernel that ignores the whole flags word.
+    #[test]
+    fn the_audit_log_flag_is_off_unless_asked_for_and_the_kernel_takes_it() {
+        const LOG_NEW_EXEC_ON: libc::c_uint = 1 << 1;
+        // Every rung, never asked for: zero. This is the shipped path.
+        for rung in 1..=LANDLOCK_BUILD_MAX_RUNG {
+            assert_eq!(
+                landlock::restrict_self_flags_for_test(rung, false),
+                0,
+                "rung {rung} produced a nonzero flags word without the diagnostic being asked \
+                 for; every shipped session enforces with flags=0"
+            );
+        }
+        // Asked for, but below the rung that defines the bit: still zero,
+        // because there the bit is EINVAL rather than ignored, and a realm
+        // must not fail to start over an instrument.
+        for rung in 1..7 {
+            assert_eq!(
+                landlock::restrict_self_flags_for_test(rung, true),
+                0,
+                "rung {rung} is below ABI 7, where the log flags do not exist"
+            );
+        }
+        for rung in 7..=LANDLOCK_BUILD_MAX_RUNG {
+            assert_eq!(
+                landlock::restrict_self_flags_for_test(rung, true),
+                LOG_NEW_EXEC_ON,
+                "rung {rung} supports the log flags and the diagnostic was asked for"
+            );
+        }
+
+        let Some(_abi) = kernel_abi_or_skip(7, "the Landlock audit-log flag") else {
+            return;
+        };
+        // The kernel's verdict. `restrict_self` is irreversible, so this is
+        // the one thing here that has to fork.
+        let measure = |flags: libc::c_uint| -> i32 {
+            fork_and_measure(move || {
+                if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } < 0 {
+                    return SETUP_FAILED;
+                }
+                let Ok((ruleset, got)) = landlock::create_ruleset(7) else {
+                    return SETUP_FAILED + 1;
+                };
+                if got != 7 {
+                    return SETUP_FAILED + 2;
+                }
+                match landlock::restrict_self(ruleset, flags) {
+                    Ok(()) => 0,
+                    Err(fail) => fail.errno,
+                }
+            })
+        };
+        assert_eq!(
+            measure(landlock::restrict_self_flags_for_test(7, true)),
+            0,
+            "the kernel refused LANDLOCK_RESTRICT_SELF_LOG_NEW_EXEC_ON at rung 7, so the \
+             diagnostic would take every realm down instead of logging one"
+        );
+        assert_eq!(
+            measure(1 << 30),
+            libc::EINVAL,
+            "the kernel accepted a flags bit that does not exist, so the acceptance above \
+             says nothing about the bit this build passes"
+        );
+    }
+
+    #[test]
+    fn a_realm_can_write_where_it_was_granted_and_nowhere_else() {
+        // #187's floor criterion, restated as this build measures it: "a
+        // write from inside the realm to a path outside the private storage
+        // and outside the designated set fails EACCES". Rung 1 is enough --
+        // this is the primitive the whole ladder stands on -- so it runs on
+        // every kernel that has Landlock at all.
+        let Some(_abi) = kernel_abi_or_skip(1, "the write-set floor") else {
+            return;
+        };
+        let scratch = Scratch::new("write-set");
+        let granted = scratch.dir.join("granted");
+        let ungranted = scratch.dir.join("ungranted");
+        std::fs::create_dir_all(&granted).expect("granted directory");
+        std::fs::create_dir_all(&ungranted).expect("ungranted directory");
+        let granted_c = Scratch::c(&granted);
+        let inside = Scratch::c(&granted.join("new"));
+        let outside = Scratch::c(&ungranted.join("new"));
+
+        // The rights the realm's own writable hierarchies carry, minus the
+        // ones that need a rung above 1.
+        const WRITE_AT_RUNG_1: u64 = (1 << 1) | (1 << 2) | (1 << 3) | (1 << 8);
+
+        for (target, expected, what) in [
+            (&inside, 0, "a write inside the granted hierarchy"),
+            (&outside, libc::EACCES, "a write outside every granted rule"),
+        ] {
+            let code = fork_and_measure(|| {
+                // Landlock's precondition, which K10 has already set in the
+                // real sequence and which a test binary has not.
+                if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } < 0 {
+                    return SETUP_FAILED;
+                }
+                let Ok((ruleset, _)) = landlock::create_ruleset(1) else {
+                    return SETUP_FAILED + 1;
+                };
+                if landlock::add_path_rule(ruleset, &granted_c, WRITE_AT_RUNG_1).is_err() {
+                    return SETUP_FAILED + 2;
+                }
+                if landlock::restrict_self(ruleset, 0).is_err() {
+                    return SETUP_FAILED + 3;
+                }
+                let fd = unsafe {
+                    libc::open(
+                        target.as_ptr(),
+                        libc::O_WRONLY | libc::O_CREAT | libc::O_CLOEXEC,
+                        0o600,
+                    )
+                };
+                if fd < 0 {
+                    return errno();
+                }
+                unsafe { libc::close(fd) };
+                0
+            });
+            assert_eq!(
+                code, expected,
+                "{what}: expected {expected}, got {code}. The pair is the point -- the denial \
+                 is only evidence because the grant in the same run succeeded"
+            );
+        }
+    }
+
+    #[test]
+    fn the_truncate_rung_is_measured_and_its_absence_is_measured_with_it() {
+        // The rung the plan row names, and the one whose absence is directly
+        // ransomware-relevant: below ABI 3 a payload that cannot WRITE a file
+        // can still destroy it.
+        //
+        // Three runs, and all three are needed. The first shows the rung's
+        // absence is a real weakening rather than a story; the second shows
+        // the rung closes it; the third is the positive control that keeps the
+        // second honest, because "EACCES" could otherwise mean "Landlock is
+        // simply on" rather than "this right was withheld".
+        let Some(_abi) = kernel_abi_or_skip(3, "the TRUNCATE rung") else {
+            return;
+        };
+        let scratch = Scratch::new("truncate");
+        let victim = scratch.file("victim", 100);
+        let dir_c = Scratch::c(&scratch.dir);
+        let victim_c = Scratch::c(&victim);
+
+        const READ_ONLY: u64 = (1 << 2) | (1 << 3);
+        const WRITE_WITH_TRUNCATE: u64 = (1 << 1) | (1 << 2) | (1 << 3) | (1 << 14);
+
+        let measure = |rung: u32, rights: u64| -> (i32, u64) {
+            std::fs::write(&victim, vec![b'x'; 100]).expect("re-fill the victim");
+            let code = fork_and_measure(|| {
+                if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } < 0 {
+                    return SETUP_FAILED;
+                }
+                let Ok((ruleset, got)) = landlock::create_ruleset(rung) else {
+                    return SETUP_FAILED + 1;
+                };
+                if got != rung {
+                    // The ladder stepped down under us, so the run would be
+                    // measuring a rung nobody asked for.
+                    return SETUP_FAILED + 2;
+                }
+                if landlock::add_path_rule(ruleset, &dir_c, rights).is_err() {
+                    return SETUP_FAILED + 3;
+                }
+                if landlock::restrict_self(ruleset, 0).is_err() {
+                    return SETUP_FAILED + 4;
+                }
+                if unsafe { libc::truncate(victim_c.as_ptr(), 0) } < 0 {
+                    return errno();
+                }
+                0
+            });
+            let size = std::fs::metadata(&victim)
+                .expect("the victim still exists")
+                .len();
+            (code, size)
+        };
+
+        let (code, size) = measure(2, READ_ONLY);
+        assert_eq!(
+            code, 0,
+            "at rung 2 `truncate(2)` is UNGATED, so it must succeed -- that is the weakening \
+             the rung above closes, and it is measured rather than asserted"
+        );
+        assert_eq!(
+            size, 0,
+            "the file survived a truncate that reported success"
+        );
+
+        let (code, size) = measure(3, READ_ONLY);
+        assert_eq!(
+            code,
+            libc::EACCES,
+            "at rung 3 `truncate(2)` on a read-granted path must fail EACCES"
+        );
+        assert_eq!(size, 100, "the file was destroyed despite the denial");
+
+        let (code, size) = measure(3, WRITE_WITH_TRUNCATE);
+        assert_eq!(
+            code, 0,
+            "the positive control failed: with TRUNCATE granted the same call must succeed, or \
+             the denial above proves only that Landlock was switched on"
+        );
+        assert_eq!(size, 0);
+    }
+
+    /// The cumulative `handled_access_fs` table, pinned.
+    ///
+    /// **It replaces a test called `the_rung_masks_grow_and_never_shrink`**,
+    /// whose closing assertion -- every rung handles a superset of its
+    /// predecessor's bits -- was true, was read as "the ladder only ever
+    /// gets stricter", and is in fact the mechanism by which a *higher* rung
+    /// permits MORE: a handled bit that the grant table also grants is a
+    /// right the domain allows, and an unhandled `REFER` is a denial. The
+    /// superset relation is still asserted, because a rung that dropped a
+    /// predecessor's bit would be a table edit nobody intended -- but it is
+    /// labelled for what it is, and the behavioural claim lives in
+    /// `rung_one_forbids_reparenting_that_the_rung_above_permits`.
+    #[test]
+    fn the_rung_masks_pin_a_measured_table() {
+        // Every value here was measured against this kernel rather than
+        // recalled, and the test pins the cumulative shape so a hand edit to
+        // one rung cannot silently move another.
+        let masks: Vec<u64> = (1..=LANDLOCK_BUILD_MAX_RUNG)
+            .map(landlock::handled_access_fs_for_test)
+            .collect();
+        assert_eq!(
+            masks,
+            vec![
+                0x1fff,  // 1
+                0x3fff,  // 2: +REFER
+                0x7fff,  // 3: +TRUNCATE
+                0x7fff,  // 4: net only, the FS mask is flat here
+                0xffff,  // 5: +IOCTL_DEV
+                0xffff,  // 6: scoped only
+                0xffff,  // 7: restrict_self flags only
+                0xffff,  // 8: restrict_self flags only
+                0x1ffff, // 9: +RESOLVE_UNIX
+            ],
+            "the cumulative FS masks are a measured table, not a derivation"
+        );
+        for pair in masks.windows(2) {
+            assert_eq!(
+                pair[0] & pair[1],
+                pair[0],
+                "a rung dropped a bit its predecessor handled. That is a table edit, NOT a \
+                 statement that the higher rung confines more: `REFER` is handled from rung 2 \
+                 and handling it is what LETS a realm reparent files"
+            );
+        }
+        // The one bit whose arrival loosens the domain, named here so the
+        // superset assertion above cannot be re-read as a strictness claim.
+        const REFER: u64 = 1 << 13;
+        assert_eq!(masks[0] & REFER, 0, "rung 1 cannot handle REFER");
+        assert_eq!(masks[1] & REFER, REFER, "rung 2 handles it, and permits it");
+        // Rung 6 is the only one that moves `scoped`, and it moves nothing on
+        // the FS mask -- the flatness above is real and is shown rather than
+        // hidden.
+        assert_eq!(landlock::scoped_for_test(5), 0);
+        assert_eq!(landlock::scoped_for_test(6), 0x3);
+        assert_eq!(landlock::scoped_for_test(LANDLOCK_BUILD_MAX_RUNG), 0x3);
+    }
 }

@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import shlex
 import shutil
 import signal
 import socket as socket_mod
@@ -82,6 +83,72 @@ IN_REALM_RUNTIME_DIR = "/run/vitrin"
 IN_REALM_WAYLAND_SOCKET = "/run/vitrin/wayland-0"
 IN_REALM_HOME = "/vitrin/home"
 IN_REALM_SHIM = "/vitrin/shim"
+
+#: The highest Landlock ABI rung this build knows how to request, mirroring
+#: `LANDLOCK_BUILD_MAX_RUNG` in `crates/vitrin-realm-init/src/lib.rs` (P2.6.3,
+#: #187). A kernel reporting more is clamped down to it, and the realm's
+#: journal entry says so -- which is only checkable from here if this side
+#: knows the number. `vitrind --print-floor` prints it as
+#: `build.landlock_max_rung`.
+LANDLOCK_BUILD_MAX_RUNG = 9
+
+#: The lowest Landlock ABI this build will start on, mirroring
+#: `LANDLOCK_MIN_ABI` in `crates/vitrin-realm-init/src/lib.rs` (owner's
+#: decision, 2026-08-15). A kernel below it is refused rather than degraded, so
+#: a confined spawn that reached the point of writing a journal entry must have
+#: obtained at least this rung -- which is the only mock-free check that the
+#: declared floor is the one a real realm actually got. `vitrind --print-floor`
+#: prints it as `build.landlock_min_abi`.
+LANDLOCK_MIN_ABI = 7
+
+#: A suite-wide `--landlock` argument for every core that does not name one.
+#:
+#: **This exists to make a published measurement repeatable, not to make a run
+#: pass.** `docs/book/src/limits.md` once cited this repo's GTK gates as
+#: failing at the shipped default and passing at `--landlock=off`, and the
+#: second half of that sentence was unreachable from the repository -- no
+#: module in the real-app ladder took a Landlock setting, so the only way to
+#: obtain it was to edit a test. A control nobody can re-run is not a control.
+#: Since K9b (2026-08-15) the first half is no longer true either: those gates
+#: pass at the shipped default, and the page has deleted the `--landlock=off`
+#: column rather than carrying a figure it never re-ran. The knob stays,
+#: because every remaining `--landlock=off` measurement on that page -- and
+#: `tests/integration/landlock-denials.sh` -- needs a control run to be
+#: reachable from here rather than only from the machine it was first taken on.
+#:
+#: Two properties keep it from quietly becoming the thing under test:
+#:
+#: * an explicit `landlock=` argument always wins, so `test_real_confinement.py`
+#:   keeps naming both settings in one run, and
+#: * the confinement gate asserts its confined half journals
+#:   `requested == "highest"`, so setting this to `off` turns that gate **red**
+#:   rather than letting a whole-suite `off` run report as an ordinary pass.
+#:   That is the intended behaviour: such a run is a control run, and
+#:   `tests/integration/run.sh` announces it as one.
+LANDLOCK_OVERRIDE = os.environ.get("VITRIN_LANDLOCK") or None
+
+#: A command prefix placed in front of every `vitrind` this suite starts.
+#:
+#: **A diagnostic, and only ever a diagnostic.** It exists for
+#: `tests/integration/landlock-denials.sh`, which needs to observe what the
+#: kernel refuses a realm *from outside the realm* -- and on a host whose audit
+#: subsystem is switched off (`audit_enabled=0`, which is the default on at
+#: least Arch and every machine measured for this repo so far) the kernel's own
+#: Landlock records do not exist to be read, so the only remaining observer is
+#: a tracer on the outside. Nothing in the suite sets this; a run with it unset
+#: builds exactly the argv it always built.
+#:
+#: `strace -D` (**--daemonize=grandchild**) is the reason this is safe to hand
+#: a tracer: with `-D` the tracer re-parents itself and `vitrind` stays a
+#: *direct* child of this process, so `Core.pid` is still the core's pid and
+#: `shims_of`'s deliberate two-level walk (core -> helper -> shim) still counts
+#: the same two levels. A wrapper without that property shifts the process tree
+#: by one and silently breaks every gate that reads it -- which is a real trap,
+#: and the reason this docstring names the flag rather than leaving the choice
+#: of tracer open.
+#:
+#: Split with `shlex`, so quoting works the way a shell's does.
+CORE_WRAPPER = shlex.split(os.environ.get("VITRIN_CORE_WRAPPER", ""))
 
 #: Hard per-test ceiling. The failure this exists for is issue #77's trap T1:
 #: a regression that registers the shim socketpair's source after the fork
@@ -745,6 +812,7 @@ class Core:
         physical_input: bool = False,
         screenshot_dir: str | os.PathLike[str] | None = None,
         isolation: str | None = None,
+        landlock: str | None = None,
         binds: tuple[str, ...] = (),
         realm_init: str | os.PathLike[str] | None = None,
     ) -> None:
@@ -886,6 +954,9 @@ class Core:
                 )
 
         argv = [
+            # Empty unless `VITRIN_CORE_WRAPPER` is set; see
+            # :data:`CORE_WRAPPER` for what may legally go in it.
+            *CORE_WRAPPER,
             str(VITRIND),
             "--headless",
             "--size",
@@ -912,6 +983,28 @@ class Core:
         # run.
         if isolation is not None:
             argv += [f"--isolation={isolation}"]
+        # `--landlock` (P2.6.3, #187), on the same rule as `--isolation`: NOT
+        # passed unless a caller names it, so the path every deployment takes
+        # (the default, `highest`) is the one the suite exercises. The only
+        # caller that names it is `test_real_confinement.py`, which spends it
+        # on `off` -- the positive control that turns "the ruleset denied
+        # this" from an assertion into a measurement.
+        #
+        # `VITRIN_LANDLOCK` supplies that argument for every test that does
+        # NOT name one (:data:`LANDLOCK_OVERRIDE`), which is what makes the
+        # `--landlock=off` half of a published claim reproducible from this
+        # repo rather than only from the machine it was first measured on.
+        # `docs/book/src/limits.md` once cited this suite's GTK gates as
+        # failing at the shipped default and passing at `--landlock=off`;
+        # before this existed no gate in the real-app ladder could be run the
+        # second way at all, so the citation named a run nobody could repeat.
+        # That pair of claims is gone from the page (K9b, 2026-08-15: the gates
+        # pass at the shipped default and the stale control column was deleted
+        # rather than carried), and the knob outlives it as the instrument the
+        # page's other control measurements are taken with.
+        landlock = landlock if landlock is not None else LANDLOCK_OVERRIDE
+        if landlock is not None:
+            argv += [f"--landlock={landlock}"]
         # A substituted confinement helper, for the gate that proves a realm
         # the core cannot verify is REFUSED (`crates/vitrin-realm-init-fixtures`).
         if realm_init is not None:

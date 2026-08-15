@@ -53,9 +53,15 @@ That is a real bar, and it is also a narrow one.
 **The sandbox is half-built.** Since P2.6.2 an app in a realm runs in six
 namespaces with an identity uid/gid map, zero capabilities and a private mount
 table it cannot reshape — verified by the core from outside, and the spawn
-refused when it cannot be. But there is still **no seccomp filter and no
-Landlock ruleset**, so the realm is path-confined and not syscall-confined, and
-it keeps the invoking user's supplementary groups. Environment hygiene confines
+refused when it cannot be. Since P2.6.3 it also gets a **Landlock ruleset**
+with an enumerated read set, enforced before the shim's `execve`, and a
+generated [ABI matrix](isolation-matrix.md) of what that ruleset requires of a
+kernel. P2.6.3 is nevertheless **not finished**: that matrix probes nothing, so
+it is a table about the build rather than about kernels; the per-kernel one its
+criteria ask for does not exist; and the ABI floor that replaced the
+degradation ladder narrowed the task rather than finishing it. But there is
+still **no seccomp filter**, so the realm is filesystem-confined and not
+syscall-confined, and it keeps the invoking user's supplementary groups. Environment hygiene confines
 the well-behaved; it does not contain the hostile.
 
 Do not deploy this against untrusted applications or untrusted agents.

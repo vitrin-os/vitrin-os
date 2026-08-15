@@ -341,9 +341,10 @@ mod shim;
 /// placed at a fixed descriptor (identity assigned at fork, never claimed),
 /// a private `0700` runtime directory, and an environment built from nothing
 /// that names only that realm's own socket. Read its module docs before
-/// believing any confinement claim: the D9 sandboxing deferral (no
-/// namespaces, no seccomp, no Landlock) and the session-D-Bus hole are
-/// stated there in full. Called at runtime by `session::start_realm`, which
+/// believing any confinement claim: what `--isolation=off` still leaves off
+/// (no namespaces, no Landlock, no seccomp), what `--isolation=default`
+/// applies (namespaces since #186, a Landlock ruleset since #187, and still
+/// no seccomp filter), and the session-D-Bus hole are stated there in full. Called at runtime by `session::start_realm`, which
 /// runs it only after `session::install` has put the loop's sources in
 /// place: a shim spawned into a loop that is not yet servicing its
 /// socketpair blocks on `configure` forever, with no timeout on its side.
@@ -690,6 +691,57 @@ USAGE:
                                 paranoid dial -- it is the dial being switched
                                 out. `none` is refused by name: it was renamed
                                 to `off` before it shipped.
+    vitrind [--landlock MODE]   How far up the Landlock ABI ladder the realm's
+                                ruleset is built (P2.6.3). `highest` (the
+                                default) asks for the highest rung this build
+                                knows that this kernel accepts. THERE IS A
+                                FLOOR, not a degradation ladder: a kernel below
+                                the ABI this build declares (--print-floor,
+                                `build.landlock_min_abi`) REFUSES TO START
+                                rather than confining realms at a weaker rung
+                                than the session's own journal names. The
+                                one-rung descent still exists and bottoms out
+                                at that floor.
+                                `abi:N` CAPS the request at rung N: it never
+                                raises anything (a rung above the kernel's own
+                                is refused at ruleset creation) and exists so
+                                each rung's absence can be MEASURED rather
+                                than described, because capping to N
+                                reproduces exactly what this build asks for on
+                                an ABI-N kernel. THREE RUNGS ARE THE
+                                EXCEPTION, and they are the reason that
+                                sentence is not `reproduces an ABI-N kernel`:
+                                a cap moves `handled_access_fs`, so it can
+                                only simulate the absence of a rung that MOVES
+                                that mask. ABI 4 buys network scoping and ABI
+                                7 and 8 buy `landlock_restrict_self` FLAGS
+                                (audit-log control; TSYNC) -- this build
+                                requests none of the three, passing
+                                `handled_access_net` and the flags word as
+                                zero. So the enforced domain is BYTE-IDENTICAL
+                                at rungs 3 and 4, and byte-identical again at
+                                rungs 6, 7 and 8: nine rung numbers, six
+                                distinct domains. `abi:4` and `abi:7` are
+                                still accepted and still journal their own
+                                `applied_profile` string, so read that string
+                                as WHICH RUNG WAS OBTAINED and never as how
+                                much confinement. It is a
+                                DIAL, not a one-way weakening: rung 1 cannot
+                                handle REFER, and a domain that does not
+                                handle REFER forbids rename/link ACROSS
+                                DIRECTORIES outright -- so `abi:1` is stricter
+                                than `highest` about reparenting (and weaker
+                                about everything else) and breaks apps that
+                                write by rename-into-place. `off` builds no
+                                ruleset at all; it is the positive control the
+                                per-rung gates need, and a session running that
+                                way journals `namespaces-only` and warns. The
+                                rung actually OBTAINED is what
+                                `applied_profile` names, with the request and
+                                the kernel's own ABI beside it, and a realm
+                                whose ladder fell below either is warned about
+                                at spawn -- a pinned-low session cannot read as
+                                a full-strength one.
     vitrind [--realm-init PATH] The helper binary the core execs to build a
                                 realm's namespaces at --isolation=default.
                                 Default: a sibling `vitrin-realm-init` beside
@@ -1061,6 +1113,9 @@ enum Action {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct IsolationOptions {
     isolation: spawn::isolation::Isolation,
+    /// `--landlock`: the cap on the ABI rung the helper may build (P2.6.3,
+    /// #187). Inert at `--isolation=off`, where no helper runs at all.
+    landlock: vitrin_realm_init::LandlockRequest,
     /// `None` means "a sibling `vitrin-realm-init` beside this `vitrind`",
     /// resolved at startup exactly like `--shim`'s default.
     realm_init: Option<PathBuf>,
@@ -1085,6 +1140,7 @@ impl Default for IsolationOptions {
     fn default() -> Self {
         IsolationOptions {
             isolation: spawn::isolation::Isolation::Default,
+            landlock: vitrin_realm_init::LandlockRequest::Highest,
             realm_init: None,
         }
     }
@@ -1136,6 +1192,7 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
     // `default`" stay distinguishable -- which is what lets a repeated flag be
     // refused, on `set_consent`'s precedent.
     let mut isolation_mode: Option<spawn::isolation::Isolation> = None;
+    let mut landlock_mode: Option<vitrin_realm_init::LandlockRequest> = None;
     let mut realm_init: Option<PathBuf> = None;
     let mut capture_dump: Option<PathBuf> = None;
     let mut chord: Option<deadman::Chord> = None;
@@ -1354,6 +1411,15 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
                     spawn::isolation::Isolation::parse(value)?,
                 )?;
             }
+            "--landlock" => {
+                let value = args
+                    .next()
+                    .ok_or("`--landlock` requires a mode (`highest`, `off`, or `abi:N`)")?;
+                set_landlock(
+                    &mut landlock_mode,
+                    vitrin_realm_init::LandlockRequest::parse(value)?,
+                )?;
+            }
             "--realm-init" => {
                 let value = args.next().ok_or(
                     "`--realm-init` requires a helper binary path \
@@ -1400,6 +1466,11 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
                     set_isolation(
                         &mut isolation_mode,
                         spawn::isolation::Isolation::parse(value)?,
+                    )?;
+                } else if let Some(value) = other.strip_prefix("--landlock=") {
+                    set_landlock(
+                        &mut landlock_mode,
+                        vitrin_realm_init::LandlockRequest::parse(value)?,
                     )?;
                 } else if let Some(value) = other.strip_prefix("--realm-init=") {
                     set_path(&mut realm_init, "--realm-init", "realm-init path", value)?;
@@ -1941,6 +2012,9 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
         // `unwrap_or_default`, so the safe value is spelled out at the site
         // that chooses it rather than hidden behind a trait.
         isolation: isolation_mode.unwrap_or(spawn::isolation::Isolation::Default),
+        // Same rule, same reason: omitting `--landlock` asks for the highest
+        // rung, and the weaker values have to be typed.
+        landlock: landlock_mode.unwrap_or(vitrin_realm_init::LandlockRequest::Highest),
         realm_init,
     };
 
@@ -2407,6 +2481,23 @@ fn set_consent(slot: &mut Option<ConsentPolicy>, policy: ConsentPolicy) -> Resul
 /// security-relevant mode twice is a command line whose author disagrees with
 /// themselves, and quietly taking the last one is how a session ends up
 /// confining less than the operator believes.
+/// `--landlock`, on `set_isolation`'s rule: given twice is a refusal, never a
+/// last-one-wins. Two spellings of the confinement on one command line is a
+/// command line whose author disagreed with themselves, and picking either
+/// one silently is how a session ends up weaker than the operator believes.
+fn set_landlock(
+    slot: &mut Option<vitrin_realm_init::LandlockRequest>,
+    landlock: vitrin_realm_init::LandlockRequest,
+) -> Result<(), String> {
+    match slot {
+        None => {
+            *slot = Some(landlock);
+            Ok(())
+        }
+        Some(_) => Err("`--landlock` given more than once".into()),
+    }
+}
+
 fn set_isolation(
     slot: &mut Option<spawn::isolation::Isolation>,
     isolation: spawn::isolation::Isolation,
@@ -2591,12 +2682,14 @@ fn main() -> ExitCode {
             let screenshot_chord = screenshot.chord;
             tracing::warn!(
                 "starting on BARE METAL: this process takes DRM master and libinput's devices \
-                 for the whole seat. The realm's app runs as this uid with no namespace, no \
-                 seccomp filter and no Landlock ruleset (docs/book/src/limits.md), and on a \
-                 real seat logind ACLs /dev/input/event* to the logged-in user -- so a \
-                 confined app can open the keyboard directly and read everything typed, \
-                 bypassing this core entirely. That hole is not created here; it becomes \
-                 reachable here"
+                 for the whole seat. The realm's app runs as this uid, and at \
+                 `--isolation=off` with no namespace, no Landlock ruleset and no seccomp \
+                 filter at all (docs/book/src/limits.md). On a real seat logind ACLs \
+                 /dev/input/event* to the logged-in user, so an app that can reach those \
+                 device nodes reads everything typed, bypassing this core entirely. At \
+                 `--isolation=default` the realm's own /dev is an enumerated tmpfs with no \
+                 /dev/input in it and the Landlock ruleset grants no path outside the realm's \
+                 view -- that hole is not created here; it becomes reachable here"
             );
             run_session(
                 consent,
@@ -3195,6 +3288,7 @@ where
                 canaries,
                 render_nodes,
                 tmpfs: vitrin_realm_init::TmpfsCaps::DEFAULT,
+                landlock: isolation_applied.landlock(),
             })
         }
     };
@@ -3448,7 +3542,7 @@ fn admit_isolation(
     options: &IsolationOptions,
 ) -> Result<(spawn::isolation::Applied, spawn::isolation::Report), ()> {
     let report = spawn::isolation::Report::probe();
-    match spawn::isolation::admit(options.isolation, &report) {
+    match spawn::isolation::admit(options.isolation, options.landlock, &report) {
         Ok(applied) if applied.isolation() == spawn::isolation::Isolation::Off => {
             warn_unconfined();
             Ok((applied, report))
@@ -3456,13 +3550,90 @@ fn admit_isolation(
         Ok(applied) => {
             tracing::info!(
                 isolation = %applied.isolation(),
-                profile = applied.profile(),
+                landlock = %applied.landlock(),
                 kernel = %report.kernel_release,
                 "realms will be confined: each gets its own user, mount, PID, IPC, UTS and \
-                 network namespace, an identity uid/gid map, and zero capabilities. \
-                 `applied_profile` is `namespaces-only` and not a tier name, because Landlock \
-                 (P2.6.3) and seccomp (P2.6.4) are not applied by this build"
+                 network namespace, an identity uid/gid map, zero capabilities, and a Landlock \
+                 ruleset enforced before the shim's execve. No `applied_profile` is printed \
+                 here on purpose: it names the rung a realm OBTAINED, and no realm exists yet \
+                 -- the ladder's landing is per-spawn. Whatever it says, it is not a tier \
+                 name, because `intra-user` means namespaces PLUS Landlock PLUS seccomp and \
+                 the seccomp filter (P2.6.4) is not applied by this build"
             );
+            // **Loud, and at WARN**, because every one of these is a session
+            // that will journal something weaker than a reader of the default
+            // would assume -- and the number is in the message rather than
+            // only in a per-realm entry, so it is in the first screen of log
+            // an operator sees rather than buried in a spawn.
+            match applied.landlock() {
+                vitrin_realm_init::LandlockRequest::Highest => {}
+                vitrin_realm_init::LandlockRequest::Off => tracing::warn!(
+                    "LANDLOCK IS OFF (--landlock=off): realms this session spawns get NO \
+                     filesystem ruleset. They are confined by the mount table alone, so a \
+                     write inside the realm's own view is bounded by what was mounted and by \
+                     nothing else -- no TRUNCATE denial, no per-path read set. Every realm \
+                     journals `applied_profile=namespaces-only` so no entry from this session \
+                     can be read as a confined one. This exists as the per-rung gates' \
+                     positive control, not as an operating mode."
+                ),
+                vitrin_realm_init::LandlockRequest::CappedAt(rung) => {
+                    // `0` for a kernel that would not answer at all, which
+                    // is not a rung: the comparison below then reads "the cap
+                    // changes nothing", and it is right -- a machine whose
+                    // ABI query failed has already been refused by `admit`
+                    // unless `--landlock=off` was given, and this arm is not
+                    // that one.
+                    let kernel = report.landlock_abi.unwrap_or_default();
+                    // A cap **below the build's own floor** is the sharpest
+                    // case and gets its own line: the flag is the one way to
+                    // reach a rung this build refuses to start a kernel at, so
+                    // a session running there is running below the confinement
+                    // this build declares. It is still permitted, because the
+                    // per-rung measurements are what the flag exists for --
+                    // but it is never passed over in silence.
+                    if rung < vitrin_realm_init::LANDLOCK_MIN_ABI {
+                        tracing::warn!(
+                            requested_rung = rung,
+                            floor = vitrin_realm_init::LANDLOCK_MIN_ABI,
+                            kernel_abi = kernel,
+                            "LANDLOCK IS PINNED BELOW THIS BUILD'S OWN FLOOR \
+                             (--landlock=abi:{rung}, floor abi:{}). A kernel that reported \
+                             rung {rung} would be REFUSED at startup; this flag reaches the \
+                             same domain by choice. It is a measurement instrument, not a \
+                             hardening option, and no confinement claim this build publishes \
+                             applies to the realms this session spawns.",
+                            vitrin_realm_init::LANDLOCK_MIN_ABI
+                        );
+                    }
+                    if kernel > rung {
+                        tracing::warn!(
+                            requested_rung = rung,
+                            kernel_abi = kernel,
+                            "LANDLOCK IS PINNED BELOW THIS KERNEL (--landlock=abi:{rung}): this \
+                             kernel offers ABI {kernel} and this session will build its realms' \
+                             rulesets at rung {rung}, reproducing an ABI-{rung} kernel -- \
+                             INCLUDING that kernel's strictness. What moves between rung \
+                             {rung} and rung {kernel}, where it applies: 2 REFER, which goes \
+                             the OTHER way (a domain that does not handle REFER forbids \
+                             rename/link across directories entirely, so a rung-1 session is \
+                             STRICTER here and breaks apps that write by rename-into-place); \
+                             3 TRUNCATE (without it a read-granted file can still be \
+                             destroyed); 5 IOCTL_DEV; 6 abstract-socket and signal scoping; 9 \
+                             RESOLVE_UNIX. The cap is a measurement instrument; it is not a \
+                             hardening option."
+                        );
+                    } else {
+                        tracing::warn!(
+                            requested_rung = rung,
+                            kernel_abi = kernel,
+                            "`--landlock=abi:{rung}` was given and this kernel offers no more \
+                             than rung {kernel}, so the cap changes nothing. Said out loud \
+                             rather than passed over: a cap that did nothing is a measurement \
+                             that proves nothing."
+                        );
+                    }
+                }
+            }
             if let Some(forecast) = spawn::isolation::forecast(&report) {
                 tracing::warn!("{forecast}");
             }
@@ -3471,8 +3642,11 @@ fn admit_isolation(
         Err(refusal) => {
             tracing::error!(
                 "fatal: {refusal} Pass `--isolation=off` to start an UNCONFINED session \
-                 anyway, or `vitrind --print-isolation` to see every row behind this answer \
-                 and `vitrind --print-floor` to see what this build requires."
+                 anyway, or -- for a Landlock refusal specifically -- `--landlock=off` to \
+                 start a session whose realms have namespaces and no ruleset. Both are \
+                 weaker than what was asked for and both say so in every journal entry. \
+                 `vitrind --print-isolation` shows every row behind this answer and \
+                 `vitrind --print-floor` what this build requires."
             );
             Err(())
         }
@@ -5622,6 +5796,7 @@ mod tests {
             // fail this test for an unrelated reason.
             IsolationOptions {
                 isolation: spawn::isolation::Isolation::Off,
+                landlock: vitrin_realm_init::LandlockRequest::Highest,
                 realm_init: None,
             },
             // Not an instrumented run: `--consent-injector-fd` is a headless
@@ -5668,6 +5843,7 @@ mod tests {
             // about auto-approve's admission, not about the kernel's.
             IsolationOptions {
                 isolation: spawn::isolation::Isolation::Off,
+                landlock: vitrin_realm_init::LandlockRequest::Highest,
                 realm_init: None,
             },
             false,

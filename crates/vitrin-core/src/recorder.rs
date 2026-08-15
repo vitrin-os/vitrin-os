@@ -2234,9 +2234,11 @@ fn key(out: &mut String, k: &str) {
 /// exactly why nothing in it is what licensed the spawn -- and why a reader
 /// must be able to tell the two apart without knowing this code.
 ///
-/// `landlock` and `seccomp` are written as explicit `not-applied` rather than
-/// omitted, on this file's own rule: absent information is an explicit value,
-/// never a missing key.
+/// `seccomp` is written as an explicit `not-applied` rather than omitted, on
+/// this file's own rule: absent information is an explicit value, never a
+/// missing key. `landlock` was such a string until P2.6.3 (#187) made it an
+/// object with a requested rung, an obtained rung, the kernel's own ABI, and
+/// whether this build's ladder is what held the rung down.
 ///
 /// # The one field above the line that the child supplied
 ///
@@ -2255,7 +2257,77 @@ fn write_isolation(out: &mut String, facts: &crate::spawn::IsolationFacts) {
     out.push_str(",\"isolation\":{");
     out.push_str("\"applied_profile\":");
     push_json_string(out, facts.applied_profile);
-    out.push_str(",\"landlock\":\"not-applied (P2.6.3)\"");
+    // Landlock (P2.6.3, #187) is an object rather than a string, because one
+    // string cannot carry the two facts a reader needs and neither is
+    // derivable from the other: what this core ASKED for (a parent fact, the
+    // session's `--landlock`) and what the realm's PID 1 said it GOT (child
+    // asserted). `requested: highest, obtained_rung: 3` on a kernel that
+    // reports 9 is a ladder fallback; `requested: abi:3` with the same
+    // numbers is an operator's cap. A single field would render those two
+    // sessions identically.
+    out.push_str(",\"landlock\":{");
+    out.push_str("\"requested\":");
+    match facts.landlock_requested {
+        Some(request) => push_json_string(out, &request.to_string()),
+        None => out.push_str("null"),
+    }
+    out.push_str(",\"obtained_rung\":");
+    match facts.landlock_rung {
+        Some(rung) => out.push_str(&rung.to_string()),
+        None => out.push_str("null"),
+    }
+    out.push_str(",\"kernel_abi\":");
+    match facts.landlock_kernel_abi {
+        Some(abi) => out.push_str(&abi.to_string()),
+        None => out.push_str("null"),
+    }
+    // Whether this BUILD, rather than the kernel or the operator, is what
+    // held the rung down (P2.6.3, #187). A parent conclusion about a
+    // child-asserted number -- `plan_rung` over the reported ABI and this
+    // build's own `LANDLOCK_BUILD_MAX_RUNG`, the same function the helper
+    // planned with -- so a kernel newer than this build reads as `true` here
+    // rather than as a silent rung. `vitrind --print-floor` prints the
+    // constant it was measured against.
+    out.push_str(",\"clamped_by_build\":");
+    match facts.landlock_clamped_by_build {
+        Some(clamped) => out.push_str(if clamped { "true" } else { "false" }),
+        None => out.push_str("null"),
+    }
+    // The label, spelled in the object rather than left to the reader's
+    // knowledge of which group a key sits in: these two numbers are the only
+    // child-asserted values written above the `child_asserted` block, because
+    // the object they belong to is about the session's *selection* too.
+    //
+    // **It is a claim about numbers, so it is written only where there are
+    // numbers.** Until an adversarial pass caught it this string was
+    // unconditional, and the object then read
+    // `{"obtained_rung":0,"kernel_abi":null,"clamped_by_build":null,
+    // "rung_evidence":"child-asserted"}` at `--landlock=off` and with every
+    // field null at `--isolation=off` -- attaching a provenance claim to an
+    // absence. Provenance for nothing is not the safe direction of a mistake:
+    // it invites a reader to treat "a child said so" as the reason a field is
+    // empty, when the truth is that no child was asked.
+    //
+    // The predicate is the ABI number rather than the rung, because the ABI is
+    // what the child had to *ask the kernel for*: the helper issues
+    // `landlock_create_ruleset(NULL, 0, VERSION)` only on the path where it
+    // then builds a ruleset, so `kernel_abi: Some(_)` is exactly "a child
+    // measured something and reported it". A rung of 0 is not -- it is what
+    // `--landlock=off` produces, and the parent already knew that from its own
+    // selection. The rung side is kept in the test anyway (`rung > 0`), so a
+    // future path that reports a real rung without an ABI still gets labelled
+    // rather than silently losing its provenance.
+    let rung_evidence =
+        facts.landlock_kernel_abi.is_some() || facts.landlock_rung.is_some_and(|rung| rung > 0);
+    out.push_str(",\"rung_evidence\":");
+    if rung_evidence {
+        push_json_string(out, "child-asserted");
+    } else {
+        // This file's rule holds: absent information is an explicit value,
+        // never a missing key. What changed is which value is honest.
+        out.push_str("null");
+    }
+    out.push('}');
     out.push_str(",\"seccomp\":\"not-applied (P2.6.4)\"");
 
     out.push_str(",\"parent_observed\":{");
@@ -3586,7 +3658,7 @@ pub(crate) mod tests {
     /// reading, only where it did not.
     fn confined_facts() -> crate::spawn::IsolationFacts {
         crate::spawn::IsolationFacts {
-            applied_profile: "namespaces-only",
+            applied_profile: "namespaces+landlock-abi9",
             namespaces_verified: vec!["user", "mnt", "ipc", "uts", "net"],
             root_dev_differs: Some(true),
             canaries_probed: 3,
@@ -3609,9 +3681,170 @@ pub(crate) mod tests {
             ]),
             stdio: "per-realm log file",
             storage_reused: false,
+            landlock_requested: Some(vitrin_realm_init::LandlockRequest::Highest),
+            landlock_clamped_by_build: Some(false),
             mount_count: Some(21),
             mount_fingerprint: Some(0xdead_beef_cafe_f00d),
+            landlock_rung: Some(9),
+            landlock_kernel_abi: Some(9),
         }
+    }
+
+    /// The Landlock object carries **four** facts, and the fourth is the one
+    /// that was computed for every confined spawn and read by nobody
+    /// (P2.6.3, #187).
+    ///
+    /// `clamped_by_build` is true only on a kernel whose Landlock ABI is
+    /// above this build's own ladder. No such kernel is available here, so it
+    /// is asserted against a **constructed** fact rather than waited for --
+    /// the same rule `vitrin-realm-init`'s `plan_rung` test follows, and the
+    /// reason ABI 10 being in mainline does not have to arrive on a test
+    /// runner before this rendering is checked.
+    #[test]
+    fn the_landlock_object_reports_the_build_clamp_rather_than_computing_it_silently() {
+        let _fd = crate::capture::tests::fd_lock();
+        let (mut rec, path) = scratch_recorder("landlock-clamp");
+        // A kernel one rung past this build's ladder: the helper enforced 9,
+        // the kernel offers 10, and the difference is this BUILD's.
+        let mut clamped = confined_facts();
+        clamped.landlock_kernel_abi = Some(vitrin_realm_init::LANDLOCK_BUILD_MAX_RUNG + 1);
+        clamped.landlock_clamped_by_build = Some(true);
+        // And the same shape where nothing measured the ABI at all
+        // (`--isolation=off`), which must be `null` and not `false`.
+        let mut unmeasured = confined_facts();
+        unmeasured.applied_profile = "none";
+        unmeasured.landlock_requested = None;
+        unmeasured.landlock_rung = None;
+        unmeasured.landlock_kernel_abi = None;
+        unmeasured.landlock_clamped_by_build = None;
+
+        for facts in [&clamped, &unmeasured] {
+            rec.record(Event::RealmSpawned {
+                realm: &crate::grants::RealmId::new("realm-0"),
+                pid: 11,
+                origin: crate::spawn::SpawnOrigin::Startup,
+                command: Path::new("/usr/bin/foot"),
+                runtime_dir: Path::new("/run/user/1000/vitrin-0/realm-0"),
+                env_allow: &[],
+                isolation: facts,
+            });
+        }
+
+        let entries = read_log(&path);
+        assert!(
+            entries[0].bool("isolation.landlock.clamped_by_build"),
+            "a kernel above this build's ladder must journal the clamp as `true`; without it \
+             the operator's only signal is diffing `kernel_abi` against a constant nothing \
+             prints",
+        );
+        assert_eq!(
+            entries[0].u64("isolation.landlock.kernel_abi"),
+            u64::from(vitrin_realm_init::LANDLOCK_BUILD_MAX_RUNG + 1),
+        );
+        assert!(
+            entries[1].is_null("isolation.landlock.clamped_by_build"),
+            "nothing measured the ABI, so the clamp is unknown rather than `false` -- a \
+             `false` here would assert that this build's ladder was long enough, which \
+             nothing checked",
+        );
+        // Non-vacuity for the pair: the ordinary confined spawn on a kernel
+        // inside the ladder journals `false`, so the `true` above is the
+        // clamp and not a constant.
+        let (mut rec, plain_path) = scratch_recorder("landlock-clamp-plain");
+        rec.record(Event::RealmSpawned {
+            realm: &crate::grants::RealmId::new("realm-0"),
+            pid: 11,
+            origin: crate::spawn::SpawnOrigin::Startup,
+            command: Path::new("/usr/bin/foot"),
+            runtime_dir: Path::new("/run/user/1000/vitrin-0/realm-0"),
+            env_allow: &[],
+            isolation: &confined_facts(),
+        });
+        let plain = read_log(&plain_path);
+        assert!(!plain[0].bool("isolation.landlock.clamped_by_build"));
+        cleanup(&path);
+        cleanup(&plain_path);
+    }
+
+    /// `rung_evidence` is a claim about the two numbers beside it, so it is
+    /// written only where those numbers exist (P2.6.3, #187).
+    ///
+    /// Three shapes, and the middle one is the one an adversarial pass
+    /// actually measured going wrong: `--landlock=off` journaled
+    /// `obtained_rung: 0, kernel_abi: null, clamped_by_build: null` under a
+    /// flat `"rung_evidence": "child-asserted"`. A reader who trusts the label
+    /// reads three empty fields as "the child asserted these", when the truth
+    /// is that no ruleset was built and nothing was measured.
+    ///
+    /// The confined arm is what keeps this non-vacuous in the other
+    /// direction: a rendering that simply deleted the label would satisfy two
+    /// of the three assertions below.
+    #[test]
+    fn the_rung_evidence_label_is_written_only_where_there_are_numbers_to_have_provenance() {
+        let _fd = crate::capture::tests::fd_lock();
+        let (mut rec, path) = scratch_recorder("landlock-rung-evidence");
+
+        // 1. A confined realm on a kernel inside this build's ladder: two real
+        //    numbers, both from the child, and the label is what says so.
+        let confined = confined_facts();
+        // 2. `--landlock=off`: a helper ran, built no ruleset, and reported
+        //    rung 0. The ABI was never queried, so `kernel_abi` is null.
+        let mut landlock_off = confined_facts();
+        landlock_off.applied_profile = "namespaces-only";
+        landlock_off.landlock_requested = Some(vitrin_realm_init::LandlockRequest::Off);
+        landlock_off.landlock_rung = Some(0);
+        landlock_off.landlock_kernel_abi = None;
+        landlock_off.landlock_clamped_by_build = None;
+        // 3. `--isolation=off`: no confined helper runs at all.
+        let mut isolation_off = confined_facts();
+        isolation_off.applied_profile = "none";
+        isolation_off.landlock_requested = None;
+        isolation_off.landlock_rung = None;
+        isolation_off.landlock_kernel_abi = None;
+        isolation_off.landlock_clamped_by_build = None;
+
+        for facts in [&confined, &landlock_off, &isolation_off] {
+            rec.record(Event::RealmSpawned {
+                realm: &crate::grants::RealmId::new("realm-0"),
+                pid: 11,
+                origin: crate::spawn::SpawnOrigin::Startup,
+                command: Path::new("/usr/bin/foot"),
+                runtime_dir: Path::new("/run/user/1000/vitrin-0/realm-0"),
+                env_allow: &[],
+                isolation: facts,
+            });
+        }
+
+        let entries = read_log(&path);
+        assert_eq!(
+            entries[0].str("isolation.landlock.rung_evidence"),
+            "child-asserted",
+            "a realm that really enforced a ruleset must still say which side of the trust \
+             line its rung came from -- the parent cannot corroborate it",
+        );
+        assert!(
+            entries[1].is_null("isolation.landlock.rung_evidence"),
+            "at --landlock=off the only number is a rung of 0 the parent already knew from \
+             its own selection, and the ABI was never asked for; a provenance label here \
+             claims a child asserted an absence",
+        );
+        assert!(
+            entries[2].is_null("isolation.landlock.rung_evidence"),
+            "at --isolation=off no confined helper runs at all, so there is nothing for any \
+             provenance label to be about",
+        );
+        // And the key is still present on every path -- this file's rule is
+        // that absent information is an explicit value, never a missing key.
+        // Without this, dropping the field entirely would satisfy both nulls
+        // above (`Json::at` would panic, but a reader of this test should not
+        // have to know that to see the rule being held).
+        for entry in &entries {
+            assert!(
+                format!("{entry:?}").contains("rung_evidence"),
+                "the key must be written on every path; only its value moves",
+            );
+        }
+        cleanup(&path);
     }
 
     #[test]

@@ -1,0 +1,319 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# ===========================================================================
+#  AppArmor profile for vitrind -- issue #286.
+#
+#  THIS PROFILE HAS NEVER BEEN LOADED BY ANYONE WHO WROTE IT.
+#
+#  It was authored on a machine with AppArmor compiled out
+#  (/sys/module/apparmor/parameters/enabled = N, Arch, kernel 7.1.8), so it
+#  was not parsed, not loaded, not attached and not observed to grant
+#  anything. The only instrument that can answer any of that is the
+#  `apparmor-profile` job in .github/workflows/ci.yml, which runs on a stock
+#  `ubuntu-latest` -- deliberately WITHOUT the
+#  `kernel.apparmor_restrict_unprivileged_userns=0` sysctl the `rust` and
+#  `integration` jobs take -- installs this file, loads it, spawns a real
+#  realm, and then REMOVES the profile and requires the spawn to fail again.
+#
+#  Until that job has run green, the honest statement about this file is:
+#  "a profile is written, and a job exists that will say whether it works."
+#  Do not upgrade that sentence anywhere -- docs/book/src/limits.md, README.md,
+#  SECURITY.md and site/index.html all carry it in that form on purpose.
+#
+#  The distinction that keeps the rest of this header honest: this file's
+#  BEHAVIOUR is unmeasured, and its FORM is cited. Every structural choice
+#  below is copied from a profile that Ubuntu 24.04 actually ships, and the
+#  PROVENANCE block names the URL each one came from. Those are different
+#  kinds of claim and the header keeps them apart on purpose -- an earlier
+#  draft of this file did not, and quoted a form from memory while presenting
+#  it as a measurement.
+# ===========================================================================
+#
+# PROVENANCE -- every URL below was fetched on 2026-08-15, and nothing in this
+# header is attributed to a source that was not.
+#
+#   [U1] https://git.launchpad.net/ubuntu/+source/apparmor/plain/profiles/apparmor.d/chrome?h=ubuntu/noble-updates
+#   [U2] https://git.launchpad.net/ubuntu/+source/apparmor/plain/profiles/apparmor.d/firefox?h=ubuntu/noble-updates
+#   [U3] https://git.launchpad.net/ubuntu/+source/apparmor/plain/profiles/apparmor.d/flatpak?h=ubuntu/noble-updates
+#   [U4] https://git.launchpad.net/ubuntu/+source/apparmor/plain/profiles/apparmor.d/unprivileged_userns?h=ubuntu/noble-updates
+#   [U5] https://git.launchpad.net/ubuntu/+source/apparmor/plain/parser/apparmor.d.pod?h=ubuntu/noble-updates
+#         -- the source of apparmor.d(5) in the same source package.
+#   [U6] https://packages.ubuntu.com/noble/amd64/apparmor/filelist
+#         -- confirms /etc/apparmor.d/{chrome,firefox,flatpak,unprivileged_userns}
+#            are installed by noble's `apparmor` BINARY package, so [U1]-[U4]
+#            are shipped files on a 24.04 host and not merely source-tree ones.
+#   [U7] https://ubuntu.com/blog/ubuntu-23-10-restricted-unprivileged-user-namespaces
+#         -- Ubuntu's own statement of the restriction this file answers.
+#   [U8] https://gitlab.com/apparmor/apparmor/-/wikis/unprivileged_userns_restriction.md
+#   [U9] https://gitlab.com/apparmor/apparmor/-/wikis/unprivileged_unconfined_restriction.md
+#         -- the upstream AppArmor project's own pages on the two restrictions.
+#            [U8] is the source for the shipped sysctl defaults and for the
+#            behaviour of an `unconfined`-tagged profile; [U9] for what an
+#            unprivileged unconfined task's `change_profile` actually does.
+#
+# [U1], [U2] and [U3] are byte-for-byte the same profile modulo the name and
+# the attachment path. [U1] in full, because this file is a copy of its shape:
+#
+#     # This profile allows everything and only exists to give the
+#     # application a name instead of having the label "unconfined"
+#
+#     abi <abi/4.0>,
+#     include <tunables/global>
+#
+#     profile chrome /opt/google/chrome/chrome flags=(unconfined) {
+#       userns,
+#
+#       # Site-specific additions and overrides. See local/README for details.
+#       include if exists <local/chrome>
+#     }
+#
+# What was NOT re-established, and is therefore not cited anywhere below: the
+# `bwrap-userns-restrict` profile. An earlier draft of this header attributed a
+# no_new_privs/stacking argument to it as "Ubuntu's own". It is not in noble --
+# absent from [U6] and 404 on the noble source tree -- so the attribution was
+# wrong for the release this file targets, and the argument now rests on [U4],
+# which IS shipped there and does the same stacking for the same reason.
+#
+# WHAT PROBLEM THIS SOLVES
+#
+# Ubuntu 24.04+ ships `kernel.apparmor_restrict_unprivileged_userns=1`. Under
+# it, a task whose AppArmor label is literally `unconfined` may still call
+# `unshare(CLONE_NEWUSER)` -- and the kernel then declines to give the new
+# namespace the capabilities it is supposed to confer. So the namespace is
+# created and the first thing `vitrin-realm-init` does inside it,
+# `mount(NULL, "/", NULL, MS_REC|MS_PRIVATE, NULL)`, answers EACCES.
+# `vitrind`'s startup preflight measures exactly that pair and refuses to
+# start (D-020(6) forbids degrading silently), which is the behaviour this
+# project wants and NOT what this file changes.
+#
+# What this file changes is the prerequisite. Ubuntu did not simply block
+# unprivileged user namespaces; it shipped a supported PER-BINARY grant, and
+# [U6] shows chrome, firefox and flatpak each already carry one on a 24.04
+# host. This is vitrin's.
+#
+# WHY EACH LINE IS HERE
+#
+#   abi <abi/4.0>,
+#       Pins the policy language this file is written against. [U1]-[U4] all
+#       declare this same ABI, and they are the profiles noble ships, so a
+#       parser that accepts them accepts this. Upstream's `master` profiles
+#       (ABI 5.0) additionally carry `@{exec_path} mr,`; that variable does not
+#       exist under abi 4.0 and must NOT be copied back here.
+#
+#   include <tunables/global>
+#       Parity with [U1], [U2] and [U3], which carry this line and nothing else
+#       between the ABI and the profile block. It defines the @{...} tunables
+#       the parser expects to be in scope.
+#
+#   profile vitrind /usr/lib/vitrin/{vitrind,vitrin-realm-init} ...
+#       The NAME is what makes this work, not the rules. Per [U7]:
+#       "unprivileged processes will only be able to create user namespaces if
+#       they are confined and have the "userns," rule in their AppArmor profile
+#       (or if they have CAP_SYS_ADMIN)". A named profile is what makes the
+#       task count as confined for that check.
+#
+#       The ATTACHMENT is a brace alternation over two binaries on purpose,
+#       and it is the single most load-bearing decision in this file. The
+#       process that issues the six-flag `unshare` is NOT `vitrind` -- it is
+#       `vitrin-realm-init`, which `vitrind` reaches by `execve` (see
+#       crates/vitrin-realm-init/src/main.rs, and crates/vitrin-core/src/spawn.rs
+#       for the exec). `vitrind` needs the grant too, because its own
+#       `--print-isolation` preflight forks a child that calls `unshare`
+#       (crates/vitrin-core/src/spawn/isolation.rs). Covering both paths with
+#       one profile means the vitrind -> vitrin-realm-init exec attaches to
+#       the SAME profile: same label, no transition, and no dependence on what
+#       AppArmor does for a child that matches no attachment. That fallback
+#       behaviour under `flags=(unconfined)` is not stated in [U5], so this
+#       glob is written to make the question moot rather than to bet on the
+#       answer.
+#
+#       `vitrind` resolves its helper as a sibling of its own `current_exe()`
+#       (crates/vitrin-core/src/main.rs, `default_realm_init_path`), so
+#       installing both binaries into /usr/lib/vitrin/ needs no `--realm-init`
+#       flag and keeps the two paths inside one glob.
+#
+#   flags=(unconfined)
+#       Confines NOTHING. [U5] on this mode: "This mode allows a task confined
+#       by the profile to behave as though it is unconfined." It exists to give
+#       the task a name instead of the label `unconfined`, which is what
+#       [U1]-[U3] say in their own words: "This profile allows everything and
+#       only exists to give the application a name instead of having the label
+#       "unconfined"".
+#
+#       Two quotes, two sources, and they are kept apart because an earlier
+#       draft ran them together and attributed the manual's sentence to the
+#       profiles' header comment. Neither says what the other says.
+#
+#       READ THIS BEFORE COPYING THE FLAG. [U5] also says, of the same mode:
+#       "This mode should not be used under regular deployment but can be
+#       useful during debugging and some system initialization scenarios", and
+#       "true unconfined is being phased out, with unconfined becoming a
+#       replaceable profile. As such unconfined mode will be emulated by a
+#       special profile compiled with the default_allow flag in newer kernels."
+#       So the flag this file uses is one its own manual discourages for
+#       deployment -- and Ubuntu ships it in [U1]-[U3] regardless. That tension
+#       is real and is not resolved here: the form is chosen to match what the
+#       distribution actually ships, because a profile that differs from every
+#       shipped example is a fourth thing nobody has tested. `default_allow` is
+#       the successor [U5] names, and switching to it is a deliberate future
+#       change to be made against a measurement, not a tidy-up.
+#
+#   userns  (spelled with its trailing comma in the rule below)
+#       The grant itself, and the rule [U7] names. [U5] gives the grammar as
+#       `USERNS RULE = [ QUALIFIERS ] 'userns' [ USERNS ACCESS PERMISSIONS ]`
+#       with `USERNS ACCESS PERMISSIONS = ( 'create' )` -- `create` is the only
+#       permission there is, so the bare rule and `allow userns create` cover
+#       the same set. [U5]'s own example is the bare form, commented
+#       "# Allow all userns perms", and the bare form is what [U1]-[U3] ship.
+#
+#       THIS RULE IS NOT DECORATION UNDER AN UNCONFINED FLAG, which is the one
+#       thing about this file most likely to be "simplified" away by someone
+#       reasoning that a profile allowing everything must already allow this.
+#       [U8], on profiles tagged unconfined: "Profiles that are tagged as
+#       unconfined have their permissions determined entirely by the profile.
+#       That is they are not controlled by the sysctl
+#       apparmor_restrict_unprivileged_userns nor do they have the exception
+#       for privileged tasks." It then gives the two cases explicitly -- "a
+#       profile without a user namespace rule will result in a DENIAL despite
+#       being tagged unconfined", versus "a profile with a user namespace rule
+#       with an unconfined rule can allow creation of user namespace". Deleting
+#       this line does not relax the profile; it inverts it.
+#
+#   include if exists <local/vitrind>
+#       The site-override convention [U1]-[U3] each carry, with the same
+#       comment. An operator adds rules in /etc/apparmor.d/local/vitrind
+#       without editing this file, so a package upgrade does not clobber them.
+#
+# WHAT IS DELIBERATELY *NOT* HERE
+#
+#   No attachment for `vitrin-shim`, and none for the app inside a realm.
+#   That is not an oversight and it is not a gap -- it is the design:
+#   `vitrin-realm-init` writes `/proc/sys/user/max_user_namespaces=0` inside
+#   the realm before it execs the shim, so nesting is already denied there by
+#   the helper itself. Adding an attachment for either path would also be
+#   actively dangerous: `vitrin-realm-init` sets `PR_SET_NO_NEW_PRIVS` before
+#   that exec, and under `no_new_privs` AppArmor denies any domain transition
+#   it cannot prove is a reduction of privilege. Today that exec is
+#   unconfined -> nothing and is always permitted; once `vitrind` is confined
+#   it becomes confined -> X, and if a profile attached to the shim's path the
+#   `execve` would FAIL. Ubuntu's shipped `unprivileged_userns` profile [U4]
+#   deals with the same class of problem by stacking rather than transitioning
+#   -- it carries `allow pix /** -> &unprivileged_userns ,`, which keeps
+#   children in the same profile. Vitrin's answer is simpler: attach nothing
+#   there, so the exec matches no attachment, performs no transition, and
+#   inherits.
+#
+#   No `mount,`, `pivot_root,` or `capability,` rules. Under
+#   `flags=(unconfined)` those are expected to be unnecessary. EXPECTED, not
+#   measured -- if the CI job reports the realm spawn failing at the mount
+#   with the label already naming `vitrind`, this is the first thing to
+#   revisit, because that outcome is byte-identical in errno to having no
+#   profile at all. [U4] is why: Ubuntu's fallback profile carries
+#   `audit deny capability,` alongside `allow userns,`, so it permits the
+#   unshare and denies every capability inside it -- which is precisely issue
+#   #286's measured signature. A WRONG profile therefore fails exactly like NO
+#   profile, and only the label separates them.
+#
+# THE SECURITY COST, WHICH IS REAL, IS CONDITIONAL, AND IS PUBLISHED
+#
+# A profile that is `flags=(unconfined)` and grants `userns` is a name any
+# local user may try to borrow: `aa-exec -p vitrind -- <anything>` asks to run
+# an arbitrary program under this profile, and this profile grants a user
+# namespace and restricts nothing else. Installing this file adds one entry to
+# the set of names that can be asked for -- alongside chrome, firefox and
+# flatpak [U6], which is company, not an excuse.
+#
+# WHETHER THAT ASK SUCCEEDS DEPENDS ON A SECOND KNOB, and an earlier draft of
+# this header got its value backwards. It said
+# `kernel.apparmor_restrict_unprivileged_unconfined` is 0 by default, and that
+# the borrow therefore just works. On Ubuntu 24.04 with the `apparmor` package
+# installed, the opposite is the shipped state: that package ships
+# `/usr/lib/sysctl.d/10-apparmor.conf` (its presence is in [U6]), and [U8]
+# quotes that file as setting BOTH
+# `kernel.apparmor_restrict_unprivileged_userns = 1` AND
+# `kernel.apparmor_restrict_unprivileged_unconfined = 1`.
+#
+# With the second knob at 1, [U9] describes what an unprivileged unconfined
+# task's `change_profile` -- which is what `aa-exec -p` performs -- actually
+# does: "instead of transitioning to the specified profile it will stack the
+# specified profile with unconfined", giving `unconfined -> target_profile//&
+# unconfined` rather than `unconfined -> target_profile`, so that "the system
+# restrictions are retained by the stacked unconfined profile". The borrow is
+# permitted and does not shed the restriction it was trying to shed.
+#
+# So the honest published statement has a condition in it: the cost is real
+# where an operator has set `apparmor_restrict_unprivileged_unconfined` to 0,
+# and is mitigated by the stacking behaviour where Ubuntu's shipped value of 1
+# is in force. Neither half is measured here -- this file's PROVENANCE is
+# citations, not experiments -- which is exactly why the `apparmor-profile` CI
+# job records that knob's value as `unconfined_knob` on the runner it uses.
+# A published cost that nothing measures is the failure this header exists to
+# avoid. docs/book/src/limits.md and SECURITY.md carry the same conditional
+# form; if you find one of them stating the cost flatly, it has drifted.
+#
+# INSTALLING IT
+#
+# Byte-for-byte what the `apparmor-profile` CI job runs, deliberately: a
+# documented recipe that differs from the measured one is a third thing nobody
+# has tested. Every other page that mentions installing this file points here
+# rather than restating these lines, for the same reason.
+#
+#   sudo install -d -m 0755 /usr/lib/vitrin
+#   sudo install -m 0755 target/debug/vitrind target/debug/vitrin-realm-init \
+#       /usr/lib/vitrin/
+#   sudo install -m 0644 packaging/apparmor/vitrind /etc/apparmor.d/vitrind
+#   sudo apparmor_parser -r /etc/apparmor.d/vitrind      # no reboot needed
+#
+# COPY THE BINARIES; DO NOT SYMLINK THEM. AppArmor attaches to the resolved
+# absolute pathname, and `vitrind` finds its helper through `current_exe()`,
+# which is `/proc/self/exe` and is likewise resolved. A symlink at
+# /usr/lib/vitrin/vitrind pointing into a build tree therefore attaches this
+# profile to NOTHING, silently, and the only symptom is the same EACCES you
+# started with.
+#
+# Verify: `sudo aa-status | grep vitrind` lists the profile, and
+# `vitrind --print-isolation` prints an `apparmor.label=` row -- which must
+# NAME `vitrind` rather than read `unconfined`, for this file to be doing
+# anything at all. It is deliberately not stated as "must read `vitrind`": a
+# label is a profile name plus an optional ` (mode)` suffix, and under this
+# file's flag the kernel is expected to render `vitrind (unconfined)`. That is
+# the string the isolation module's own unit test pins
+# (crates/vitrin-core/src/spawn/isolation.rs), so an exact-match instruction
+# here would have told operators to look for something the code says they will
+# not see.
+#
+# ONE EDITING RULE FOR THIS FILE'S COMMENTS, and it is load-bearing rather
+# than stylistic. `cargo xtask limits-check` anchors the published claim "this
+# profile still grants a user namespace" on the LAST LINE OF THE PROFILE
+# DECLARATION TOGETHER WITH THE RULE THAT FOLLOWS IT -- attachment, flags,
+# opening brace and grant, as one string -- and its comparison collapses ALL
+# whitespace in the file into single spaces before matching. The needle is
+# spelled out in crates/xtask/src/limits.rs and is deliberately NOT reproduced
+# here, which is the whole of the rule: **no comment in this file may restate
+# the anchor, in whole or in part, as a contiguous run of text.**
+#
+# Quoting the rule on its own is fine and this header does it several times.
+# What is not fine is a comment in which the profile's opening brace and the
+# rule end up adjacent after whitespace collapses -- the quoted upstream
+# profile above is safe only because each of its lines begins with a `#`,
+# which survives normalisation and sits between them.
+#
+# This is not a hypothetical, twice over. The needle was ONCE the bare rule,
+# and commenting the rule out left the gate green because the prose explaining
+# the rule satisfied it. It was then re-anchored on the brace -- and the
+# rewritten paragraph describing THAT anchor quoted it verbatim, restoring the
+# vacuity in the very sentence warning against it. Both were found the same
+# way and it is the only way: comment the rule out, run
+# `cargo xtask limits-check`, require RED, restore. Do that after any edit to
+# this header, not just after an edit to the rule.
+
+abi <abi/4.0>,
+
+include <tunables/global>
+
+profile vitrind /usr/lib/vitrin/{vitrind,vitrin-realm-init} flags=(unconfined) {
+  userns,
+
+  # Site-specific additions and overrides. See local/README for details.
+  include if exists <local/vitrind>
+}

@@ -37,6 +37,8 @@ vitrin-os/
 │   │   └── run_shell.py          #   line-oriented, host-side; README.md says why that is structural
 │   ├── realm.toml                # realm config template + security commentary
 │   └── principals.toml           # identity-registry template
+├── packaging/         # what a DISTRIBUTOR installs on a host — see §5
+│   └── apparmor/vitrind          # the Ubuntu 24.04+ userns grant (#286), UNPROVEN
 └── tests/
     ├── integration/    # drives the SHIPPED vitrind BINARY over a real socket — see §5
     └── golden/         # reference frames + the golden-regeneration entrypoint (`cargo xtask bless`)
@@ -135,6 +137,7 @@ implementation of the wire protocol, not a binding to the Rust one).
 | `examples/realm.toml`, `principals.toml` | Doc 2 §4.1 (spawn model); the spawn-path security notes in the root README | Config templates with the security rules (ownership/writability checks, environment allow-listing) spelled out inline. |
 | `tests/integration/` | PRD plan E9 (P1.9.1/.6); the honesty rule in [#111](https://github.com/vitrin-os/vitrin-os/issues/111) | Drives the **shipped `vitrind` binary** over a real socket with a real forked realm (never an in-process runtime) — the only place startup-ordering regressions are visible. Hosts the M1.2–M1.5 real-app gates (`test_real_app.py`, `test_real_capture_fidelity.py`, `test_real_actuation.py`, `test_real_deadman.py`, `test_real_consent.py`, `test_demo.py`, plus the `test_real_firefox.py`/`test_real_gtk.py` rungs); `run.sh` names those gates in `MILESTONE_GATES` and fails if one is missing, since `unittest discover` cannot tell an absent gate from a green suite. See [`tests/integration/README.md`](../tests/integration/README.md) for the full entry-point contract. |
 | `tests/golden/` | PRD plan E9 (P1.9.2) | Reference frames + the `cargo xtask bless` regeneration entrypoint for every golden test scattered across the workspace (consent-prompt ink map, SDK wire vectors, headless test pattern). |
+| `packaging/apparmor/vitrind` | Doc 2 §4.1 (spawn model) as a HOST prerequisite rather than as code; issue [#286](https://github.com/vitrin-os/vitrin-os/issues/286) | The only thing in this tree that is installed **onto a host** rather than run from it: the AppArmor profile Ubuntu 24.04+ needs before `vitrind --isolation=default` can create a user namespace that carries its capabilities. It is here, and not under `crates/`, because it is not this project's code being confined — it is a grant a *distribution's* policy has to make, and a distributor packaging vitrin is the one who installs it. **It has never been loaded by anyone who wrote it** (the maintainer's box has AppArmor compiled out), so it is an artefact with no evidence behind it yet; the `apparmor-profile` job in `.github/workflows/ci.yml` is the instrument that will say, and `docs/book/src/limits.md` publishes that state rather than the profile's intent. `tests/integration/apparmor-realm-probe.py` is that job's realm-spawn driver — deliberately not named `test_*.py`, because it is a diagnostic and must not join any suite's coverage claim. |
 
 ## 6. What this map deliberately omits
 

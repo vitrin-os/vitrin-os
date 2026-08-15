@@ -47,7 +47,18 @@ APACHE-2.0 (LICENSE) — explicit patent grant
     reviewable property;
   - the client SDKs: sdk/python/ and any future SDK;
   - the integration harness and the shipped examples: tests/integration/,
-    examples/.
+    examples/;
+  - packaging/ -- the artifacts a distributor installs on a host rather than
+    links into a binary. Today that is packaging/apparmor/vitrind, the
+    AppArmor profile issue #286 needs on Ubuntu 24.04+. It is named here
+    EXPLICITLY rather than left to the catch-all below, because the catch-all
+    covers "repository tooling that is not part of a shipped artifact" and an
+    installed AppArmor profile is exactly a shipped artifact -- it lands in
+    /etc/apparmor.d/ on an operator's machine. Apache-2.0 for the same reason
+    the SDKs are: a distributor packaging this project, or a fork wanting a
+    profile for their own binary, must not have to touch a copyleft file to
+    do it. The profile carries an inline `# SPDX-License-Identifier:
+    Apache-2.0` header of its own.
 
   The rule behind that list: content derived from the Apache-2.0 protocol
   artifacts stays Apache-2.0. Nobody should have to touch a copyleft file to

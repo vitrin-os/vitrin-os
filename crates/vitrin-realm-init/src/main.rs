@@ -1654,7 +1654,9 @@ mod tests {
     use std::cell::Cell;
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStrExt;
-    use vitrin_realm_init::{plan_rung, LandlockRequest, TmpfsCaps, LANDLOCK_BUILD_MAX_RUNG};
+    use vitrin_realm_init::{
+        plan_rung, LandlockRequest, TmpfsCaps, LANDLOCK_BUILD_MAX_RUNG, LANDLOCK_MIN_ABI,
+    };
 
     /// Exit codes the forked bodies below use for their own failures, chosen
     /// above every errno so a setup failure can never be read as a kernel
@@ -2466,5 +2468,84 @@ mod tests {
         assert_eq!(landlock::scoped_for_test(5), 0);
         assert_eq!(landlock::scoped_for_test(6), 0x3);
         assert_eq!(landlock::scoped_for_test(LANDLOCK_BUILD_MAX_RUNG), 0x3);
+    }
+
+    /// **Why the floor is 6 and not 7** (owner's decision, 2026-08-16), pinned
+    /// as an assertion rather than as a paragraph.
+    ///
+    /// The floor moved down a rung so a Debian 13 machine (measured at
+    /// `landlock.abi=6`; see `tests/kernel-matrix/rows/debian-13-6.12.row`)
+    /// stops being refused. The claim that costs nothing rides with it, and it
+    /// is *this*: the **enforced domain** -- the triple this build actually
+    /// hands `landlock_create_ruleset` and `landlock_restrict_self`, i.e.
+    /// `handled_access_fs`, `scoped` and the flags word -- is identical at rungs
+    /// 6, 7 and 8, because the only thing rungs 7 and 8 buy is
+    /// `landlock_restrict_self` *flags* and every shipped run passes zero
+    /// there.
+    ///
+    /// Three assertions, and the last two are what stop it being vacuous:
+    ///
+    /// 1. the triple is flat across 6..=8, so a machine admitted under the old
+    ///    floor of 7 is confined by the identical domain under the new one;
+    /// 2. the triple at rung 5 **differs** -- rung 6 is where `scoped` arrives
+    ///    -- so 6 is the *lowest* floor that gives nothing up, and this test
+    ///    would fail for a floor of 5;
+    /// 3. rung 9's triple differs too (`RESOLVE_UNIX`), which is why no page
+    ///    here says "identical at 6 through 9". The floor decides **admission**;
+    ///    the rung applied is still `min(kernel ABI, build ceiling)`, so a
+    ///    rung-9 kernel is unaffected by where the floor sits.
+    #[test]
+    fn the_floor_costs_nothing_because_the_domain_is_flat_from_six_to_eight() {
+        // The whole request this build makes at a rung, in one value. Nothing
+        // else reaches the kernel: `create_ruleset` sends these two mask fields
+        // and `restrict_self` sends this flags word.
+        let domain = |rung: u32| {
+            (
+                landlock::handled_access_fs_for_test(rung),
+                landlock::scoped_for_test(rung),
+                landlock::restrict_self_flags_for_test(rung, false),
+            )
+        };
+
+        assert_eq!(
+            LANDLOCK_MIN_ABI, 6,
+            "this test is the published justification for the floor's value; if the floor moved, \
+             the justification has to move with it rather than be left pointing at a number \
+             nothing declares"
+        );
+
+        // 1. Flat across the floor and the two rungs above it.
+        let at_floor = domain(LANDLOCK_MIN_ABI);
+        for rung in LANDLOCK_MIN_ABI..=8 {
+            assert_eq!(
+                domain(rung),
+                at_floor,
+                "rung {rung} does not enforce the same domain as the floor (rung {}), so lowering \
+                 the floor to it would have given something up. Rungs 7 and 8 buy \
+                 `landlock_restrict_self` flags, and this build passes flags = 0.",
+                LANDLOCK_MIN_ABI
+            );
+        }
+
+        // 2. Non-vacuity below. If the domain were flat all the way down, the
+        //    assertion above would be satisfied by a build that asked the
+        //    kernel for nothing, and the floor could be argued down to 1.
+        assert_ne!(
+            domain(LANDLOCK_MIN_ABI - 1),
+            at_floor,
+            "rung {} enforces the same domain as the floor, which would make the floor's value \
+             arbitrary. It is 6 because 6 is where `scoped` arrives.",
+            LANDLOCK_MIN_ABI - 1
+        );
+
+        // 3. Non-vacuity above, and the reason no page says "6 through 9".
+        assert_ne!(
+            domain(LANDLOCK_BUILD_MAX_RUNG),
+            at_floor,
+            "rung {LANDLOCK_BUILD_MAX_RUNG} was expected to add `RESOLVE_UNIX` to \
+             `handled_access_fs`. If it no longer does, the published sentence \"the domain is \
+             identical at 6, 7 and 8, and rung 9 is a superset\" is wrong in the overclaiming \
+             direction and has to be rewritten."
+        );
     }
 }

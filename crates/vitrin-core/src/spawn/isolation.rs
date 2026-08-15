@@ -584,8 +584,9 @@ fn remedy_for(mechanism: Mechanism, support: Support, report: &Report) -> String
     if let Support::BelowFloor { found, required } = support {
         return format!(
             "This kernel has Landlock and reports ABI {found}; this build's floor is ABI \
-             {required} (owner's decision, 2026-08-15: target recent kernels rather than \
-             publish a multi-rung ladder nothing measures). Nothing is misconfigured here and \
+             {required} (owner's decisions of 2026-08-15 and 2026-08-16: declare a floor rather \
+             than publish a multi-rung ladder nothing measures, and set it at the lowest rung \
+             that gives up no enforcement). Nothing is misconfigured here and \
              no sysctl, LSM list or boot parameter will change the number -- the remedy is a \
              newer kernel. `uname -r` says {release}, and `vitrind --print-floor` prints the \
              required number as `build.landlock_min_abi`. This build will not fall back to a \

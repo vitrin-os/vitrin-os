@@ -25,7 +25,53 @@ import time
 import unittest
 
 REPO = pathlib.Path(os.environ.get("VITRIN_REPO", pathlib.Path(__file__).resolve().parents[2]))
-VITRIND = REPO / "target" / "debug" / "vitrind"
+
+
+def _resolve_core() -> pathlib.Path:
+    """The `vitrind` every core in this suite starts.
+
+    Defaults to the build tree, which is what every existing caller wants.
+    `VITRIN_CORE_BIN` moves it, and exists for exactly one reason (issue
+    #286): AppArmor attaches a profile to a binary's **resolved absolute
+    pathname**, so a profile written for an installed `vitrind` cannot be
+    exercised against `target/debug/vitrind`. The `apparmor-profile` job in
+    `.github/workflows/ci.yml` installs both binaries into `/usr/lib/vitrin/`
+    and points this at them; nothing else in the repository sets it.
+
+    **Set-but-wrong is a misconfiguration, not a machine state**, and it fails
+    here rather than 90 times inside `setUp` — the same rule, and the same
+    reasoning, as `VITRIN_C_SHIM_BIN` in `tests/integration/run.sh`. Silently
+    falling back to the build tree would be worse than any error: the suite
+    would pass, against the binary the caller was specifically trying not to
+    test, and the log would look identical to a real run.
+    """
+    named = os.environ.get("VITRIN_CORE_BIN")
+    if not named:
+        return REPO / "target" / "debug" / "vitrind"
+    path = pathlib.Path(named)
+    if not path.is_file() or not os.access(path, os.X_OK):
+        sys.exit(
+            f"VITRIN_CORE_BIN={named} is not an executable file. It is SET, so a run against "
+            "a specific vitrind was requested; refusing to fall back to target/debug/vitrind, "
+            "which would pass while testing the wrong binary."
+        )
+    # The core resolves its helper as a sibling of its own `current_exe()`
+    # (`default_realm_init_path` in crates/vitrin-core/src/main.rs), so a
+    # relocated vitrind with no sibling helper starts fine and then fails
+    # every confined spawn with a message about the helper — which reads like
+    # a confinement bug and is not one. Say so here instead.
+    helper = path.parent / "vitrin-realm-init"
+    if not helper.is_file() or not os.access(helper, os.X_OK):
+        sys.exit(
+            f"VITRIN_CORE_BIN={named} has no executable `vitrin-realm-init` beside it "
+            f"({helper}). vitrind resolves the helper as a sibling of its own resolved "
+            "path, so every `--isolation=default` spawn would fail for a reason that has "
+            "nothing to do with what this run is measuring. Install both binaries together."
+        )
+    return path
+
+
+VITRIND = _resolve_core()
 MOCK_SHIM = REPO / "target" / "debug" / "vitrin-mock-shim"
 #: The P1.8.5 SSIM bridge (issue #107): the compiled `vitrin-golden` compare
 #: tool the real-app fidelity gate shells out to, so the dependency-free Python

@@ -21,6 +21,12 @@ does, is [the isolation matrix](isolation-matrix.md) — a **build**-static page
 probes no machine. Do not read the two as one document: that page says what this
 build requires, this one says what these 5 kernels answered.
 
+**These rows are STALE IN THEIR BUILD HALF, and pending re-collection.** They were collected (2026-08-15) against a build whose startup floor was `namespaces`, `landlock`. This tree's floor is `namespaces`, `landlock`, `seccomp`, `no-new-privs`, so every row's `--print-floor` section and startup line describe a binary that did not gate on `seccomp`, `no-new-privs` — and the `applies.` rows still read `not-yet` for `seccomp`, which this build prints `yes` for.
+
+**What is still current is the half this page exists for.** The `landlock.abi`, `ns.*`, `mount.in_userns`, `policy.*` and `tier` readings are **kernel** facts: they are properties of the booted bytes and do not move when this repository changes. So the measured table below, the admitted/refused split and the cross-validation are unaffected. The `tier` column in particular: `intra-user` has always been defined as all four mechanisms, and these kernels' answers to all four are what the rows already carry. What is stale is every cell that describes the *binary* — the `--print-floor` provenance and the verbatim startup line under each provenance block. Note the direction: the old rows **understate** what this build refuses, so a reader following them would expect a session to start where it now might not.
+
+**This is detected, not merely written down.** `cargo xtask kernel-matrix --check` reads each row's recorded mechanism sets and holds them to the sets declared in `crates/vitrin-core/src/spawn/isolation.rs`. It passes today only because the difference is exactly the one acknowledged in `crates/xtask/src/kernel_matrix.rs` — `ROWS_PREDATE_FLOOR` names {`seccomp`, `no-new-privs`} and `ROWS_PREDATE_APPLIED` names {`seccomp`} — and this paragraph is generated from that measured difference rather than typed, so it names what moved and cannot be left behind. Any further move goes RED and asks for a re-collection by name. Re-collecting means re-booting all five kernels under QEMU (`tests/kernel-matrix/collect.sh`), which no pull request runs; it is owed and is not done, and this is the record of that rather than a silence.
+
 ## The measured table
 
 | kernel `release` | shipped by | `landlock.abi` | `ns.all` | `mount.in_userns` | `tier` | `--isolation=default` |

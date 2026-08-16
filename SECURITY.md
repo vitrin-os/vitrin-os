@@ -168,7 +168,13 @@ does not spend a weekend on something the project already says out loud:
   reporting ABI 1, 2, 4, 6 and 7, three of them refused below the floor. Those
   are **kernel** readings taken in a bare initramfs — the number of
   *distributions* whose policy this repository has measured is still one, and
-  the suite itself has still only ever run on two machines.
+  the suite itself has still only ever run on two machines. The rows are also
+  **stale in their build half and pending re-collection**: they predate P2.6.4
+  putting `seccomp` and `no-new-privs` into the startup floor, so their
+  `--print-floor` and startup lines describe an older binary — the kernel
+  readings and the admitted/refused split are unaffected. `cargo xtask
+  kernel-matrix --check` detects that difference rather than passing over it,
+  and re-collecting needs QEMU.
 
   One consequence is worth knowing before you report it as a bug: a Landlock
   domain denies **every mount-topology change** to the process and its

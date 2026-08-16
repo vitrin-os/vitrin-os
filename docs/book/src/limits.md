@@ -418,7 +418,20 @@ inferred from the word "Landlock":
   one of those rows is a **kernel** reading taken in a bare initramfs, so the
   number of *distributions* measured as such is still one; nobody other than
   the author has re-run the collector's own failure levers, which needs QEMU on
-  a second machine; and five kernels is five kernels, not a spectrum. PRD §20's
+  a second machine; and five kernels is five kernels, not a spectrum. A fourth
+  is newer: **the checked-in rows are stale in their build half and pending
+  re-collection.** They were collected on 2026-08-15, and P2.6.4 put `seccomp`
+  and `no-new-privs` into this build's startup floor the next day, so every
+  row's `--print-floor` section and startup line describe an older binary. The
+  *kernel* readings — `landlock.abi`, `ns.*`, `mount.in_userns`, `policy.*`,
+  `tier` — are unaffected, and so are the admitted/refused verdicts. This is
+  **detected rather than merely written down**: `cargo xtask kernel-matrix
+  --check` now reads each row's own recorded mechanism sets and holds them to
+  the ones `crates/vitrin-core/src/spawn/isolation.rs` declares, and it passes
+  only while the difference is exactly the one acknowledged in
+  `crates/xtask/src/kernel_matrix.rs` — any further move is red and names what
+  moved. Re-collection needs QEMU, which no pull request has; until it is run
+  the kernel page publishes the delta by name. PRD §20's
   "coverage is kernel-dependent" caveat is answered for those five and for no
   others. The per-rung *behavioural* statements quoted above
   (the `TRUNCATE` pair, the `REFER` pair) are held by `vitrin-realm-init`'s own

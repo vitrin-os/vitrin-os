@@ -2155,6 +2155,96 @@ pub const CLAIMS: &[Claim] = &[
             },
         ],
     },
+    Claim {
+        id: "kernel-matrix-rows-are-stale-in-their-build-half",
+        says: "the checked-in per-kernel boot rows are STALE IN THEIR BUILD HALF and pending \
+               re-collection -- they were taken before P2.6.4 put `seccomp` and `no-new-privs` \
+               into the startup floor, so every row's `--print-floor` section and startup line \
+               describe an older binary. Their KERNEL readings, and the admitted/refused split \
+               those readings decide, are unaffected. The difference is DETECTED by `cargo xtask \
+               kernel-matrix --check` rather than assumed.",
+        issue: "#281 built the row set and #188 is what moved the floor out from under it. \
+                Re-collection needs QEMU and was deferred by the owner on 2026-08-16, so this is \
+                a named, detected gap rather than a silence.",
+        // **The failure this row exists for is the one that already happened.**
+        // `cargo xtask kernel-matrix --check` passed green over rows whose
+        // `--print-floor` said the seccomp filter "is not applied by this
+        // build" on the very branch that applies it, because the check
+        // compared the PAGE against the ROWS and both were stale together. It
+        // is fixed in the generator; this row is what stops the *published
+        // sentences* about those rows from drifting apart from each other while
+        // the debt is outstanding, and -- the direction that matters more --
+        // what turns red on the day `collect.sh` finally runs, so four
+        // surfaces cannot go on describing a staleness that has been paid off.
+        //
+        // Two anchors per surface, on this file's standing rule: the first pins
+        // the ADMISSION, and a page could carry it while implying nobody would
+        // notice a further move, so the second pins the DETECTION.
+        surfaces: &[
+            Anchor {
+                path: LIMITS,
+                needle: "stale in their build half and pending re-collection",
+            },
+            Anchor {
+                path: LIMITS,
+                needle: "detected rather than merely written down",
+            },
+            Anchor {
+                path: README,
+                needle: "stale in their build half and pending re-collection",
+            },
+            Anchor {
+                path: README,
+                needle: "holds each row's own recorded\n  mechanism set to this build's",
+            },
+            Anchor {
+                path: SECURITY,
+                needle: "stale in their build half and pending re-collection",
+            },
+            Anchor {
+                path: SECURITY,
+                needle: "detects that difference rather than passing over it",
+            },
+            Anchor {
+                path: SITE,
+                needle: "stale in their build half and pending re-collection",
+            },
+            Anchor {
+                path: SITE,
+                needle: "rather than assumed, and re-collecting needs QEMU",
+            },
+        ],
+        evidence: &[
+            Evidence::Contains {
+                path: "crates/xtask/src/kernel_matrix.rs",
+                needle: "const ROWS_PREDATE_FLOOR: &[&str] = &[\"seccomp\", \"no-new-privs\"];",
+                means: "the acknowledged delta is still exactly these two mechanisms. This is \
+                        the row that decides whether the four sentences above are true: the \
+                        generator refuses ANY other difference between a row's recorded floor \
+                        and this build's, so if this constant changes, the published admission \
+                        names the wrong mechanisms -- and if it becomes `&[]`, the rows were \
+                        re-collected and all four surfaces are describing a debt that has been \
+                        paid.",
+            },
+            Evidence::Contains {
+                path: "crates/xtask/src/kernel_matrix.rs",
+                needle: "fn staleness(rows: &[Row], build: &BuildMechanisms) -> Result<Staleness>",
+                means: "the comparison still HAPPENS. Without it the admission above is a \
+                        sentence somebody typed, and the next floor move would republish the \
+                        rows as current exactly as P2.6.4's did -- `kernel-matrix --check` \
+                        compares the page against the rows, so it is blind to the two being \
+                        stale together.",
+            },
+            Evidence::Contains {
+                path: "docs/book/src/isolation-kernels.md",
+                needle: "STALE IN THEIR BUILD HALF",
+                means: "the page the four surfaces send a reader to still publishes the \
+                        staleness itself, generated from the measured delta rather than typed. \
+                        A limits entry that admits a gap while the cited page reads as current \
+                        is the drift this whole gate exists for, one link further out.",
+            },
+        ],
+    },
 ];
 
 // ---------------------------------------------------------------------------
@@ -2807,6 +2897,12 @@ pub const COVERED_CLAIMS: &[&str] = &[
     // closed, which is the case a `known-limit` sweep is most likely to do
     // on half its surfaces.
     "seccomp-is-a-deny-list",
+    // #188's second, and the only claim here whose subject is this
+    // repository's own MEASUREMENTS going stale rather than its prose. It is
+    // on the roll so the admission cannot be quietly dropped from a surface
+    // while the debt is still outstanding -- and so it goes red on the day the
+    // debt is paid.
+    "kernel-matrix-rows-are-stale-in-their-build-half",
 ];
 
 /// Every derived value this gate covers. Same contract as [`COVERED_CLAIMS`],

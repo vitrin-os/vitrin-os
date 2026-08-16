@@ -454,7 +454,13 @@ grant.pointer.click(640, 84)</pre>
       kernel (ABI 4) are refused. Those are <em>kernel</em> rows, taken with no
       distribution policy loaded, and they are not distribution rows &mdash;
       <a href="docs/isolation-kernels.html">the kernel page</a> has the rows and
-      says why the difference matters.
+      says why the difference matters. Those rows are also
+      <strong>stale in their build half and pending re-collection</strong>:
+      they predate P2.6.4 putting <code>seccomp</code> and
+      <code>no-new-privs</code> into the startup floor, so their
+      <code>--print-floor</code> and startup lines describe an older binary
+      while the kernel readings above stand. That difference is
+      <em>detected</em> rather than assumed, and re-collecting needs QEMU.
       <strong>Do not cross the two
       remedies</strong>: the
       refusal names the mechanism it could not get &mdash;

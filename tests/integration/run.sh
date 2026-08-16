@@ -137,6 +137,34 @@ PROPERTY_GATES=(
                                 # against an --isolation=off positive control in
                                 # the same run. No new CI wiring and no cargo
                                 # feature.
+  test_real_seccomp.py          # P2.6.4 (#188): the TABLE-DRIVEN seccomp gate.
+                                # It reads the shipped filter table out of
+                                # `vitrind --print-seccomp` rather than
+                                # transcribing it, runs the repo-authored
+                                # `solid-client --syscall-probe` inside a realm
+                                # and again at `--isolation=off` with
+                                # byte-identical argv, and for EVERY row asserts
+                                # the exact errno in-realm against the outside
+                                # run as that row's positive control. Two
+                                # properties are the point: a row added to the
+                                # filter without a probe case turns this RED
+                                # (the row set comes from the binary, so there
+                                # is nothing here to forget), and a row whose
+                                # syscall fails outside a realm too is REPORTED
+                                # NOT DEMONSTRATED rather than counted as
+                                # confinement -- `bpf` and `userfaultfd` land
+                                # there on a box with
+                                # unprivileged_bpf_disabled or
+                                # unprivileged_userfaultfd set, which is a
+                                # property of the kernel and is therefore
+                                # measured here rather than declared in the
+                                # table. The negative controls matter as much:
+                                # a filter is inherited and unremovable, so
+                                # `seccomp(2)` itself, `get_mempolicy`,
+                                # `fork` and the four kept socket families must
+                                # SUCCEED inside the realm or Firefox's own
+                                # content-process sandbox is broken. No new CI
+                                # wiring and no cargo feature.
   test_launch.py                # a consented `realm_launch` grant makes the
                                 # TRUSTED CORE fork a process, and the journal
                                 # names who asked (#207). The one gate covering

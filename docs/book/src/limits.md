@@ -418,20 +418,20 @@ inferred from the word "Landlock":
   one of those rows is a **kernel** reading taken in a bare initramfs, so the
   number of *distributions* measured as such is still one; nobody other than
   the author has re-run the collector's own failure levers, which needs QEMU on
-  a second machine; and five kernels is five kernels, not a spectrum. A fourth
-  is newer: **the checked-in rows are stale in their build half and pending
-  re-collection.** They were collected on 2026-08-15, and P2.6.4 put `seccomp`
-  and `no-new-privs` into this build's startup floor the next day, so every
-  row's `--print-floor` section and startup line describe an older binary. The
-  *kernel* readings — `landlock.abi`, `ns.*`, `mount.in_userns`, `policy.*`,
-  `tier` — are unaffected, and so are the admitted/refused verdicts. This is
-  **detected rather than merely written down**: `cargo xtask kernel-matrix
-  --check` now reads each row's own recorded mechanism sets and holds them to
-  the ones `crates/vitrin-core/src/spawn/isolation.rs` declares, and it passes
-  only while the difference is exactly the one acknowledged in
-  `crates/xtask/src/kernel_matrix.rs` — any further move is red and names what
-  moved. Re-collection needs QEMU, which no pull request has; until it is run
-  the kernel page publishes the delta by name. PRD §20's
+  a second machine; and five kernels is five kernels, not a spectrum. What holds
+  the *build* half of those rows is a gate rather than anybody's memory: `cargo
+  xtask kernel-matrix --check` reads each row's own recorded `floor.mechanism=`
+  and `applies.*` lines and holds them to the sets
+  `crates/vitrin-core/src/spawn/isolation.rs` declares, so the page goes **red
+  the day the floor moves out from under them** and names the mechanism that
+  moved. That is worth stating because it has already failed once: P2.6.4 grew
+  the floor by two mechanisms and every gate stayed green, because the check
+  compared the page against the rows and both were stale together. Read its
+  scope narrowly, though — it **re-boots nothing**, so a green pull request says
+  the rows describe this build and says nothing whatever about whether these
+  kernels still answer this way. Only `tests/kernel-matrix/collect.sh --check`
+  re-takes that half; it needs QEMU, no pull request runs it, and every row
+  carries the date it was last taken on. PRD §20's
   "coverage is kernel-dependent" caveat is answered for those five and for no
   others. The per-rung *behavioural* statements quoted above
   (the `TRUNCATE` pair, the `REFER` pair) are held by `vitrin-realm-init`'s own

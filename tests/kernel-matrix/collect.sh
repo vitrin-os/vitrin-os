@@ -26,6 +26,12 @@
 #                differ would be reported rather than absorbed.)
 #   CACHE        download/extract cache      (default target/kernel-matrix)
 #   MAX_ROW_AGE_DAYS  age at which --check calls a row stale (default 180)
+#   VITRIND_UNVERIFIED=1  measure a $VITRIND whose sources cannot be located
+#                (a binary built elsewhere). The provenance block then prints
+#                UNVERIFIED instead of the source it was checked against, so the
+#                weaker run says so in the log rather than looking like the
+#                stronger one. It does NOT skip check 2 for a binary whose
+#                sources ARE locatable and ARE newer.
 #
 # ---------------------------------------------------------------------------
 # WHAT THIS SCRIPT IS WRITTEN AGAINST
@@ -37,20 +43,22 @@
 # like an answer:
 #
 #   1. the tools must exist                 -- a missing qemu must not skip
-#   2. the .deb must match its pinned sha   -- a mirror serving something else
+#   2. the binary must match its own sources -- measuring a stale `vitrind` and
+#      reporting "unchanged" is a green run about a build nobody ships
+#   3. the .deb must match its pinned sha   -- a mirror serving something else
 #                                              is not this kernel
-#   3. the vmlinuz must match its pinned sha
-#   4. the guest must reach our init        -- VITRIN-INIT-BEGIN
-#   5. the guest must not have died mid-way -- VITRIN-INIT-DONE, no VITRIN-FATAL
-#   6. the probe must have exited 0         -- a missing /vitrind exits 127
-#   7. the row must be schema-tagged and complete
-#   8. kernel.release must equal the PINNED release -- booting the wrong image
+#   4. the vmlinuz must match its pinned sha
+#   5. the guest must reach our init        -- VITRIN-INIT-BEGIN
+#   6. the guest must not have died mid-way -- VITRIN-INIT-DONE, no VITRIN-FATAL
+#   7. the probe must have exited 0         -- a missing /vitrind exits 127
+#   8. the row must be schema-tagged and complete
+#   9. kernel.release must equal the PINNED release -- booting the wrong image
 #      is the single most plausible way to publish a row about a kernel nobody
 #      ran
-#   9. exactly one startup verdict must be present -- neither zero nor both
-#  10. every manifest record must produce a row, and every row file must have a
+#  10. exactly one startup verdict must be present -- neither zero nor both
+#  11. every manifest record must produce a row, and every row file must have a
 #      manifest record (full runs only)
-#  11. a run that processed no records at all is a failure, not a pass
+#  12. a run that processed no records at all is a failure, not a pass
 #
 # Anything that trips these prints `FAIL:` and exits nonzero. There is no
 # branch that prints a row it did not measure.
@@ -100,16 +108,87 @@ note() { echo "kernel-matrix: $*" >&2; }
 #    did nothing is the exact shape issue #288 exists to forbid.
 # ---------------------------------------------------------------------------
 missing=()
-for tool in "$QEMU" gcc cpio gzip curl sha256sum ar tar zstd xz diff; do
+for tool in "$QEMU" gcc cpio gzip curl sha256sum stat ar tar zstd xz diff; do
   command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
 done
 [ ${#missing[@]} -eq 0 ] || fail "these tools are not on PATH: ${missing[*]}. This script measures kernels; without them it can measure nothing, and it will not pretend otherwise."
 [ -x "$VITRIND" ] || fail "\$VITRIND ($VITRIND) is not an executable. Build it first: cargo build --release --bin vitrind"
 
+# ---------------------------------------------------------------------------
+# 2. THE BINARY UNDER TEST: say which one, and refuse a stale one.
+# ---------------------------------------------------------------------------
+#
+# This check exists because its absence shipped. `--check` used whatever
+# `target/release/vitrind` happened to be lying in the tree and printed
+# "5 rows re-measured and unchanged" -- a green run, against a binary built
+# fifteen hours before the seccomp filter landed. The rows it blessed described
+# a build nobody ships, and nothing in the output said so, because every other
+# check in this file scrutinises the KERNEL and none of them looked at the
+# binary. A `--check` that silently measures a stale binary is worse than no
+# `--check`: it converts "nobody has re-measured this" into "re-measured and
+# unchanged".
+#
+# Two things happen here, and they are different:
+#
+#   * PROVENANCE, always printed, in both modes: which file, how big, its
+#     sha256, and when it was built. This is the half that works for any binary,
+#     including one built somewhere else, and it means a log can always be read
+#     back to ask what produced a row.
+#   * A REFUSAL, when the binary can be shown to be older than the sources it
+#     was built from. The source list is not guessed: `cargo` writes the exact
+#     set beside the binary as `<binary>.d` (Makefile dep-info), so this asks
+#     the build system what the binary depends on rather than approximating it
+#     with a `find` over the workspace. Approximating is what makes a check like
+#     this cry wolf -- `crates/xtask/**` is newer than `vitrind` most of the
+#     time and has nothing to do with it.
+#
+# No dep-info means the provenance cannot be established, and that is a failure
+# rather than a shrug, on this file's standing rule that a missing input is
+# never a skip. `VITRIND_UNVERIFIED=1` is the deliberate, logged way to measure
+# a binary from elsewhere.
+binary_bytes="$(stat -c%s "$VITRIND")"
+binary_epoch="$(stat -c%Y "$VITRIND")"
+binary_sha="$(sha256sum "$VITRIND" | cut -d' ' -f1)"
+note "binary under test: ${VITRIND#$root/}"
+note "  built $(date -u -d "@$binary_epoch" +%Y-%m-%dT%H:%M:%SZ), $binary_bytes bytes, sha256 $binary_sha"
+
+deps="$VITRIND.d"
+if [ -f "$deps" ]; then
+  # The dep-info is `<target>: <src> <src> ...`; cargo also emits bare
+  # `<src>:` rules with no prerequisites, which the `s///p` skips because no
+  # substitution happens on them.
+  newest_epoch=0
+  newest_file=
+  while IFS= read -r dep; do
+    [ -n "$dep" ] && [ -f "$dep" ] || continue
+    dep_epoch="$(stat -c%Y "$dep")"
+    if [ "$dep_epoch" -gt "$newest_epoch" ]; then
+      newest_epoch="$dep_epoch"
+      newest_file="$dep"
+    fi
+  done < <(sed -n 's/^[^:]*: //p' "$deps" | tr ' ' '\n')
+
+  [ "$newest_epoch" -gt 0 ] \
+    || fail "${deps#$root/} names no source file that exists. That is not an up-to-date binary, it is an unreadable dep-info; rebuild with \`cargo build --release --bin vitrind\`."
+
+  if [ "$newest_epoch" -gt "$binary_epoch" ]; then
+    fail "\$VITRIND is STALE: ${newest_file#$root/} was modified $(date -u -d "@$newest_epoch" +%Y-%m-%dT%H:%M:%SZ), which is AFTER ${VITRIND#$root/} was built ($(date -u -d "@$binary_epoch" +%Y-%m-%dT%H:%M:%SZ)).
+Measuring it would produce rows describing a build that does not exist, and in --check mode would report them as 'unchanged' -- which is how a stale binary was blessed once already.
+Rebuild first: cargo build --release --bin vitrind"
+  fi
+  note "  sources: newest is ${newest_file#$root/}, $(( (binary_epoch - newest_epoch) / 60 )) min older than the binary -- OK"
+elif [ "${VITRIND_UNVERIFIED:-0}" = "1" ]; then
+  note "  sources: UNVERIFIED (VITRIND_UNVERIFIED=1, no ${deps#$root/}). Nothing here checked this binary against any source tree."
+else
+  fail "there is no ${deps#$root/} beside \$VITRIND, so this script cannot tell whether the binary matches the sources it would be measuring.
+That dep-info is written by cargo next to the binary, so the usual cause is a binary that was not built by this workspace -- or a \`target/\` that was cleaned of everything but the executable.
+Either build it here (cargo build --release --bin vitrind), or, to measure a binary from elsewhere on purpose, re-run with VITRIND_UNVERIFIED=1 -- which prints UNVERIFIED in the provenance block above rather than pretending the check happened."
+fi
+
 mkdir -p "$CACHE/deb" "$CACHE/vmlinuz" "$CACHE/logs" "$ROWS"
 
 # ---------------------------------------------------------------------------
-# 2. The initramfs, built once from the binary under test.
+# 3. The initramfs, built once from the binary under test.
 # ---------------------------------------------------------------------------
 build_initramfs() {
   local img="$CACHE/initramfs.cpio.gz"
@@ -148,7 +227,7 @@ build_initramfs() {
 }
 
 # ---------------------------------------------------------------------------
-# 3. Kernels: fetch by URL, but pin by sha256. The checksum is the identity;
+# 4. Kernels: fetch by URL, but pin by sha256. The checksum is the identity;
 #    the URL is only where these bytes were found on the collection date.
 # ---------------------------------------------------------------------------
 fetch_deb() {
@@ -189,7 +268,7 @@ extract_vmlinuz() {
 }
 
 # ---------------------------------------------------------------------------
-# 4. One boot, and every way it can lie about having measured something.
+# 5. One boot, and every way it can lie about having measured something.
 # ---------------------------------------------------------------------------
 
 # Strip the kernel's own printk lines and any carriage returns, so a row is
@@ -254,7 +333,7 @@ $(tail -n 20 "$log")"
 }
 
 # ---------------------------------------------------------------------------
-# 5. Render one row from one boot log.
+# 6. Render one row from one boot log.
 # ---------------------------------------------------------------------------
 render_row() {
   local id="$1" class="$2" release="$3" url="$4" deb_sha="$5" member="$6" vmlinuz_sha="$7" append_extra="$8" log="$9"
@@ -288,13 +367,13 @@ $(tail -n 20 "$log")"
   grep -qE '^vitrin-floor [0-9]+$' <<<"$floor" \
     || fail "[$id] the floor phase produced no schema-tagged block"
 
-  # Check 8: this must be the kernel that was PINNED.
+  # Check 9: this must be the kernel that was PINNED.
   local booted
   booted="$(grep -m1 '^kernel.release=' <<<"$isolation" || true)"
   [ "$booted" = "kernel.release=$release" ] \
     || fail "[$id] booted kernel is not the pinned one: the row says '$booted', kernels.manifest pins 'kernel.release=$release'"
 
-  # Check 9: exactly one startup verdict.
+  # Check 10: exactly one startup verdict.
   local startup verdict verbatim refusals admissions
   startup="$(phase_body "$log" startup | sed -E 's/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z +//')"
   refusals="$(grep -c "fatal: this build's isolation floor requires" <<<"$startup" || true)"
@@ -354,7 +433,7 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# 6. Drive the manifest.
+# 7. Drive the manifest.
 # ---------------------------------------------------------------------------
 initramfs="$(build_initramfs)"
 note "initramfs: $initramfs ($(stat -c%s "$initramfs") bytes), vitrind: $VITRIND, accel: $ACCEL"
@@ -420,10 +499,10 @@ for record in "${records[@]}"; do
   fi
 done
 
-# Check 11: a run that measured nothing is a failure.
+# Check 12: a run that measured nothing is a failure.
 [ "$processed" -gt 0 ] || fail "no kernel was processed. The manifest has ${#seen_ids[@]} records and --only matched none of them; a collector that measured nothing must not exit 0."
 
-# Check 10: the row set and the manifest must be the same set (full runs).
+# Check 11: the row set and the manifest must be the same set (full runs).
 if [ ${#only[@]} -eq 0 ]; then
   for f in "$ROWS"/*.row; do
     [ -e "$f" ] || continue

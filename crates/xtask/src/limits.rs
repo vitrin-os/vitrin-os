@@ -2166,92 +2166,109 @@ pub const CLAIMS: &[Claim] = &[
         ],
     },
     Claim {
-        id: "kernel-matrix-rows-are-stale-in-their-build-half",
-        says: "the checked-in per-kernel boot rows are STALE IN THEIR BUILD HALF and pending \
-               re-collection -- they were taken before P2.6.4 put `seccomp` and `no-new-privs` \
-               into the startup floor, so every row's `--print-floor` section and startup line \
-               describe an older binary. Their KERNEL readings, and the admitted/refused split \
-               those readings decide, are unaffected. The difference is DETECTED by `cargo xtask \
-               kernel-matrix --check` rather than assumed.",
-        issue: "#281 built the row set and #188 is what moved the floor out from under it. \
-                Re-collection needs QEMU and was deferred by the owner on 2026-08-16, so this is \
-                a named, detected gap rather than a silence.",
-        // **The failure this row exists for is the one that already happened.**
-        // `cargo xtask kernel-matrix --check` passed green over rows whose
-        // `--print-floor` said the seccomp filter "is not applied by this
-        // build" on the very branch that applies it, because the check
-        // compared the PAGE against the ROWS and both were stale together. It
-        // is fixed in the generator; this row is what stops the *published
-        // sentences* about those rows from drifting apart from each other while
-        // the debt is outstanding, and -- the direction that matters more --
-        // what turns red on the day `collect.sh` finally runs, so four
-        // surfaces cannot go on describing a staleness that has been paid off.
+        id: "kernel-matrix-rows-are-held-to-this-builds-floor",
+        says: "the per-kernel boot rows record the BUILD they were taken with as well as the \
+               kernel's answers, and `cargo xtask kernel-matrix --check` holds that half to this \
+               tree: it goes RED the day this build's floor moves out from under the rows, so a \
+               row cannot go on describing an older binary in silence. That check RE-BOOTS \
+               NOTHING -- it says the rows describe this build and says nothing about whether \
+               these kernels still answer this way, which only \
+               `tests/kernel-matrix/collect.sh --check` re-takes.",
+        issue: "#281 built the row set and #188 moved the floor out from under it. The rows were \
+                re-collected on 2026-08-16, which retired the staleness admission this row \
+                replaces -- what survives the payment is the guarantee, not the freshness.",
+        // **This row is deliberately NOT the inverse of the one it replaces.**
+        // Until 2026-08-16 four surfaces carried
+        // `kernel-matrix-rows-are-stale-in-their-build-half`: an admission that
+        // the rows predated P2.6.4's floor. `collect.sh` re-booted all five
+        // kernels against the current binary, the acknowledgement constants in
+        // crates/xtask/src/kernel_matrix.rs went to `&[]`, and that claim went
+        // red exactly as it was designed to -- so it was retired rather than
+        // reworded.
         //
-        // Two anchors per surface, on this file's standing rule: the first pins
-        // the ADMISSION, and a page could carry it while implying nobody would
-        // notice a further move, so the second pins the DETECTION.
+        // What replaced it is NOT "the rows are current". That would be a claim
+        // with a shelf life, true on the day it was written and decaying from
+        // then on, which is the failure mode this repository has been bitten by
+        // often enough to have a gate for it. A freshness assertion also cannot
+        // be held by evidence: no needle in the source can witness that a QEMU
+        // boot happened recently. So what is published instead is what the
+        // MECHANISM guarantees -- a floor move reddens the gate -- which is
+        // durable, checkable against code, and the half a reader actually needs
+        // in order to know how much a green build is worth.
+        //
+        // Two anchors per surface, on this file's standing rule. Here the pair
+        // is GUARANTEE and SCOPE: the first pins what the gate does when the
+        // floor moves, and the second pins what it deliberately does not do, so
+        // a surface cannot keep the reassuring half while dropping the sentence
+        // that stops a green pull request being read as a re-measurement.
+        //
+        // One needle spelling for all four surfaces, which is unusual here and
+        // is why the wording avoids an apostrophe: site/index.html writes them
+        // `&rsquo;`, so "the floor" rather than "this build's floor" is what
+        // lets one string cascade across Markdown and HTML alike.
         surfaces: &[
             Anchor {
                 path: LIMITS,
-                needle: "stale in their build half and pending re-collection",
+                needle: "red\n  the day the floor moves out from under them",
             },
             Anchor {
                 path: LIMITS,
-                needle: "detected rather than merely written down",
+                needle: "re-boots nothing",
             },
             Anchor {
                 path: README,
-                needle: "stale in their build half and pending re-collection",
+                needle: "red the day the floor moves\n  out from under them",
             },
             Anchor {
                 path: README,
-                needle: "holds each row's own recorded\n  mechanism set to this build's",
+                needle: "re-boots nothing",
             },
             Anchor {
                 path: SECURITY,
-                needle: "stale in their build half and pending re-collection",
+                needle: "red the day the\n  floor moves out from under them",
             },
             Anchor {
                 path: SECURITY,
-                needle: "detects that difference rather than passing over it",
+                needle: "re-boots nothing",
             },
             Anchor {
                 path: SITE,
-                needle: "stale in their build half and pending re-collection",
+                needle: "red the day the floor moves out from under\n      them",
             },
             Anchor {
                 path: SITE,
-                needle: "rather than assumed, and re-collecting needs QEMU",
+                needle: "re-boots nothing",
             },
         ],
         evidence: &[
             Evidence::Contains {
                 path: "crates/xtask/src/kernel_matrix.rs",
-                needle: "const ROWS_PREDATE_FLOOR: &[&str] = &[\"seccomp\", \"no-new-privs\"];",
-                means: "the acknowledged delta is still exactly these two mechanisms. This is \
-                        the row that decides whether the four sentences above are true: the \
-                        generator refuses ANY other difference between a row's recorded floor \
-                        and this build's, so if this constant changes, the published admission \
-                        names the wrong mechanisms -- and if it becomes `&[]`, the rows were \
-                        re-collected and all four surfaces are describing a debt that has been \
-                        paid.",
+                needle: "fn staleness(rows: &[Row], build: &BuildMechanisms) -> Result<Staleness>",
+                means: "the comparison still HAPPENS. Without it the guarantee above is a \
+                        sentence somebody typed, and the next floor move would republish the \
+                        rows as current exactly as P2.6.4's did -- `kernel-matrix --check` \
+                        otherwise compares the page against the rows, so it is blind to the two \
+                        being stale together.",
             },
             Evidence::Contains {
                 path: "crates/xtask/src/kernel_matrix.rs",
-                needle: "fn staleness(rows: &[Row], build: &BuildMechanisms) -> Result<Staleness>",
-                means: "the comparison still HAPPENS. Without it the admission above is a \
-                        sentence somebody typed, and the next floor move would republish the \
-                        rows as current exactly as P2.6.4's did -- `kernel-matrix --check` \
-                        compares the page against the rows, so it is blind to the two being \
-                        stale together.",
+                needle: "THE CHECKED-IN ROWS MUST BE RE-COLLECTED",
+                means: "the comparison is a REFUSAL and not a warning. This is the difference \
+                        between the published sentence and a weaker true one: a gate that \
+                        printed a note and rendered the page anyway would satisfy the needle \
+                        above while letting exactly the drift this claim promises against reach \
+                        a reader.",
             },
             Evidence::Contains {
                 path: "docs/book/src/isolation-kernels.md",
-                needle: "STALE IN THEIR BUILD HALF",
-                means: "the page the four surfaces send a reader to still publishes the \
-                        staleness itself, generated from the measured delta rather than typed. \
-                        A limits entry that admits a gap while the cited page reads as current \
-                        is the drift this whole gate exists for, one link further out.",
+                needle: "goes RED",
+                means: "the page the four surfaces send a reader to publishes the same \
+                        guarantee, generated rather than typed. A limits entry describing a gate \
+                        while the cited page describes something else is the drift this whole \
+                        file exists for, one link further out. The banner it appears in is \
+                        rendered from the measured delta, so the day that delta is non-empty \
+                        this needle moves to the stale paragraph and the claim has to be \
+                        rewritten deliberately.",
             },
         ],
     },
@@ -2907,12 +2924,14 @@ pub const COVERED_CLAIMS: &[&str] = &[
     // closed, which is the case a `known-limit` sweep is most likely to do
     // on half its surfaces.
     "seccomp-is-a-deny-list",
-    // #188's second, and the only claim here whose subject is this
-    // repository's own MEASUREMENTS going stale rather than its prose. It is
-    // on the roll so the admission cannot be quietly dropped from a surface
-    // while the debt is still outstanding -- and so it goes red on the day the
-    // debt is paid.
-    "kernel-matrix-rows-are-stale-in-their-build-half",
+    // #188's second. This replaced `kernel-matrix-rows-are-stale-in-their-build-half`
+    // when the rows were re-collected on 2026-08-16 and that claim went red as
+    // designed. The subject changed with it, deliberately: the retired row
+    // published a DEBT, and this one publishes the GUARANTEE that outlives the
+    // payment -- a floor move reddens the gate, and the cheap check re-boots
+    // nothing. Swapping in "the rows are current" instead would have put a
+    // claim with a shelf life on four surfaces.
+    "kernel-matrix-rows-are-held-to-this-builds-floor",
 ];
 
 /// Every derived value this gate covers. Same contract as [`COVERED_CLAIMS`],

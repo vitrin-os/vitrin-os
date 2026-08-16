@@ -15,7 +15,7 @@
 # boot: qemu-system-x86_64 -accel <accel> -m 512 -smp 1 -nographic -no-reboot -kernel <vmlinuz> -initrd <initramfs> -append "console=ttyS0 panic=1 quiet"
 # userspace: minimal initramfs from tests/kernel-matrix/init.c -- static PID 1, /vitrind and its library closure, /proc /sys /dev /run mounted, NO distribution policy loaded, NO /etc/subuid, uid 0 with a full capability set. This is a KERNEL row and never a distribution row.
 # normalized: policy.max_user_namespaces -- memory-derived, tracks the compressed initramfs size, so it would go stale on commits that only change vitrind's size
-#~ collected: 2026-08-15
+#~ collected: 2026-08-16
 #~ accel: tcg
 #~ policy.max_user_namespaces (raw): 1775
 --- vitrind --print-isolation ---
@@ -45,9 +45,11 @@ vitrin-floor 1
 build.version=0.1.0
 floor.mechanism=namespaces
 floor.mechanism=landlock
+floor.mechanism=seccomp
+floor.mechanism=no-new-privs
 applies.namespaces=yes
 applies.landlock=yes
-applies.seccomp=not-yet
+applies.seccomp=yes
 applies.no-new-privs=yes
 build.landlock_max_rung=9
 build.landlock_min_abi=6

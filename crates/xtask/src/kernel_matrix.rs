@@ -83,10 +83,18 @@
 //!   one of these two, does not get the benefit of an acknowledgement written
 //!   for something else.
 //!
-//! Re-collecting needs QEMU and is deferred (owner's call, 2026-08-16), so this
-//! converts a blocked dependency into a **named, detected gap** rather than a
-//! silence. What it does not do is make the rows current: nothing here re-boots
-//! a kernel, and the acknowledgement is a record of a debt, not a payment.
+//! Both acknowledgements are **empty** as this is written: the rows were
+//! re-collected on 2026-08-16 against a build carrying the whole of P2.6.4's
+//! floor, so the delta is nothing and the page renders the current banner. That
+//! is a fact with a shelf life and this module does not publish it as more:
+//! nothing here re-boots a kernel, so what the mechanism *guarantees* is only
+//! that the rows cannot go on describing an older binary in silence — the day
+//! the floor moves again, this gate is RED until either `collect.sh` runs or
+//! the new delta is named in the two constants below and published on the page.
+//! The debt case is therefore still live code, exercised by
+//! [`tests::an_acknowledged_delta_renders_the_stale_banner_and_a_wrong_one_is_refused`]
+//! through [`staleness_with`], because the day it is next needed is a day
+//! somebody is already deferring something.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -115,31 +123,39 @@ const CORE_ISOLATION_RS: &str = "crates/vitrin-core/src/spawn/isolation.rs";
 /// publishes each of these by name as a reason the rows are stale, and
 /// [`validate`] goes red the moment the real delta is anything else.
 ///
-/// Provenance: the rows were collected on 2026-08-15 against a build whose
-/// floor was `{namespaces, landlock}`. P2.6.4 ([#188]) added both entries below
-/// on 2026-08-16. Re-collecting means re-booting five kernels under QEMU, which
-/// the owner deferred on the same day (`qemu-system-x86` is not installed and
-/// installing it needs a password nobody was at the keyboard for), so the debt
-/// is recorded here and published on the page rather than left as a silence.
+/// **Empty, and that is the paid-off state rather than the default one.** The
+/// rows collected on 2026-08-15 predated P2.6.4 ([#188]) putting `seccomp` and
+/// `no-new-privs` into the floor, and this constant named those two for as long
+/// as that was true. `tests/kernel-matrix/collect.sh` re-booted all five kernels
+/// on 2026-08-16 against a build that carries them, so the delta is now nothing.
 ///
-/// **To clear it**: run `tests/kernel-matrix/collect.sh`, then set this to
-/// `&[]`. The empty case is a real branch — [`render`] prints a
-/// rows-are-current paragraph instead of the stale banner, and
-/// [`the_stale_banner_and_the_current_banner_are_both_reachable`] renders both.
+/// **Do not read the emptiness as a guarantee of freshness.** It says the rows'
+/// build half matches *this* tree, which is re-checked on every run; it says
+/// nothing about the kernels, which only `collect.sh --check` re-takes.
+///
+/// **To defer a re-collection again**: name the moved mechanisms here, and the
+/// page publishes them by name instead of the current banner. That branch is not
+/// dead code — [`staleness_with`] takes the acknowledgement as an argument so
+/// [`tests::an_acknowledged_delta_renders_the_stale_banner_and_a_wrong_one_is_refused`]
+/// exercises both outcomes while these constants are empty, and
+/// [`the_stale_banner_and_the_current_banner_are_both_reachable`] renders both
+/// paragraphs.
 ///
 /// [#188]: https://github.com/vitrin-os/vitrin-os/issues/188
-const ROWS_PREDATE_FLOOR: &[&str] = &["seccomp", "no-new-privs"];
+const ROWS_PREDATE_FLOOR: &[&str] = &[];
 
-/// **The same staleness in what the build APPLIES**, which is a different set.
+/// **The same acknowledgement for what the build APPLIES**, which is a
+/// different set from the floor and is why there are two constants.
 ///
-/// `no-new-privs` is deliberately absent: `vitrin-realm-init` set
+/// Empty for the same reason as [`ROWS_PREDATE_FLOOR`]. While it was not, it
+/// named `seccomp` alone and *not* `no-new-privs`: `vitrin-realm-init` set
 /// `PR_SET_NO_NEW_PRIVS` on every confined spawn long before #188, so the rows
 /// already read `applies.no-new-privs=yes`. It was not a *gate* until #188,
 /// which is exactly why `--print-floor` prints two row families and why this
 /// gate compares both — a build that started applying a mechanism without
 /// gating it would move one set and not the other, and one constant could not
 /// tell the difference.
-const ROWS_PREDATE_APPLIED: &[&str] = &["seccomp"];
+const ROWS_PREDATE_APPLIED: &[&str] = &[];
 
 /// What a kernel is in the set FOR.
 ///
@@ -624,6 +640,25 @@ fn row_applied(row: &Row) -> Vec<String> {
 /// including the direction nobody expects, a row naming a mechanism this build
 /// has stopped gating on.
 fn staleness(rows: &[Row], build: &BuildMechanisms) -> Result<Staleness> {
+    staleness_with(rows, build, ROWS_PREDATE_FLOOR, ROWS_PREDATE_APPLIED)
+}
+
+/// [`staleness`] with the acknowledgement passed in rather than read from the
+/// two constants.
+///
+/// This split exists because both constants are now `&[]`, and with an empty
+/// acknowledgement two of this function's three refusals become **unreachable**:
+/// nothing can be "acknowledged as stale but did not move" when nothing is
+/// acknowledged, and the stale banner has no delta to render. Those are the
+/// paths the next deferred re-collection depends on, so they are held by
+/// argument rather than left to be discovered broken on the day somebody needs
+/// them. `staleness` is the only caller that supplies the real constants.
+fn staleness_with(
+    rows: &[Row],
+    build: &BuildMechanisms,
+    ack_floor: &[&str],
+    ack_applied: &[&str],
+) -> Result<Staleness> {
     let mut out = Staleness::default();
     for row in rows {
         let row_applied = row_applied(row);
@@ -631,16 +666,11 @@ fn staleness(rows: &[Row], build: &BuildMechanisms) -> Result<Staleness> {
         for (what, acknowledged, build_set, row_set) in [
             (
                 "floor.mechanism",
-                ROWS_PREDATE_FLOOR,
+                ack_floor,
                 &build.floor,
                 &row.floor_mechanisms,
             ),
-            (
-                "applies",
-                ROWS_PREDATE_APPLIED,
-                &build.applied,
-                &row_applied,
-            ),
+            ("applies", ack_applied, &build.applied, &row_applied),
         ] {
             // The direction an acknowledgement can never cover: the row was
             // taken under a build that did something this one does not.
@@ -897,13 +927,20 @@ fn staleness_banner(stale: &Staleness, build: &BuildMechanisms) -> String {
 
     if stale.is_current() {
         return format!(
-            "**The rows' build half is current.** Each was collected ({dates}) against a build \
-             whose startup floor was the same set this tree declares — {build_floor} — and \
-             `cargo xtask kernel-matrix --check` holds every row's own `floor.mechanism=` and \
-             `applies.*` lines to it. That check is cheap and re-boots nothing, so it says the \
-             rows describe THIS build and says nothing about whether these kernels still answer \
-             this way; `tests/kernel-matrix/collect.sh --check` is the only thing that re-takes \
-             that half.\n\n"
+            "**The rows' build half is held to this build, and that is the durable part.** \
+             `cargo xtask kernel-matrix --check` reads every row's own `floor.mechanism=` and \
+             `applies.*` lines and holds them to the sets declared in \
+             `crates/vitrin-core/src/spawn/isolation.rs`, so **the day this build's floor moves \
+             out from under these rows, this page goes RED** and names the mechanism that moved. \
+             It cannot quietly go on describing an older binary, which is the failure it was \
+             built after: the floor grew by two mechanisms and every gate stayed green because \
+             the page and the rows were stale together. As rendered, that delta is empty — each \
+             row below was collected ({dates}) against a build whose startup floor was the same \
+             set this tree declares, {build_floor}.\n\n\
+             Read the scope of that narrowly. This check is cheap and **re-boots nothing**, so it \
+             says the rows describe THIS build and says nothing whatever about whether these \
+             kernels still answer this way; only `tests/kernel-matrix/collect.sh --check` re-takes \
+             that half, and every row carries the date it was last taken on.\n\n"
         );
     }
 
@@ -1696,18 +1733,12 @@ mod tests {
             "the failure must name what moved: {text}"
         );
 
-        // (2) THE FLOOR MOVE IS REVERTED and the acknowledgement is not. The
-        //     page would then publish a staleness that is not there, which is
-        //     the same defect in the other direction, so it is red too.
-        let mut reverted = real.clone();
-        reverted.floor.retain(|m| m != "seccomp");
-        let err = staleness(&rows, &reverted)
-            .expect_err("an acknowledgement for a move that did not happen must be red");
-        assert!(format!("{err}").contains("did NOT move"), "got: {err}");
-
-        // (3) A row naming a mechanism this build no longer has. A row can only
+        // (2) A row naming a mechanism this build no longer has. A row can only
         //     be older than the build, never newer, so no acknowledgement
-        //     covers this.
+        //     covers this. Note this is now also what a REVERTED floor move
+        //     looks like -- with the rows re-collected, dropping `seccomp` from
+        //     the build makes every row newer than the build rather than
+        //     stale-and-acknowledged.
         let mut shrunk = real.clone();
         shrunk.floor.retain(|m| m != "landlock");
         shrunk.applied.retain(|m| m != "landlock");
@@ -1718,37 +1749,97 @@ mod tests {
         );
     }
 
-    /// The page publishes the staleness, and publishes it by name.
+    /// **The deferred-re-collection path, kept alive while nothing is
+    /// deferred.**
     ///
-    /// The banner is generated from the measured delta rather than typed, so
-    /// this asserts the mechanisms appear on the page -- the failure the whole
-    /// mechanism exists against is a stale row published as a current one.
+    /// [`ROWS_PREDATE_FLOOR`] and [`ROWS_PREDATE_APPLIED`] are both `&[]` since
+    /// the rows were re-collected, which makes two of [`staleness_with`]'s
+    /// refusals unreachable through [`staleness`] -- an empty acknowledgement
+    /// can never be "acknowledged but did not move", and the stale banner has no
+    /// delta to render. Without this test those paths would rot silently and be
+    /// found broken on the day somebody has to defer a re-collection again,
+    /// which is exactly when nobody wants to debug the gate.
+    ///
+    /// So the acknowledgement is passed in, against the REAL rows and the REAL
+    /// build, and both outcomes are asserted.
     #[test]
-    fn the_page_publishes_the_measured_staleness_by_name() {
+    fn an_acknowledged_delta_renders_the_stale_banner_and_a_wrong_one_is_refused() {
+        let rows = load_rows(&root()).expect("rows");
+        let real = build();
+
+        // A build one mechanism ahead of the rows, with that mechanism
+        // acknowledged: the shape the page carried between P2.6.4 and the
+        // re-collection. It renders, and it renders the delta.
+        let mut ahead = real.clone();
+        ahead.floor.push("landlock-net".to_string());
+        ahead.applied.push("landlock-net".to_string());
+        let stale = staleness_with(&rows, &ahead, &["landlock-net"], &["landlock-net"])
+            .expect("an acknowledged delta must render");
+        assert_eq!(stale.floor, vec!["landlock-net".to_string()]);
+        let banner = staleness_banner(&stale, &ahead);
+        assert!(
+            banner.contains("STALE IN THEIR BUILD HALF") && banner.contains("`landlock-net`"),
+            "the stale banner must name the acknowledged mechanism: {banner}"
+        );
+
+        // The same acknowledgement against a build that did NOT move. The page
+        // would publish a staleness that is not there, so it is red -- the
+        // direction that catches an acknowledgement nobody cleared after
+        // running the collector.
+        let err = staleness_with(&rows, &real, &["landlock-net"], &[])
+            .expect_err("an acknowledgement for a move that did not happen must be red");
+        assert!(format!("{err}").contains("did NOT move"), "got: {err}");
+    }
+
+    /// The page publishes what the gate GUARANTEES, not a freshness assertion.
+    ///
+    /// The rows are current as this is written, and a page that simply said so
+    /// would start decaying the moment it was rendered -- the exact shape this
+    /// repository has been bitten by. What the page must carry instead is the
+    /// durable half: that a floor move reddens this gate, and that the cheap
+    /// check says nothing about the kernels.
+    #[test]
+    fn the_page_publishes_the_guarantee_rather_than_a_freshness_claim() {
         let rows = load_rows(&root()).expect("rows");
         let page = page_of(&rows);
         assert!(
-            page.contains("STALE IN THEIR BUILD HALF"),
-            "the page does not say the rows are stale"
+            !page.contains("STALE IN THEIR BUILD HALF"),
+            "the rows are not stale, so the page must not say they are"
         );
-        for mechanism in ROWS_PREDATE_FLOOR {
+        assert!(
+            page.contains("goes RED"),
+            "the page must say what the gate does when the floor moves, not merely that the \
+             rows happen to match today"
+        );
+        // The scope limit is as load-bearing as the guarantee: this check never
+        // boots anything, and a reader must not take a green page as evidence
+        // that these kernels were re-measured.
+        assert!(
+            page.contains("re-boots nothing"),
+            "the page must bound the cheap check's scope"
+        );
+        assert!(
+            page.contains("tests/kernel-matrix/collect.sh --check"),
+            "the page must name the only thing that re-takes the kernel half"
+        );
+        // Provenance survives: every row's collection date is still published.
+        for row in &rows {
             assert!(
-                page.contains(&format!("`{mechanism}`")),
-                "the page does not name `{mechanism}` as part of what moved"
+                page.contains(&row.collected),
+                "the page must publish {}'s collection date",
+                row.id
             );
         }
-        assert!(
-            page.contains("tests/kernel-matrix/collect.sh"),
-            "the page must name the command that clears the debt"
-        );
     }
 
-    /// **Both banners render**, so the stale one is a branch and not the only
-    /// text this generator can emit.
+    /// **Both banners render**, so the one that is not currently on the page is
+    /// a branch rather than dead text.
     ///
-    /// Without this, `ROWS_PREDATE_FLOOR = &[]` -- the state the day somebody
-    /// runs `collect.sh` -- would be an unexercised path on the command that
-    /// re-renders a published page.
+    /// The rows are current, so the STALE banner is now the unexercised half --
+    /// the mirror image of why this test was written, and the same hazard. A
+    /// generator that can only emit the paragraph it happens to emit today is
+    /// one whose other paragraph is discovered broken while somebody is already
+    /// dealing with a moved floor.
     #[test]
     fn the_stale_banner_and_the_current_banner_are_both_reachable() {
         let b = build();
@@ -1760,13 +1851,19 @@ mod tests {
         let current = Staleness {
             floor: Vec::new(),
             applied: Vec::new(),
-            collected: vec!["2026-08-15".into()],
+            collected: vec!["2026-08-16".into()],
         };
         assert!(!stale.is_current() && current.is_current());
         let stale_text = staleness_banner(&stale, &b);
         let current_text = staleness_banner(&current, &b);
         assert!(stale_text.contains("STALE IN THEIR BUILD HALF"));
-        assert!(current_text.contains("build half is current"));
+        // The current banner leads with the GUARANTEE, and the guarantee is
+        // that a floor move reddens this gate. A banner that merely announced
+        // the rows were current would be a claim with a shelf life.
+        assert!(
+            current_text.contains("goes RED") && current_text.contains("re-boots nothing"),
+            "the current banner must publish the guarantee and its scope: {current_text}"
+        );
         assert!(
             !current_text.contains("STALE"),
             "the current banner must not carry the stale one's words: {current_text}"

@@ -15,7 +15,7 @@
 # boot: qemu-system-x86_64 -accel <accel> -m 512 -smp 1 -nographic -no-reboot -kernel <vmlinuz> -initrd <initramfs> -append "console=ttyS0 panic=1 quiet"
 # userspace: minimal initramfs from tests/kernel-matrix/init.c -- static PID 1, /vitrind and its library closure, /proc /sys /dev /run mounted, NO distribution policy loaded, NO /etc/subuid, uid 0 with a full capability set. This is a KERNEL row and never a distribution row.
 # normalized: policy.max_user_namespaces -- memory-derived, tracks the compressed initramfs size, so it would go stale on commits that only change vitrind's size
-#~ collected: 2026-08-15
+#~ collected: 2026-08-16
 #~ accel: tcg
 #~ policy.max_user_namespaces (raw): 1806
 --- vitrind --print-isolation ---
@@ -45,12 +45,14 @@ vitrin-floor 1
 build.version=0.1.0
 floor.mechanism=namespaces
 floor.mechanism=landlock
+floor.mechanism=seccomp
+floor.mechanism=no-new-privs
 applies.namespaces=yes
 applies.landlock=yes
-applies.seccomp=not-yet
+applies.seccomp=yes
 applies.no-new-privs=yes
 build.landlock_max_rung=9
 build.landlock_min_abi=6
 --- vitrind --headless --consent=auto-approve: the isolation preflight's own line ---
 verdict: admitted
-INFO vitrind: realms will be confined: each gets its own user, mount, PID, IPC, UTS and network namespace, an identity uid/gid map, zero capabilities, and a Landlock ruleset enforced before the shim's execve. No `applied_profile` is printed here on purpose: it names the rung a realm OBTAINED, and no realm exists yet -- the ladder's landing is per-spawn. Whatever it says, it is not a tier name, because `intra-user` means namespaces PLUS Landlock PLUS seccomp and the seccomp filter (P2.6.4) is not applied by this build isolation=default landlock=highest kernel=6.12.101+deb13-amd64
+INFO vitrind: realms will be confined: each gets its own user, mount, PID, IPC, UTS and network namespace, an identity uid/gid map, zero capabilities, a Landlock ruleset enforced before the shim's execve, and a seccomp-bpf DENY-LIST installed immediately after it. The deny-list is a named-class claim and not a completeness one: `vitrind --print-seccomp` prints every row it closes, and the rest of the kernel's syscall surface is unenumerated -- a realm is filtered against a named list, NOT syscall-confined. No `applied_profile` is printed here on purpose: it names the rung a realm OBTAINED, and no realm exists yet -- the ladder's landing is per-spawn. Whatever it says, it is not a tier name either, because `intra-user` means namespaces PLUS Landlock PLUS seccomp and a profile string names only the Landlock rung isolation=default landlock=highest kernel=6.12.101+deb13-amd64

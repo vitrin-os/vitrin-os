@@ -566,14 +566,14 @@ That is the complete list of what confines a realm right now.
   every one of those rows is a kernel reading in a bare initramfs rather than a
   distribution, the per-rung *behavioural* statements are still measured on one
   box, and nobody but the collector's author has re-run its failure levers.
-  **Those rows are also stale in their build half and pending re-collection**:
-  they were collected before P2.6.4 put `seccomp` and `no-new-privs` into the
-  startup floor, so their `--print-floor` and startup lines describe an older
-  binary while their kernel readings stand. That is detected rather than
-  assumed — `cargo xtask kernel-matrix --check` holds each row's own recorded
-  mechanism set to this build's and goes red on any move beyond the one
-  acknowledged in `crates/xtask/src/kernel_matrix.rs` — and re-collecting needs
-  QEMU, which no pull request has.
+  Each row records the build it was taken with as well as the kernel's answers,
+  and `cargo xtask kernel-matrix --check` holds that half to this tree: it reads
+  each row's own recorded mechanism set and goes **red the day the floor moves
+  out from under them**, so a row cannot quietly go on describing an older
+  binary. It **re-boots nothing**, though — a green pull request says the rows
+  describe this build and says nothing about whether these kernels still answer
+  this way. Only `tests/kernel-matrix/collect.sh --check` re-takes that half,
+  and it needs QEMU, which no pull request has.
 
   The rung the ruleset was **obtained** at is what the realm's
   `applied_profile` names, with the rung the session asked for and the ABI the

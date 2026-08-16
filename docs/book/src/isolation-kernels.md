@@ -21,11 +21,9 @@ does, is [the isolation matrix](isolation-matrix.md) — a **build**-static page
 probes no machine. Do not read the two as one document: that page says what this
 build requires, this one says what these 5 kernels answered.
 
-**These rows are STALE IN THEIR BUILD HALF, and pending re-collection.** They were collected (2026-08-15) against a build whose startup floor was `namespaces`, `landlock`. This tree's floor is `namespaces`, `landlock`, `seccomp`, `no-new-privs`, so every row's `--print-floor` section and startup line describe a binary that did not gate on `seccomp`, `no-new-privs` — and the `applies.` rows still read `not-yet` for `seccomp`, which this build prints `yes` for.
+**The rows' build half is held to this build, and that is the durable part.** `cargo xtask kernel-matrix --check` reads every row's own `floor.mechanism=` and `applies.*` lines and holds them to the sets declared in `crates/vitrin-core/src/spawn/isolation.rs`, so **the day this build's floor moves out from under these rows, this page goes RED** and names the mechanism that moved. It cannot quietly go on describing an older binary, which is the failure it was built after: the floor grew by two mechanisms and every gate stayed green because the page and the rows were stale together. As rendered, that delta is empty — each row below was collected (2026-08-16) against a build whose startup floor was the same set this tree declares, `namespaces`, `landlock`, `seccomp`, `no-new-privs`.
 
-**What is still current is the half this page exists for.** The `landlock.abi`, `ns.*`, `mount.in_userns`, `policy.*` and `tier` readings are **kernel** facts: they are properties of the booted bytes and do not move when this repository changes. So the measured table below, the admitted/refused split and the cross-validation are unaffected. The `tier` column in particular: `intra-user` has always been defined as all four mechanisms, and these kernels' answers to all four are what the rows already carry. What is stale is every cell that describes the *binary* — the `--print-floor` provenance and the verbatim startup line under each provenance block. Note the direction: the old rows **understate** what this build refuses, so a reader following them would expect a session to start where it now might not.
-
-**This is detected, not merely written down.** `cargo xtask kernel-matrix --check` reads each row's recorded mechanism sets and holds them to the sets declared in `crates/vitrin-core/src/spawn/isolation.rs`. It passes today only because the difference is exactly the one acknowledged in `crates/xtask/src/kernel_matrix.rs` — `ROWS_PREDATE_FLOOR` names {`seccomp`, `no-new-privs`} and `ROWS_PREDATE_APPLIED` names {`seccomp`} — and this paragraph is generated from that measured difference rather than typed, so it names what moved and cannot be left behind. Any further move goes RED and asks for a re-collection by name. Re-collecting means re-booting all five kernels under QEMU (`tests/kernel-matrix/collect.sh`), which no pull request runs; it is owed and is not done, and this is the record of that rather than a silence.
+Read the scope of that narrowly. This check is cheap and **re-boots nothing**, so it says the rows describe THIS build and says nothing whatever about whether these kernels still answer this way; only `tests/kernel-matrix/collect.sh --check` re-takes that half, and every row carries the date it was last taken on.
 
 ## The measured table
 
@@ -159,7 +157,7 @@ a re-measurement against whatever the pool holds now.
 | | |
 |---|---|
 | row | [`tests/kernel-matrix/rows/ubuntu-22.04-5.15.row`](https://github.com/vitrin-os/vitrin-os/blob/main/tests/kernel-matrix/rows/ubuntu-22.04-5.15.row) |
-| collected | 2026-08-15 (UTC) |
+| collected | 2026-08-16 (UTC) |
 | `vitrind` version | 0.1.0 |
 | `--print-isolation` schema | `vitrin-isolation 3` |
 | package | `http://archive.ubuntu.com/ubuntu/pool/main/l/linux/linux-image-unsigned-5.15.0-191-generic_5.15.0-191.201_amd64.deb` |
@@ -180,7 +178,7 @@ ERROR vitrind: fatal: this build's isolation floor requires `landlock` and this 
 | | |
 |---|---|
 | row | [`tests/kernel-matrix/rows/debian-12-6.1.row`](https://github.com/vitrin-os/vitrin-os/blob/main/tests/kernel-matrix/rows/debian-12-6.1.row) |
-| collected | 2026-08-15 (UTC) |
+| collected | 2026-08-16 (UTC) |
 | `vitrind` version | 0.1.0 |
 | `--print-isolation` schema | `vitrin-isolation 3` |
 | package | `https://deb.debian.org/debian/pool/main/l/linux/linux-image-6.1.0-50-amd64-unsigned_6.1.176-1_amd64.deb` |
@@ -201,7 +199,7 @@ ERROR vitrind: fatal: this build's isolation floor requires `landlock` and this 
 | | |
 |---|---|
 | row | [`tests/kernel-matrix/rows/ubuntu-24.04-6.8.row`](https://github.com/vitrin-os/vitrin-os/blob/main/tests/kernel-matrix/rows/ubuntu-24.04-6.8.row) |
-| collected | 2026-08-15 (UTC) |
+| collected | 2026-08-16 (UTC) |
 | `vitrind` version | 0.1.0 |
 | `--print-isolation` schema | `vitrin-isolation 3` |
 | package | `http://archive.ubuntu.com/ubuntu/pool/main/l/linux/linux-image-unsigned-6.8.0-139-generic_6.8.0-139.139_amd64.deb` |
@@ -222,7 +220,7 @@ ERROR vitrind: fatal: this build's isolation floor requires `landlock` and this 
 | | |
 |---|---|
 | row | [`tests/kernel-matrix/rows/debian-13-6.12.row`](https://github.com/vitrin-os/vitrin-os/blob/main/tests/kernel-matrix/rows/debian-13-6.12.row) |
-| collected | 2026-08-15 (UTC) |
+| collected | 2026-08-16 (UTC) |
 | `vitrind` version | 0.1.0 |
 | `--print-isolation` schema | `vitrin-isolation 3` |
 | package | `https://deb.debian.org/debian/pool/main/l/linux/linux-image-6.12.101+deb13-amd64-unsigned_6.12.101-1_amd64.deb` |
@@ -235,7 +233,7 @@ ERROR vitrind: fatal: this build's isolation floor requires `landlock` and this 
 The startup line this kernel produced, verbatim:
 
 ```text
-INFO vitrind: realms will be confined: each gets its own user, mount, PID, IPC, UTS and network namespace, an identity uid/gid map, zero capabilities, and a Landlock ruleset enforced before the shim's execve. No `applied_profile` is printed here on purpose: it names the rung a realm OBTAINED, and no realm exists yet -- the ladder's landing is per-spawn. Whatever it says, it is not a tier name, because `intra-user` means namespaces PLUS Landlock PLUS seccomp and the seccomp filter (P2.6.4) is not applied by this build isolation=default landlock=highest kernel=6.12.101+deb13-amd64
+INFO vitrind: realms will be confined: each gets its own user, mount, PID, IPC, UTS and network namespace, an identity uid/gid map, zero capabilities, a Landlock ruleset enforced before the shim's execve, and a seccomp-bpf DENY-LIST installed immediately after it. The deny-list is a named-class claim and not a completeness one: `vitrind --print-seccomp` prints every row it closes, and the rest of the kernel's syscall surface is unenumerated -- a realm is filtered against a named list, NOT syscall-confined. No `applied_profile` is printed here on purpose: it names the rung a realm OBTAINED, and no realm exists yet -- the ladder's landing is per-spawn. Whatever it says, it is not a tier name either, because `intra-user` means namespaces PLUS Landlock PLUS seccomp and a profile string names only the Landlock rung isolation=default landlock=highest kernel=6.12.101+deb13-amd64
 ```
 
 ### `6.17.0-1020-azure` — Ubuntu (azure kernel) — what this repository's CI runners boot
@@ -243,7 +241,7 @@ INFO vitrind: realms will be confined: each gets its own user, mount, PID, IPC, 
 | | |
 |---|---|
 | row | [`tests/kernel-matrix/rows/ubuntu-azure-6.17.row`](https://github.com/vitrin-os/vitrin-os/blob/main/tests/kernel-matrix/rows/ubuntu-azure-6.17.row) |
-| collected | 2026-08-15 (UTC) |
+| collected | 2026-08-16 (UTC) |
 | `vitrind` version | 0.1.0 |
 | `--print-isolation` schema | `vitrin-isolation 3` |
 | package | `http://archive.ubuntu.com/ubuntu/pool/main/l/linux-azure/linux-image-unsigned-6.17.0-1020-azure_6.17.0-1020.20_amd64.deb` |
@@ -256,7 +254,7 @@ INFO vitrind: realms will be confined: each gets its own user, mount, PID, IPC, 
 The startup line this kernel produced, verbatim:
 
 ```text
-INFO vitrind: realms will be confined: each gets its own user, mount, PID, IPC, UTS and network namespace, an identity uid/gid map, zero capabilities, and a Landlock ruleset enforced before the shim's execve. No `applied_profile` is printed here on purpose: it names the rung a realm OBTAINED, and no realm exists yet -- the ladder's landing is per-spawn. Whatever it says, it is not a tier name, because `intra-user` means namespaces PLUS Landlock PLUS seccomp and the seccomp filter (P2.6.4) is not applied by this build isolation=default landlock=highest kernel=6.17.0-1020-azure
+INFO vitrind: realms will be confined: each gets its own user, mount, PID, IPC, UTS and network namespace, an identity uid/gid map, zero capabilities, a Landlock ruleset enforced before the shim's execve, and a seccomp-bpf DENY-LIST installed immediately after it. The deny-list is a named-class claim and not a completeness one: `vitrind --print-seccomp` prints every row it closes, and the rest of the kernel's syscall surface is unenumerated -- a realm is filtered against a named list, NOT syscall-confined. No `applied_profile` is printed here on purpose: it names the rung a realm OBTAINED, and no realm exists yet -- the ladder's landing is per-spawn. Whatever it says, it is not a tier name either, because `intra-user` means namespaces PLUS Landlock PLUS seccomp and a profile string names only the Landlock rung isolation=default landlock=highest kernel=6.17.0-1020-azure
 ```
 
 ## One cell is normalized, and it is named

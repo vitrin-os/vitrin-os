@@ -1,0 +1,76 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The tracker half of issue #172, and the half that cannot be a gate.
+#
+# WHY THIS IS NOT IN ci.yml
+# -------------------------
+# #172's third acceptance criterion asks that `is:open label:known-limit` and
+# the published limits page describe the same set. Two things stop that being a
+# pull-request check, and both are reasons rather than excuses:
+#
+#   1. It needs the GitHub API. A docs gate that depends on network and
+#      credentials fails for reasons that have nothing to do with the diff.
+#   2. It would go RED when somebody else opens an issue. That is the
+#      "brittle... which trains people to weaken the check" outcome issue #224's
+#      own risk list names, and the first thing a red build of that shape earns
+#      is a pull request deleting it.
+#
+# And the property itself is impossible in one direction by policy: many
+# published limits deliberately have no issue, and README.md promises exactly
+# that ("Every bullet names the issue behind it, or says plainly that it has
+# none"). Set equality would demand a tracker entry for every permanent
+# exclusion this project has decided on.
+#
+# So this job REPORTS. `cargo xtask limits-check --tracker` exits 0 whatever it
+# finds, including when `gh` is missing or unauthenticated -- an advisory report
+# that could not run is a report that did not run, and dressing that up as a
+# pass would be the same dishonesty in miniature. Read its output; do not treat
+# a green tick here as evidence of anything.
+#
+# THE BLOCKING HALF IS ELSEWHERE, and it is narrower. `cargo xtask limits-check`
+# in ci.yml holds the other direction: every issue the claim table names as the
+# provenance of a published claim must be cited on one of that claim's own
+# surfaces. That is strictly weaker than #172's criterion 3 and
+# crates/xtask/src/limits.rs says so in `uncited_issues`'s own documentation
+# rather than ticking the criterion.
+name: honesty-tracker
+
+on:
+  # On demand: the button to press before claiming the tracker and the limits
+  # page agree, or after closing a known-limit issue.
+  workflow_dispatch:
+  # Weekly. Issues open and close on a human cadence, and a monthly report
+  # would be a season out of date by the time anybody read it.
+  schedule:
+    - cron: "23 5 * * 1"
+
+permissions:
+  contents: read
+  issues: read
+
+jobs:
+  report:
+    name: "open known-limit issues cited on no published surface (ADVISORY)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "cargo xtask limits-check --tracker"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # `set -o pipefail`, and it is not boilerplate. The report exits 0 by
+        # construction -- that is the whole design above -- but `cargo xtask`
+        # can still fail to BUILD, and a pipeline's status is its last command's,
+        # so without pipefail `tee` would return 0 over a compile error and this
+        # step would go green having reported nothing at all. An advisory report
+        # that cannot go red is decoration; one that cannot go red even when it
+        # never ran is worse, because the green tick is then evidence of the
+        # opposite of what it looks like.
+        #
+        # So: red here means the tool did not run. It does NOT mean the tracker
+        # and the limits page disagree -- nothing in this repository can say
+        # that, and the reasoning at the top of this file is why.
+        run: |
+          set -o pipefail
+          cargo xtask limits-check --tracker | tee -a "$GITHUB_STEP_SUMMARY"

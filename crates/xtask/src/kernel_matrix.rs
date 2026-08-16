@@ -122,9 +122,14 @@ const KERNELS: &[KernelNote] = &[
     KernelNote {
         id: "ubuntu-azure-6.17",
         distribution: "Ubuntu (azure kernel) — what this repository's CI runners boot",
-        why: "The cross-validation row. It is the same kernel release the CI runner reports, so \
-              booting it here says whether this harness reproduces that machine — and, on the \
-              policy cells, whether it does not.",
+        why: "The cross-validation row. It is the kernel release the CI runner reported ON THE \
+              COLLECTION DATE, so booting it here says whether this harness reproduces that \
+              machine — and, on the policy cells, whether it does not. **The runner's kernel \
+              moves:** it reported `6.17.0-1020-azure` on 2026-08-14 and `6.17.0-1022-azure` by \
+              2026-08-16. Both are ABI 7, so the rung this row cross-validates is unaffected, \
+              but do not read the row as naming whatever the runner boots today. GitHub bumps \
+              that image with no commit here, which is why this table is dated rather than \
+              presented as current.",
     },
 ];
 

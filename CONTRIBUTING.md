@@ -108,6 +108,17 @@ meson setup shim/build shim && meson compile -C shim/build
 VITRIN_C_SHIM_BIN="$PWD/shim/build/vitrin-shim" bash tests/integration/run.sh
 ```
 
+The two `meson` lines create `shim/build/`, and `cargo test --workspace`
+passes in a tree that has it. That was not true until
+[#295](https://github.com/vitrin-os/vitrin-os/issues/295): `xtask`'s
+repository-scanning gates walked the directory and reported meson's copy of
+wlroots as if it were this project's source, so the crate failed for anyone
+who had followed the lines above. Those gates — `cargo xtask limits-check`,
+`cargo xtask skip-scan` and the tests behind them — now ask `git` which paths
+are build output instead of guessing from directory names, which means they
+read the tree CI's checkout reads, and it means they need a git work tree to
+run at all.
+
 CI builds with `RUSTFLAGS="-D warnings"` and the toolchain is pinned exactly
 in [`rust-toolchain.toml`](rust-toolchain.toml) — the pin is exact because
 `codegen --check` compares output byte-for-byte and that depends on

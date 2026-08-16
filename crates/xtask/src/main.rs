@@ -176,7 +176,7 @@ fn main() -> ExitCode {
 }
 
 fn usage() -> &'static str {
-    "usage: cargo xtask codegen [--check]\n       cargo xtask demo [--headless] [--task K=V]...\n       cargo xtask bless [--filter SUBSTR]\n       cargo xtask session-matrix [--check]\n       cargo xtask isolation-matrix [--check]\n       cargo xtask kernel-matrix [--check]\n       cargo xtask limits-check\n       cargo xtask skip-scan\n       cargo xtask skip-census --min-tests N [--expect-self-marker] -- CMD [ARG...]"
+    "usage: cargo xtask codegen [--check]\n       cargo xtask demo [--headless] [--task K=V]...\n       cargo xtask bless [--filter SUBSTR]\n       cargo xtask session-matrix [--check]\n       cargo xtask isolation-matrix [--check]\n       cargo xtask kernel-matrix [--check]\n       cargo xtask limits-check [--tracker]\n       cargo xtask skip-scan\n       cargo xtask skip-census --min-tests N [--expect-self-marker] -- CMD [ARG...]"
 }
 
 fn run() -> Result<()> {
@@ -297,16 +297,28 @@ fn run() -> Result<()> {
             kernel_matrix::kernel_matrix(&workspace_root()?, check)
         }
         "limits-check" => {
-            // No flags: the check has exactly one mode. A `--check` spelling
-            // would be noise -- it never writes.
-            if let Some(arg) = args.get(1) {
-                if arg == "-h" || arg == "--help" {
-                    println!("{}", usage());
-                    return Ok(());
+            // Two modes, and the second one is deliberately not the default.
+            // `--tracker` shells out to `gh`, needs network and credentials,
+            // and is ADVISORY: it reports and exits 0 whatever it finds. The
+            // default mode is the offline gate CI runs; keeping them apart is
+            // #172's answer to "an offline gate that pretends to check the
+            // tracker is worse than none".
+            let mut tracker = false;
+            for arg in &args[1..] {
+                match arg.as_str() {
+                    "-h" | "--help" => {
+                        println!("{}", usage());
+                        return Ok(());
+                    }
+                    "--tracker" => tracker = true,
+                    other => bail!("unknown flag '{other}' for 'limits-check'\n\n{}", usage()),
                 }
-                bail!("unknown flag '{arg}' for 'limits-check'\n\n{}", usage());
             }
-            limits::limits_check(&workspace_root()?)
+            let root = workspace_root()?;
+            if tracker {
+                return limits::tracker_report(&root);
+            }
+            limits::limits_check(&root)
         }
         "skip-scan" => {
             // Reads sources, writes nothing -- one mode, like limits-check.

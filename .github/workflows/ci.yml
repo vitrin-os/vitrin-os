@@ -635,7 +635,7 @@ jobs:
         # text, so CI can genuinely enforce it -- unlike most of the rest of
         # this workstream."
         #
-        # Three different failures, and the tool's output says which:
+        # Several different failures, and the tool's output says which:
         #
         #   SURFACE  -- a claim is missing from one of docs/book/src/limits.md,
         #               README.md, SECURITY.md or site/index.html while the
@@ -657,19 +657,62 @@ jobs:
         #               and three agreeing surfaces would have agreed on both.
         #               A page that OVERSTATES a gap is as dishonest as one
         #               that hides it.
+        #   DERIVED  -- one value with ONE canonical definition, rendered
+        #               differently on each surface, and a surface's rendering
+        #               no longer matches the definition. This is the failure a
+        #               literal anchor cannot see, and it was not theoretical:
+        #               six surfaces stated one AppArmor measurement and split
+        #               three/three over which kernel it was taken on, with
+        #               this step green throughout, because the SURFACE anchors
+        #               pinned the artefact path and the bound and never the
+        #               kernel release.
+        #   MIRROR   -- a constant duplicated in a second file under a comment
+        #               promising it mirrors the first has stopped doing so.
+        #   ISSUE    -- a claim names the issue behind it and no surface it is
+        #               published on cites that issue, so a reader who meets
+        #               the gap cannot find what tracks it.
+        #   SELF-DRIFT -- ONE surface renders the same derived value in two
+        #               places and the two disagree, so a page contradicts
+        #               itself. Matching is every-occurrence, not first-hit,
+        #               and this is why: site/index.html said the per-kernel
+        #               matrix had not been built in one paragraph and cited
+        #               its measurements ninety lines below, and a `contains`
+        #               check calls that green. The message names both line
+        #               numbers.
+        #   COVERAGE -- a table and its written roll of ids disagree, so the
+        #               SET this gate holds has changed. Deleting a claim row
+        #               used to leave every check passing and move only the
+        #               tally printed at the end of this step; that is #288's
+        #               failure mode -- a green check over a quietly smaller
+        #               set -- and it is red now. Shrinking coverage is a
+        #               decision somebody makes in a diff, not a side effect.
         #
-        # EXPLICITLY TEMPORARY. Issue #172 owns the choice of drift mechanism
-        # for this repository's honesty surfaces and has not made it; this is
-        # its option (b), built narrow, and crates/xtask/src/limits.rs states
-        # in its own module docs what replaces it under each of #172's three
-        # options. Do not grow it into a docs linter -- #172's scope note is
-        # that the claim set is small, known and slow-moving.
+        # NO LONGER TEMPORARY. This step's comment used to say issue #172 owned
+        # the choice of drift mechanism and had not made it. #172 has now taken
+        # option (b) -- a drift check that fails when one surface disagrees,
+        # built by EXTENDING this tool rather than adding a parallel one -- and
+        # its four named claims (the fuzz soak, the wlcs counts, OIN, REUSE) are
+        # rows in the table. Do not grow it into a docs linter: #172's scope
+        # note is that the claim set is small, known and slow-moving.
+        #
+        # NOT here, on purpose: #172's tracker cross-check. `cargo xtask
+        # limits-check --tracker` shells out to `gh`, needs network and
+        # credentials, and is ADVISORY -- it reports and exits 0. It runs in
+        # .github/workflows/honesty-tracker.yml on a schedule, never on a pull
+        # request, because a gate that goes red when somebody else opens an
+        # issue is the "trains people to weaken the check" failure #224's risk
+        # list names. An offline gate PRETENDING to check the tracker would be
+        # worse than none, so this one does not pretend.
         #
         # It reads files and writes nothing. Its own non-vacuity tests -- a
         # claim missing from a surface must fail, a claim the code contradicts
         # must fail in BOTH directions, a claim with no code evidence must be
-        # refused outright -- run in the `rust` job's `cargo test --workspace`,
-        # because xtask is a workspace member.
+        # refused outright, a canonical value that moves must fail EVERY
+        # rendering of it, a render function that ignores its input must be
+        # refused, a surface that states the value twice and disagrees must fail
+        # with both line numbers, and a deleted table row must fail by id -- run
+        # in the `rust` job's `cargo test --workspace`, because xtask is a
+        # workspace member.
         run: cargo xtask limits-check
 
   deny:

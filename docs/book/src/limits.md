@@ -159,7 +159,7 @@ inferred from the word "Landlock":
   by `the_floor_costs_nothing_because_the_domain_is_flat_from_six_to_eight` in
   `crates/vitrin-realm-init/src/main.rs`.
   **Which kernel releases the floor excludes IS measured now**, and it is
-  measured on kernels rather than inferred from mainline changelogs. Five
+  measured on kernels rather than inferred from mainline changelogs — five
   distribution kernels were booted under QEMU with the shipped binary and their
   answers are checked in: Ubuntu 22.04's `5.15.0-191-generic` at ABI 1, Debian
   12's `6.1.0-50-amd64` at ABI 2 and Ubuntu 24.04's GA `6.8.0-139-generic` at
@@ -658,7 +658,7 @@ happens). It installs the profile, loads it, spawns a real realm, runs the
 real-app confinement gate, then **removes the profile and requires the spawn to
 fail again**.
 
-What it reported on kernel `6.17.0-1020-azure` with
+What it reported on kernel `6.17.0-1022-azure` with
 `apparmor_restrict_unprivileged_userns=1` and no sysctl touched:
 
 | | baseline | with the profile |
@@ -709,7 +709,7 @@ Whether the ask *succeeds* depends on a second knob,
 `kernel.apparmor_restrict_unprivileged_unconfined`, and **it has now been
 measured: `0`.** Recorded by the `apparmor profile` CI job as
 `RESULT unconfined_knob=0` on a stock `ubuntu-latest` (kernel
-`6.17.0-1020-azure`, 2026-08-15), on the same machine and in the same run that
+`6.17.0-1022-azure`, 2026-08-15), on the same machine and in the same run that
 `apparmor_restrict_unprivileged_userns` read `1`.
 
 **So the cost is real and unmitigated.** At `0`, `aa-exec -p vitrind` borrows
@@ -945,13 +945,18 @@ path is gone.
 
 ## Testing gaps
 
-**The 24-hour fuzz soak has never been run.** `fuzz/` ships two cargo-fuzz
-targets with a checked-in corpus that CI replays on every PR, plus a short
-per-PR burst. The 24-hour clean run the plan asks for is a documented manual
+**The 24-hour fuzz soak has never been run**
+([#156](https://github.com/vitrin-os/vitrin-os/issues/156))**.** `fuzz/` ships
+two cargo-fuzz targets with a checked-in corpus that CI replays on every PR,
+plus a short per-PR burst. The 24-hour clean run the plan asks for is a documented manual
 procedure, not a scheduled job, and nobody has executed it end to end.
 
-**wlcs conformance is advisory and mostly red.** The 2026-07-25 run:
-`total=180 passed=3 failed=145 skipped=32`.
+**wlcs conformance is advisory and mostly red**
+([#157](https://github.com/vitrin-os/vitrin-os/issues/157))**.** The
+2026-07-25 run, against wlcs 1.6.1-1:
+`total=180 passed=3 failed=145 skipped=32`. The version is part of the number
+and not a footnote — the same shim scores 8/49 against wlcs 1.7.0 with no shim
+change in between.
 
 That number needs its context, and the context is not an excuse. wlcs tests
 a general-purpose desktop compositor. The shim deliberately serves a narrow
@@ -2233,14 +2238,79 @@ as a first-class project risk rather than waved away; the standing
 mitigations are spec-first artifacts, a design-doc-per-subsystem rule, and a
 review norm against cleverness in the TCB.
 
-**No OIN membership yet.** The project files no patents and relies on
-defensive publication plus the Apache-2.0 §3 and MPL-2.0 §2.1(b) grants,
-which are in force today. Joining the Open Invention Network is decided and
+**No OIN membership yet**
+([#159](https://github.com/vitrin-os/vitrin-os/issues/159))**.** The project
+files no patents and relies on defensive publication plus the Apache-2.0 §3
+and MPL-2.0 §2.1(b) grants, which are in force today. Joining the Open Invention Network is decided and
 not yet done. None of this is a freedom-to-operate opinion.
 
-**SPDX header coverage is not machine-checked.** There is no `reuse
-lint`-style CI gate, so a new file without a header will not be caught
+**SPDX header coverage is not machine-checked**
+([#155](https://github.com/vitrin-os/vitrin-os/issues/155))**.** There is no
+`reuse lint`-style CI gate, so a new file without a header will not be caught
 automatically.
+
+## What holds this page to the others, and what it does not
+
+This page, [the README](https://github.com/vitrin-os/vitrin-os/blob/main/README.md),
+[`SECURITY.md`](https://github.com/vitrin-os/vitrin-os/blob/main/SECURITY.md)
+and the project site state the same gaps in four different registers, and
+`cargo xtask limits-check` fails the build when they stop agreeing. How much of
+that is machine-held is worth writing down, because *"there is a check"* and
+*"this page is checked"* are different sentences, and only the second one is
+what a reader is really asking.
+
+**What it holds.** Every claim in its table has to appear on each surface that
+carries it **and** still be true of the code — a page that overstates a gap
+fails as loudly as one that hides it, and both directions have caught real
+drift here. Every value with a single canonical definition — the Landlock ABI
+floor, the advisory wlcs counts, the wlcs release they were measured against,
+the kernel the AppArmor run was taken on, the size of the booted-kernel set —
+has to appear in **every** place each surface renders it, not merely somewhere
+on the page, so a surface cannot contradict itself the way this project's own
+site once did. Constants duplicated between two files under a comment promising
+they mirror have to still mirror. The plan documents that enumerate this
+project's limits have to enumerate the same set as this page. And the tables
+themselves are held to a written roll of ids, so **losing coverage is a red
+build rather than a smaller number in a log nobody reads**.
+
+**What it does not hold, listed rather than left to be inferred from a green
+build:**
+
+- **Claims about the world.** Dates, hardware, *"the runbook has been executed
+  twice"*, *"the suite has only ever run on two machines"*. No program can
+  check those. They are published with their date and their one machine named,
+  and a human repeating the run is the only check there is.
+- **Whether the wlcs numbers are still true of the shim.** The gate holds every
+  surface to the same four counts and the same wlcs release; nothing re-runs
+  wlcs, because the advisory job commits no artefact to compare against. That
+  is [#157](https://github.com/vitrin-os/vitrin-os/issues/157).
+- **A paragraph that states a held value in a register the table does not
+  know.** The check finds every occurrence of the registers it is given; it
+  cannot find one nobody told it about. That gap closes by adding a row, and
+  the same is true of any claim on this page with no row at all — most of this
+  page is argued prose, and only the named subset is machine-held.
+- **A published page nobody added to the table.** Coverage is per page and per
+  claim: a page the table does not name is unheld entirely, however many of
+  these claims it repeats. `docs/ARCHITECTURE.md` and the Phase-2 plan document
+  both restate the five-kernel figure today and neither is held; a page added
+  tomorrow inherits the same gap on the day it ships.
+- **Text a reader never sees.** The check reads the file's bytes, not the page a
+  browser draws, so a block commented out or fenced still satisfies every
+  anchor in it. The gate would report agreement across surfaces that had
+  stopped publishing the claim at all — which is the understating direction,
+  the one this page cares about most.
+- **That this page and the issue tracker describe the same set.** They do not,
+  by policy and on purpose: many gaps here are permanent decisions with no
+  issue, and the README promises exactly that. What runs on every pull request
+  is the narrower, offline direction — every issue a held claim names must be
+  cited on one of that claim's own surfaces, so a reader who meets a gap can
+  find what tracks it without leaving the page. The other direction needs the
+  GitHub API and is a scheduled advisory report
+  (`.github/workflows/honesty-tracker.yml`), never a gate, because a build that
+  goes red when somebody else opens an issue is a build people learn to delete.
+
+The tables, their rolls and the full argument for each of these bounds are in
+`crates/xtask/src/limits.rs`, and the gate prints what it compared on every run.
 
 ## Why this page exists
 

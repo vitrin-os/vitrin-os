@@ -58,8 +58,9 @@ Entries D-001 through D-011 are seeded from decisions the [PRD](../PRD.md) alrea
 **Decision:** v1 targets the two deployments with no open incumbent (headless agent fleets; nested-in-a-desktop). The X11 shim, network sessions, and fleet mode follow in Phase 3. Session mode on bare DRM/KMS is horizon-tier.
 
 ### D-012 — DCO, not CLA
-**Status:** proposed
+**Status:** accepted, executed
 **Decision:** contributions are accepted under the Developer Certificate of Origin (sign-off), not a Contributor License Agreement.
+**Execution:** [`CONTRIBUTING.md`](../../CONTRIBUTING.md) states the policy and `.github/workflows/dco.yml` enforces it per commit on every pull request, so the decision is machine-enforced rather than aspirational. This status line read `proposed` until 2026-08-16, months after both landed — see [12-workstream-community.md](12-workstream-community.md) §2, which said the same thing on its own checklist. That is the drift [#172](https://github.com/vitrin-os/vitrin-os/issues/172) exists for, and `cargo xtask limits-check`'s `dco-is-executed` claim now holds the checkbox, this file and the published pages to the existence of that workflow.
 **Rationale:** a CLA is a contributor deterrent, and a single-maintainer project needs contributors more than it needs relicensing optionality; the licensing split (D-005) already secures the protocol/implementation boundary. Revisit only if a fiscal host requires otherwise.
 
 ### D-013 — Single-file decision log

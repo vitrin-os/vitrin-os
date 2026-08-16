@@ -147,11 +147,13 @@ impl BuildOutput {
         rel.ancestors().any(|a| self.prefixes.contains(a))
     }
 
-    /// How many entries git reported. Only a test that wants to say "this set
-    /// is not empty, so the scan below it was actually filtered" needs this.
+    /// What git reported, for a test that wants to hold [`covers`] to the
+    /// listing it was built from rather than to a path the test hopes exists.
+    ///
+    /// [`covers`]: BuildOutput::covers
     #[cfg(test)]
-    pub fn len(&self) -> usize {
-        self.prefixes.len()
+    pub fn entries(&self) -> impl Iterator<Item = &Path> {
+        self.prefixes.iter().map(PathBuf::as_path)
     }
 }
 
@@ -168,26 +170,38 @@ mod tests {
             .to_path_buf()
     }
 
-    /// **The end-to-end reading of git, against the real repository.** It
-    /// holds in CI as well as locally, because the one path it asserts on --
-    /// `target/` -- is where the binary running this assertion lives, so it
-    /// exists in every tree that can execute this test at all.
+    /// **The end-to-end reading of git, against the real repository**: it
+    /// parses, every entry it reports is one `covers` agrees with, and no
+    /// tracked source is covered.
     ///
-    /// Both directions matter. Only the second half would notice a parse that
-    /// returned "everything is ignored", which is how a filter silences the
-    /// scan it was added to protect.
+    /// The obvious assertion -- "`target/` is build output" -- is the one this
+    /// test must NOT make, and finding that out is worth the comment. A
+    /// worktree built with `CARGO_TARGET_DIR` pointing outside the repository
+    /// has no `target/` at all, and `.github/workflows/ci.yml` names "a
+    /// `CARGO_TARGET_DIR` move" as a change it expects to survive. A test
+    /// that asserts a path exists is a test that fails on somebody else's
+    /// machine for a reason that has nothing to do with what it checks, which
+    /// is the shape of the bug this whole module is about.
+    ///
+    /// So the positive direction is driven by git's own listing here, and
+    /// deterministically -- with paths this test creates -- in
+    /// [`ignored_paths_are_recognised_whatever_their_name`]. The direction
+    /// that matters most is the second one either way: only it would notice a
+    /// parse that answered "everything is ignored", which is how a filter
+    /// silences the scan it was added to protect.
     #[test]
     fn the_real_tree_reports_its_build_output_and_not_its_sources() {
         let root = root();
         let out = BuildOutput::of_tree(&root).expect("the workspace is a git work tree");
-        assert!(
-            out.covers(&root.join("target")),
-            "`target/` holds the binary running this test, so it exists and git ignores it"
-        );
-        assert!(
-            out.covers(&root.join("target/debug/build")),
-            "a path INSIDE an ignored directory is covered by the directory's entry"
-        );
+        let reported: Vec<PathBuf> = out.entries().map(Path::to_path_buf).collect();
+        for entry in &reported {
+            let full = root.join(entry);
+            assert!(out.covers(&full), "{} was reported by git", entry.display());
+            assert!(
+                out.covers(&full.join("a/deeper/path")),
+                "a path INSIDE a reported entry is covered by that entry"
+            );
+        }
         for tracked in [
             "crates/xtask/src/build_output.rs",
             "shim/meson.build",
@@ -219,7 +233,8 @@ mod tests {
         tree.git_init();
 
         let out = BuildOutput::of_tree(tree.path()).expect("a git work tree");
-        assert!(out.len() >= 3, "git reported {} entries", out.len());
+        let reported = out.entries().count();
+        assert!(reported >= 3, "git reported {reported} entries");
         for ignored in [
             "out-dir",
             "out-dir/deep/generated.rs",

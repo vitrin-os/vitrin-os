@@ -73,10 +73,35 @@ class ThreeRealms(IntegrationTest):
 
     def test_each_configured_realm_gets_its_own_shim_and_runtime_tree(self):
         with self.core(realms=EXTRA_REALMS) as core:
-            # The socket is up, so `run_session` finished startup: the loop
-            # forked all three realms *after* `install()` registered their
-            # sources, or the second and third would still be blocked in
-            # `configure` and the core would never have bound.
+            # The harness waited for three `realm_spawned` entries, so the
+            # fork loop ran to completion: all three realms were forked
+            # *after* `install()` registered their sources, or the second and
+            # third would still be blocked in `configure` and the third entry
+            # would never have been written.
+            #
+            # It is `await_realms` and NOT `await_socket` that licenses this,
+            # and the difference is issue #292: the core binds its socket in
+            # `run_session` before the backend exists, so the socket file
+            # appears ~8 ms before the last of these three trees does, and
+            # asserting on socket-up alone failed here about one run in four.
+            # The trees below are still asserted rather than waited for --
+            # `spawn_realm` creates the tree and then journals -- so this
+            # still fails a core that journalled a spawn it never housed.
+            #
+            # First, that the wait was not VACUOUS. `await_realms` derives
+            # what to wait for by parsing the same `realm.toml` the core
+            # loads, and returns `()` for a config it cannot read -- which
+            # degrades it to a no-op. A no-op here would not fail; it would
+            # quietly restore the ~1-in-4 flake, which is the shape #288's
+            # machinery exists to make impossible. So the derived set is
+            # asserted to be the three realms this test configured.
+            self.assertEqual(
+                sorted(core.autostart_realms()),
+                sorted(ALL_REALMS),
+                "the harness must have waited for all three realms; an empty or short "
+                "set here means await_realms no-opped and the tree assertions below "
+                "are racing again",
+            )
             for realm in ALL_REALMS:
                 directory = _realm_dir(core, realm)
                 self.assertTrue(
@@ -266,10 +291,30 @@ class OneRealmDies(IntegrationTest):
             1,
             f"exactly one realm_died for the killed realm; got {died}",
         )
-        self.assertEqual(
+        # ...and it is recorded as *that realm's own death*, not as a session
+        # shutdown and not as a protocol fault.
+        #
+        # **Deliberately two causes, and it is not a weakened assertion**
+        # (issue #292). A `SIGKILL`ed shim makes both death signals available
+        # at once -- EOF on the socketpair and a `SIGCHLD` the reaper turns
+        # into a `waitpid` -- and `crates/vitrin-core/src/lifecycle.rs`
+        # documents that pair as arriving "in either order", with the latch in
+        # `RealmLifecycle::die` making whichever lands first the recorded
+        # cause. Pinning `connection_closed` was therefore pinning an epoll
+        # coin flip: it came up `process_exit` on ~5% of runs and reddened the
+        # whole suite, which under `run.sh` voids the run as milestone
+        # evidence. Nothing published names either string.
+        #
+        # What is still excluded is what this test is actually about:
+        # `shutdown` would mean the kill was buried by the session ending
+        # rather than observed on its own, and `connection_fault` would mean
+        # a killed shim was misread as a protocol violation. Both are real
+        # regressions and both still fail here.
+        self.assertIn(
             for_editor[0]["cause"],
-            "connection_closed",
-            f"the killed shim's death is observed as its connection ending: {for_editor}",
+            {"connection_closed", "process_exit"},
+            "a killed shim's death must be observed as its own -- its connection "
+            f"ending or its process exiting, whichever the loop saw first: {for_editor}",
         )
 
     def test_a_dead_realms_grant_cannot_capture_a_live_siblings_frame(self):

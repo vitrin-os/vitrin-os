@@ -17,8 +17,26 @@
 #      is verifiable rather than merely stated. A pin that is not checksummed
 #      is not a pin.
 #
+# WHY THERE IS A BUILD ID HERE AS WELL AS A CHECKSUM (issue #298).
+#
+# The checksum pins what is DOWNLOADED. It says nothing about what is
+# INSTALLED, and Firefox ships an updater that rewrites the unpacked tree in
+# place -- which it did on this machine on 2026-07-22, turning a pinned
+# 140.12.0esr into 140.13.0esr while the tarball beside it still hashed to the
+# line below. So the pin also carries the identity the UNPACKED tree states
+# about itself, in firefox/application.ini: its [App] Version and BuildID.
+# BuildID and not version alone, because a respin carries the same version and
+# different bytes.
+#
+# Note the asymmetry the BuildID line's comment repeats: application.ini says
+# `140.12.0` where VITRIN_FIREFOX_VERSION says `140.12.0esr`. The `esr` suffix
+# is in the display version only. fetch-esr.sh DERIVES the application.ini
+# form by stripping it rather than pinning it a fifth time, so the sentence at
+# the top of this file stays true: there is exactly one place the version
+# lives.
+#
 # UPGRADING IS A DELIBERATE ACT (the issue says so: "upgrade deliberately, not
-# by drift"). To move to a new ESR: change the three values below, re-run
+# by drift"). To move to a new ESR: change the four values below, re-run
 # fetch-esr.sh, re-run the acceptance script, and REGENERATE the checked-in
 # globals ledger (shim/docs/globals-touched-firefox-140.12.0esr.log) -- a new
 # Firefox may want different globals, and that file is the evidence the v0
@@ -27,6 +45,10 @@
 VITRIN_FIREFOX_VERSION=140.12.0esr
 VITRIN_FIREFOX_SHA256=3323ee13ac6fe4877fa2e1f4a3aa6b8009f65a620c7bbca96fe86f1a6f433d92
 VITRIN_FIREFOX_URL=https://download-installer.cdn.mozilla.net/pub/firefox/releases/140.12.0esr/linux-x86_64/en-US/firefox-140.12.0esr.tar.xz
+# firefox/application.ini's [App] BuildID for the tarball above. Read out of
+# the tarball, not typed from a release page:
+#   tar -xJOf shim/.firefox/firefox-140.12.0esr.tar.xz firefox/application.ini
+VITRIN_FIREFOX_BUILDID=20260609153453
 
 # Where fetch-esr.sh unpacks it. Gitignored (see the repo root .gitignore):
 # neither the tarball nor the unpacked browser is ever committed.

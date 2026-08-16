@@ -153,12 +153,15 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
+mod build_output;
 mod isolation_matrix;
 mod kernel_matrix;
 mod limits;
 mod session_matrix;
 mod skip_census;
 mod test_census;
+#[cfg(test)]
+mod testtree;
 
 /// Paths this task operates on, relative to the workspace root.
 const XML_PATH: &str = "protocol/vitrin-v0.xml";

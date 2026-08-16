@@ -239,6 +239,17 @@ class RealFirefox(IntegrationTest):
         re-verified without touching the network (`--verify-only`) -- the same
         two calls firefox_bringup.sh makes, so an unverifiable browser can
         never make a result here unattributable to a version.
+
+        `--verify-only` checks two different things (issue #298), and this
+        gate needs both. The tarball's sha256 says what was DOWNLOADED; the
+        unpacked tree's `application.ini` Version and BuildID say what is
+        INSTALLED -- and those diverged in practice, because Firefox ships an
+        updater that rewrites the unpacked tree in place while leaving the
+        tarball alone. On the development machine it did so on 2026-07-22:
+        the browser this method resolved was 140.13.0esr from that date until
+        2026-08-16, against a pin of 140.12.0esr, and neither `--verify-only`
+        nor anything in this file could tell. The frames were real and the
+        colour assertion was real; the version they were filed under was not.
         """
         fetch = FF_DIR / "fetch-esr.sh"
         printed = subprocess.run(

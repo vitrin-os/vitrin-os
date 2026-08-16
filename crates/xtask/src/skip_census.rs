@@ -96,6 +96,8 @@ use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context, Result};
 
+use crate::build_output::BuildOutput;
+
 /// One skip this repository has decided is legitimate.
 ///
 /// Every field is load-bearing. `class` and `test` are the key the runtime
@@ -873,8 +875,21 @@ fn last_word(text: &str) -> &str {
     &text[start..]
 }
 
-/// Every `.rs` file under `dir`, recursively.
-pub(crate) fn rust_sources(dir: &Path, root: &Path, out: &mut Vec<(String, String)>) -> Result<()> {
+/// Every `.rs` file under `dir`, recursively, except build output.
+///
+/// This skipped one directory NAME -- `target` -- until #295. That is the
+/// right rule stated in the wrong units: `fuzz/target/` is skipped because
+/// `.gitignore` says `**/target`, not because of the seven letters, and a
+/// meson build directory under a scanned root is named by whoever ran `meson
+/// setup`. Asking git covers both, and covers them with the same answer CI's
+/// checkout gives -- so a `#[test]` in a directory that will never exist in
+/// CI can no longer be demanded of a CI step.
+pub(crate) fn rust_sources(
+    dir: &Path,
+    root: &Path,
+    built: &BuildOutput,
+    out: &mut Vec<(String, String)>,
+) -> Result<()> {
     if !dir.is_dir() {
         return Ok(());
     }
@@ -884,12 +899,11 @@ pub(crate) fn rust_sources(dir: &Path, root: &Path, out: &mut Vec<(String, Strin
         .collect::<std::result::Result<_, _>>()?;
     entries.sort();
     for path in entries {
+        if built.covers(&path) {
+            continue;
+        }
         if path.is_dir() {
-            // `target/` is build output, never a source of truth.
-            if path.file_name().is_some_and(|n| n == "target") {
-                continue;
-            }
-            rust_sources(&path, root, out)?;
+            rust_sources(&path, root, built, out)?;
         } else if path.extension().is_some_and(|e| e == "rs") {
             let text = std::fs::read_to_string(&path)
                 .with_context(|| format!("reading {}", path.display()))?;
@@ -925,9 +939,10 @@ const SCANNED: &[&str] = &["crates", "fuzz"];
 /// cross-check without the subcommand.
 #[cfg(test)]
 pub(crate) fn files_with_tests(root: &Path) -> Result<BTreeSet<String>> {
+    let built = BuildOutput::of_tree(root)?;
     let mut sources = Vec::new();
     for dir in SCANNED {
-        rust_sources(&root.join(dir), root, &mut sources)?;
+        rust_sources(&root.join(dir), root, &built, &mut sources)?;
     }
     let mut out = BTreeSet::new();
     for (file, text) in &sources {
@@ -939,9 +954,13 @@ pub(crate) fn files_with_tests(root: &Path) -> Result<BTreeSet<String>> {
 }
 
 pub fn skip_scan(root: &Path) -> Result<()> {
+    // Once per scan; `check_test_coverage` below reads the same tree and asks
+    // git the same question, and the two answers have to agree or the
+    // cross-check between them reports a file rather than a defect.
+    let built = BuildOutput::of_tree(root)?;
     let mut sources = Vec::new();
     for dir in SCANNED {
-        rust_sources(&root.join(dir), root, &mut sources)?;
+        rust_sources(&root.join(dir), root, &built, &mut sources)?;
     }
     // A scan that found no sources would pass silently, which is the exact
     // failure this module exists to forbid.
@@ -1888,6 +1907,7 @@ fn census_text(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testtree::TestTree;
 
     /// The const-name mapping [`call_sites`] relies on, asserted rather than
     /// assumed: the scan reads `vitrin_skip::CONFINEMENT` out of a macro
@@ -1994,9 +2014,10 @@ fn f<'a>(x: &'a str) -> String {
         assert_eq!(mask_code(src).len(), src.len());
 
         let root = crate::workspace_root().expect("the workspace root");
+        let built = BuildOutput::of_tree(&root).expect("the workspace is a git work tree");
         let mut sources = Vec::new();
         for dir in SCANNED {
-            rust_sources(&root.join(dir), &root, &mut sources).expect("reading sources");
+            rust_sources(&root.join(dir), &root, &built, &mut sources).expect("reading sources");
         }
         assert!(sources.len() > 50, "found only {} sources", sources.len());
         for (file, text) in &sources {
@@ -2013,9 +2034,10 @@ fn f<'a>(x: &'a str) -> String {
     #[test]
     fn the_mask_preserves_every_line_of_every_source_in_the_tree() {
         let root = crate::workspace_root().expect("the workspace root");
+        let built = BuildOutput::of_tree(&root).expect("the workspace is a git work tree");
         let mut sources = Vec::new();
         for dir in SCANNED {
-            rust_sources(&root.join(dir), &root, &mut sources).expect("reading sources");
+            rust_sources(&root.join(dir), &root, &built, &mut sources).expect("reading sources");
         }
         assert!(
             sources.len() > 50,
@@ -2029,6 +2051,48 @@ fn f<'a>(x: &'a str) -> String {
                 "the mask lost a line in {file}"
             );
         }
+    }
+
+    /// **#295's shape, in the roots THIS scan walks.** The sibling gate's bug
+    /// was a walk over `shim/` that read `shim/build/`; the same walk here is
+    /// over `crates/` and `fuzz/`, and it skipped exactly one directory name.
+    ///
+    /// A `#[test]` in a directory CI will never check out cannot be run by a
+    /// CI step, so demanding one of it reports the developer's disk rather
+    /// than the repository -- and the census's cross-check would name the
+    /// file as unreachable-by-`mod`, which is a real defect class, so the
+    /// false report looks exactly like a true one.
+    ///
+    /// The build directory here is deliberately not called `target`: naming
+    /// it `builddir` is what a `meson setup` under a scanned root would do,
+    /// and the name check this replaced would have walked straight into it.
+    /// The tracked source beside it must still be read, or the scan has been
+    /// silenced rather than corrected.
+    #[test]
+    fn build_output_under_a_scanned_root_is_not_a_source() {
+        let tree = TestTree::new("skip-census-build-output");
+        tree.write(".gitignore", "builddir/\n");
+        tree.write(
+            "crates/vitrin-core/src/lib.rs",
+            "#[test]\nfn a_real_test() {}\n",
+        );
+        tree.write(
+            "crates/vitrin-core/builddir/sub/generated.rs",
+            "#[test]\nfn a_generated_test() {}\n",
+        );
+        tree.git_init();
+
+        let built = BuildOutput::of_tree(tree.path()).expect("a git work tree");
+        let mut sources = Vec::new();
+        rust_sources(
+            &tree.path().join("crates"),
+            tree.path(),
+            &built,
+            &mut sources,
+        )
+        .expect("reading sources");
+        let files: Vec<&str> = sources.iter().map(|(f, _)| f.as_str()).collect();
+        assert_eq!(files, ["crates/vitrin-core/src/lib.rs"]);
     }
 
     /// NON-VACUITY for the scan: a synthetic test body with a bare `return`

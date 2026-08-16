@@ -348,6 +348,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Result};
 
+use crate::build_output::BuildOutput;
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -600,6 +602,14 @@ const DECISIONS: &str = "docs/plan/20-decision-log.md";
 /// an [`Evidence::AbsentFrom`] check. `shim/subprojects/` is vendored wlroots,
 /// pixman, libxkbcommon and v4l-utils; every one of them mentions X11, touch
 /// and accessibility, and none of them is this project's code.
+///
+/// **This list is about provenance, not about tracking.** Every path in it
+/// happens also to be gitignored today, and [`BuildOutput`] would therefore
+/// skip it too -- but that is a coincidence of this tree, not the rule. A
+/// vendored tree that somebody checks in tomorrow is still not this project's
+/// code, and this list is what says so. The converse hole is the one #295
+/// reports: a build directory is not named here, cannot be, and needs git to
+/// find. Both skips, for two different reasons.
 const VENDORED: &[&str] = &["shim/subprojects", "target", "docs/book/book"];
 
 // ---------------------------------------------------------------------------
@@ -3384,6 +3394,8 @@ pub fn tracker_report(root: &Path) -> Result<()> {
 /// Run every claim and return one string per failure. Split out so the tests
 /// can drive a synthetic claim table without a process exit.
 pub fn run_claims(root: &Path, claims: &[Claim]) -> Result<Vec<String>> {
+    // Once per run, not once per root: every `AbsentFrom` below shares it.
+    let built = BuildOutput::of_tree(root)?;
     let mut failures = Vec::new();
     for claim in claims {
         // A claim with no evidence is decoration: it would pin a wording
@@ -3463,7 +3475,7 @@ pub fn run_claims(root: &Path, claims: &[Claim]) -> Result<Vec<String>> {
                 } => {
                     let mut hits = Vec::new();
                     for r in roots {
-                        collect_hits(root, &root.join(r), needle, &mut hits)?;
+                        collect_hits(root, &root.join(r), needle, &built, &mut hits)?;
                     }
                     if !hits.is_empty() {
                         hits.sort();
@@ -4628,9 +4640,23 @@ fn surface_list(claim: &Claim) -> String {
 }
 
 /// Every `path:line` under `dir` (or `dir` itself, if it is a file) whose text
-/// contains `needle`, skipping [`VENDORED`] trees and non-UTF-8 files.
-fn collect_hits(root: &Path, dir: &Path, needle: &str, out: &mut Vec<String>) -> Result<()> {
-    if is_vendored(root, dir) {
+/// contains `needle`, skipping [`VENDORED`] trees, `built` output and
+/// non-UTF-8 files.
+///
+/// The two skips are independent and both are load-bearing. [`VENDORED`] names
+/// third-party trees by path, so a vendored copy stays skipped even on the day
+/// somebody checks one in; [`BuildOutput`] asks git, so a build directory is
+/// skipped whatever it is called and wherever it appears. Neither implies the
+/// other, and dropping either one puts back a hit this gate has already
+/// reported once (issue #295).
+fn collect_hits(
+    root: &Path,
+    dir: &Path,
+    needle: &str,
+    built: &BuildOutput,
+    out: &mut Vec<String>,
+) -> Result<()> {
+    if is_vendored(root, dir) || built.covers(dir) {
         return Ok(());
     }
     let meta = match fs::metadata(dir) {
@@ -4647,11 +4673,11 @@ fn collect_hits(root: &Path, dir: &Path, needle: &str, out: &mut Vec<String>) ->
         .collect();
     entries.sort();
     for entry in entries {
-        if is_vendored(root, &entry) {
+        if is_vendored(root, &entry) || built.covers(&entry) {
             continue;
         }
         if entry.is_dir() {
-            collect_hits(root, &entry, needle, out)?;
+            collect_hits(root, &entry, needle, built, out)?;
         } else {
             scan_file(root, &entry, needle, out);
         }
@@ -4688,6 +4714,7 @@ fn is_vendored(root: &Path, path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testtree::TestTree;
 
     fn root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -5323,15 +5350,106 @@ mod tests {
     /// Vendored third-party trees never satisfy or break an absence check.
     /// Without this, `AbsentFrom` over `shim/` would fail on wlroots' own
     /// XWayland sources and the obvious repair would be to delete the check.
+    ///
+    /// # What #295 changed here
+    ///
+    /// The property is now stated as **every hit is a file this repository
+    /// tracks**, which is what "third-party trees do not answer questions
+    /// about this project's code" has always meant. The older form asserted
+    /// only that no hit contained the string `subprojects`, and #295 walked
+    /// straight past it: `shim/build/` is meson output, gitignored, with a
+    /// full copy of wlroots' generated XWayland sources inside it. The copy
+    /// under `shim/build/subprojects/` did contain the word, so the assertion
+    /// fired -- but only in a tree where the shim had been built, so CI never
+    /// saw it and the ~1500 other files of build output it walked would not
+    /// have tripped the old assertion at all.
+    ///
+    /// Non-emptiness is not decoration. A filter that excluded all of `shim/`
+    /// satisfies every other line of this test, and would silence every
+    /// absence check that names a root under it.
     #[test]
     fn vendored_trees_are_skipped() {
         let root = root();
+        let built = BuildOutput::of_tree(&root).expect("the workspace is a git work tree");
         let mut hits = Vec::new();
-        collect_hits(&root, &root.join("shim"), "xwayland", &mut hits).expect("shim exists");
+        collect_hits(&root, &root.join("shim"), "xwayland", &built, &mut hits)
+            .expect("shim exists");
         assert!(
-            hits.iter().all(|h| !h.contains("subprojects")),
-            "vendored hits leaked: {hits:?}"
+            !hits.is_empty(),
+            "not one hit under shim/ for a string the shim's own build file contains: this walk \
+             is reading nothing, and every absence check over shim/ now passes vacuously"
         );
+        let tracked = tracked_files(&root, "shim");
+        for hit in &hits {
+            let file = hit.rsplit_once(':').expect("hits are path:line").0;
+            assert!(
+                tracked.contains(file),
+                "{hit} is not tracked by git, so it is not this repository's own text and \
+                 cannot answer a question about it.\n    All hits: {hits:?}"
+            );
+        }
+    }
+
+    /// **The built-tree lever for [`collect_hits`], constructed rather than
+    /// found.** #295 reproduces only where somebody has run `meson setup`, so
+    /// held against the shipped tree alone the skip above is exercised on one
+    /// developer's machine and is vacuous everywhere else -- which is the
+    /// exact shape of the bug: green in CI for months.
+    ///
+    /// The layout is the real one in miniature, and each of the two skips is
+    /// the only thing that can catch its own file:
+    ///
+    /// * `shim/subprojects/wlroots/xwayland/` -- vendored source, untracked
+    ///   but **not** ignored in this tree, so only [`VENDORED`] skips it.
+    ///   This is the case the docstring above describes, and it must still be
+    ///   skipped after #295 or the fix weakened the guard instead of fixing
+    ///   the walk.
+    /// * `shim/build/subprojects/wlroots/protocol/` -- the same generated
+    ///   sources copied into a gitignored meson build directory, which no
+    ///   path list names, so only [`BuildOutput`] skips it.
+    /// * `shim/meson.build` -- the shim's own file, which really does say the
+    ///   word, and must still be found.
+    #[test]
+    fn neither_a_vendored_source_nor_build_output_answers_an_absence_check() {
+        let tree = TestTree::new("limits-absence");
+        tree.write(".gitignore", "/shim/build/\n");
+        tree.write("shim/meson.build", "# xwayland support is off\n");
+        tree.write(
+            "shim/subprojects/wlroots/xwayland/xwm.c",
+            "static void xwayland_surface_destroy(struct wlr_xwayland_surface *s) {}\n",
+        );
+        tree.write(
+            "shim/build/subprojects/wlroots/protocol/xwayland-shell-v1-protocol.c",
+            "static const struct wl_interface xwayland_shell_v1_interface = { 0 };\n",
+        );
+        tree.git_init();
+
+        let root = tree.path();
+        let built = BuildOutput::of_tree(root).expect("a git work tree");
+        let mut hits = Vec::new();
+        collect_hits(root, &root.join("shim"), "xwayland", &built, &mut hits).expect("shim exists");
+        assert_eq!(
+            hits,
+            ["shim/meson.build:1"],
+            "the shim's own file is the only hit this tree may produce"
+        );
+    }
+
+    /// The repository-relative paths git tracks under `dir`.
+    fn tracked_files(root: &Path, dir: &str) -> std::collections::BTreeSet<String> {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["ls-files", "-z", dir])
+            .output()
+            .expect("git is on PATH");
+        assert!(out.status.success(), "git ls-files {dir} failed");
+        let listing = String::from_utf8(out.stdout).expect("tracked paths are UTF-8");
+        listing
+            .split('\0')
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .collect()
     }
 
     // -----------------------------------------------------------------------

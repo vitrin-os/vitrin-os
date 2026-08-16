@@ -1592,16 +1592,22 @@ pub const CLAIMS: &[Claim] = &[
             },
             Evidence::Contains {
                 path: "crates/vitrin-core/src/spawn/isolation.rs",
-                needle: "pub const FLOOR: &[Mechanism] = &[Mechanism::Namespaces, \
-                         Mechanism::Landlock];",
+                needle: "pub const FLOOR: &[Mechanism] = &[\n    Mechanism::Namespaces,\n    \
+                         Mechanism::Landlock,\n    Mechanism::Seccomp,\n    \
+                         Mechanism::NoNewPrivs,\n];",
                 means: "Landlock is still a STARTUP GATE and not merely applied. This is the \
                         one row that decides whether the published requirement is true at all: \
                         take `Mechanism::Landlock` back out of `FLOOR` and every page above \
                         describes a refusal that no longer happens, which is the overclaiming \
-                        direction. It is pinned as the whole line rather than as \
+                        direction. It is pinned as the whole DECLARATION rather than as \
                         `Mechanism::Landlock`, which also appears in `APPLIED` -- a mechanism \
                         can be applied without gating startup, and that distinction is exactly \
-                        what this claim is about.",
+                        what this claim is about. The declaration grew from two entries to four \
+                        at P2.6.4 (#188), which is why this needle spans four lines: `FLOOR` now \
+                        equals `Report::tier`'s base predicate, and a needle that still named \
+                        two entries would have gone red on a move that made the published claim \
+                        MORE true rather than less. That is the correct behaviour -- the gate \
+                        asks for a re-read, and this comment is the re-read.",
             },
             Evidence::Contains {
                 path: "crates/vitrin-core/src/spawn/isolation.rs",
@@ -1944,8 +1950,12 @@ pub const CLAIMS: &[Claim] = &[
                distribution kernels booted under QEMU with the shipped binary -- and the \
                readings are KERNEL rows taken with no distribution policy loaded, so the number \
                of distributions measured as such is still one.",
-        issue: "#281 delivered it. P2.6.3's remaining gap is the seccomp filter (#187), which is \
-                a different sentence and must not be collapsed into this one.",
+        issue: "#281 delivered it. The seccomp filter that used to be named here as P2.6.3's \
+                remaining gap is #188, not #187 -- #187 is Landlock -- and it LANDED, so the \
+                sentence it belonged to is now the `seccomp-is-a-deny-list` claim below rather \
+                than a gap. Kept as a correction rather than deleted: this field is the \
+                provenance a reader follows, and a wrong issue number in it sends them to the \
+                wrong task.",
         // This row exists because of a drift that was live on `main` when #172
         // was implemented, and it is the cleanest instance of #172's thesis in
         // the repository. PR #294's doc sweep rewrote README.md,
@@ -2025,6 +2035,216 @@ pub const CLAIMS: &[Claim] = &[
             },
         ],
     },
+    Claim {
+        id: "seccomp-is-a-deny-list",
+        says: "The seccomp filter P2.6.4 installs is a DENY-LIST -- a named-class claim, never \
+               a completeness one. It closes the rows `vitrind --print-seccomp` prints and \
+               leaves the rest of the kernel's syscall surface UNENUMERATED, so a realm is \
+               filtered against a named list and is NOT syscall-confined.",
+        issue: "#188 (P2.6.4) landed it. The gap it closes -- `no seccomp filter` / `a realm is \
+                path-confined, not syscall-confined` -- was published on six surfaces before \
+                this row existed, which is exactly the shape #172 was written for: the sentence \
+                had to change on all six in one commit or two of them would still be saying a \
+                filter does not exist.",
+        // The anchor is the WORD, not the sentence. Every surface says
+        // `deny-list` because that word is the whole claim -- a reader who
+        // takes "seccomp filter" for "syscall-confined" has read a deny-list
+        // as an allow-list -- and pinning the word rather than a paragraph
+        // leaves each surface free to keep its own register, which the module
+        // docs above argue at length must not be forced to converge.
+        //
+        // TWO anchors per surface, and the second is not decoration: the first
+        // could be satisfied by a page that says `deny-list` while still
+        // claiming the realm is syscall-confined, so the second pins the
+        // NEGATION that makes the claim honest.
+        surfaces: &[
+            Anchor {
+                path: LIMITS,
+                needle: "it is a DENY-LIST",
+            },
+            Anchor {
+                path: LIMITS,
+                needle: "the residual surface is the kernel's whole surface minus",
+            },
+            Anchor {
+                path: README,
+                needle: "it is a **deny-list**",
+            },
+            Anchor {
+                path: README,
+                needle: "it is **not** syscall-confined",
+            },
+            Anchor {
+                path: SECURITY,
+                needle: "The syscall boundary is a DENY-LIST",
+            },
+            Anchor {
+                path: SECURITY,
+                needle: "but **not** syscall-confined",
+            },
+            Anchor {
+                path: SITE,
+                needle: "it is a\n      <strong>deny-list</strong>",
+            },
+            Anchor {
+                path: SITE,
+                needle: "filtered against a named list but not\n      syscall-confined",
+            },
+        ],
+        evidence: &[
+            Evidence::Contains {
+                path: "crates/vitrin-core/src/spawn/isolation.rs",
+                needle: "Mechanism::Seccomp,\n    Mechanism::NoNewPrivs,\n];",
+                means: "seccomp and no-new-privs are still STARTUP GATES and not merely \
+                        applied -- the tail of `FLOOR`'s declaration. Take them out and every \
+                        surface above describes a refusal that no longer happens, in the \
+                        overclaiming direction. Pinned as the tail of the declaration rather \
+                        than as `Mechanism::Seccomp`, which also appears in `APPLIED`: a \
+                        mechanism can be applied without gating startup, and that distinction \
+                        is what `--print-floor` prints two row families for.",
+            },
+            Evidence::Contains {
+                path: "crates/vitrin-realm-init/src/main.rs",
+                needle: "let filtered = seccomp::apply()",
+                means: "the helper still INSTALLS the filter before the shim's `execve`. This \
+                        is the row that decides whether the published sentence is true at all: \
+                        a `FLOOR` naming seccomp beside a helper that installs nothing would \
+                        refuse machines and confine none of them. The call site is inside \
+                        `exec_shim`, after Landlock and after `close_range`, because a filter \
+                        cannot be removed once installed.",
+            },
+            Evidence::Contains {
+                path: "crates/vitrin-realm-init/src/seccomp.rs",
+                needle: "pub enum EscapeClass {",
+                means: "every row still names its escape class through a CLOSED vocabulary \
+                        rather than a free-text field. #188 asks that `a lint or test asserts \
+                        no row has an empty class field`, and a non-empty string is trivially \
+                        satisfied by a row naming nothing real; the enum makes an unnamed class \
+                        unrepresentable and `every_class_label_is_in_the_prd` holds all eight \
+                        labels to `docs/PRD.md` verbatim.",
+            },
+            Evidence::Contains {
+                path: "tests/integration/test_real_seccomp.py",
+                needle: "reported NOT DEMONSTRATED rather than counted",
+                means: "the gate still runs a POSITIVE CONTROL per row and refuses to count a \
+                        row whose syscall already fails outside a realm. Without it the \
+                        published `13 rows` would be a count of denials rather than of \
+                        confinement, which is the overclaim `docs/plan/02-phase-2-semantic-\
+                        epochs.md` §4 names by name for the whole of M2.5.",
+            },
+            Evidence::AbsentFrom {
+                roots: &["crates/vitrin-realm-init/src", "crates/vitrin-core/src"],
+                // `SeccompRequest` and not the flag spelling `--seccomp=off`:
+                // the flag spelling appears in the PROSE of four files here
+                // that say the switch does not exist, so an absence check on it
+                // fires on its own documentation. `LandlockRequest` is exactly
+                // how this codebase spells a per-session confinement selector
+                // -- parsed from a flag, carried in `Config`, journaled as
+                // `requested` -- so the absence of the seccomp-shaped twin is
+                // the CODE form of "there is no off-switch", and it is a needle
+                // no comment has a reason to write.
+                needle: "SeccompRequest",
+                means: "there is still no way to run a session whose realms are unfiltered \
+                        while the journal reads as confined. Landlock has `--landlock=off` \
+                        because a kernel can lack Landlock entirely and an operator on such a \
+                        machine still needs a session; seccomp filter mode is present in every \
+                        kernel this build's floor admits, so the same flag here would only ever \
+                        be a way to publish confinement that was not applied. If this fires, a \
+                        selector was added and every surface above has to say what it does \
+                        before it ships.",
+            },
+        ],
+    },
+    Claim {
+        id: "kernel-matrix-rows-are-stale-in-their-build-half",
+        says: "the checked-in per-kernel boot rows are STALE IN THEIR BUILD HALF and pending \
+               re-collection -- they were taken before P2.6.4 put `seccomp` and `no-new-privs` \
+               into the startup floor, so every row's `--print-floor` section and startup line \
+               describe an older binary. Their KERNEL readings, and the admitted/refused split \
+               those readings decide, are unaffected. The difference is DETECTED by `cargo xtask \
+               kernel-matrix --check` rather than assumed.",
+        issue: "#281 built the row set and #188 is what moved the floor out from under it. \
+                Re-collection needs QEMU and was deferred by the owner on 2026-08-16, so this is \
+                a named, detected gap rather than a silence.",
+        // **The failure this row exists for is the one that already happened.**
+        // `cargo xtask kernel-matrix --check` passed green over rows whose
+        // `--print-floor` said the seccomp filter "is not applied by this
+        // build" on the very branch that applies it, because the check
+        // compared the PAGE against the ROWS and both were stale together. It
+        // is fixed in the generator; this row is what stops the *published
+        // sentences* about those rows from drifting apart from each other while
+        // the debt is outstanding, and -- the direction that matters more --
+        // what turns red on the day `collect.sh` finally runs, so four
+        // surfaces cannot go on describing a staleness that has been paid off.
+        //
+        // Two anchors per surface, on this file's standing rule: the first pins
+        // the ADMISSION, and a page could carry it while implying nobody would
+        // notice a further move, so the second pins the DETECTION.
+        surfaces: &[
+            Anchor {
+                path: LIMITS,
+                needle: "stale in their build half and pending re-collection",
+            },
+            Anchor {
+                path: LIMITS,
+                needle: "detected rather than merely written down",
+            },
+            Anchor {
+                path: README,
+                needle: "stale in their build half and pending re-collection",
+            },
+            Anchor {
+                path: README,
+                needle: "holds each row's own recorded\n  mechanism set to this build's",
+            },
+            Anchor {
+                path: SECURITY,
+                needle: "stale in their build half and pending re-collection",
+            },
+            Anchor {
+                path: SECURITY,
+                needle: "detects that difference rather than passing over it",
+            },
+            Anchor {
+                path: SITE,
+                needle: "stale in their build half and pending re-collection",
+            },
+            Anchor {
+                path: SITE,
+                needle: "rather than assumed, and re-collecting needs QEMU",
+            },
+        ],
+        evidence: &[
+            Evidence::Contains {
+                path: "crates/xtask/src/kernel_matrix.rs",
+                needle: "const ROWS_PREDATE_FLOOR: &[&str] = &[\"seccomp\", \"no-new-privs\"];",
+                means: "the acknowledged delta is still exactly these two mechanisms. This is \
+                        the row that decides whether the four sentences above are true: the \
+                        generator refuses ANY other difference between a row's recorded floor \
+                        and this build's, so if this constant changes, the published admission \
+                        names the wrong mechanisms -- and if it becomes `&[]`, the rows were \
+                        re-collected and all four surfaces are describing a debt that has been \
+                        paid.",
+            },
+            Evidence::Contains {
+                path: "crates/xtask/src/kernel_matrix.rs",
+                needle: "fn staleness(rows: &[Row], build: &BuildMechanisms) -> Result<Staleness>",
+                means: "the comparison still HAPPENS. Without it the admission above is a \
+                        sentence somebody typed, and the next floor move would republish the \
+                        rows as current exactly as P2.6.4's did -- `kernel-matrix --check` \
+                        compares the page against the rows, so it is blind to the two being \
+                        stale together.",
+            },
+            Evidence::Contains {
+                path: "docs/book/src/isolation-kernels.md",
+                needle: "STALE IN THEIR BUILD HALF",
+                means: "the page the four surfaces send a reader to still publishes the \
+                        staleness itself, generated from the measured delta rather than typed. \
+                        A limits entry that admits a gap while the cited page reads as current \
+                        is the drift this whole gate exists for, one link further out.",
+            },
+        ],
+    },
 ];
 
 // ---------------------------------------------------------------------------
@@ -2081,6 +2301,145 @@ pub const DERIVED: &[Derived] = &[
                 path: SITE,
                 render: floor_strong_in_this_build,
                 context: "</strong> in this build",
+            },
+            // A FIFTH surface, added at P2.6.4 because it had already rotted.
+            // Commit e7b5514 lowered the floor from 7 to 6 and moved the four
+            // renderings above; this one -- condition (4) of the Phase-2 plan's
+            // own `host-must-have-landlock` bullet -- kept saying **7** for a
+            // day, on the document `CLAUDE.md`'s `known-limit` rule sends
+            // whoever closes a limit to read.
+            //
+            // It is a NUMBER, not argued prose, which is why adding it here
+            // does not cross the line this module's docs draw against
+            // anchoring the two registers to each other: the plan document and
+            // the limits page may say the same thing in different words, and
+            // may not say different NUMBERS. The `Anchor` warning above is
+            // about phrases; `Derived` exists for exactly this.
+            Rendering {
+                path: "docs/plan/02-phase-2-semantic-epochs.md",
+                render: floor_bold_paren,
+                context: "`build.landlock_min_abi` (**",
+            },
+        ],
+    },
+    Derived {
+        id: "seccomp-deny-list-rows",
+        says: "how many rows the shipped seccomp deny-list holds. `deny-list` is a claim whose \
+               SIZE is half its meaning -- a reader is being told what the filter does NOT \
+               cover -- so six surfaces state the number, and nothing but this row holds them \
+               to the table.",
+        issue: "#188 (P2.6.4). #172 is why it is a `Derived` and not six literals: adding a \
+                fourteenth row would otherwise leave six pages saying thirteen and no build \
+                would be red.",
+        // The canonical source is a LITERAL in the crate that owns the table,
+        // and `the_published_row_count_is_the_tables_own` holds that literal to
+        // `ROWS.len()`. Two steps rather than one because this gate reads text
+        // and cannot evaluate `len()`; the in-crate test is what stops the
+        // literal from being the lie instead.
+        source: Source::File {
+            path: "crates/vitrin-realm-init/src/seccomp.rs",
+            reads: &[Read {
+                after: "pub const ROW_COUNT: usize = ",
+                shape: Shape::Digits,
+            }],
+        },
+        // One register on all six, which is unusual here and is a deliberate
+        // choice rather than a shortcut: `13 denied syscall rows` is a phrase
+        // no page had a reason to write before this row existed, so a single
+        // `context` identifies it everywhere without forcing any page to give
+        // up its own voice around it. The limits page and README each say it
+        // more than once; `scan_surface` holds every occurrence, so a page
+        // cannot update one mention and leave the other behind.
+        renderings: &[
+            Rendering {
+                path: LIMITS,
+                render: seccomp_rows,
+                context: "denied syscall rows",
+            },
+            Rendering {
+                path: README,
+                render: seccomp_rows,
+                context: "denied syscall rows",
+            },
+            Rendering {
+                path: SECURITY,
+                render: seccomp_rows,
+                context: "denied syscall rows",
+            },
+            Rendering {
+                path: SITE,
+                render: seccomp_rows,
+                context: "denied syscall rows",
+            },
+            Rendering {
+                path: "examples/realm.toml",
+                render: seccomp_rows,
+                context: "denied syscall rows",
+            },
+            Rendering {
+                path: "docs/plan/02-phase-2-semantic-epochs.md",
+                render: seccomp_rows,
+                context: "denied syscall rows",
+            },
+        ],
+    },
+    Derived {
+        id: "seccomp-rows-demonstrated",
+        says: "how many of the deny-list's rows were DEMONSTRATED against a positive control on \
+               the kernel the published measurement was taken on. The row count says how much \
+               the filter denies; this says how much of that denial is confinement the filter \
+               ADDS on a real machine, which is the honest half and the one three surfaces \
+               state in the same breath.",
+        issue: "#188 (P2.6.4) measured it. It is a `Derived` because it was a word -- `Eleven` \
+                -- on three surfaces and a literal nowhere, so it could rot in silence while \
+                `seccomp-deny-list-rows` held the 13 beside it to the table.",
+        // **The canonical source is the file that PRODUCED the measurement.**
+        // Not the filter table: which rows have a working positive control is
+        // a property of the kernel's sysctls, not of the table, so a build
+        // constant would be the wrong kind of thing. Not one of the three
+        // published pages either -- deriving a page from a page is circular.
+        // `tests/integration/test_real_seccomp.py` is the gate that runs the
+        // control, and the constant there carries the machine and the date.
+        //
+        // Two checks stand behind it, and neither alone is enough. This one
+        // holds three pages to the constant; the gate's own
+        // `test_the_published_demonstration_figure_still_describes_this_table`
+        // holds the constant to the SHIPPED TABLE -- eleven demonstrated plus
+        // two named as shadowed must be the whole row set -- so a fourteenth
+        // row makes the figure red instead of leaving three pages saying
+        // `11 of the 13` beside a sentence saying `14 denied syscall rows`.
+        source: Source::File {
+            path: "tests/integration/test_real_seccomp.py",
+            reads: &[Read {
+                after: "\nPUBLISHED_DEMONSTRATED = ",
+                shape: Shape::Digits,
+            }],
+        },
+        // The `13` inside each context is deliberate and is NOT a second copy
+        // of the row count getting in through the back door: it is part of the
+        // register that identifies this sentence, and if the table ever grows
+        // the context stops matching and this row goes red -- which is the
+        // correct outcome, because a changed table means the measurement has
+        // to be re-taken rather than re-worded.
+        renderings: &[
+            Rendering {
+                path: README,
+                render: rows_demonstrated,
+                context: " of the 13 denied syscall rows are demonstrated",
+            },
+            Rendering {
+                path: SECURITY,
+                render: rows_demonstrated,
+                context: " of the 13 denied syscall rows are demonstrated",
+            },
+            // The limits page shouts the verb, and the case is what tells its
+            // sentence apart from the other two rather than a style choice --
+            // `normalize` does not fold case, so one shared context would
+            // simply not match here.
+            Rendering {
+                path: LIMITS,
+                render: rows_demonstrated_shouted,
+                context: " of the 13 denied syscall rows are DEMONSTRATED",
             },
         ],
     },
@@ -2533,6 +2892,17 @@ pub const COVERED_CLAIMS: &[&str] = &[
     "spdx-coverage-not-machine-checked",
     "dco-is-executed",
     "per-kernel-isolation-matrix-exists",
+    // #188's, and the sixth surface-set this gate holds: the published gap
+    // "a realm is path-confined, not syscall-confined" CHANGED rather than
+    // closed, which is the case a `known-limit` sweep is most likely to do
+    // on half its surfaces.
+    "seccomp-is-a-deny-list",
+    // #188's second, and the only claim here whose subject is this
+    // repository's own MEASUREMENTS going stale rather than its prose. It is
+    // on the roll so the admission cannot be quietly dropped from a surface
+    // while the debt is still outstanding -- and so it goes red on the day the
+    // debt is paid.
+    "kernel-matrix-rows-are-stale-in-their-build-half",
 ];
 
 /// Every derived value this gate covers. Same contract as [`COVERED_CLAIMS`],
@@ -2545,6 +2915,15 @@ pub const COVERED_DERIVED: &[&str] = &[
     "wlcs-version",
     "apparmor-green-run-kernel",
     "kernels-measured",
+    // #188's. Six surfaces, one number, and the number is the size of a
+    // deny-list -- which is the half of "deny-list" a reader is actually
+    // being told.
+    "seccomp-deny-list-rows",
+    // #188's second, and the only derived value here that is a MEASUREMENT
+    // rather than a build constant: how much of that deny-list is confinement
+    // the filter adds on a real kernel. It was spelled as an English word on
+    // three surfaces and existed as a literal nowhere.
+    "seccomp-rows-demonstrated",
 ];
 
 /// Every code-to-code mirror this gate covers. Same contract as
@@ -2642,6 +3021,30 @@ fn floor_bold_here(v: &[String]) -> String {
 /// `docs/book/src/limits.md`: "... **6** in this build ...".
 fn floor_bold_in_this(v: &[String]) -> String {
     format!("**{}** in this", v[0])
+}
+
+/// All six surfaces that state the deny-list's size: "... 13 denied syscall
+/// rows ...".
+fn seccomp_rows(v: &[String]) -> String {
+    format!("{} denied syscall rows", v[0])
+}
+
+/// `README.md` and `SECURITY.md`: "... 11 of the 13 denied syscall rows are
+/// demonstrated against a positive control ...".
+fn rows_demonstrated(v: &[String]) -> String {
+    format!("{} of the 13 denied syscall rows are demonstrated", v[0])
+}
+
+/// `docs/book/src/limits.md`, which shouts the verb: "... **11 of the 13
+/// denied syscall rows are DEMONSTRATED on the kernel ...".
+fn rows_demonstrated_shouted(v: &[String]) -> String {
+    format!("{} of the 13 denied syscall rows are DEMONSTRATED", v[0])
+}
+
+/// `docs/plan/02-phase-2-semantic-epochs.md`: "... `build.landlock_min_abi`
+/// (**6**), and ...".
+fn floor_bold_paren(v: &[String]) -> String {
+    format!("`build.landlock_min_abi` (**{}**)", v[0])
 }
 
 /// `site/index.html`. Short and tag-free past the one element it owns, so

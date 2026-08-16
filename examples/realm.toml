@@ -325,10 +325,22 @@ command = "/usr/bin/foot"
 # kernel -- it states what THIS BUILD requires -- so treat every per-rung
 # BEHAVIOURAL claim about this ruleset as prose measured once on one box.
 #
-# Still absent, and this is the half that matters most: NO seccomp filter
-# (P2.6.4). A realm can issue any syscall it likes; Landlock gates filesystem
-# operations, not syscalls in general. Treat it as FILESYSTEM-confined and not
-# SYSCALL-confined. Three things also survive: the invoking user's
+# Since P2.6.4 there IS a seccomp filter, and it is a DENY-LIST -- which is a
+# named-class claim and never a completeness one. It closes the
+# 13 denied syscall rows that `vitrind --print-seccomp` prints, each naming
+# the PRD Doc 2 section 15 escape class it answers and the errno it returns,
+# and leaves the rest of the kernel's syscall surface UNENUMERATED. Treat a
+# realm as FILESYSTEM-confined and FILTERED AGAINST A NAMED LIST, and not
+# SYSCALL-confined. Two costs are stated rather than implied: a realm cannot
+# execute a 32-bit binary on a 64-bit host (syscall numbers are per-ABI and a
+# foreign ABI is killed rather than passed unfiltered), and the `ptrace` row
+# breaks the pinned Firefox's crash reporter -- a path
+# `tests/integration/test_real_firefox.py` does not exercise, so its green
+# tick is not evidence for that row. There is no `--seccomp=off`: a kernel
+# that cannot accept a filter refuses the session instead of running one
+# unfiltered.
+#
+# Three things also survive the namespaces: the invoking user's
 # supplementary groups (the kernel gives no window to drop them -- see
 # D-037(5)), a read-write GPU render node, and anything a `binds` key below
 # hands over.
@@ -349,7 +361,8 @@ command = "/usr/bin/foot"
 # what it starts: a launch grant is authority to start a process confined
 # exactly as much as this session is -- which at `--isolation=off` means an
 # UNCONFINED one with the core's own uid and filesystem view, and at `default`
-# means one that is path-confined and not syscall-confined. What bounds it is
+# means one that is path-confined and filtered against a named list of thirteen
+# syscalls, which is not the same as syscall-confined. What bounds it is
 # who holds the
 # grant (a human approved it, naming this template's program on the card), how
 # long (expiry, revocation), how often (max_event_rate) and how many

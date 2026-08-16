@@ -60,7 +60,10 @@ kernel. P2.6.3 is nevertheless **not finished**: that matrix probes nothing, so
 it is a table about the build rather than about kernels; the per-kernel one its
 criteria ask for does not exist; and the ABI floor that replaced the
 degradation ladder narrowed the task rather than finishing it. But there is
-still **no seccomp filter**, so the realm is filesystem-confined and not
+since P2.6.4 a **seccomp deny-list** rather than a syscall boundary: it closes
+the 13 rows `vitrind --print-seccomp` prints and leaves the rest of the
+kernel's syscall surface unenumerated, so the realm is filesystem-confined and
+filtered against a named list and not
 syscall-confined, and it keeps the invoking user's supplementary groups. Environment hygiene confines
 the well-behaved; it does not contain the hostile.
 

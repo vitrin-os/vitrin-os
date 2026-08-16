@@ -50,7 +50,43 @@
 //!    row and the constant are two independent witnesses and the page prints
 //!    both, so they are held to each other rather than averaged;
 //! 4. a row missing any cell the table prints, or missing its provenance —
-//!    an empty cell rendered into a published table reads as a fact.
+//!    an empty cell rendered into a published table reads as a fact;
+//! 5. a row whose recorded **floor mechanism set** differs from this build's by
+//!    anything other than the one acknowledged, named delta — see below.
+//!
+//! # The staleness this file could not see, and now can
+//!
+//! Refusal (2) above holds each row's `build.landlock_min_abi` to this tree's.
+//! That is one number out of the whole build half of a row, and P2.6.4 (#188)
+//! walked straight through the gap it left: the floor grew from
+//! `{namespaces, landlock}` to `{namespaces, landlock, seccomp, no-new-privs}`,
+//! every checked-in row went on saying `applies.seccomp=not-yet` and carrying a
+//! startup line that ends *“the seccomp filter (P2.6.4) is not applied by this
+//! build”* — and `cargo xtask kernel-matrix --check` **passed**, because it
+//! compares the page against the rows and both were stale together. It never
+//! re-boots, so it had no witness to the build the rows were taken against
+//! except the one number it already read.
+//!
+//! The rows always carried the rest of that witness: `--print-floor`'s
+//! `floor.mechanism=` lines and `applies.*` rows are in every row file,
+//! verbatim. [`BuildMechanisms::from_source`] reads the same two sets out of the
+//! crate that declares them, and [`validate`] holds one to the other. The
+//! difference is then **acknowledged rather than tolerated**:
+//! [`ROWS_PREDATE_FLOOR`] and [`ROWS_PREDATE_APPLIED`] name exactly which
+//! mechanisms entered this build after the rows were collected, so
+//!
+//! * a delta equal to the acknowledgement renders — and the page publishes the
+//!   rows as **stale pending re-collection**, naming the moved mechanisms, in a
+//!   paragraph generated from the computed difference rather than typed;
+//! * **any other delta is red**, in either direction, naming what moved and
+//!   asking for a re-collection. A sixth mechanism, or a floor move that undid
+//!   one of these two, does not get the benefit of an acknowledgement written
+//!   for something else.
+//!
+//! Re-collecting needs QEMU and is deferred (owner's call, 2026-08-16), so this
+//! converts a blocked dependency into a **named, detected gap** rather than a
+//! silence. What it does not do is make the rows current: nothing here re-boots
+//! a kernel, and the acknowledgement is a record of a debt, not a payment.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -68,6 +104,42 @@ const MANIFEST: &str = "tests/kernel-matrix/kernels.manifest";
 const PAGE: &str = "docs/book/src/isolation-kernels.md";
 /// Where the floor constant is declared.
 const REALM_INIT_LIB_RS: &str = "crates/vitrin-realm-init/src/lib.rs";
+/// Where the floor's *mechanism set* is declared, and the source of the
+/// `floor.mechanism=` and `applies.*` rows every row file carries.
+const CORE_ISOLATION_RS: &str = "crates/vitrin-core/src/spawn/isolation.rs";
+
+/// **The build-half staleness the checked-in rows carry, in the FLOOR.**
+///
+/// Every mechanism named here is one this build **gates startup on** and no row
+/// was collected under. It is an acknowledgement, not a permission: the page
+/// publishes each of these by name as a reason the rows are stale, and
+/// [`validate`] goes red the moment the real delta is anything else.
+///
+/// Provenance: the rows were collected on 2026-08-15 against a build whose
+/// floor was `{namespaces, landlock}`. P2.6.4 ([#188]) added both entries below
+/// on 2026-08-16. Re-collecting means re-booting five kernels under QEMU, which
+/// the owner deferred on the same day (`qemu-system-x86` is not installed and
+/// installing it needs a password nobody was at the keyboard for), so the debt
+/// is recorded here and published on the page rather than left as a silence.
+///
+/// **To clear it**: run `tests/kernel-matrix/collect.sh`, then set this to
+/// `&[]`. The empty case is a real branch — [`render`] prints a
+/// rows-are-current paragraph instead of the stale banner, and
+/// [`the_stale_banner_and_the_current_banner_are_both_reachable`] renders both.
+///
+/// [#188]: https://github.com/vitrin-os/vitrin-os/issues/188
+const ROWS_PREDATE_FLOOR: &[&str] = &["seccomp", "no-new-privs"];
+
+/// **The same staleness in what the build APPLIES**, which is a different set.
+///
+/// `no-new-privs` is deliberately absent: `vitrin-realm-init` set
+/// `PR_SET_NO_NEW_PRIVS` on every confined spawn long before #188, so the rows
+/// already read `applies.no-new-privs=yes`. It was not a *gate* until #188,
+/// which is exactly why `--print-floor` prints two row families and why this
+/// gate compares both — a build that started applying a mechanism without
+/// gating it would move one set and not the other, and one constant could not
+/// tell the difference.
+const ROWS_PREDATE_APPLIED: &[&str] = &["seccomp"];
 
 /// What a kernel is in the set FOR.
 ///
@@ -133,6 +205,134 @@ const KERNELS: &[KernelNote] = &[
     },
 ];
 
+/// This build's two mechanism sets, read out of the crate that declares them.
+///
+/// **Parsed, never transcribed**, for the reason [`Constants::from_source`]
+/// gives about the floor number: a second copy of a set is a second thing to
+/// keep true, and the whole point of this check is that moving the declaration
+/// makes the checked-in rows stale.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildMechanisms {
+    /// `vitrin_core::spawn::isolation::FLOOR`, in its wire spellings — what
+    /// this build **refuses to start without**, and what `--print-floor` emits
+    /// as `floor.mechanism=` lines.
+    floor: Vec<String>,
+    /// `vitrin_core::spawn::isolation::APPLIED` — what this build applies to a
+    /// confined realm, gate or not, and what `--print-floor` emits as
+    /// `applies.<name>=yes`.
+    applied: Vec<String>,
+}
+
+impl BuildMechanisms {
+    /// Read `FLOOR`, `APPLIED` and the `Display` spellings out of
+    /// [`CORE_ISOLATION_RS`].
+    ///
+    /// The spellings are parsed too, rather than mapped here from variant
+    /// names: the row files carry the **wire** spelling (`no-new-privs`, not
+    /// `NoNewPrivs`), and a hand-written mapping in this file would be a third
+    /// copy that could disagree with the `Display` impl the binary actually
+    /// prints through.
+    pub fn from_source(isolation_rs: &str) -> Result<BuildMechanisms> {
+        let spellings = mechanism_spellings(isolation_rs)?;
+        let read = |name: &str| -> Result<Vec<String>> {
+            let variants = mechanism_list(isolation_rs, name)?;
+            variants
+                .iter()
+                .map(|variant| {
+                    spellings.get(variant).cloned().with_context(|| {
+                        format!(
+                            "kernel-matrix: `{name}` names `Mechanism::{variant}` and the \
+                             `Display` impl in {CORE_ISOLATION_RS} gives it no wire spelling. \
+                             The row files record the wire spelling, so a variant this cannot \
+                             name is a mechanism this check would silently skip."
+                        )
+                    })
+                })
+                .collect()
+        };
+        Ok(BuildMechanisms {
+            floor: read("FLOOR")?,
+            applied: read("APPLIED")?,
+        })
+    }
+}
+
+/// `Mechanism::Namespaces => write!(f, "namespaces"),` → `Namespaces` →
+/// `namespaces`.
+fn mechanism_spellings(src: &str) -> Result<BTreeMap<String, String>> {
+    let body = src
+        .split_once("impl fmt::Display for Mechanism {")
+        .map(|(_, rest)| rest)
+        .and_then(|rest| rest.split_once("\n}\n"))
+        .map(|(body, _)| body)
+        .with_context(|| {
+            format!(
+                "kernel-matrix: {CORE_ISOLATION_RS} no longer carries an `impl fmt::Display for \
+                 Mechanism` this parser can find. That impl is what turns a variant into the \
+                 `floor.mechanism=` spelling every row file records, so without it this check \
+                 cannot compare a row to the build and refuses to guess."
+            )
+        })?;
+    let mut out = BTreeMap::new();
+    for line in body.lines() {
+        let Some((_, rest)) = line.split_once("Mechanism::") else {
+            continue;
+        };
+        let Some((variant, rest)) = rest.split_once(" => write!(f, \"") else {
+            continue;
+        };
+        let Some((spelling, _)) = rest.split_once('"') else {
+            continue;
+        };
+        out.insert(variant.to_string(), spelling.to_string());
+    }
+    if out.is_empty() {
+        bail!(
+            "kernel-matrix: the `Display` impl in {CORE_ISOLATION_RS} yielded no \
+             `Mechanism::X => write!(f, \"y\")` arms. Refusing to compare a row's recorded floor \
+             against an empty vocabulary, which would call every row current."
+        );
+    }
+    Ok(out)
+}
+
+/// The `Mechanism::X` variants of `pub const NAME: &[Mechanism] = &[...];`, in
+/// declaration order.
+fn mechanism_list(src: &str, name: &str) -> Result<Vec<String>> {
+    let head = format!("pub const {name}: &[Mechanism] = &[");
+    let body = src
+        .split_once(head.as_str())
+        .map(|(_, rest)| rest)
+        .and_then(|rest| rest.split_once("];"))
+        .map(|(body, _)| body)
+        .with_context(|| {
+            format!(
+                "kernel-matrix: could not read `{head}...];` from {CORE_ISOLATION_RS}. That \
+                 declaration is what `vitrind --print-floor` renders, and every checked-in row \
+                 holds a copy of what it printed on the collection date; without it this check \
+                 cannot tell a current row from a stale one."
+            )
+        })?;
+    let mut out = Vec::new();
+    for piece in body.split("Mechanism::").skip(1) {
+        let variant: String = piece
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if !variant.is_empty() && !out.contains(&variant) {
+            out.push(variant);
+        }
+    }
+    if out.is_empty() {
+        bail!(
+            "kernel-matrix: `{name}` in {CORE_ISOLATION_RS} declares no mechanisms. An empty \
+             floor is a build that gates on nothing, and this generator will not publish a \
+             per-kernel table describing one."
+        );
+    }
+    Ok(out)
+}
+
 /// One parsed row file.
 struct Row {
     id: String,
@@ -153,8 +353,18 @@ struct Row {
     /// `--print-isolation`'s key=value lines.
     isolation: BTreeMap<String, String>,
     /// `--print-floor`'s key=value lines. `floor.mechanism` repeats, so only
-    /// the single-valued keys this page reads are kept.
+    /// the single-valued keys this page reads are kept -- the repeating one is
+    /// [`Row::floor_mechanisms`].
     floor: BTreeMap<String, String>,
+    /// **Every** `floor.mechanism=` line of the row, in the order the collected
+    /// binary printed them.
+    ///
+    /// This is the row's own record of the build it was taken against, and the
+    /// witness [`validate`] holds to [`BuildMechanisms::floor`]. It is kept as
+    /// a list rather than folded into [`Row::floor`] because that map is
+    /// last-wins, which for a repeating key means every reading but one was
+    /// thrown away -- and the whole set is the fact.
+    floor_mechanisms: Vec<String>,
     /// `admitted` or `refused`, as the collector classified the startup phase.
     verdict: String,
     /// The startup line itself, verbatim.
@@ -255,12 +465,26 @@ fn parse_row(id: &str, text: &str) -> Result<Row> {
             )
         })?;
     let isolation = kv(&isolation_lines);
-    let floor = kv(&section(text, "--- vitrind --print-floor ---"));
+    let floor_lines = section(text, "--- vitrind --print-floor ---");
+    let floor_mechanisms: Vec<String> = floor_lines
+        .iter()
+        .filter_map(|line| line.strip_prefix("floor.mechanism="))
+        .map(str::to_string)
+        .collect();
+    let floor = kv(&floor_lines);
     if isolation.is_empty() {
         bail!("kernel-matrix: {id}.row holds no `--print-isolation` section");
     }
     if floor.is_empty() {
         bail!("kernel-matrix: {id}.row holds no `--print-floor` section");
+    }
+    if floor_mechanisms.is_empty() {
+        bail!(
+            "kernel-matrix: {id}.row's `--print-floor` section carries no `floor.mechanism=` \
+             line. That set is the row's own record of the build it was collected against, and \
+             the only witness this generator has to whether the row is stale in its build half. \
+             A row without it would be compared against nothing and published as current."
+        );
     }
 
     let startup = section(
@@ -299,6 +523,7 @@ fn parse_row(id: &str, text: &str) -> Result<Row> {
         schema,
         isolation,
         floor,
+        floor_mechanisms,
         verdict,
         verdict_line,
     })
@@ -350,6 +575,138 @@ fn load_rows(root: &Path) -> Result<Vec<Row>> {
         rows.push(parse_row(note.id, &text)?);
     }
     Ok(rows)
+}
+
+/// What moved in the build since the rows were collected, computed rather than
+/// asserted, and rendered onto the page.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Staleness {
+    /// Mechanisms this build **gates startup on** that no row was collected
+    /// under. Empty means the rows' floor is this build's floor.
+    floor: Vec<String>,
+    /// Mechanisms this build **applies** that no row was collected under.
+    applied: Vec<String>,
+    /// The distinct collection dates across the row set, sorted. Rendered so a
+    /// reader sees how old the stale half is without opening a row.
+    collected: Vec<String>,
+}
+
+impl Staleness {
+    fn is_current(&self) -> bool {
+        self.floor.is_empty() && self.applied.is_empty()
+    }
+}
+
+/// Everything in `build` that `row` does not have, in `build` order.
+fn missing(build: &[String], row: &[String]) -> Vec<String> {
+    build.iter().filter(|m| !row.contains(m)).cloned().collect()
+}
+
+/// The mechanisms a row records as **applied**, from its `applies.<name>=yes`
+/// rows.
+fn row_applied(row: &Row) -> Vec<String> {
+    row.floor
+        .iter()
+        .filter(|(_, v)| v.as_str() == "yes")
+        .filter_map(|(k, _)| k.strip_prefix("applies.").map(str::to_string))
+        .collect()
+}
+
+/// Hold every row's recorded **build half** to this tree's, and acknowledge the
+/// one named difference.
+///
+/// See this module's docs for why this exists at all: `validate`'s
+/// `build.landlock_min_abi` check covers one number, and P2.6.4 moved the
+/// mechanism *sets* straight past it with every gate green.
+///
+/// Returns what moved, so [`render`] can publish it. Fails when the delta is
+/// anything other than [`ROWS_PREDATE_FLOOR`] / [`ROWS_PREDATE_APPLIED`] --
+/// including the direction nobody expects, a row naming a mechanism this build
+/// has stopped gating on.
+fn staleness(rows: &[Row], build: &BuildMechanisms) -> Result<Staleness> {
+    let mut out = Staleness::default();
+    for row in rows {
+        let row_applied = row_applied(row);
+
+        for (what, acknowledged, build_set, row_set) in [
+            (
+                "floor.mechanism",
+                ROWS_PREDATE_FLOOR,
+                &build.floor,
+                &row.floor_mechanisms,
+            ),
+            (
+                "applies",
+                ROWS_PREDATE_APPLIED,
+                &build.applied,
+                &row_applied,
+            ),
+        ] {
+            // The direction an acknowledgement can never cover: the row was
+            // taken under a build that did something this one does not.
+            let dropped = missing(row_set, build_set);
+            if !dropped.is_empty() {
+                bail!(
+                    "kernel-matrix: {}.row records `{what}` = {row_set:?} and this build's set \
+                     is {build_set:?}, so the row names {dropped:?}, which this build no longer \
+                     has. That is not staleness in the row -- a row can only be older than the \
+                     build, never newer -- so either the mechanism was removed from \
+                     {CORE_ISOLATION_RS} and the published page still describes it, or the row \
+                     was hand-edited. Neither is publishable: re-collect with \
+                     tests/kernel-matrix/collect.sh, or restore the mechanism.",
+                    row.id
+                );
+            }
+
+            let moved = missing(build_set, row_set);
+            let unacknowledged: Vec<&String> = moved
+                .iter()
+                .filter(|m| !acknowledged.contains(&m.as_str()))
+                .collect();
+            let stale_acknowledgement: Vec<&&str> = acknowledged
+                .iter()
+                .filter(|m| !moved.iter().any(|got| got == *m))
+                .collect();
+            if !unacknowledged.is_empty() || !stale_acknowledgement.is_empty() {
+                bail!(
+                    "kernel-matrix: THE CHECKED-IN ROWS MUST BE RE-COLLECTED. {}.row records \
+                     `{what}` = {row_set:?}; this build's set is {build_set:?}. What moved: \
+                     {moved:?}. The acknowledged, published staleness is {acknowledged:?} -- \
+                     {}{}This generator will not publish a table whose build half describes a \
+                     binary nobody ran. Either run tests/kernel-matrix/collect.sh (needs QEMU) \
+                     and re-render, or -- if the move is deliberate and re-collection is being \
+                     deferred again -- update the acknowledgement in \
+                     crates/xtask/src/kernel_matrix.rs so the page publishes the new delta by \
+                     name.",
+                    row.id,
+                    if unacknowledged.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{unacknowledged:?} moved and is NOT acknowledged. ")
+                    },
+                    if stale_acknowledgement.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            "{stale_acknowledgement:?} is acknowledged as stale and did NOT \
+                             move, so the page would publish a staleness that is not there. "
+                        )
+                    },
+                );
+            }
+            if what == "floor.mechanism" {
+                out.floor.clone_from(&moved);
+            } else {
+                out.applied.clone_from(&moved);
+            }
+        }
+
+        if !out.collected.contains(&row.collected) {
+            out.collected.push(row.collected.clone());
+        }
+    }
+    out.collected.sort();
+    Ok(out)
 }
 
 /// Hold every row to the build it was collected against, and to itself.
@@ -518,7 +875,98 @@ fn cross_validation(rows: &[Row]) -> Result<String> {
     Ok(table)
 }
 
-fn render(rows: &[Row], constants: &Constants, crossval: &str) -> String {
+/// The staleness paragraph, **generated from the computed delta**.
+///
+/// Typed prose is what this whole module exists to replace: the page carried a
+/// hand-written "these rows predate P2.6.4" paragraph for exactly as long as
+/// somebody remembered to write one, and nothing would have removed it when the
+/// rows were re-collected or extended it when the next mechanism landed. This
+/// renders from [`Staleness`], so the mechanism names on the page are the ones
+/// [`staleness`] measured and the paragraph disappears by itself the day
+/// `collect.sh` is run.
+fn staleness_banner(stale: &Staleness, build: &BuildMechanisms) -> String {
+    let list = |items: &[String]| -> String {
+        items
+            .iter()
+            .map(|m| format!("`{m}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let dates = stale.collected.join(", ");
+    let build_floor = list(&build.floor);
+
+    if stale.is_current() {
+        return format!(
+            "**The rows' build half is current.** Each was collected ({dates}) against a build \
+             whose startup floor was the same set this tree declares — {build_floor} — and \
+             `cargo xtask kernel-matrix --check` holds every row's own `floor.mechanism=` and \
+             `applies.*` lines to it. That check is cheap and re-boots nothing, so it says the \
+             rows describe THIS build and says nothing about whether these kernels still answer \
+             this way; `tests/kernel-matrix/collect.sh --check` is the only thing that re-takes \
+             that half.\n\n"
+        );
+    }
+
+    let mut p = String::new();
+    p.push_str(&format!(
+        "**These rows are STALE IN THEIR BUILD HALF, and pending re-collection.** They were \
+         collected ({dates}) against a build whose startup floor was {}. This tree's floor is \
+         {build_floor}",
+        list(&stale_floor_of(stale, build)),
+    ));
+    p.push_str(&format!(
+        ", so every row's `--print-floor` section and startup line describe a binary that did \
+         not gate on {} — and the `applies.` rows still read `not-yet` for {}, which this build \
+         prints `yes` for.\n\n",
+        list(&stale.floor),
+        list(&stale.applied),
+    ));
+    p.push_str(
+        "**What is still current is the half this page exists for.** The `landlock.abi`, `ns.*`, \
+         `mount.in_userns`, `policy.*` and `tier` readings are **kernel** facts: they are \
+         properties of the booted bytes and do not move when this repository changes. So the \
+         measured table below, the admitted/refused split and the cross-validation are \
+         unaffected. The `tier` column in particular: `intra-user` has always been defined as \
+         all four mechanisms, and these kernels' answers to all four are what the rows already \
+         carry. What is stale is every cell that describes the *binary* — the `--print-floor` \
+         provenance and the verbatim startup line under each provenance block. Note the \
+         direction: the old rows **understate** what this build refuses, so a reader following \
+         them would expect a session to start where it now might not.\n\n",
+    );
+    p.push_str(&format!(
+        "**This is detected, not merely written down.** `cargo xtask kernel-matrix --check` reads \
+         each row's recorded mechanism sets and holds them to the sets declared in \
+         `crates/vitrin-core/src/spawn/isolation.rs`. It passes today only because the difference \
+         is exactly the one acknowledged in `crates/xtask/src/kernel_matrix.rs` — \
+         `ROWS_PREDATE_FLOOR` names {{{}}} and `ROWS_PREDATE_APPLIED` names {{{}}} — and this \
+         paragraph is generated from that measured difference rather than typed, so it names \
+         what moved and cannot be left behind. Any further move goes RED and asks for a \
+         re-collection by name. Re-collecting means re-booting all five kernels under QEMU \
+         (`tests/kernel-matrix/collect.sh`), which no pull request runs; it is owed and is not \
+         done, and this is the record of that rather than a silence.\n\n",
+        list(&stale.floor),
+        list(&stale.applied),
+    ));
+    p
+}
+
+/// The floor the rows were collected under: this build's, minus what moved.
+fn stale_floor_of(stale: &Staleness, build: &BuildMechanisms) -> Vec<String> {
+    build
+        .floor
+        .iter()
+        .filter(|m| !stale.floor.contains(m))
+        .cloned()
+        .collect()
+}
+
+fn render(
+    rows: &[Row],
+    constants: &Constants,
+    crossval: &str,
+    stale: &Staleness,
+    build: &BuildMechanisms,
+) -> String {
     let mut p = String::new();
     let floor = constants.min_abi;
 
@@ -546,6 +994,7 @@ fn render(rows: &[Row], constants: &Constants, crossval: &str) -> String {
          build requires, this one says what these {n} kernels answered.\n\n",
         n = rows.len(),
     ));
+    p.push_str(&staleness_banner(stale, build));
 
     // ---------------------------------------------------------------- table
     p.push_str("## The measured table\n\n");
@@ -837,6 +1286,9 @@ pub fn kernel_matrix(root: &Path, check: bool) -> Result<()> {
     let lib_rs = fs::read_to_string(root.join(REALM_INIT_LIB_RS))
         .with_context(|| format!("kernel-matrix: reading {REALM_INIT_LIB_RS}"))?;
     let constants = Constants::from_source(&lib_rs)?;
+    let isolation_rs = fs::read_to_string(root.join(CORE_ISOLATION_RS))
+        .with_context(|| format!("kernel-matrix: reading {CORE_ISOLATION_RS}"))?;
+    let build = BuildMechanisms::from_source(&isolation_rs)?;
     let manifest = fs::read_to_string(root.join(MANIFEST))
         .with_context(|| format!("kernel-matrix: reading {MANIFEST}"))?;
 
@@ -848,9 +1300,10 @@ pub fn kernel_matrix(root: &Path, check: bool) -> Result<()> {
         );
     }
     validate(&rows, &constants, &manifest)?;
+    let stale = staleness(&rows, &build)?;
 
     let crossval = cross_validation(&rows)?;
-    let page = render(&rows, &constants, &crossval);
+    let page = render(&rows, &constants, &crossval, &stale, &build);
     let path = root.join(PAGE);
 
     if check {
@@ -869,6 +1322,21 @@ pub fn kernel_matrix(root: &Path, check: bool) -> Result<()> {
             "xtask: kernel-matrix --check: {PAGE} matches {} checked-in rows",
             rows.len()
         );
+        // Green, and NOT current. Printed at every `--check` so the debt is in
+        // front of whoever runs the command and not only in front of whoever
+        // reads the page -- a pass that says nothing is how this went unseen
+        // in the first place.
+        if !stale.is_current() {
+            eprintln!(
+                "xtask: kernel-matrix --check: the rows are STALE IN THEIR BUILD HALF and \
+                 pending re-collection. This build gates on {:?} and applies {:?} that no row \
+                 was collected under; the difference is the acknowledged one \
+                 (ROWS_PREDATE_FLOOR / ROWS_PREDATE_APPLIED in \
+                 crates/xtask/src/kernel_matrix.rs) and is published on {PAGE}. Clear it with \
+                 tests/kernel-matrix/collect.sh (needs QEMU).",
+                stale.floor, stale.applied,
+            );
+        }
     } else {
         fs::write(&path, &page).with_context(|| format!("kernel-matrix: writing {PAGE}"))?;
         eprintln!(
@@ -898,6 +1366,18 @@ mod tests {
         Constants::from_source(&lib_rs).expect("constants")
     }
 
+    fn build() -> BuildMechanisms {
+        let src = fs::read_to_string(root().join(CORE_ISOLATION_RS)).expect("isolation.rs");
+        BuildMechanisms::from_source(&src).expect("the build's mechanism sets")
+    }
+
+    fn page_of(rows: &[Row]) -> String {
+        let build = build();
+        let stale = staleness(rows, &build).expect("the checked-in rows must validate");
+        let crossval = cross_validation(rows).expect("the cross-validation row must render");
+        render(rows, &constants(), &crossval, &stale, &build)
+    }
+
     /// The checked-in page is what the checked-in rows render to.
     ///
     /// This is `--check` as a test, so a hand edit to the page is red in the
@@ -910,8 +1390,7 @@ mod tests {
             KERNELS.len(),
             "every KERNELS entry must have a row"
         );
-        let crossval = cross_validation(&rows).expect("the cross-validation row must render");
-        let page = render(&rows, &constants(), &crossval);
+        let page = page_of(&rows);
         let current = fs::read_to_string(root().join(PAGE)).expect("the page must exist");
         assert_eq!(
             current, page,
@@ -976,11 +1455,7 @@ mod tests {
         }
         // And the rendered page really carries them, so a cell that stopped
         // being emitted would not pass on the strength of the struct alone.
-        let page = render(
-            &rows,
-            &constants(),
-            &cross_validation(&rows).expect("cross-validation"),
-        );
+        let page = page_of(&rows);
         assert!(
             !page.contains('?'),
             "the page carries a placeholder: look for `?`"
@@ -1145,6 +1620,158 @@ mod tests {
             .landlock_abi()
             .expect_err("a row with no landlock.abi must not render");
         assert!(format!("{err:#}").contains("landlock.abi"), "got: {err:#}");
+    }
+
+    /// This build's two mechanism sets really parse out of the crate that
+    /// declares them, and are not empty or identical by accident.
+    #[test]
+    fn the_builds_mechanism_sets_are_read_from_the_crate_that_declares_them() {
+        let b = build();
+        assert!(
+            b.floor.contains(&"namespaces".to_string())
+                && b.floor.contains(&"landlock".to_string()),
+            "the floor parsed as {:?}, which is not this build's",
+            b.floor
+        );
+        assert!(!b.applied.is_empty(), "APPLIED parsed empty");
+        // The wire spellings, not the variant names -- the row files carry the
+        // former, and a parser that returned `NoNewPrivs` would compare two
+        // vocabularies and call every row stale.
+        for m in b.floor.iter().chain(b.applied.iter()) {
+            assert!(
+                m.chars().all(|c| c.is_ascii_lowercase() || c == '-') && !m.is_empty(),
+                "{m:?} is not a wire spelling; the Display impl is what row files record"
+            );
+        }
+        // FLOOR must be a subset of APPLIED -- a build that gates on something
+        // it does not apply refuses machines in exchange for nothing -- and the
+        // parse would be worthless if it silently returned the same list twice.
+        for m in &b.floor {
+            assert!(b.applied.contains(m), "{m} is gated and not applied");
+        }
+        // Non-vacuity for the two parsers: a source that declares neither is
+        // refused rather than read as an empty set.
+        assert!(BuildMechanisms::from_source("").is_err());
+        assert!(mechanism_list("pub const FLOOR: &[Mechanism] = &[];", "FLOOR").is_err());
+    }
+
+    /// **The staleness detector, levered in both directions.**
+    ///
+    /// The gap this closes was live and measured: `cargo xtask kernel-matrix
+    /// --check` passed over a floor that had grown by two mechanisms, because
+    /// it compared the PAGE to the ROWS and both were stale together. So the
+    /// assertions that matter here are the failures.
+    #[test]
+    fn a_build_half_that_moved_by_anything_but_the_acknowledgement_is_refused() {
+        let rows = load_rows(&root()).expect("rows");
+        let real = build();
+        let stale = staleness(&rows, &real).expect("the checked-in rows must be acknowledged");
+
+        // The acknowledgement describes the tree, exactly.
+        assert_eq!(
+            stale.floor,
+            ROWS_PREDATE_FLOOR
+                .iter()
+                .map(|m| m.to_string())
+                .collect::<Vec<_>>(),
+            "the measured floor delta and the published acknowledgement disagree"
+        );
+        assert_eq!(
+            stale.applied,
+            ROWS_PREDATE_APPLIED
+                .iter()
+                .map(|m| m.to_string())
+                .collect::<Vec<_>>()
+        );
+
+        // (1) A SIXTH mechanism enters the floor. Nobody acknowledged it, so
+        //     the rows must be re-collected and the check says so by name.
+        let mut grown = real.clone();
+        grown.floor.push("landlock-net".to_string());
+        grown.applied.push("landlock-net".to_string());
+        let err = staleness(&rows, &grown).expect_err("an unacknowledged floor move must be red");
+        let text = format!("{err}");
+        assert!(
+            text.contains("MUST BE RE-COLLECTED") && text.contains("landlock-net"),
+            "the failure must name what moved: {text}"
+        );
+
+        // (2) THE FLOOR MOVE IS REVERTED and the acknowledgement is not. The
+        //     page would then publish a staleness that is not there, which is
+        //     the same defect in the other direction, so it is red too.
+        let mut reverted = real.clone();
+        reverted.floor.retain(|m| m != "seccomp");
+        let err = staleness(&rows, &reverted)
+            .expect_err("an acknowledgement for a move that did not happen must be red");
+        assert!(format!("{err}").contains("did NOT move"), "got: {err}");
+
+        // (3) A row naming a mechanism this build no longer has. A row can only
+        //     be older than the build, never newer, so no acknowledgement
+        //     covers this.
+        let mut shrunk = real.clone();
+        shrunk.floor.retain(|m| m != "landlock");
+        shrunk.applied.retain(|m| m != "landlock");
+        let err = staleness(&rows, &shrunk).expect_err("a row newer than the build must be red");
+        assert!(
+            format!("{err}").contains("which this build no longer has"),
+            "got: {err}"
+        );
+    }
+
+    /// The page publishes the staleness, and publishes it by name.
+    ///
+    /// The banner is generated from the measured delta rather than typed, so
+    /// this asserts the mechanisms appear on the page -- the failure the whole
+    /// mechanism exists against is a stale row published as a current one.
+    #[test]
+    fn the_page_publishes_the_measured_staleness_by_name() {
+        let rows = load_rows(&root()).expect("rows");
+        let page = page_of(&rows);
+        assert!(
+            page.contains("STALE IN THEIR BUILD HALF"),
+            "the page does not say the rows are stale"
+        );
+        for mechanism in ROWS_PREDATE_FLOOR {
+            assert!(
+                page.contains(&format!("`{mechanism}`")),
+                "the page does not name `{mechanism}` as part of what moved"
+            );
+        }
+        assert!(
+            page.contains("tests/kernel-matrix/collect.sh"),
+            "the page must name the command that clears the debt"
+        );
+    }
+
+    /// **Both banners render**, so the stale one is a branch and not the only
+    /// text this generator can emit.
+    ///
+    /// Without this, `ROWS_PREDATE_FLOOR = &[]` -- the state the day somebody
+    /// runs `collect.sh` -- would be an unexercised path on the command that
+    /// re-renders a published page.
+    #[test]
+    fn the_stale_banner_and_the_current_banner_are_both_reachable() {
+        let b = build();
+        let stale = Staleness {
+            floor: vec!["seccomp".into()],
+            applied: vec!["seccomp".into()],
+            collected: vec!["2026-08-15".into()],
+        };
+        let current = Staleness {
+            floor: Vec::new(),
+            applied: Vec::new(),
+            collected: vec!["2026-08-15".into()],
+        };
+        assert!(!stale.is_current() && current.is_current());
+        let stale_text = staleness_banner(&stale, &b);
+        let current_text = staleness_banner(&current, &b);
+        assert!(stale_text.contains("STALE IN THEIR BUILD HALF"));
+        assert!(current_text.contains("build half is current"));
+        assert!(
+            !current_text.contains("STALE"),
+            "the current banner must not carry the stale one's words: {current_text}"
+        );
+        assert_ne!(stale_text, current_text);
     }
 
     /// The parser reads the fenced sections, and reads them as sections.

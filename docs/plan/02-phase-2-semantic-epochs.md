@@ -862,7 +862,7 @@ The limit set follows.
   `vitrind --print-isolation` answers all three as `landlock.abi=N` without
   spawning anything. **A fourth condition arrived with the ABI floor** (owner's
   decision, 2026-08-15, "P2.6.3, corrected" above): the reported ABI must be at
-  or above `build.landlock_min_abi` (**7**), and this is the one condition a
+  or above `build.landlock_min_abi` (**6**), and this is the one condition a
   correctly configured, working Landlock can still fail. Its remedy is different
   from the other three — nothing is misconfigured, no knob moves the number, the
   answer is a newer kernel — so the refusal renders as
@@ -887,5 +887,39 @@ The limit set follows.
   configurable kernel either: it builds no ruleset, so every published claim
   about the read set, the write set and the rung ladder stops applying to that
   session.
+
+- <!-- limit: seccomp-is-a-deny-list -->
+  **The seccomp filter is a deny-list, so "seccomp" here is a named-class claim
+  and never a completeness one.** P2.6.4 put `Mechanism::Seccomp` and
+  `Mechanism::NoNewPrivs` in `spawn/isolation.rs`'s `FLOOR` — the third and
+  last scheduled floor move, after which `FLOOR` *equals* `Report::tier`'s base
+  predicate — so a kernel without `CONFIG_SECCOMP_FILTER` now refuses
+  `--isolation=default`, and there is deliberately no `--seccomp=off` to waive
+  it with. What the filter closes is the row set `vitrind --print-seccomp`
+  prints; what it leaves open is everything else, **unenumerated**. An
+  allow-list is the right long-term shape and belongs to a phase that has a
+  measured syscall trace of the acceptance apps to build one from; built now it
+  would fail closed against Firefox, which is this project's own standing
+  acceptance app. Three things the plan must not let a later reader
+  over-read. **First**, of PRD Doc 2 §15's eight actor rows the filter answers
+  two (*Compromised shim*, *Malicious app in a shim*) and part of a third
+  (*Reachable-service lateral escape*) — and that third only at two services
+  §4.5's own enumeration missed, the kernel keyring and `AF_VSOCK`, both
+  measured reachable from inside a realm on 2026-08-16. §4.5's "there is simply
+  nothing to reach" sentence has been corrected in the PRD rather than left
+  standing. **Second**, whether a given row is *demonstrated* is a property of
+  the kernel and not of the table: `bpf` and `userfaultfd` are already denied by
+  `kernel.unprivileged_bpf_disabled` and `vm.unprivileged_userfaultfd` on a
+  hardened box, so `tests/integration/test_real_seccomp.py` runs a positive
+  control per row and reports those as *not demonstrated* rather than counting
+  them — 11 of the 13 denied syscall rows demonstrated on the box this was
+  measured on. **Third**, the
+  table costs two things that are published rather than implied: a realm cannot
+  execute a foreign-ABI (32-bit) binary, because syscall numbers are per-ABI and
+  the filter kills a foreign `arch` rather than passing it unfiltered; and the
+  `ptrace` row breaks the pinned Firefox's crash reporter, a path
+  `test_real_firefox.py` does not exercise because it sets
+  `MOZ_CRASHREPORTER_DISABLE=1` — so that gate's green tick is not evidence for
+  that row, and the limits page says so.
 
 <!-- limit-set: end -->

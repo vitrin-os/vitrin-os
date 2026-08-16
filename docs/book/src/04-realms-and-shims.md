@@ -130,10 +130,17 @@ without spawning anything.
 > — but P2.6.3 is **still not finished**: that table measures no kernel, the
 > per-kernel one its criteria ask for is not built, and the ABI floor narrowed
 > the task rather than closing it.
-> But there is still **no seccomp filter**, so the realm is
-> filesystem-confined and not syscall-confined. At `--isolation=off` none of it
+> Since P2.6.4 there is also a **seccomp deny-list**, installed immediately
+> before the shim's `execve` and inherited by every process the shim forks: it
+> closes the 13 rows `vitrind --print-seccomp` prints, each naming the escape
+> class it answers and the errno it returns, and leaves the rest of the
+> kernel's syscall surface unenumerated. So the realm is
+> filesystem-confined and filtered against a named list and not
+> syscall-confined. At `--isolation=off` none of it
 > applies and the paragraph below holds in full; `--landlock=off` turns off the
-> ruleset alone, and both say so in every journal entry.
+> ruleset alone, and both say so in every journal entry. **There is no
+> `--seccomp=off`**: a kernel that cannot accept a filter refuses the session
+> instead of running one unfiltered.
 
 An application that ignores `WAYLAND_DISPLAY` and connects directly to a
 path it already knows is not stopped by anything in this MVP.

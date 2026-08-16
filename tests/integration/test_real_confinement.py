@@ -111,8 +111,9 @@ observed, not what the child claimed:
 
 7. `realm_spawned.isolation` under `default`: `applied_profile` is
    `namespaces+landlock-abiN` for the rung the realm **obtained** (never a tier
-   name -- `intra-user` means namespaces *plus* Landlock *plus* seccomp and
-   this build applies the first two),
+   name -- a tier is what the *machine* measured and a profile is what *this
+   spawn* obtained, which stays true now that this build applies all three of
+   `intra-user`'s mechanisms),
    `parent_observed.namespaces_verified` is the five the supervisor is checked
    on, `root_dev_differs` and `canaries_unreachable` are true, `writable` is a
    measured list, `landlock` is an object whose obtained rung is **at least
@@ -120,8 +121,9 @@ observed, not what the child claimed:
    decision 2026-08-15 — a kernel below it is refused, so a spawn that got far
    enough to journal cannot be under it) and at most the kernel's own ABI,
    which labels both numbers child-asserted and
-   carries `clamped_by_build`, and `seccomp` is the explicit `not-applied`
-   string rather than an absent key.
+   carries `clamped_by_build`, and `seccomp` is an object carrying the row and
+   instruction counts PID 1 reported -- a SIZE and never a policy -- rather
+   than the pre-P2.6.4 `not-applied` string or an absent key.
 8. `shim_host_pid` and `supervisor_pid` agree with what **this process** read
    out of procfs -- the journal's account of the spine checked against an
    independent one.
@@ -180,11 +182,14 @@ fields with real discriminating power here are `namespaces_verified`,
   rung-9 domain from a rung-1 one. Per-rung behaviour (`TRUNCATE` at rung 3,
   `REFER` at rung 2) is measured in `vitrin-realm-init`'s own suite, where a
   forked child can enforce a capped domain and then try the syscall.
-* **Seccomp.** Not applied by this build (P2.6.4), and the journal says
-  `not-applied` in as many words. Nothing here should be read as evidence of a
-  syscall policy. `RealConfinementNestedUserns` is **not** an exception: it
-  measures one ucount limit, which the kernel enforces inside `create_user_ns`,
-  and says nothing about any other syscall.
+* **Seccomp.** Applied since P2.6.4, and this gate asserts only that the
+  journal carries a filter of non-zero size. **Nothing here is evidence of a
+  syscall policy**: the counts are child-asserted, they say what shape of
+  filter was installed and not what it denies, and what a realm actually
+  refuses is `test_real_seccomp.py`'s question -- table-driven, exact errno per
+  row, positive control per row. `RealConfinementNestedUserns` is **not** an
+  exception either: it measures one ucount limit, which the kernel enforces
+  inside `create_user_ns`, and says nothing about any other syscall.
 * **That a nested sandbox works.** It does not, and 6c does not claim it does.
   Mounting is denied to any process in a Landlock domain, so a realm's app
   cannot build a second boundary inside the first one -- what 6c measures is
@@ -1024,17 +1029,36 @@ class RealConfinementJournal(_RealChain):
         self.assertNotIn(
             "intra-user",
             iso["applied_profile"],
-            "a build with no seccomp filter may not journal a tier that means one",
+            "a per-realm profile named a TIER. The reason changed at P2.6.4 and the rule did "
+            "not: the tier is what the MACHINE measured and the profile is what THIS SPAWN "
+            "obtained, so the day the two agree in value is not the day one may be printed "
+            "for the other",
         )
-        # Still a tripwire for a future build: the day P2.6.4 lands, this
-        # gate's "what this does not prove" section and `limits.md` both go
-        # stale, and this fires to say so.
-        self.assertEqual(
+        # This tripwire FIRED, as it was written to. It asserted the string
+        # `not-applied (P2.6.4)` and demanded that whoever landed P2.6.4 edit
+        # this gate's module docs and `docs/book/src/limits.md` with the same
+        # commit. Both were edited; what it asserts now is the other side of
+        # the same property -- the journal must carry a filter, and it must
+        # carry it as a SIZE rather than as a policy. What the filter actually
+        # denies is `test_real_seccomp.py`'s question, with a positive control
+        # per row; nothing here is evidence about a syscall.
+        self.assertIsInstance(
             iso["seccomp"],
-            "not-applied (P2.6.4)",
-            "the journal must say in as many words that no seccomp filter is applied. If "
-            "P2.6.4 has landed, this gate's module docs and docs/book/src/limits.md are now "
-            "wrong and both need editing with this line",
+            dict,
+            "`isolation.seccomp` is still the pre-P2.6.4 `not-applied` string while the helper "
+            f"installs a filter, or the key changed shape again: {iso['seccomp']!r}",
+        )
+        self.assertGreater(
+            iso["seccomp"]["rows"],
+            0,
+            "a filter of zero rows denies nothing, and journaling it would publish confinement "
+            "this session did not apply",
+        )
+        self.assertEqual(
+            iso["seccomp"]["evidence"],
+            "child-asserted",
+            "no /proc interface reports a process's seccomp RULES -- only its mode -- so the "
+            "parent cannot corroborate these counts and the journal must say so",
         )
         self.assertEqual(
             observed["namespaces_verified"],

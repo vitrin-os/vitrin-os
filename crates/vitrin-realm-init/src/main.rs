@@ -53,8 +53,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use vitrin_realm_init::{
-    mount_fingerprint, Config, Frame, Stage, CONFIG_MAX, IN_REALM_HOME, IN_REALM_RUNTIME_DIR,
-    IN_REALM_SHIM, PRE_EXEC_EXIT,
+    mount_fingerprint, seccomp, Config, Frame, Stage, CONFIG_MAX, IN_REALM_HOME,
+    IN_REALM_RUNTIME_DIR, IN_REALM_SHIM, PRE_EXEC_EXIT,
 };
 
 mod landlock;
@@ -1447,6 +1447,30 @@ fn exec_shim(chan: &Chan, config: &Config) -> Result<std::convert::Infallible, F
     if core_flags < 0 || core_flags & libc::FD_CLOEXEC != 0 {
         return Err(Fail::with(Stage::Internal, libc::EBADF));
     }
+
+    // K13b. **The seccomp-bpf deny-list** (P2.6.4, #188), and its position is
+    // forced from both sides just as K12b's is.
+    //
+    // It must come after K12b, because `landlock_restrict_self` is itself a
+    // syscall and a filter installed first would have to carry a row
+    // permitting it. It must come after K13, because `close_range` is a
+    // syscall too and this table's job is to be the last thing installed. And
+    // it must come **immediately before** the `execve`: a seccomp filter can
+    // never be removed, so everything after it runs under it -- which is why
+    // the `chdir` below and the `execve` itself are deliberately not rows.
+    //
+    // It is here in the helper rather than in the shim for the reason PRD Doc
+    // 2 §15 gives: the shim is outside the TCB. `vitrin-realm-init` execve's
+    // it directly, so the filter binds by construction instead of by the shim
+    // cooperating with its own confinement.
+    //
+    // The frame is sent before `execve` for the same reason K12b's is: after
+    // it there is no sender.
+    let filtered = seccomp::apply().map_err(|e| Fail::with(Stage::Seccomp, e))?;
+    chan.send(&Frame::Filtered {
+        rows: filtered.rows,
+        instructions: filtered.instructions,
+    })?;
 
     // K14. The realm's own runtime directory as cwd -- the in-realm spelling
     // of what the core sets on the unconfined path, so a relative path the app

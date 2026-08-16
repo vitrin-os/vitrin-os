@@ -323,7 +323,11 @@ than [`tests/kernel-matrix/kernels.manifest`](../tests/kernel-matrix/kernels.man
 which hashes both the `.deb` and the `vmlinuz` extracted from it. It is
 recorded here rather than fixed in passing: closing it means a commit-sha
 revision and a decision about the system-first path, which is not pinned at
-all.
+all. Tracked as [#300](https://github.com/vitrin-os/vitrin-os/issues/300) — a
+named gap with no issue is the shape this repo's own conventions object to.
+The weakest instance of this class is neither of these: the binary that builds
+the published site is fetched with no checksum at all
+([#299](https://github.com/vitrin-os/vitrin-os/issues/299)).
 
 ```bash
 meson setup build            # uses system wlroots-0.19 if available

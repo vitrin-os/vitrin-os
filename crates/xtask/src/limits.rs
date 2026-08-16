@@ -243,6 +243,23 @@
 //! and what it does not"* -- a gap written down only in Rust source is written
 //! down only for the person who already knows.
 //!
+//! * **A surface the tables do not NAME is unheld entirely, however many
+//!   claims it repeats.** Coverage is per-(row, path): a row lists the paths it
+//!   holds, so a page nobody listed is invisible to the gate rather than
+//!   partially checked. Two live instances at the time of writing:
+//!   `docs/ARCHITECTURE.md` and `docs/plan/02-phase-2-semantic-epochs.md` both
+//!   restate the five-kernel figure in the `kernels-measured` register, and
+//!   neither is a `Rendering`; both can be edited to "three" with a green
+//!   build. A NEW published page inherits the same hole on the day it is added,
+//!   which is the likelier future case. What would close it is a rule that
+//!   every path under the published roots must appear in some row -- the
+//!   `test_census` shape from #288 -- and that is not built here.
+//! * **Text a reader never sees still satisfies an anchor.** The scan reads
+//!   bytes, not rendered output, so wrapping a block in `<!-- -->` on
+//!   `site/index.html`, or fencing it on a Markdown page, leaves every anchor
+//!   and every rendering green while the published page says nothing. The
+//!   failure direction is the one #172 calls worst: the gate reports agreement
+//!   across surfaces that no longer publish the claim at all.
 //! * **Whether the wlcs number is still true of the shim.** The `wlcs-counts`
 //!   row holds five prose surfaces to each other and to
 //!   `shim/wlcs/README.md`'s canonical block, and `wlcs-version` now holds the
@@ -517,7 +534,12 @@ pub struct Rendering {
 pub struct Derived {
     pub id: &'static str,
     pub says: &'static str,
-    /// Same contract as [`Claim::issue`], and checked the same way.
+    /// Same contract as [`Claim::issue`] — but NOT checked the same way, and
+    /// the difference is worth stating rather than discovering. The citation
+    /// half (`uncited_issues`) runs over [`CLAIMS`] only; a `DERIVED` row's
+    /// `issue` is read out in failure text and nowhere else, so a wrong number
+    /// here is latent rather than red. Every shipped row happens to be correct
+    /// today; nothing keeps it that way.
     pub issue: &'static str,
     pub source: Source,
     pub renderings: &'static [Rendering],

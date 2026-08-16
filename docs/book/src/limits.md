@@ -2289,6 +2289,16 @@ build:**
   cannot find one nobody told it about. That gap closes by adding a row, and
   the same is true of any claim on this page with no row at all — most of this
   page is argued prose, and only the named subset is machine-held.
+- **A published page nobody added to the table.** Coverage is per page and per
+  claim: a page the table does not name is unheld entirely, however many of
+  these claims it repeats. `docs/ARCHITECTURE.md` and the Phase-2 plan document
+  both restate the five-kernel figure today and neither is held; a page added
+  tomorrow inherits the same gap on the day it ships.
+- **Text a reader never sees.** The check reads the file's bytes, not the page a
+  browser draws, so a block commented out or fenced still satisfies every
+  anchor in it. The gate would report agreement across surfaces that had
+  stopped publishing the claim at all — which is the understating direction,
+  the one this page cares about most.
 - **That this page and the issue tracker describe the same set.** They do not,
   by policy and on purpose: many gaps here are permanent decisions with no
   issue, and the README promises exactly that. What runs on every pull request

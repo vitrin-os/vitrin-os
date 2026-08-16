@@ -56,10 +56,11 @@
  * compositor never comes up, which is what stops "the probe never ran" from
  * being indistinguishable from "the probe ran and found nothing".
  *
- *   PROBE-VERSION 2
+ *   PROBE-VERSION 3
  *   PROBE-GROUPS n=<count> gids=<g,g,...>
  *   PROBE-USERNS created=<yes|no|error> errno=<n>
  *   PROBE path=<abs> open=<ok|fail> errno=<n> dev=<u> ino=<u>   (one per --probe)
+ *   PROBE-SYSCALL name=<key> rc=<n> errno=<n>          (one per row, --syscall-probe)
  *   PROBE-END
  *
  * PROBE-USERNS arrived with version 2 (P2.6.3): a realm refuses to create user
@@ -68,6 +69,39 @@
  * could have measured it. It is reported unconditionally alongside
  * PROBE-GROUPS because it costs one fork and because a report that carried it
  * only on request would let the interesting run be the one nobody asked for.
+ *
+ * THE SYSCALL PROBE (--syscall-probe), added by P2.6.4 (issue #188).
+ *
+ * THIS CODE IS REPO-AUTHORED. It is not a third party's conformance suite and
+ * it is not an independent check: the same repository writes the seccomp table
+ * (`crates/vitrin-realm-init/src/seccomp.rs`) and writes the probe that
+ * measures it, so a filter and a probe could agree with each other and both be
+ * wrong about the world. That reduction in independence is stated here rather
+ * than left for a reader to find (R2.7), on the precedent of `click-target`
+ * and `form-target` in `tests/integration/`. What keeps it honest is the
+ * POSITIVE CONTROL, not the code: `tests/integration/test_real_seccomp.py`
+ * runs this same binary OUTSIDE a realm, and a row whose syscall fails there
+ * too is reported NOT DEMONSTRATED rather than counted as confinement.
+ *
+ * One line per row, and the key is the table's own `name` field, so the gate
+ * can iterate `vitrind --print-seccomp` and fail on any row this probe did not
+ * attempt. `rc` is the syscall's return value and `errno` is what it set;
+ * errno is part of the filter's contract (EPERM and ENOSYS are behaviourally
+ * different to a library that probes and falls back), so the gate asserts the
+ * exact value rather than "not zero".
+ *
+ * Every probe with a side effect on the calling process runs in a FORKED
+ * CHILD, for the reason `probe_userns` gives above: `ptrace(PTRACE_TRACEME)`
+ * makes the caller traced, `personality` changes its persona for life, and
+ * `seccomp(SECCOMP_SET_MODE_FILTER)` installs a filter that cannot be removed
+ * -- so a probe run in-process would destroy the run it is reporting on. The
+ * keyring probes deliberately use KEY_SPEC_PROCESS_KEYRING and not the session
+ * keyring: a process keyring dies with the process, so the control run outside
+ * a realm leaves nothing on the operator's own keyring. The finding that
+ * motivated those rows was measured against the SESSION keyring; reproducing
+ * it here would mean writing to the operator's keyring on every CI run, and
+ * the row is demonstrated either way because the syscall is what the filter
+ * denies.
  */
 #define _GNU_SOURCE
 
@@ -75,6 +109,11 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <inttypes.h>
+#include <linux/audit.h>
+#include <linux/bpf.h>
+#include <linux/filter.h>
+#include <linux/perf_event.h>
+#include <linux/seccomp.h>
 #include <sched.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -83,7 +122,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
+#include <sys/ptrace.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -422,10 +465,334 @@ static void probe_userns(FILE *out) {
 	fprintf(out, "PROBE-USERNS created=%s errno=%d\n", result == 0 ? "yes" : "no", result);
 }
 
+/* ---------------------------------------------------------------------------
+ * The syscall probe (P2.6.4, issue #188)
+ * ------------------------------------------------------------------------- */
+
+#ifndef AF_VSOCK
+#define AF_VSOCK 40
+#endif
+#ifndef AF_ALG
+#define AF_ALG 38
+#endif
+#ifndef KEY_SPEC_PROCESS_KEYRING
+#define KEY_SPEC_PROCESS_KEYRING (-2)
+#endif
+#ifndef KEYCTL_GET_KEYRING_ID
+#define KEYCTL_GET_KEYRING_ID 0
+#endif
+#ifndef ADDR_NO_RANDOMIZE
+#define ADDR_NO_RANDOMIZE 0x0040000
+#endif
+
+/* One row's outcome. `rc` is the raw syscall return; `err` is errno when rc is
+ * negative and 0 otherwise. */
+struct syscall_result {
+	long rc;
+	int err;
+};
+
+/* Attempt one syscall IN THIS PROCESS. Only used for probes with no lasting
+ * effect on the caller: every descriptor is closed again, and the keyring
+ * probes land on the PROCESS keyring, which dies with the process. */
+typedef struct syscall_result (*probe_fn)(void);
+
+static struct syscall_result done(long rc) {
+	struct syscall_result r;
+	r.rc = rc;
+	r.err = rc < 0 ? errno : 0;
+	return r;
+}
+
+static struct syscall_result probe_keyctl(void) {
+	/* create=1, so this SUCCEEDS unfiltered rather than answering ENOKEY --
+	 * the positive control has to be a success, not merely a different error. */
+	return done(syscall(SYS_keyctl, KEYCTL_GET_KEYRING_ID, KEY_SPEC_PROCESS_KEYRING, 1));
+}
+
+static struct syscall_result probe_add_key(void) {
+	return done(syscall(SYS_add_key, "user", "vitrin188-probe", "x", (size_t)1,
+			KEY_SPEC_PROCESS_KEYRING));
+}
+
+static struct syscall_result probe_request_key(void) {
+	/* The key this looks for is the one `probe_add_key` just planted on the
+	 * process keyring, so unfiltered this RETURNS A SERIAL rather than ENOKEY.
+	 * Without that the row would only ever demonstrate an errno CHANGE, and a
+	 * gate cannot tell a changed error from a denied call. */
+	return done(syscall(SYS_request_key, "user", "vitrin188-probe", NULL, 0));
+}
+
+static struct syscall_result probe_io_uring_setup(void) {
+	/* `struct io_uring_params` is 120 bytes and every field must be zero for a
+	 * plain setup. Spelled as a byte array so this file does not need
+	 * <linux/io_uring.h>, which is absent on older build hosts. */
+	unsigned char params[120];
+	memset(params, 0, sizeof(params));
+	struct syscall_result r = done(syscall(SYS_io_uring_setup, 1, params));
+	if (r.rc >= 0) {
+		close((int)r.rc);
+	}
+	return r;
+}
+
+static struct syscall_result probe_socket_family(int family, int type) {
+	struct syscall_result r = done(socket(family, type, 0));
+	if (r.rc >= 0) {
+		close((int)r.rc);
+	}
+	return r;
+}
+
+static struct syscall_result probe_socket_vsock(void) {
+	return probe_socket_family(AF_VSOCK, SOCK_STREAM);
+}
+static struct syscall_result probe_socket_alg(void) {
+	return probe_socket_family(AF_ALG, SOCK_SEQPACKET);
+}
+static struct syscall_result probe_socket_unix(void) {
+	return probe_socket_family(AF_UNIX, SOCK_STREAM);
+}
+static struct syscall_result probe_socket_inet(void) {
+	return probe_socket_family(AF_INET, SOCK_STREAM);
+}
+static struct syscall_result probe_socket_inet6(void) {
+	return probe_socket_family(AF_INET6, SOCK_STREAM);
+}
+static struct syscall_result probe_socket_netlink(void) {
+	return probe_socket_family(AF_NETLINK, SOCK_RAW);
+}
+static struct syscall_result probe_socket_packet(void) {
+	/* NOT a demonstration of this filter: AF_PACKET needs CAP_NET_RAW, which
+	 * the realm dropped at K10, so it already fails without any filter. It is
+	 * reported so the gate can SAY that rather than leave it unmeasured. */
+	return probe_socket_family(AF_PACKET, SOCK_RAW);
+}
+
+static struct syscall_result probe_ptrace(void) {
+	/* PTRACE_TRACEME on the caller itself. In a realm the interesting target
+	 * would be a sibling, but the honest claim this row makes is about the
+	 * SYSCALL, and PTRACE_TRACEME is the one form that needs no second
+	 * process and no permission of its own -- so a denial here is the filter
+	 * and never yama or the pid namespace. Forked, because it makes the
+	 * caller traced for life. */
+	return done(ptrace(PTRACE_TRACEME, 0, NULL, NULL));
+}
+
+static struct syscall_result probe_perf_event_open(void) {
+	/* A real `struct perf_event_attr`, not a hand-rolled one: a size mismatch
+	 * produces a misleading errno, and an earlier probe that got this wrong
+	 * reported EACCES for a call that in fact succeeds. A disabled software
+	 * CPU-clock counter on the calling process is what an unprivileged caller
+	 * is allowed at the default perf_event_paranoid. */
+	struct perf_event_attr pe;
+	memset(&pe, 0, sizeof(pe));
+	pe.type = PERF_TYPE_SOFTWARE;
+	pe.size = sizeof(pe);
+	pe.config = PERF_COUNT_SW_CPU_CLOCK;
+	pe.disabled = 1;
+	pe.exclude_kernel = 1;
+	pe.exclude_hv = 1;
+	struct syscall_result r = done(syscall(SYS_perf_event_open, &pe, 0, -1, -1, 0));
+	if (r.rc >= 0) {
+		close((int)r.rc);
+	}
+	return r;
+}
+
+static struct syscall_result probe_bpf(void) {
+	union bpf_attr attr;
+	memset(&attr, 0, sizeof(attr));
+	attr.map_type = BPF_MAP_TYPE_ARRAY;
+	attr.key_size = 4;
+	attr.value_size = 4;
+	attr.max_entries = 1;
+	struct syscall_result r = done(syscall(SYS_bpf, BPF_MAP_CREATE, &attr, sizeof(attr)));
+	if (r.rc >= 0) {
+		close((int)r.rc);
+	}
+	return r;
+}
+
+static struct syscall_result probe_userfaultfd(void) {
+	struct syscall_result r = done(syscall(SYS_userfaultfd, O_CLOEXEC));
+	if (r.rc >= 0) {
+		close((int)r.rc);
+	}
+	return r;
+}
+
+static struct syscall_result probe_personality(void) {
+	/* ADDR_NO_RANDOMIZE: the value the row exists for. Forked, because it
+	 * changes the persona of the caller and everything it execs. */
+	return done(syscall(SYS_personality, (unsigned long)ADDR_NO_RANDOMIZE));
+}
+
+static struct syscall_result probe_personality_query(void) {
+	/* 0xffffffff is the READ form glibc and setarch issue. The predicate keeps
+	 * it, so this is a standing negative control: if it ever fails, the
+	 * argument predicate has become a blanket denial. */
+	return done(syscall(SYS_personality, 0xffffffffUL));
+}
+
+static struct syscall_result probe_mbind(void) {
+	void *mem = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (mem == MAP_FAILED) {
+		struct syscall_result r = {-1, errno};
+		return r;
+	}
+	/* MPOL_DEFAULT with a NULL nodemask: legal, and a no-op on the policy. */
+	struct syscall_result r =
+			done(syscall(SYS_mbind, mem, (unsigned long)4096, 0, NULL, 0UL, 0U));
+	munmap(mem, 4096);
+	return r;
+}
+
+static struct syscall_result probe_set_mempolicy(void) {
+	return done(syscall(SYS_set_mempolicy, 0 /* MPOL_DEFAULT */, NULL, 0UL));
+}
+
+static struct syscall_result probe_move_pages(void) {
+	/* nr_pages = 0: the kernel walks an empty list and returns 0, so this
+	 * touches no memory and still exercises the syscall entry point. */
+	return done(syscall(SYS_move_pages, 0, 0UL, NULL, NULL, NULL, 0));
+}
+
+static struct syscall_result probe_get_mempolicy(void) {
+	/* A standing NEGATIVE control. Firefox's own filter Allow()s this under
+	 * `Required by libnuma for FFmpeg` while returning ENOSYS for the setters
+	 * beside it, so a filter that denied it would break the acceptance app. */
+	int mode = 0;
+	return done(syscall(SYS_get_mempolicy, &mode, NULL, 0UL, NULL, 0UL));
+}
+
+static struct syscall_result probe_seccomp(void) {
+	/* A standing NEGATIVE control, and the most consequential one: Firefox and
+	 * Chromium install their own filters for content processes. Forked,
+	 * because a filter cannot be removed. NO_NEW_PRIVS first, because an
+	 * unprivileged seccomp(2) without it is EACCES for a reason that has
+	 * nothing to do with vitrin -- inside a realm K10 has already set it, and
+	 * outside one this is what makes the control run comparable. */
+	struct sock_filter allow[] = {BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW)};
+	struct sock_fprog prog;
+	prog.len = 1;
+	prog.filter = allow;
+	if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) {
+		return done(-1);
+	}
+	return done(syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, &prog));
+}
+
+static struct syscall_result probe_fork(void) {
+	/* A standing NEGATIVE control. This build denies neither clone nor clone3,
+	 * and glibc >= 2.34 issues clone3 for fork(3) -- so if this ever fails,
+	 * the table has grown a row that breaks every process a realm creates. */
+	pid_t pid = fork();
+	if (pid == 0) {
+		_exit(0);
+	}
+	if (pid < 0) {
+		return done(-1);
+	}
+	int status = 0;
+	while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+		/* retry */
+	}
+	return done(0);
+}
+
+/* Run `f` in a forked child and report its result through a pipe.
+ *
+ * For the probes that change the caller: `ptrace(PTRACE_TRACEME)`,
+ * `personality`, `seccomp`. `rc = -1, errno = 0` is the distinct "the child
+ * died before it could say anything" outcome, which a reader must not take for
+ * a refusal -- exactly the distinction `probe_userns` draws. */
+static struct syscall_result in_a_child(probe_fn f) {
+	int pipefd[2];
+	struct syscall_result dead = {-1, 0};
+	if (pipe2(pipefd, O_CLOEXEC) != 0) {
+		return dead;
+	}
+	pid_t pid = fork();
+	if (pid < 0) {
+		close(pipefd[0]);
+		close(pipefd[1]);
+		return dead;
+	}
+	if (pid == 0) {
+		close(pipefd[0]);
+		struct syscall_result r = f();
+		ssize_t ignored = write(pipefd[1], &r, sizeof(r));
+		(void)ignored;
+		_exit(0);
+	}
+	close(pipefd[1]);
+	struct syscall_result r = dead;
+	ssize_t got = read(pipefd[0], &r, sizeof(r));
+	close(pipefd[0]);
+	int status = 0;
+	while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+		/* retry */
+	}
+	if (got != (ssize_t)sizeof(r)) {
+		return dead;
+	}
+	return r;
+}
+
+/* The probe table. `name` is the seccomp table's own `name` field for a denied
+ * row, or a `never-denied` key, or one of the two rows reported so the gate can
+ * SAY they are not demonstrations. `forked` marks the probes that change the
+ * caller. */
+static const struct {
+	const char *name;
+	probe_fn fn;
+	bool forked;
+} SYSCALL_PROBES[] = {
+		/* Denied rows. */
+		{"keyctl", probe_keyctl, false},
+		{"add_key", probe_add_key, false},
+		{"request_key", probe_request_key, false},
+		{"io_uring_setup", probe_io_uring_setup, false},
+		{"socket_family", probe_socket_vsock, false},
+		{"ptrace", probe_ptrace, true},
+		{"perf_event_open", probe_perf_event_open, false},
+		{"bpf", probe_bpf, false},
+		{"userfaultfd", probe_userfaultfd, false},
+		{"personality", probe_personality, true},
+		{"mbind", probe_mbind, false},
+		{"set_mempolicy", probe_set_mempolicy, false},
+		{"move_pages", probe_move_pages, false},
+		/* The socket row's second demonstration, and the one it must NOT be
+		 * demonstrated by. */
+		{"socket_alg", probe_socket_alg, false},
+		{"socket_packet", probe_socket_packet, false},
+		/* Standing negative controls: these must SUCCEED inside a realm. */
+		{"socket_unix", probe_socket_unix, false},
+		{"socket_inet", probe_socket_inet, false},
+		{"socket_inet6", probe_socket_inet6, false},
+		{"socket_netlink", probe_socket_netlink, false},
+		{"personality_query", probe_personality_query, true},
+		{"get_mempolicy", probe_get_mempolicy, false},
+		{"seccomp", probe_seccomp, true},
+		{"fork", probe_fork, false},
+};
+
+static void probe_syscalls(FILE *out) {
+	size_t n = sizeof(SYSCALL_PROBES) / sizeof(SYSCALL_PROBES[0]);
+	for (size_t i = 0; i < n; i++) {
+		struct syscall_result r = SYSCALL_PROBES[i].forked ? in_a_child(SYSCALL_PROBES[i].fn)
+														   : SYSCALL_PROBES[i].fn();
+		fprintf(out, "PROBE-SYSCALL name=%s rc=%ld errno=%d\n", SYSCALL_PROBES[i].name, r.rc,
+				r.err);
+	}
+}
+
 /* Write the whole report, and return false if anything about writing it
  * failed. A probe whose report never landed must not be mistaken for a probe
  * that ran, so the caller exits non-zero. */
-static bool write_probe_report(const char *out_name, char *const *paths, int count) {
+static bool write_probe_report(const char *out_name, char *const *paths, int count,
+		bool syscalls) {
 	char resolved[4096];
 	if (out_name[0] == '/') {
 		if ((size_t)snprintf(resolved, sizeof(resolved), "%s", out_name) >= sizeof(resolved)) {
@@ -460,7 +827,7 @@ static bool write_probe_report(const char *out_name, char *const *paths, int cou
 		close(fd);
 		return false;
 	}
-	fprintf(out, "PROBE-VERSION 2\n");
+	fprintf(out, "PROBE-VERSION 3\n");
 	/* The supplementary groups this process still holds. D-037(5): they cannot
 	 * be dropped -- `setgroups=deny` blocks the CALL and drops nothing -- so
 	 * the realm keeps `video`, `render`, `input` and the rest as kgids, and
@@ -478,6 +845,13 @@ static bool write_probe_report(const char *out_name, char *const *paths, int cou
 	for (int i = 0; i < count; i++) {
 		probe_one(out, paths[i]);
 	}
+	/* Opt-in, unlike PROBE-GROUPS and PROBE-USERNS: this one forks four times
+	 * and installs a seccomp filter in one of those children, which is more
+	 * than every existing caller of `--probe` should pay for a fact it does
+	 * not read. */
+	if (syscalls) {
+		probe_syscalls(out);
+	}
 	/* Last, so a truncated report is detectable rather than readable. */
 	fprintf(out, "PROBE-END\n");
 	if (fflush(out) != 0 || fsync(fileno(out)) != 0) {
@@ -493,6 +867,7 @@ int main(int argc, char **argv) {
 	char *probes[MAX_PROBES];
 	int probe_count = 0;
 	const char *probe_out = NULL;
+	bool syscall_probe = false;
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--run-ms") == 0 && i + 1 < argc) {
 			run_ms = atoi(argv[++i]);
@@ -510,23 +885,38 @@ int main(int argc, char **argv) {
 			probes[probe_count++] = argv[++i];
 		} else if (strcmp(argv[i], "--probe-out") == 0 && i + 1 < argc) {
 			probe_out = argv[++i];
+		} else if (strcmp(argv[i], "--syscall-probe") == 0) {
+			syscall_probe = true;
 		} else {
 			fprintf(stderr,
 					"usage: %s [--run-ms MS] [--colour RRGGBB] "
-					"[--probe PATH]... [--probe-out FILE]\n",
+					"[--probe PATH]... [--syscall-probe] [--probe-out FILE]\n",
 					argv[0]);
 			return 2;
 		}
 	}
-	if ((probe_count > 0) != (probe_out != NULL)) {
+	if (syscall_probe && probe_out == NULL) {
+		/* Same rule as `--probe`: a probe with nowhere to report is a gate that
+		 * reads an absent file as an absent finding. */
+		fprintf(stderr, "--syscall-probe needs --probe-out\n");
+		return 2;
+	}
+	if (syscall_probe && probe_count == 0) {
+		/* `--syscall-probe` alone is legal and is how the seccomp gate runs:
+		 * it wants the PROBE-SYSCALL lines and no path probes. The pairing
+		 * rule below is relaxed for exactly that case, and only that one. */
+		if (!write_probe_report(probe_out, NULL, 0, true)) {
+			return 3;
+		}
+	} else if ((probe_count > 0) != (probe_out != NULL)) {
 		/* Refused rather than defaulted: a `--probe` with nowhere to report is
 		 * a gate that would read an absent file as an absent canary, and a
 		 * `--probe-out` with nothing to probe writes a report whose emptiness
 		 * means nothing. */
 		fprintf(stderr, "--probe and --probe-out are used together or not at all\n");
 		return 2;
-	}
-	if (probe_count > 0 && !write_probe_report(probe_out, probes, probe_count)) {
+	} else if (probe_count > 0 &&
+			!write_probe_report(probe_out, probes, probe_count, syscall_probe)) {
 		return 3;
 	}
 	signal(SIGINT, on_signal);

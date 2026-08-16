@@ -191,22 +191,25 @@ must name a published claim whose sentence still exists on
 `docs/book/src/limits.md`, `README.md` or `SECURITY.md`. **It measures no
 kernel**, which is Correction 5 below.
 
-**What still did not land — status: DEFERRED, not delivered:** the
-*multi-kernel per-ABI ladder*, one row per ABI actually reported, on each kernel
-in a CI matrix. It is not scheduled inside P2.6.3 any more and it is not
-abandoned: the evidence it needs is `vitrind --print-isolation` collected from
-more than one kernel, which is exactly what
-[#281](https://github.com/vitrin-os/vitrin-os/issues/281) owns, so the deferral
-has a home rather than being a gap with nobody's name on it. Exactly two
-machines have ever been asked for their Landlock ABI — this repository's
-development box answered `landlock.abi=9` on 2026-08-15 and the runner its CI
-uses answered `landlock.abi=7` on 2026-08-14 — and **the runner's number was
-read out of a CI job log, which no artefact in this repository records**, so
-even the two-machine claim rests on one transcription and one reproducible
-command. No page states which kernel releases clear the floor, and the per-rung
-*behavioural* statements are still measured on one box.
-**Nothing may describe P2.6.3 as complete** while that is true, and
-`docs/book/src/limits.md` says so in the same words.
+**What did not land inside P2.6.3, and has since landed elsewhere:** the
+*multi-kernel per-ABI ladder*, one row per ABI actually reported. It was
+recorded here as DEFERRED-not-delivered and handed to
+[#281](https://github.com/vitrin-os/vitrin-os/issues/281); **#281 has since
+delivered it**, and the details are Correction 6 below — five distribution
+kernels booted under QEMU with the shipped `vitrind`, reporting ABI 1, 2, 4, 6
+and 7, rendered into `docs/book/src/isolation-kernels.md` and held by
+`cargo xtask kernel-matrix --check`. Read this paragraph *with* Correction 6,
+never instead of it: the deferral it records is discharged, and which kernel
+releases clear the floor is now a measured, checked-in answer rather than an
+open question.
+
+What has **not** changed is the axis this section was careful about. Those are
+**kernel** rows taken in a bare initramfs, so the number of *distributions*
+measured as such is still one; the per-rung *behavioural* statements are still
+measured on one box; and nobody other than the collector's author has re-run its
+failure levers. **Nothing may describe P2.6.3 as complete** on the strength of
+the kernel table alone, and `docs/book/src/limits.md` states the same three
+residuals in the same terms.
 
 **Correction 1 — `ftruncate` on a read-only fd is `EINVAL`, not `EACCES`, and
 Landlock has nothing to do with it.** The row asks for "on the highest ABI

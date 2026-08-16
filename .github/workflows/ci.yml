@@ -121,10 +121,12 @@ name: CI
 #                 REMOVES the profile and requires the spawn to fail again.
 #                 That last half is the whole job: without it, every green
 #                 result is equally explained by a runner whose policy
-#                 drifted. The profile has never been loaded by anyone who
-#                 wrote it, so this job is the deliverable and the profile is
-#                 what it measures -- do not read a green check here as
-#                 anything broader than one runner, one kernel, one image.
+#                 drifted. The profile's author never loaded it (his box has
+#                 AppArmor compiled out), so this job is the deliverable and
+#                 the profile is what it measures -- do not read a green check
+#                 here as anything broader than one runner, one kernel, one
+#                 image. Nobody has loaded it on an INSTALLED Ubuntu system,
+#                 and nothing outside this job installs it at all (issue #293).
 #   fuzz-smoke    P1.9.3 (#46)'s other half: short cargo-fuzz (libFuzzer)
 #                 runs of fuzz/'s two targets (vitrin-protocol decode,
 #                 vitrin-ipc framing) on every PR, seeded from the

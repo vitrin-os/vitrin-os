@@ -21,9 +21,19 @@ task's second deliverable — a *generated* ladder table with a CI staleness gat
 `cargo xtask isolation-matrix` and held byte-for-byte by CI. **It is not the
 per-kernel table the task's restated criteria describe**, and the difference is
 not a detail: it publishes what *this build* requires of a kernel's Landlock,
-one row per ABI rung, and it probes nothing. There is still no row per ABI
-"actually reported" by a kernel in a CI matrix, and this repository has still
-measured exactly two machines. That gap is its own entry below.
+one row per ABI rung, and it probes nothing. The row-per-ABI-*actually-reported*
+half now exists separately, and is **measured**: [which kernels this build
+starts on](isolation-kernels.md) carries five distribution kernels booted under
+QEMU with the shipped `vitrind`, reporting ABI 1, 2, 4, 6 and 7 — three refused
+below the floor, two admitted. Read the two pages as what they each are: one
+says what this build requires of a kernel, the other says what five kernels
+answered.
+
+What has **not** grown is the number of machines on which the suite itself has
+ever run, which is still exactly two. A kernel row is one binary printing its
+isolation report in a minimal initramfs; it is not a run of `run.sh`, and it is
+not a statement about the distribution that ships that kernel. The remaining
+gap is narrower than it was and is its own entry below.
 
 The grant set is two tiers, and one sentence about "the write set" gets it
 wrong in the flattering direction — an earlier draft of this page said "its
@@ -154,7 +164,7 @@ inferred from the word "Landlock":
   answers are checked in: Ubuntu 22.04's `5.15.0-191-generic` at ABI 1, Debian
   12's `6.1.0-50-amd64` at ABI 2 and Ubuntu 24.04's GA `6.8.0-139-generic` at
   ABI 4 are **refused**; Debian 13's `6.12.101+deb13-amd64` at ABI 6 and the
-  `6.17.0-1020-azure` kernel this repository's CI runners boot at ABI 7 **start**.
+  azure kernel this repository's CI runners boot at ABI 7 **start**.
   See [the kernel page](isolation-kernels.md) for the rows, their provenance,
   and why they are kernel rows and not distribution rows. Two live machines are
   also on record and are a different kind of evidence: this repository's
@@ -328,22 +338,28 @@ inferred from the word "Landlock":
   What now exists is `cargo xtask isolation-matrix`, which emits
   [the Landlock ABI matrix](isolation-matrix.md), and a `--check` step in
   `.github/workflows/ci.yml` that goes red when the checked-in page is stale.
-  **What still does not exist is the per-kernel half, and its status is
-  DEFERRED rather than delivered** — it is not scheduled inside P2.6.3 any
-  more, and the evidence it needs (`--print-isolation` from more than one
-  kernel) is what
-  [#281](https://github.com/vitrin-os/vitrin-os/issues/281) owns. That generator probes
-  nothing: it parses the rung ladder out of the helper's own source and the ABI
-  floor out of the crate that declares it, because a page carrying the ABI of
-  the machine that produced it could not be byte-identical on this
-  repository's two machines (development box: `landlock.abi=9`; CI runner:
-  `landlock.abi=7`, read from a job log rather than from any artefact here) and
-  so could not be the thing CI holds. **Nothing in this repository has ever
-  measured a third kernel**, and no page states which kernel releases clear the
-  floor. The ABI floor **narrowed** the task rather than closing it — this
-  build declares which kernels it serves instead of publishing a spectrum it
-  never measured — and PRD §20's "coverage is kernel-dependent" caveat is
-  *deferred*, not answered. The per-rung *behavioural* statements quoted above
+  **The per-kernel half has since been delivered by
+  [#281](https://github.com/vitrin-os/vitrin-os/issues/281)**, and it is no
+  longer correct to call it deferred: [which kernels this build starts
+  on](isolation-kernels.md) is rendered from five checked-in boot rows under
+  `tests/kernel-matrix/rows/`, each holding `vitrind --print-isolation` and
+  `--print-floor` verbatim from a QEMU boot of that kernel, with
+  `cargo xtask kernel-matrix --check` going red when the page and the rows
+  disagree. It stayed a *separate* page rather than becoming a column on the
+  ladder, for the reason that generator probes nothing: it parses the rung
+  ladder out of the helper's own source and the ABI floor out of the crate that
+  declares it, because a page carrying the ABI of the machine that produced it
+  could not be byte-identical on this repository's two machines (development
+  box: `landlock.abi=9`; CI runner: `landlock.abi=7`) and so could not be the
+  thing CI holds. **Which kernel releases clear the floor is now stated, and
+  measured** — 6.12 and 6.17 start; 5.15, 6.1 and 6.8 are refused
+  `below-floor`. Three things about it are still true and still limits: every
+  one of those rows is a **kernel** reading taken in a bare initramfs, so the
+  number of *distributions* measured as such is still one; nobody other than
+  the author has re-run the collector's own failure levers, which needs QEMU on
+  a second machine; and five kernels is five kernels, not a spectrum. PRD §20's
+  "coverage is kernel-dependent" caveat is answered for those five and for no
+  others. The per-rung *behavioural* statements quoted above
   (the `TRUNCATE` pair, the `REFER` pair) are held by `vitrin-realm-init`'s own
   tests on one box; everything else about a rung is now generated and gated,
   which is a narrower promise than "measured". Do not read "P2.6.3" anywhere in
@@ -420,15 +436,34 @@ The right-hand column is not an assertion; it is what a whole
 ran`.
 
 One qualification on that sentence, because a page about honesty may not cite
-a green suite as if it were a reproducible constant. The suite carries a
-**pre-existing flake in `tests/integration/test_multi_realm.py`** — unrelated
-to Landlock, reproduced on `main` in a clean worktree — which takes the whole
-run red roughly one run in two or three. So "0 failures" is a run that
-happened, not a state the suite reliably returns to, and the whole-suite line
-is quoted here as corroboration rather than as the evidence. **The three-gate
-claim above does not rest on it:** each gate was also run individually at the
-shipped default, and the per-gate lines below are what actually carry the
-column.
+a green suite as if it were a reproducible constant. When it was written the
+suite carried a **flake in `tests/integration/test_multi_realm.py`** — unrelated
+to Landlock, reproduced on `main` in a clean worktree — which took the whole run
+red often enough that "0 failures" was a run that happened rather than a state
+the suite returned to.
+
+**That flake was root-caused and fixed under
+[#292](https://github.com/vitrin-os/vitrin-os/issues/292)**, and the numbers are
+worth stating because they are the only thing that distinguishes a fix from a
+re-run. It was two independent races, *both in the test's observation and
+neither in the core*: one test asserted on the runtime tree the instant the
+core's socket appeared, which is a median 8.4 ms before the last of three realms
+is forked; the other pinned a death cause the core's own module documentation
+calls nondeterministic in as many words. Measured on this box, that module run
+back-to-back as its own process: **19 red out of 60 before, 0 red out of 100
+after**. Each fix was reverted separately to confirm it was load-bearing — the
+first brought the failure back at 15/60, the second at 8/100 — and the second
+race's member ran 100 more times green with its fix restored.
+
+What that does **not** license is reading a green suite as a constant. Since the
+fix the whole suite has run **13 consecutive times green on this one box**, each
+reporting `Ran 118 tests`, `OK`, 0 skips. Thirteen runs on one machine is
+thirteen runs on one machine: it is enough to say the *known* flake is gone —
+the pre-fix rate would have reddened roughly four of them — and it is not enough
+to say the suite has no others. **The three-gate claim
+above does not rest on the whole-suite line either way:** each gate was also run
+individually at the shipped default, and the per-gate lines below are what
+actually carry the column.
 
 Each gate's own line: `test_real_gtk.py` captured a 640×480 frame
 (196 distinct colour values in that run, 192 in a separate one the same day —
@@ -579,55 +614,86 @@ across kernels is [#281](https://github.com/vitrin-os/vitrin-os/issues/281).
 behaviour this project wants, and its message already tells an operator where
 to look. What nothing published said, until this entry, was that a host may
 need to be granted something *at all* before the default isolation will run —
-so an operator met a stop rather than a prerequisite. Making that grant
-routine, so that installing this project satisfies it, is
-[#286](https://github.com/vitrin-os/vitrin-os/issues/286).
+so an operator met a stop rather than a prerequisite. Saying it, and shipping a
+profile that makes the grant, was
+[#286](https://github.com/vitrin-os/vitrin-os/issues/286), which is closed.
+Making it *routine* — having an installation of this project put the profile
+and the binaries where the profile expects them — is
+[#293](https://github.com/vitrin-os/vitrin-os/issues/293), and until that lands
+nothing here installs anything: a build outside
+`/usr/lib/vitrin/` is not attached to the profile at all.
 `--isolation=off` is **not** that arrangement: it starts an unconfined session,
 and every confinement claim on this page stops applying to it.
 
-**There is now an AppArmor profile in the tree, and it has never been loaded by
-anyone who wrote it.** `packaging/apparmor/vitrind` is the per-binary grant
-Ubuntu ships a mechanism for — the same shape the `chrome`, `firefox` and
-`flatpak` profiles in Ubuntu 24.04's own `apparmor` package already use, chosen
-over telling operators to weaken a system-wide default. It was written on a
-machine with AppArmor **compiled out**
-(`/sys/module/apparmor/parameters/enabled` reads `N`), so it has not been
-parsed, not loaded, not attached, and not observed to grant anything. That is
-not modesty about a thing that probably works; it is the entire state of the
-evidence. **Do not install it expecting it to work, and do not cite it as
-closing anything.**
+**There is an AppArmor profile in the tree, and as of 2026-08-15 it has been
+loaded and measured — on one kernel, on one CI image.**
+`packaging/apparmor/vitrind` is the per-binary grant Ubuntu ships a mechanism
+for — the same shape the `chrome`, `firefox` and `flatpak` profiles in Ubuntu
+24.04's own `apparmor` package already use, chosen over telling operators to
+weaken a system-wide default. It was *written* on a machine with AppArmor
+**compiled out** (`/sys/module/apparmor/parameters/enabled` reads `N`), so for
+its first day here it had not been parsed, loaded, attached or observed to
+grant anything, and this page said exactly that. The `apparmor-profile` job now
+reports otherwise, and the numbers are below rather than a paraphrase of them.
 
-Two different kinds of claim are in play in that paragraph and this page keeps
-them apart, because an earlier draft did not. The profile's **behaviour** is
-unmeasured — that is the sentence above. The profile's **form** is cited: every
-structural choice in it is copied from a profile Ubuntu actually ships, and the
-file's own header carries a provenance block naming the URL each one was
-fetched from and the date. An earlier draft named `bubblewrap` in that list
-from memory; the `bwrap-userns-restrict` profile is not in 24.04's `apparmor`
-package at all, and the claim is gone rather than softened. If you are checking
-this page against reality, check the header's URLs — that is what they are
-there for.
+Two different kinds of claim are in play here and this page keeps them apart,
+because an earlier draft did not. The profile's **behaviour** is now measured —
+that is the table below. The profile's **form** is cited: every structural
+choice in it is copied from a profile Ubuntu actually ships, and the file's own
+header carries a provenance block naming the URL each one was fetched from and
+the date. An earlier draft named `bubblewrap` in that list from memory; the
+`bwrap-userns-restrict` profile is not in 24.04's `apparmor` package at all,
+and the claim is gone rather than softened. If you are checking this page
+against reality, check the header's URLs — that is what they are there for.
 
-What exists instead of a result is an instrument. The `apparmor-profile` job in
-`.github/workflows/ci.yml` runs on a `ubuntu-latest` runner it does **not**
-modify — it is the only job in that workflow that never touches
-`kernel.apparmor_restrict_unprivileged_userns`, and it refuses to run at all if
-that knob is not `1` when it starts. It installs the profile, loads it, spawns
-a real realm, runs the real-app confinement gate, then **removes the profile
-and requires the spawn to fail again**. When that job has run green, this
-paragraph gets rewritten against what it reported. Until then the honest
-statement is the one above: a profile is written, and a job exists that will
-say.
+The instrument is the `apparmor-profile` job in `.github/workflows/ci.yml`. It
+runs on a `ubuntu-latest` runner it does **not** modify — the only job in that
+workflow that never touches `kernel.apparmor_restrict_unprivileged_userns` —
+and it **fails rather than skips** if that knob is not `1` when it starts, so
+it cannot quietly measure nothing. It re-reads the knob after setup and fails
+if it moved, because installing the `apparmor` package would load the distro's
+own profiles and grant what this profile is meant to grant
+(`parser_present=stock`: the parser is already on the image, so no install
+happens). It installs the profile, loads it, spawns a real realm, runs the
+real-app confinement gate, then **removes the profile and requires the spawn to
+fail again**.
 
-One question decides whether the profile is worth anything, and it is the
-question the job is built around. `vitrind` does not create the user namespace
-itself — it `execve`s `vitrin-realm-init`, which does. If an AppArmor grant does
-not survive that exec, the profile fixes the core's startup and **not** the
-realm's spawn, which is worse than shipping nothing because the refusal moves
-somewhere less legible. The profile is written to make that question moot (one
-attachment glob covering both binaries, so the exec is same-label and performs
-no transition at all) rather than to bet on an answer nobody could find
-documented. Whether that works is unmeasured.
+What it reported on kernel `6.17.0-1020-azure` with
+`apparmor_restrict_unprivileged_userns=1` and no sysctl touched:
+
+| | baseline | with the profile |
+|---|---|---|
+| `apparmor.label` | `unconfined` | `vitrind (unconfined)` |
+| `mount.in_userns` | `restricted-by-policy(errno=13)` | `available` |
+| `tier` | `none` | `per-uid` |
+| realm spawn | `refused-as-expected` | `ok` |
+
+with `realapp=pass` over 8 executed confinement assertions, and the lever in
+the same run: `lever_without=refused`, `lever_restored=ok`. That lever is what
+distinguishes this profile working from Ubuntu's own fallback
+`unprivileged_userns` profile, which carries `audit deny capability,` beside
+`allow userns,` and therefore fails with the *identical* `EACCES=13` signature
+— a job that only asked "did it spawn?" could not tell a wrong profile from no
+profile.
+
+**Read the boundary as narrowly as it is written: one kernel, one image, one
+distribution.** Nobody has loaded this profile on an installed Ubuntu system,
+and this repository has never measured a second AppArmor-carrying
+distribution.
+
+One question decided whether the profile was worth anything, and the job was
+built around it. `vitrind` does not create the user namespace itself — it
+`execve`s `vitrin-realm-init`, which does. If an AppArmor grant did not survive
+that exec, the profile would fix the core's startup and **not** the realm's
+spawn, which is worse than shipping nothing because the refusal moves somewhere
+less legible. The profile is written to make that question moot — one
+attachment glob over `/usr/lib/vitrin/{vitrind,vitrin-realm-init}`, so the exec
+is same-label and performs no transition at all, rather than betting on
+fallback semantics that `PR_SET_NO_NEW_PRIVS` restricts. **A realm spawning
+under the profile is the measurement that answers it.** The shim and the app
+deliberately get nothing further: `vitrin-realm-init` writes
+`max_user_namespaces=0` inside the realm (K9b), so a nested user namespace is
+refused by design.
 
 **And the profile has a security cost, which is published here rather than
 buried in the file — but it is conditional, and an earlier draft of this page
@@ -793,10 +859,11 @@ about a stock 24.04 in either direction.
 
 **One interaction that is easy to miss, because it spans two refusals.** PR #290
 shipped an AppArmor profile aimed at the *namespace* requirement on Ubuntu
-24.04 (issue #286). Whether that profile works is **not measured** — see the
-entry above, which records that it has never been loaded by anyone who wrote it
-— and this paragraph does not assume it does. The point is what the measurement
-adds regardless: 24.04's GA kernel is the ABI-4 row above, so on a **stock**
+24.04 (issue #286). That profile is measured, on the Azure kernel the runner
+carries — see the entry above for what it reported. This paragraph holds
+either way, and that was deliberate when it was written: the point is what the
+kernel rows add regardless. 24.04's GA kernel is the ABI-4 row above, so on a
+**stock**
 24.04 the Landlock floor refuses the session at the next gate even if the
 profile grants everything it is meant to grant. The two remedies are disjoint —
 no AppArmor policy changes the number a kernel reports for its Landlock ABI — so

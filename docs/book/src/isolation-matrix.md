@@ -50,7 +50,9 @@ The first prints what your kernel answers; the second prints the two build
 numbers above. The next table says what this build does with each possible
 answer. **Which kernel releases produce which answer is not stated anywhere on
 this page, because it was not measured here** — that mapping is a fact about
-mainline and about distributions, and this repository has measured two machines.
+mainline and about distributions, and this page probes neither. It is measured
+on a page of its own: [which kernels this build starts on](isolation-kernels.md),
+from boot rows checked in under `tests/kernel-matrix/rows/`.
 
 ## Read your own kernel against it
 

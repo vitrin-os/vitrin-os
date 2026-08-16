@@ -3,25 +3,34 @@
 # ===========================================================================
 #  AppArmor profile for vitrind -- issue #286.
 #
-#  THIS PROFILE HAS NEVER BEEN LOADED BY ANYONE WHO WROTE IT.
+#  THIS PROFILE IS MEASURED ON ONE KERNEL ON ONE CI IMAGE, AND NOWHERE ELSE.
 #
 #  It was authored on a machine with AppArmor compiled out
-#  (/sys/module/apparmor/parameters/enabled = N, Arch, kernel 7.1.8), so it
-#  was not parsed, not loaded, not attached and not observed to grant
-#  anything. The only instrument that can answer any of that is the
-#  `apparmor-profile` job in .github/workflows/ci.yml, which runs on a stock
-#  `ubuntu-latest` -- deliberately WITHOUT the
+#  (/sys/module/apparmor/parameters/enabled = N, Arch, kernel 7.1.8), so its
+#  author never parsed, loaded, attached or observed it. The instrument that
+#  answers for it is the `apparmor-profile` job in .github/workflows/ci.yml,
+#  which runs on a stock `ubuntu-latest` -- deliberately WITHOUT the
 #  `kernel.apparmor_restrict_unprivileged_userns=0` sysctl the `rust` and
 #  `integration` jobs take -- installs this file, loads it, spawns a real
 #  realm, and then REMOVES the profile and requires the spawn to fail again.
 #
-#  Until that job has run green, the honest statement about this file is:
-#  "a profile is written, and a job exists that will say whether it works."
-#  Do not upgrade that sentence anywhere -- docs/book/src/limits.md, README.md,
-#  SECURITY.md and site/index.html all carry it in that form on purpose.
+#  What it reported on kernel 6.17.0-1020-azure, first green run 2026-08-15:
+#  apparmor.label unconfined -> `vitrind (unconfined)`, mount.in_userns
+#  restricted-by-policy(errno=13) -> available, tier none -> per-uid, realm
+#  spawn refused-as-expected -> ok, realapp=pass over 8 executed assertions,
+#  and the lever both ways (lever_without=refused, lever_restored=ok).
+#
+#  THE BOUND, and do not let any page exceed it: one kernel, one CI image, one
+#  distribution. NOBODY HAS LOADED THIS PROFILE ON AN INSTALLED UBUNTU SYSTEM,
+#  and nothing in this repository installs it outside that job (issue #293) --
+#  so a build that is not at the attachment path below is not covered by this
+#  file at all. docs/book/src/limits.md, README.md, SECURITY.md and
+#  site/index.html all carry that bound, and `cargo xtask limits-check`
+#  anchors it on each of them.
 #
 #  The distinction that keeps the rest of this header honest: this file's
-#  BEHAVIOUR is unmeasured, and its FORM is cited. Every structural choice
+#  BEHAVIOUR is measured on that one machine, and its FORM is cited. Every
+#  structural choice
 #  below is copied from a profile that Ubuntu 24.04 actually ships, and the
 #  PROVENANCE block names the URL each one came from. Those are different
 #  kinds of claim and the header keeps them apart on purpose -- an earlier

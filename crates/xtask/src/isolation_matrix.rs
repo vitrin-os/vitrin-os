@@ -98,6 +98,11 @@ const LANDLOCK_RS: &str = "crates/vitrin-realm-init/src/landlock.rs";
 const REALM_INIT_LIB_RS: &str = "crates/vitrin-realm-init/src/lib.rs";
 const REALM_INIT_MAIN_RS: &str = "crates/vitrin-realm-init/src/main.rs";
 const ISOLATION_RS: &str = "crates/vitrin-core/src/spawn/isolation.rs";
+/// The integration harness, which keeps a **Python copy** of both constants
+/// so a mock-free gate can assert the rung a real realm obtained against the
+/// floor this build declares. Loaded here because that copy is the one thing
+/// on the ladder no Rust check could reach.
+const HARNESS_PY: &str = "tests/integration/harness.py";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -272,6 +277,7 @@ pub struct Sources {
     realm_init_lib_rs: String,
     realm_init_main_rs: String,
     isolation_rs: String,
+    harness_py: String,
 }
 
 impl Sources {
@@ -295,6 +301,7 @@ impl Sources {
             realm_init_lib_rs: read(REALM_INIT_LIB_RS)?,
             realm_init_main_rs: read(REALM_INIT_MAIN_RS)?,
             isolation_rs: read(ISOLATION_RS)?,
+            harness_py: read(HARNESS_PY)?,
         })
     }
 
@@ -393,6 +400,50 @@ impl Constants {
             );
         }
         Ok(Constants { min_abi, max_rung })
+    }
+
+    /// Hold the integration harness's **Python copy** of these two numbers to
+    /// the crate that declares them.
+    ///
+    /// `tests/integration/harness.py` mirrors both, because
+    /// `test_real_confinement.py` asserts a real realm's *obtained* rung
+    /// against the declared floor and a Python test cannot read a Rust
+    /// `const`. Nothing checked the mirror until now, and the cost was
+    /// concrete rather than theoretical: commit e7b5514 lowered the crate's
+    /// floor from 7 to 6 for the owner's ABI-6 VPS and left the harness at 7,
+    /// so `obtained_rung >= LANDLOCK_MIN_ABI` would have gone RED on exactly
+    /// the kernels the change existed to serve -- and green everywhere the
+    /// suite is actually run, which is why nobody saw it.
+    ///
+    /// Checked *here* rather than in a Python test of its own for the reason
+    /// this whole module exists: the drift is between two files, so the check
+    /// belongs with the thing that already reads one of them and refuses to
+    /// publish when the other disagrees.
+    pub fn cross_check_harness(&self, harness_py: &str) -> Result<()> {
+        for (name, ours) in [
+            ("LANDLOCK_MIN_ABI", self.min_abi),
+            ("LANDLOCK_BUILD_MAX_RUNG", self.max_rung),
+        ] {
+            let theirs = u32_after(harness_py, &format!("\n{name} = ")).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "isolation-matrix: could not read `{name} = N` from {HARNESS_PY}. The \
+                     mock-free confinement gate asserts a real realm's obtained rung against \
+                     that copy, so a copy this cannot find is a copy nothing holds to \
+                     {REALM_INIT_LIB_RS}."
+                )
+            })?;
+            if theirs != ours {
+                bail!(
+                    "isolation-matrix: {HARNESS_PY} says `{name} = {theirs}` and \
+                     {REALM_INIT_LIB_RS} says {ours}. The harness copy is what \
+                     `tests/integration/test_real_confinement.py` compares a real realm's \
+                     obtained rung against, so this drift does not fail here -- it fails as a \
+                     confinement gate going red on whichever kernels sit between the two \
+                     numbers, and nowhere else. Update {HARNESS_PY} to {ours}."
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -775,6 +826,7 @@ pub fn render(corpus: &Corpus, sources: &Sources) -> Result<String> {
 
     // (2) and (3): the build's own numbers, and the ladder they bound.
     let constants = Constants::from_source(&sources.realm_init_lib_rs)?;
+    constants.cross_check_harness(&sources.harness_py)?;
     let ladder = Ladder::from_source(&sources.landlock_rs, constants.max_rung)?;
     ladder.cross_check(&sources.realm_init_main_rs)?;
 
@@ -1088,7 +1140,9 @@ fn render_preamble(p: &mut String, c: &Constants, ladder: &Ladder, domains: &[Do
          numbers above. The next table says what this build does with each possible\n\
          answer. **Which kernel releases produce which answer is not stated anywhere on\n\
          this page, because it was not measured here** — that mapping is a fact about\n\
-         mainline and about distributions, and this repository has measured two machines.\n\n",
+         mainline and about distributions, and this page probes neither. It is measured\n\
+         on a page of its own: [which kernels this build starts on](isolation-kernels.md),\n\
+         from boot rows checked in under `tests/kernel-matrix/rows/`.\n\n",
     ));
 }
 
@@ -2062,6 +2116,64 @@ mod tests {
         assert_eq!(
             moved.min_abi, 8,
             "re-tuning the constant must move the number this page prints"
+        );
+    }
+
+    /// The harness's Python copy of the floor and the ceiling agrees with the
+    /// crate -- and the check that says so can actually fail.
+    ///
+    /// The first assertion is the live one: it is what would have caught
+    /// e7b5514 leaving `tests/integration/harness.py` at 7 while the crate
+    /// went to 6. The rest is the lever, because a mirror check that passed on
+    /// a mismatch would be indistinguishable from one that passed on a match.
+    #[test]
+    fn the_harness_copy_of_the_floor_is_held_to_the_crate_and_the_hold_can_fail() {
+        let src = sources();
+        let c = Constants::from_source(&src.realm_init_lib_rs).expect("constants must parse");
+        c.cross_check_harness(&src.harness_py)
+            .expect("the checked-in harness must mirror the checked-in crate");
+
+        // Lever 1: a harness that drifted on the floor is refused, and the
+        // message names both numbers so the reader knows which to move.
+        let drifted = src.harness_py.replace(
+            &format!("\nLANDLOCK_MIN_ABI = {}", c.min_abi),
+            "\nLANDLOCK_MIN_ABI = 7",
+        );
+        assert_ne!(
+            drifted, src.harness_py,
+            "the replacement matched nothing, so this lever would be testing the unmodified \
+             harness against itself"
+        );
+        let err = c
+            .cross_check_harness(&drifted)
+            .expect_err("a drifted floor must refuse")
+            .to_string();
+        assert!(err.contains("LANDLOCK_MIN_ABI = 7"), "{err}");
+        assert!(err.contains(&c.min_abi.to_string()), "{err}");
+
+        // Lever 2: the ceiling is mirrored too, and separately.
+        let capped = src.harness_py.replace(
+            &format!("\nLANDLOCK_BUILD_MAX_RUNG = {}", c.max_rung),
+            "\nLANDLOCK_BUILD_MAX_RUNG = 3",
+        );
+        assert_ne!(
+            capped, src.harness_py,
+            "the ceiling replacement matched nothing"
+        );
+        assert!(
+            c.cross_check_harness(&capped).is_err(),
+            "a drifted ceiling must refuse"
+        );
+
+        // Lever 3: a harness that dropped the constant entirely is refused
+        // rather than silently unchecked -- the failure mode a `find`-based
+        // mirror check falls into.
+        let deleted = src
+            .harness_py
+            .replace("\nLANDLOCK_MIN_ABI = ", "\nLANDLOCK_MIN_ABI_OLD = ");
+        assert!(
+            c.cross_check_harness(&deleted).is_err(),
+            "a missing copy must refuse, not pass for want of anything to compare"
         );
     }
 

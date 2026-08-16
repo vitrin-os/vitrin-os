@@ -22,7 +22,7 @@ Planned for first public push; status tracked here. [D-016](20-decision-log.md) 
 - [x] The pre-existing **GPL-3.0-only carve-out** (`shim/wlcs/`) is preserved and now has its license text in the tree, which GPL-3.0 §4 requires and which was missing.
 - [x] **No patent filings; defensive publication instead** ([D-015](20-decision-log.md)) — recorded, with the 2026-07-26 landscape scan, its prior-art anchors, and its explicit limits (a public-source scan, *not* a freedom-to-operate opinion).
 - [ ] **Join the Open Invention Network** (D-015) — free below $10M revenue and the third leg of that decision, but **not yet done**; the other two legs (publication, license patent grants) are already in force.
-- [ ] **DCO, not CLA** (D-012): sign-off on commits; a CLA deters the contributors a single-maintainer project needs most. The decision is recorded and stated publicly in the README and `NOTICE`, but is **not executed** — D-012 is still `proposed`, there is no `CONTRIBUTING.md` yet, and nothing enforces sign-off. Lands with the M1 hygiene ladder (§3).
+- [x] **DCO, not CLA** (D-012): sign-off on commits; a CLA deters the contributors a single-maintainer project needs most. **Executed**: [`CONTRIBUTING.md`](../../CONTRIBUTING.md) states the policy, `.github/workflows/dco.yml` enforces a `Signed-off-by:` trailer per commit on every pull request, and D-012 is `accepted, executed` in the log. This bullet said the opposite — "not executed", "no `CONTRIBUTING.md` yet", "nothing enforces sign-off" — for months after all three became false, which is exactly the drift [#172](https://github.com/vitrin-os/vitrin-os/issues/172) exists for; `cargo xtask limits-check` now holds this tick to that workflow's existence in both directions.
 
 ## 3. Repo-hygiene ladder
 

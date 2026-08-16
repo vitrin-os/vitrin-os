@@ -14,7 +14,7 @@
 #  `integration` jobs take -- installs this file, loads it, spawns a real
 #  realm, and then REMOVES the profile and requires the spawn to fail again.
 #
-#  What it reported on kernel 6.17.0-1020-azure, first green run 2026-08-15:
+#  What it reported on kernel 6.17.0-1022-azure, first green run 2026-08-15:
 #  apparmor.label unconfined -> `vitrind (unconfined)`, mount.in_userns
 #  restricted-by-policy(errno=13) -> available, tier none -> per-uid, realm
 #  spawn refused-as-expected -> ok, realapp=pass over 8 executed assertions,
@@ -27,6 +27,17 @@
 #  file at all. docs/book/src/limits.md, README.md, SECURITY.md and
 #  site/index.html all carry that bound, and `cargo xtask limits-check`
 #  anchors it on each of them.
+#
+#  THE KERNEL RELEASE ABOVE IS CANONICAL, AND IT IS NOW MACHINE-HELD. Since
+#  issue #172, `cargo xtask limits-check`'s `apparmor-green-run-kernel` row
+#  reads that string out of THIS line and requires all four published pages --
+#  and the limits page twice, because it reports the run in two places -- to
+#  render it. Change it here and every one of them goes red until it follows.
+#  That is not decoration: on 2026-08-16 three surfaces said 1022 and three
+#  said 1020 about this one run, and the commit that corrected three of them
+#  missed the other three, because nothing compared them. The runner's image
+#  moves without a commit in this repository, so re-read this line against the
+#  job's own `uname -srvm` before quoting it anywhere new.
 #
 #  The distinction that keeps the rest of this header honest: this file's
 #  BEHAVIOUR is measured on that one machine, and its FORM is cited. Every

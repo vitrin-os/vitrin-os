@@ -198,14 +198,19 @@ convinces you of more than it should.
   drop. Environment hygiene confines the well-behaved; it does not contain the
   hostile. This is still the big one — see
   [Security notes](#security-notes--what-the-mvp-does-and-does-not-confine).
-- **The 24-hour fuzz soak has not been run.** `fuzz/` ships two cargo-fuzz
-  targets (protocol decode, `vitrin-ipc` framing) with a checked-in corpus
-  CI replays on every PR plus a short per-PR burst, but the 24-hour clean
-  run the plan asks for is still a manual, documented procedure rather than
-  a scheduled job — [fuzz/README.md](fuzz/README.md) says so in its own
-  words. Nobody has run it end to end.
-- **wlcs conformance is advisory and mostly red:** `total=180 passed=3
-  failed=145 skipped=32` on the 2026-07-25 run. That number is expected and
+- **The 24-hour fuzz soak has not been run**
+  ([#156](https://github.com/vitrin-os/vitrin-os/issues/156))**.** `fuzz/`
+  ships two cargo-fuzz targets (protocol decode, `vitrin-ipc` framing) with a
+  checked-in corpus CI replays on every PR plus a short per-PR burst, but the
+  24-hour clean run the plan asks for is still a manual, documented procedure
+  rather than a scheduled job — [fuzz/README.md](fuzz/README.md) says so in
+  its own words. Nobody has run it end to end.
+- **wlcs conformance is advisory and mostly red**
+  ([#157](https://github.com/vitrin-os/vitrin-os/issues/157))**:**
+  `total=180 passed=3 failed=145 skipped=32` on the 2026-07-25 run, against
+  wlcs 1.6.1-1. The version belongs beside the numbers: the same shim scores
+  8/49 against wlcs 1.7.0 with no shim change in between, so a ratio from this
+  harness means nothing on its own. That number is expected and
   is not a bug count — [wlcs](https://github.com/canonical/wlcs) tests a
   general-purpose desktop compositor, and the shim deliberately serves a
   narrow surface (no touch, no full `xdg-shell` policy, no decoration
@@ -232,8 +237,13 @@ exactly when unstated gaps mislead**, so the list below is published here rather
 than left to be discovered. Every item is argued out at length on
 [`docs/book/src/limits.md`](docs/book/src/limits.md); this is the short form, and
 neither surface is allowed to say something the other contradicts —
-`cargo xtask limits-check` fails the build if one of them drops a claim or if the
-code stops matching one. **Every bullet names the issue behind it, or says
+`cargo xtask limits-check` fails the build if either drops a claim it holds, if
+one page contradicts *itself*, or if the code stops matching one. It holds a
+named subset of what these pages say rather than every sentence on them, and
+[what it does not
+hold](docs/book/src/limits.md#what-holds-this-page-to-the-others-and-what-it-does-not)
+is written down there — a gap recorded only in the checker's source code is
+recorded only for the person who already knows. **Every bullet names the issue behind it, or says
 plainly that it has none and why** — a published limit with nothing tracking it
 is a different promise from one that is scheduled.
 

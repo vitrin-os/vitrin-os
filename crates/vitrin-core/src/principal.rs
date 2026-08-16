@@ -275,7 +275,14 @@ pub(crate) const AUTH_REFUSED_PHRASE: &str = "authentication refused";
 /// the one object class a bound principal can mint without bound in this
 /// build. Version 1 defines no destructors, so every `get_realm` is a
 /// permanent per-connection allocation; a compliant client needs exactly
-/// one (`realm-0`), and 16 mirrors the shim server's surface cap.
+/// one (`realm-0`), and 16 mirrors the shim server's surface cap --
+/// [`crate::shim::MAX_LIVE_SURFACES`], named here rather than left as "the
+/// shim server's cap" because an audit went looking for it under `shim/`,
+/// found nothing (the C shim has no such bound), and reported this
+/// justification as unbacked. It is backed; it was just unfindable. The two
+/// are now held equal by the `max-live-realms-mirrors-the-surface-cap` row in
+/// `cargo xtask limits-check`'s `MIRRORS` table, so this sentence cannot go
+/// quietly false the way it nearly went quietly unreadable.
 pub(crate) const MAX_LIVE_REALMS: usize = 16;
 
 /// Cap on petitions per connection -- the live-object cap's petition half:

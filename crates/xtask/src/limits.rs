@@ -2,38 +2,63 @@
 //! `cargo xtask limits-check` -- the published-claim drift gate (WS-E.4.4,
 //! issue #224, acceptance criterion 1).
 //!
-//! # THIS IS EXPLICITLY TEMPORARY, AND IT SAYS SO IN ITS OWN COMMENTS
+//! # #172 HAS LANDED, AND THIS IS NO LONGER TEMPORARY
 //!
-//! Issue #224's first task reads: *"Reuse #172's chosen drift mechanism rather
-//! than inventing a second convention. If #172 has not landed, add an
-//! explicitly temporary claim-string check and label it as such in its own
-//! comments, so it is replaced rather than entrenched."*
+//! This module was written under #224's first task -- *"Reuse #172's chosen
+//! drift mechanism rather than inventing a second convention. If #172 has not
+//! landed, add an explicitly temporary claim-string check and label it as such
+//! in its own comments, so it is replaced rather than entrenched."* -- at a
+//! time when #172 was open and had chosen nothing. Its header said so at
+//! length, and enumerated what would happen under each of #172's three
+//! candidate shapes.
 //!
-//! **#172 has not landed.** It is open, it has not chosen between its three
-//! candidate shapes (a single generated source of truth; a claim-string drift
-//! check; a checklist convention in the issue template), and
-//! `.github/workflows/ci.yml` carried zero references to `docs/book/src/limits.md`
-//! before this module. So this is #172's **option (b)**, built narrow, and it
-//! is a placeholder for whatever #172 decides -- not the decision.
+//! **The owner took option (b): a drift check that fails when one surface
+//! disagrees, implemented by extending this module rather than by building a
+//! parallel tool.** Option (a), a single generated source, was rejected because
+//! the three published surfaces legitimately want different registers for the
+//! same fact -- `README.md` a contributor's summary, `docs/book/src/limits.md`
+//! an argued page, `site/index.html` a landing-page warning box. Option (c), a
+//! checklist convention, is the one #172's own body calls weakest, and it is
+//! what #224's acceptance criterion refuses on its own: *"Changing a WS-E claim
+//! on one surface and not the others **fails something in CI**."*
 //!
-//! What "replaced rather than entrenched" means concretely, so a later reader
-//! does not have to reconstruct it:
+//! So the four claims #172 names as known to drift -- the fuzz soak, the wlcs
+//! counts, OIN, REUSE -- are now rows in [`CLAIMS`], and the site's undated
+//! `3/180` has been normalised to the full four-number form with its date and
+//! its wlcs version, which is what made gating them possible. Alongside them
+//! #172 added three things this module did not have, each closing a hole that
+//! was live on `main`:
 //!
-//! * If #172 picks **option (a)**, a single source the surfaces are generated
-//!   from, this module is **deleted**, not extended. A generator makes the
-//!   surfaces agree by construction, and a string check over generated text
-//!   checks nothing.
-//! * If #172 picks **option (b)**, this module is the seed and the four claims
-//!   #172 names as known to drift -- the fuzz soak, the wlcs counts, OIN, REUSE
-//!   -- are the first ones to be added to [`CLAIMS`]. **They are deliberately
-//!   NOT here yet**: they are #172's to normalise (the site quotes an undated
-//!   `3/180` derived from counts it does not show, which is #172's own
-//!   complaint), and gating a number before it is normalised would freeze the
-//!   wrong wording into CI.
-//! * If #172 picks **option (c)**, a checklist convention, this module stays as
-//!   the machine half of it, because a checklist is exactly the thing #224's
-//!   acceptance criterion refuses to accept on its own: *"Changing a WS-E claim
-//!   on one surface and not the others **fails something in CI**."*
+//! * [`DERIVED`] -- one value, one canonical definition, several renderings.
+//!   [`Anchor`] cannot express this and the gap was not theoretical: six
+//!   surfaces stated one AppArmor measurement, three said kernel `1022` and
+//!   three said `1020`, and `apparmor-profile-is-one-image-and-uninstalled`
+//!   passed green over all six because it anchored the artefact path and the
+//!   bound sentence and never the kernel release.
+//! * [`MIRRORS`] -- the same machinery over code-to-code duplicates, the class
+//!   `tests/integration/harness.py`'s `LANDLOCK_MIN_ABI = 7` belonged to.
+//! * [`uncited_issues`] and [`tracker_report`] -- the two halves of #172's
+//!   third acceptance criterion, split because only one of them can honestly be
+//!   a pull-request gate. Read [`uncited_issues`]'s own docs before treating
+//!   either as closing that criterion; neither does, and both say so.
+//!
+//! An adversarial pass over the first cut of all three found two holes that are
+//! now closed here, and they are worth stating as properties rather than as
+//! history, because both are shapes this kind of tool acquires by default:
+//!
+//! * **A surface is held at every occurrence, not at the first one.** A
+//!   `contains` test stops at the first match, so a page that states a value
+//!   twice was held only at one of them and could contradict *itself* with the
+//!   build green. That is not a hypothetical: `site/index.html` said the
+//!   per-kernel matrix "has not been built" in one paragraph and cited its
+//!   measurements ninety lines below. [`Rendering::context`] and
+//!   [`scan_surface`] hold all of them, and a second, disagreeing occurrence
+//!   fails with both line numbers.
+//! * **The covered set cannot shrink quietly.** Deleting a whole [`Claim`] row
+//!   used to leave every check green and move only a tally printed at the end of
+//!   a passing step. [`COVERED_CLAIMS`], [`COVERED_DERIVED`] and
+//!   [`COVERED_MIRRORS`] name every row, so a deletion is red and the failure
+//!   says which id left.
 //!
 //! # What it checks, which is two different things
 //!
@@ -203,6 +228,67 @@
 //! invisible to it; [`is_top_level_item`] now takes every list marker Markdown
 //! has.
 //!
+//! # The uncovered set, written down rather than assumed empty
+//!
+//! #172's audit enumerated the duplicated claims in this repository. Most are
+//! now held. These are not, and each one is here so the uncovered set is a
+//! **list** rather than an absence somebody infers from a green build.
+//!
+//! **This list is itself a published claim, and it has already gone stale
+//! once**: it opened with a count of uncited tracker issues that the same
+//! branch's own edits falsified before the branch was committed. So every
+//! number below is now dated as the reading it is, and the list is restated for
+//! readers who will never open this file, under
+//! `docs/book/src/limits.md`'s heading *"What holds this page to the others,
+//! and what it does not"* -- a gap written down only in Rust source is written
+//! down only for the person who already knows.
+//!
+//! * **Whether the wlcs number is still true of the shim.** The `wlcs-counts`
+//!   row holds five prose surfaces to each other and to
+//!   `shim/wlcs/README.md`'s canonical block, and `wlcs-version` now holds the
+//!   release those counts were taken against -- the component that README's own
+//!   conclusion calls load-bearing, and the one nothing held until it was
+//!   pointed out. Neither re-runs wlcs: the advisory job uploads its summary and
+//!   commits nothing, so unlike `tests/kernel-matrix/rows/` there is no in-tree
+//!   artefact to compare against. A checked-in row file is the stronger fix and
+//!   it is #157's.
+//! * **The 8/49-on-1.7.0 comparison.** Three surfaces carry it as the reason a
+//!   bare ratio means nothing, and it comes from the same canonical block, but
+//!   the block states it as prose rather than as a counts line -- there is no
+//!   `total=`-shaped literal to read it out of. Adding one would mean editing
+//!   `shim/wlcs/README.md`'s report of a run to suit this gate, which is the
+//!   wrong direction of fix.
+//! * **The hardware evidence's dates and kernel strings.** The runs themselves
+//!   are claims about the world and no runner can hold them -- see the bullet
+//!   below, which is correct about the runs. It is over-broad about the TEXT:
+//!   `7.1.5-arch1-2` and `2026-08-09` are strings, they are restated on four
+//!   surfaces, and they COULD be derived from an artefact under
+//!   `docs/book/src/`. They are not, because no single file in the tree is
+//!   their canonical home yet, and inventing one as a side effect of #172 would
+//!   be worse than naming the gap.
+//! * **"The suite has only ever run on two machines."** Nothing derives it, and
+//!   it is the claim most likely to drift silently the day a third machine runs
+//!   anything -- there is no artefact that counts machines. Note also the
+//!   near-collision it creates for any future anchor: `limits.md` says *"still
+//!   exactly two"* about the SUITE and *"this repository's two machines"* about
+//!   BYTE-STABILITY, which are two claims sharing a phrase.
+//! * **`_toml_string_array`'s behavioural mirror.** See [`MIRRORS`], which
+//!   lists it and says why a string comparison cannot hold it.
+//! * **Most open `known-limit` issues are cited on no published surface** --
+//!   six of thirteen when the tracker was last read, on 2026-08-16 (#282, #253,
+//!   #252, #172, #171, #167). That is a reading of a tracker on a date, not a
+//!   property of this tree, and nothing offline can keep it true: the number
+//!   moves when somebody who is not touching this repository opens an issue.
+//!   Re-read it with `cargo xtask limits-check --tracker` rather than trusting
+//!   this line. [`uncited_issues`] holds the other direction only, and the
+//!   report is [`tracker_report`], which is advisory by design.
+//! * **A surface can still state a value in a register no `Rendering` names.**
+//!   [`scan_surface`] holds every occurrence of a register the table knows
+//!   about; it cannot hold a paragraph that invents a new one. That is the
+//!   residual half of the self-drift hole and it is closed by adding a
+//!   `Rendering`, not by widening a context until it matches prose it was never
+//!   about.
+//!
 //! # What it deliberately does NOT check
 //!
 //! * **It is not a docs linter.** #172's own scope note: *"the claim set is
@@ -222,6 +308,12 @@
 //!   reader sees, and moves a newline into the middle of every anchor on a
 //!   76-column surface -- cannot turn the build red. What still trips it is
 //!   deleting or rewording the claim, which is the event worth catching.
+//! * **[`normalize`] collapses whitespace and decodes nothing.** No case
+//!   folding, no entity decoding, no regex. `site/index.html` is full of
+//!   `&mdash;` and `&rsquo;`, and a [`Rendering`] that happened to straddle a
+//!   tag boundary would produce a false RED -- the safe direction, but one that
+//!   gets blamed on the gate rather than on the render function. Every rendered
+//!   form here is deliberately short and free of markup it does not own.
 //!
 //! # Why this is not `--check` on a generator
 //!
@@ -287,9 +379,148 @@ pub struct Claim {
     /// none. #224's task 6 requires every published WS-E bullet to name an
     /// issue or say plainly that it has none; carrying it here means the gate
     /// cannot hold a claim whose provenance nobody wrote down.
+    ///
+    /// Since #172 this field is **checked**, not only printed: every `#N` it
+    /// names must be cited on at least one of the claim's own surfaces. See
+    /// [`uncited_issues`] for what that property is and, more importantly,
+    /// what it is not.
     pub issue: &'static str,
     pub surfaces: &'static [Anchor],
     pub evidence: &'static [Evidence],
+}
+
+// ---------------------------------------------------------------------------
+// Derived values -- #172's one new concept
+// ---------------------------------------------------------------------------
+
+/// Where a derived value is read from.
+pub enum Source {
+    /// Read one or more values out of a single file, each following a literal.
+    ///
+    /// Matching here is **raw**, not [`normalize`]d, and that is the opposite
+    /// choice from [`Anchor`] on purpose: a canonical value lives in a
+    /// constant declaration, a fenced code block or a `#define`, none of which
+    /// reflow. Reading it raw is what lets a `\n`-prefixed literal disambiguate
+    /// `\ntotal=` (the counts line) from `` `total=/passed=` `` (prose about
+    /// the format) in the same file.
+    File {
+        path: &'static str,
+        reads: &'static [Read],
+    },
+    /// Count the files directly under `dir` whose name ends with `suffix`.
+    ///
+    /// The value is that count in decimal. This exists for exactly one shape:
+    /// a published number that is the size of a checked-in set
+    /// (`tests/kernel-matrix/rows/`), where the honest canonical source is the
+    /// set itself and not a second copy of its size.
+    FileCount {
+        dir: &'static str,
+        suffix: &'static str,
+    },
+}
+
+/// One value to read out of a [`Source::File`].
+pub struct Read {
+    /// The literal the value immediately follows. Must occur **exactly once**
+    /// in the file: a second occurrence means the first one wins silently, and
+    /// a canonical value that silently picks a side is not canonical.
+    pub after: &'static str,
+    pub shape: Shape,
+}
+
+/// How a value's end is found.
+pub enum Shape {
+    /// The run of ASCII digits immediately following `after`.
+    Digits,
+    /// Everything from `after` up to (not including) the next occurrence of
+    /// this terminator.
+    UpTo(&'static str),
+}
+
+/// One surface, and the form in which it prints the derived value(s).
+pub struct Rendering {
+    pub path: &'static str,
+    /// The values, in `reads` order, rendered the way this surface prints
+    /// them.
+    ///
+    /// Keep every rendered form **short and tag-free**. [`normalize`] collapses
+    /// whitespace and decodes nothing, so a rendering that straddles an HTML
+    /// tag boundary or an `&mdash;` on `site/index.html` produces a false RED
+    /// -- the safe direction, but one that gets blamed on the gate.
+    pub render: fn(&[String]) -> String,
+    /// **The value-free part of `render`'s output, and the reason a surface
+    /// cannot drift from itself behind a green build.**
+    ///
+    /// A `contains` test asks *"does this value appear somewhere on the
+    /// page"*, and answers yes as soon as one occurrence is right. That is not
+    /// the property this table claims. `docs/book/src/limits.md` states the
+    /// AppArmor run's kernel in two places several hundred lines apart and the
+    /// Landlock floor in two places six hundred lines apart; `site/index.html`
+    /// asserted that the per-kernel matrix *"has not been built"* in one
+    /// paragraph and cited its measurements ninety lines later. A first-hit
+    /// check is blind to exactly the failure this gate exists for.
+    ///
+    /// So a rendering names the literal that identifies **every** place on this
+    /// surface where the value belongs -- the register, not the value -- and
+    /// [`scan_surface`] holds all of them:
+    ///
+    /// * it must occur **exactly once** inside the rendered form, which is what
+    ///   fixes the value's offset relative to it (refused at run time
+    ///   otherwise);
+    /// * it must be **value-free**, so that rendering a different value leaves
+    ///   it unmoved (`every_context_is_value_free`);
+    /// * every occurrence of it on the surface must sit inside a full,
+    ///   canonical rendering. A second, disagreeing occurrence is a failure
+    ///   naming both line numbers.
+    ///
+    /// **Choosing it is a judgement, and both ways of getting it wrong are
+    /// visible.** Too narrow -- a context so specific that only the one correct
+    /// occurrence carries it -- and a stale sibling stays invisible; that is the
+    /// residual hole, and it is the same class as an [`Anchor`] needle that is
+    /// too specific. Too broad -- `` ` of them` `` on `site/index.html`, `` `**
+    /// ` `` in any Markdown -- and honest sentences that were never about this
+    /// value go red. A false RED is the safe direction, but it is also the one
+    /// that gets the gate deleted, so prefer the narrowest literal that still
+    /// covers the whole register: `"total="` for the wlcs counts (every counts
+    /// line on the page), `"** in this"` for the floor (both of the limits
+    /// page's statements of it), not `"6"` and not the whole sentence.
+    ///
+    /// Where one surface legitimately carries the value in two different
+    /// registers -- the limits page reports the AppArmor run once in a table
+    /// header and once in the `unconfined_knob` paragraph -- **model the second
+    /// register as its own `Rendering` with its own context**. Two rows for one
+    /// path is the intended shape, not a workaround.
+    pub context: &'static str,
+}
+
+/// One value with **one** canonical definition and several renderings of it.
+///
+/// This is the concept [`Anchor`] cannot express and #172 needs. An anchor is a
+/// literal: where every surface shares one string (`60 KiB`, `16 realms`),
+/// editing the table's needle cascades to all of them and the mechanism works.
+/// Where the surfaces legitimately render the same value differently --
+/// `passed=3` against `3/180`, `pub const LANDLOCK_MIN_ABI: u32 = 6;` against
+/// four published literal **6**s -- the cascade breaks, and the value can go
+/// stale on one surface with the gate green. That hole was live on the floor
+/// claim, and it is why the 1020/1022 attribution survived a commit whose whole
+/// purpose was fixing that attribution.
+///
+/// A `Derived` row closes it: change the canonical definition alone and
+/// **every** rendering fails at once, so the fix is to move the surfaces rather
+/// than to move a needle in this table.
+///
+/// The shape is not an invention. `crates/xtask/src/isolation_matrix.rs`'s
+/// `Constants::cross_check_harness` already does exactly this for one pair of
+/// files, and `crates/xtask/src/test_census.rs`'s `published_count_sentence`
+/// renders a number-word into a sentence and matches it against the page. This
+/// generalises the two.
+pub struct Derived {
+    pub id: &'static str,
+    pub says: &'static str,
+    /// Same contract as [`Claim::issue`], and checked the same way.
+    pub issue: &'static str,
+    pub source: Source,
+    pub renderings: &'static [Rendering],
 }
 
 // ---------------------------------------------------------------------------
@@ -303,6 +534,45 @@ const SITE: &str = "site/index.html";
 /// otherwise spend a weekend proving something this project already publishes
 /// -- a refusal to start being designed behaviour is exactly that shape.
 const SECURITY: &str = "SECURITY.md";
+
+// The surfaces #172 added, and the reason each one is here rather than being
+// left to care. Every one of them carries a claim #172 names, and before #172
+// none of them was a surface at all.
+//
+// A WARNING that has to be read before the next row is added, because the
+// module docs above argue at length (see "And a third thing, which is a set and
+// not a string") that the plan documents and the limits page are written in two
+// registers which must NOT be forced to converge, and that anchoring a phrase
+// across them is exactly what that passage refuses:
+//
+//   The two plan-document anchors below are safe because they pin CHECKBOX
+//   STATE and STATUS WORDS -- `- [ ] **Join the Open Invention Network**`,
+//   `- [x] **DCO, not CLA**` -- and not argued prose. A checkbox is a fact
+//   about the world with two values; a paragraph is a register. Anchoring the
+//   first is a drift gate. Anchoring the second is the brittleness #224's risk
+//   list names by name, and this precedent is not licence for it.
+/// The licensing map. Normative for the path->license question, and the only
+/// place the SPDX-coverage caveat is stated to a packager.
+const NOTICE: &str = "NOTICE";
+/// The community workstream's checklist. Its ticks are the project's own record
+/// of what is done, and until #172 nothing held a single one of them to the
+/// tree -- which is how it came to say, for months, that there was no
+/// `CONTRIBUTING.md` and that nothing enforced sign-off while both existed.
+const COMMUNITY: &str = "docs/plan/12-workstream-community.md";
+/// The fuzzing harness's own README, which is where the "not scheduled yet"
+/// half of the soak claim is stated in the first person.
+const FUZZ_README: &str = "fuzz/README.md";
+/// The wlcs harness's README. It is the CANONICAL statement of the conformance
+/// counts -- the only surface carrying all four numbers plus the wlcs version
+/// plus the date -- and everything else quotes it.
+const WLCS_README: &str = "shim/wlcs/README.md";
+/// The AppArmor profile. Its header is the canonical statement of which kernel
+/// the profile's one green run was on, and the header itself claims that
+/// `limits-check` anchors that bound on four pages.
+const PROFILE: &str = "packaging/apparmor/vitrind";
+/// The decision log. A `**Status:**` line is a status word, not a register --
+/// see the warning above.
+const DECISIONS: &str = "docs/plan/20-decision-log.md";
 
 /// Directories whose contents are third-party and must never satisfy or break
 /// an [`Evidence::AbsentFrom`] check. `shim/subprojects/` is vendored wlroots,
@@ -1277,9 +1547,16 @@ pub const CLAIMS: &[Claim] = &[
                         `the_floor_costs_nothing_because_the_domain_is_flat_from_six_to_eight` \
                         in crates/vitrin-realm-init/src/main.rs). Raising or lowering it \
                         changes which hosts this build refuses, so it may not move without the \
-                        four pages moving with it -- and the constant is pinned as a whole \
-                        line, value included, precisely so a silent re-tune cannot leave four \
-                        published numbers stale.",
+                        four pages moving with it. This row's own comment used to claim that \
+                        pinning the constant as a whole line was what stopped a silent re-tune \
+                        from leaving four published numbers stale. IT WAS NOT, and the \
+                        correction matters more than the claim did: a re-tune fails THIS row, \
+                        whoever fixes it updates the needle here, and the gate goes green with \
+                        four pages still printing the old number -- nothing ever compared them. \
+                        What actually holds them is the `landlock-abi-floor` row in DERIVED, \
+                        which reads this constant and requires each surface's own rendering of \
+                        it. Keep both: this row holds that the floor is still a startup gate, \
+                        that row holds that the pages print the floor this build declares.",
             },
             Evidence::Contains {
                 path: "crates/vitrin-core/src/spawn/isolation.rs",
@@ -1324,7 +1601,1141 @@ pub const CLAIMS: &[Claim] = &[
             },
         ],
     },
+    // -----------------------------------------------------------------------
+    // #172's four named claims. They were deliberately absent until now: the
+    // module header above records that they were #172's to normalise first,
+    // "and gating a number before it is normalised would freeze the wrong
+    // wording into CI". #172 has now taken option (b) and normalised the wlcs
+    // figure, so they land here.
+    // -----------------------------------------------------------------------
+    Claim {
+        id: "fuzz-soak-never-run",
+        says: "the 24-hour fuzz soak the plan asks for has never been executed end to end and is \
+               not a scheduled job. What CI runs is a corpus replay plus a short per-PR burst, \
+               which is a different and much weaker statement.",
+        issue: "#156.",
+        // Three registers of one fact, plus the harness's own first-person
+        // statement. `fuzz/README.md` is a surface rather than only evidence
+        // because it is the document a contributor reaches for when wiring the
+        // job, and it is the one that would go stale first the day somebody
+        // does.
+        surfaces: &[
+            Anchor {
+                path: LIMITS,
+                needle: "24-hour fuzz soak has never been run",
+            },
+            Anchor {
+                path: LIMITS,
+                needle: "nobody has executed it end to end",
+            },
+            Anchor {
+                path: README,
+                needle: "24-hour fuzz soak has not been run",
+            },
+            Anchor {
+                path: README,
+                needle: "Nobody has run it end to end",
+            },
+            Anchor {
+                path: SITE,
+                needle: "24-hour fuzz soak that has never been run",
+            },
+            Anchor {
+                path: FUZZ_README,
+                needle: "Not scheduled yet",
+            },
+        ],
+        evidence: &[
+            Evidence::Contains {
+                path: FUZZ_README,
+                needle: "presently a manual, documented, reproducible procedure",
+                means: "the harness still describes the soak as a hand procedure. This is the \
+                        sentence somebody deletes on the day they wire the job, which is exactly \
+                        the day all three published surfaces stop being true.",
+            },
+            Evidence::AbsentFrom {
+                roots: &[".github/workflows"],
+                needle: "-max_total_time=86400",
+                means: "no workflow asks libFuzzer for a 24-hour run. THE BOUND ON THIS NEEDLE, \
+                        stated rather than left to be discovered: it catches the soak spelled the \
+                        way fuzz/README.md's own documented procedure spells it, and it would \
+                        NOT catch `-max_total_time=$((24*3600))` or a matrix that sums to a day. \
+                        A bare `schedule:` needle would have been the general check and is \
+                        refused: .github/workflows/kernel-matrix.yml has one, so it would fail \
+                        today for an unrelated reason, and a gate that is red for the wrong \
+                        cause is a gate people learn to edit.",
+            },
+            Evidence::Contains {
+                path: ".github/workflows/ci.yml",
+                needle: "fuzz-smoke:",
+                means: "the per-PR burst all three surfaces credit still exists. This is the \
+                        overclaim-in-the-other-direction half: a page saying CI replays the \
+                        corpus on every PR while the soak has never run becomes false if the \
+                        smoke job is deleted, and it becomes false in the direction that \
+                        flatters the project.",
+            },
+        ],
+    },
+    Claim {
+        id: "wlcs-advisory-and-mostly-red",
+        says: "the wlcs conformance run is ADVISORY -- it never gates a pull request and the \
+               shim is never built by default -- and its counts are a dated, version-pinned \
+               snapshot that has not been re-measured. The four numbers themselves are held by \
+               the `wlcs-counts` row in DERIVED, because the surfaces render them differently.",
+        issue: "#157 asks for the re-measure. It was cited on no published surface until #172.",
+        surfaces: &[
+            Anchor {
+                path: LIMITS,
+                needle: "wlcs conformance is advisory and mostly red",
+            },
+            Anchor {
+                path: LIMITS,
+                needle: "2026-07-25 run",
+            },
+            Anchor {
+                path: README,
+                needle: "wlcs conformance is advisory and mostly red",
+            },
+            Anchor {
+                path: README,
+                needle: "2026-07-25 run",
+            },
+            Anchor {
+                path: SITE,
+                needle: "advisory wlcs conformance at",
+            },
+            Anchor {
+                path: SITE,
+                needle: "2026-07-25 run",
+            },
+            Anchor {
+                path: WLCS_README,
+                needle: "2026-07-25 run",
+            },
+            // The fifth number on the canonical line, and the one that decides
+            // whether the other four are a tally or a floor. `run-advisory.sh`
+            // prints `status=aborted` when the runner dies part-way, and a
+            // partial run's `failed=` reads exactly like a clean sweep's.
+            Anchor {
+                path: WLCS_README,
+                needle: "status=complete",
+            },
+        ],
+        evidence: &[
+            Evidence::Contains {
+                path: WLCS_README,
+                needle: "have NOT been re-measured",
+                means: "the canonical statement still carries its own staleness caveat. Every \
+                        quoting surface says the counts were not re-measured; this is the \
+                        sentence they are quoting, and it is the one that would go first if \
+                        somebody tidied the canonical block into a bare table.",
+            },
+            Evidence::Contains {
+                path: WLCS_README,
+                needle: "wlcs 1.6.1-1 — the version in Ubuntu 24.04",
+                means: "the canonical statement still pins the wlcs VERSION. This file's own \
+                        conclusion is that a number from this harness means nothing without the \
+                        wlcs version beside it -- the same shim scores 8/49 against 1.7.0 with \
+                        no shim change -- so a count published without it is not a weaker claim, \
+                        it is an uninterpretable one. That is why #172 made the site quote the \
+                        version rather than making the canonical statement quote less.",
+            },
+            Evidence::Contains {
+                path: ".github/workflows/ci.yml",
+                needle: "ADVISORY: never blocks a PR",
+                means: "the job still declares itself advisory in its own name. `advisory` is a \
+                        word every surface uses about this number, and the day it starts gating \
+                        merges every one of them is describing a different instrument.",
+            },
+            Evidence::Contains {
+                path: ".github/workflows/ci.yml",
+                needle: "shim/wlcs/run-advisory.sh itself always exits 0",
+                means: "the second half of `advisory`, and the load-bearing one: the runner \
+                        script cannot fail the job even if wlcs itself does. WHAT THIS GATE \
+                        CANNOT DO, and it must be read narrowly: nothing here re-runs wlcs. That \
+                        job uploads its summary and commits nothing, so there is no in-tree \
+                        artefact to compare against -- unlike tests/kernel-matrix/rows/. The \
+                        gate holds five prose surfaces to each other and to \
+                        shim/wlcs/README.md's canonical block; it can never tell you the number \
+                        is still TRUE of the shim. A checked-in row file is the stronger fix and \
+                        it is #157's, not this row's.",
+            },
+        ],
+    },
+    Claim {
+        id: "no-oin-membership-yet",
+        says: "joining the Open Invention Network is decided (D-015) and NOT yet done. The other \
+               two legs of that decision -- defensive publication and the licenses' own patent \
+               grants -- are in force today, and the published sentences must keep the three \
+               apart.",
+        issue: "#159. Cited on no published surface until #172.",
+        surfaces: &[
+            Anchor {
+                path: LIMITS,
+                needle: "Joining the Open Invention Network is decided and",
+            },
+            Anchor {
+                path: README,
+                needle: "Open Invention Network",
+            },
+            Anchor {
+                path: README,
+                needle: "is decided but **not yet done**",
+            },
+        ],
+        evidence: &[
+            // The checkbox is the EVIDENCE, not a surface, and the distinction
+            // is the whole mechanism. docs/plan/12-workstream-community.md's
+            // tick is this project's own record of whether the thing has
+            // happened; the two published pages are what it tells a reader. So
+            // the day somebody joins OIN and ticks the box, this row goes RED
+            // and stays red until both published pages have moved -- which is
+            // precisely the failure #172 was opened for, closed in the one
+            // direction it is known to travel.
+            Evidence::Contains {
+                path: COMMUNITY,
+                needle: "- [ ] **Join the Open Invention Network**",
+                means: "the project's own checklist still records OIN membership as NOT done. \
+                        Tick that box without editing docs/book/src/limits.md and README.md and \
+                        this row fails -- which is the point of putting it here rather than \
+                        among the surfaces.",
+            },
+            Evidence::Contains {
+                path: "docs/plan/20-decision-log.md",
+                needle: "**Open Invention Network membership**, to be joined",
+                means: "D-015 still records membership as decided-and-pending rather than as \
+                        done or as abandoned. If the decision itself is reversed, `no OIN \
+                        membership yet` stops being a gap and becomes a position, and both \
+                        published pages need rewriting rather than deleting.",
+            },
+        ],
+    },
+    Claim {
+        id: "spdx-coverage-not-machine-checked",
+        says: "SPDX header coverage is asserted by convention and by review, NOT by a machine. \
+               There is no REUSE-style CI gate, so a first-party source file added without a \
+               header is not caught.",
+        issue: "#155. Cited on no published surface until #172.",
+        surfaces: &[
+            Anchor {
+                path: LIMITS,
+                needle: "SPDX header coverage is not machine-checked",
+            },
+            Anchor {
+                path: NOTICE,
+                needle: "Header coverage is not machine-checked",
+            },
+            // A status caveat inside a `[x]` bullet, not argued prose -- see
+            // the warning beside COMMUNITY's declaration.
+            Anchor {
+                path: COMMUNITY,
+                needle: "coverage is *not machine-checked*",
+            },
+        ],
+        evidence: &[
+            // THE TRAP THIS ROW WALKED AROUND, recorded because the same one
+            // is available to every future row and this module has fallen into
+            // its twin once already (see
+            // `apparmor-profile-is-one-image-and-uninstalled`). The obvious
+            // needle is the bare word. It is VACUOUS: .github/workflows/ci.yml
+            // contains the English word "reuses" twice, in prose, so an
+            // AbsentFrom on it would fail TODAY for a reason that has nothing
+            // to do with licensing -- and the fix somebody would reach for is
+            // deleting the check. The needles are therefore the two spellings
+            // a real gate would actually have: the action, and the command.
+            Evidence::AbsentFrom {
+                roots: &[".github/workflows"],
+                needle: "fsfe/reuse-action",
+                means: "no workflow runs the REUSE action. The day one does, this gap is closed \
+                        and three surfaces are lying in the direction that understates the \
+                        project -- the direction #172 names as the one that erodes the trust \
+                        these pages exist to earn.",
+            },
+            Evidence::AbsentFrom {
+                roots: &[".github/workflows"],
+                needle: "reuse lint",
+                means: "no workflow runs the command either, whether or not it uses the action. \
+                        Two needles rather than one because a hand-rolled step and a marketplace \
+                        action are different spellings of the same closure, and either of them \
+                        makes all three published sentences false.",
+            },
+        ],
+    },
+    Claim {
+        id: "dco-is-executed",
+        says: "D-012 is EXECUTED, not proposed: CONTRIBUTING.md states the sign-off policy and \
+               .github/workflows/dco.yml enforces a Signed-off-by trailer per commit on every \
+               pull request.",
+        issue: "No issue: this is not a gap, it is the correction of one. \
+                docs/plan/12-workstream-community.md carried three false statements about it in \
+                one bullet -- no CONTRIBUTING.md, nothing enforcing sign-off, D-012 still \
+                proposed -- for months after all three became false, and #172 is why it was \
+                found. The row exists so the tick cannot silently go stale in either direction.",
+        // The only claim here whose direction is the OPPOSITE of a gap, and it
+        // is in this table on purpose. #224's argument -- "a page that
+        // OVERSTATES a gap is as dishonest as one that hides it" -- has a
+        // planning half nothing was holding: a checklist that under-reports its
+        // own project is a document that sends the next reader to do work that
+        // is already done.
+        surfaces: &[
+            Anchor {
+                path: COMMUNITY,
+                needle: "- [x] **DCO, not CLA**",
+            },
+            Anchor {
+                path: README,
+                needle: "Developer Certificate of Origin",
+            },
+            Anchor {
+                path: DECISIONS,
+                needle: "### D-012 — DCO, not CLA **Status:** accepted, executed",
+            },
+        ],
+        evidence: &[
+            Evidence::Contains {
+                path: ".github/workflows/dco.yml",
+                needle: "Executes decision D-012",
+                means: "the workflow that makes the policy true rather than aspirational still \
+                        exists and still says which decision it executes. Delete it and the \
+                        tick above becomes the false statement the untick used to be.",
+            },
+            Evidence::Contains {
+                path: ".github/workflows/dco.yml",
+                needle: "pull_request:",
+                means: "it still runs on pull requests, which is the only trigger under which \
+                        `nothing enforces sign-off` stops being true. A workflow reduced to \
+                        workflow_dispatch would keep the file, keep the name, and enforce \
+                        nothing.",
+            },
+            Evidence::Contains {
+                path: "CONTRIBUTING.md",
+                needle: "Sign your commits (DCO, not a CLA)",
+                means: "the document the workflow's own header says states the policy still \
+                        states it. The plan bullet's specific false claim was that this file did \
+                        not exist at all.",
+            },
+        ],
+    },
+    Claim {
+        id: "per-kernel-isolation-matrix-exists",
+        says: "the per-kernel half of P2.6.3's criteria EXISTS and is measured -- five \
+               distribution kernels booted under QEMU with the shipped binary -- and the \
+               readings are KERNEL rows taken with no distribution policy loaded, so the number \
+               of distributions measured as such is still one.",
+        issue: "#281 delivered it. P2.6.3's remaining gap is the seccomp filter (#187), which is \
+                a different sentence and must not be collapsed into this one.",
+        // This row exists because of a drift that was live on `main` when #172
+        // was implemented, and it is the cleanest instance of #172's thesis in
+        // the repository. PR #294's doc sweep rewrote README.md,
+        // docs/book/src/limits.md, SECURITY.md, the Phase-2 plan and both
+        // generated pages to say the per-kernel matrix now exists -- and left
+        // site/index.html's first warn paragraph saying it "has not been
+        // built", ninety lines above a paragraph on the same page citing the
+        // very measurement it denied. The landing page understated the project
+        // to itself, in the direction #172 names by name, in a commit whose
+        // purpose was removing exactly that.
+        //
+        // Per-surface needles rather than one shared string: `vitrind` is
+        // backticked on three surfaces and wrapped in <code> on the fourth, and
+        // forcing one spelling on all four would mean editing the site's markup
+        // to suit a gate.
+        surfaces: &[
+            Anchor {
+                path: LIMITS,
+                needle: "booted under QEMU with the shipped `vitrind`",
+            },
+            Anchor {
+                path: LIMITS,
+                needle: "not a statement about the distribution that ships that kernel",
+            },
+            Anchor {
+                path: README,
+                needle: "under QEMU with the shipped `vitrind`",
+            },
+            Anchor {
+                path: README,
+                needle: "the number of *distributions* measured as such is still",
+            },
+            Anchor {
+                path: SECURITY,
+                needle: "booted under QEMU with the shipped `vitrind`",
+            },
+            Anchor {
+                path: SECURITY,
+                needle: "the number of *distributions* whose policy this repository has measured",
+            },
+            Anchor {
+                path: SITE,
+                needle: "booted under QEMU with the shipped <code>vitrind</code>",
+            },
+            Anchor {
+                path: SITE,
+                needle: "taken with no distribution policy loaded",
+            },
+        ],
+        evidence: &[
+            Evidence::Contains {
+                path: ".github/workflows/ci.yml",
+                needle: "cargo xtask kernel-matrix --check",
+                means: "the generated per-kernel page is still held to the checked-in rows on \
+                        every pull request. Without it the four sentences above cite a page \
+                        nothing keeps in step with its own measurements.",
+            },
+            Evidence::Contains {
+                path: ".github/workflows/kernel-matrix.yml",
+                needle: "collect.sh --check",
+                means: "the rows are still held to the KERNELS by a scheduled job. This is the \
+                        other half and the surfaces depend on it: `measured` in four published \
+                        registers means a boot happened, and a page held only to stale rows \
+                        would satisfy every other check here while measuring nothing.",
+            },
+            // The claim's opposite direction, and the one that actually
+            // drifted. A surface that says the per-kernel matrix has NOT been
+            // built is now a red build rather than a paragraph nobody re-read.
+            Evidence::AbsentFrom {
+                roots: &[SITE, README, LIMITS, SECURITY],
+                needle: "per-kernel one its criteria ask for has not been built",
+                means: "no published surface still says the per-kernel matrix does not exist. \
+                        That sentence was true until #281 landed and false afterwards, and it \
+                        survived on site/index.html through the sweep that corrected every other \
+                        surface. It is pinned as an absence rather than trusted to review, \
+                        because review is what missed it.",
+            },
+        ],
+    },
 ];
+
+// ---------------------------------------------------------------------------
+// The derived tables
+// ---------------------------------------------------------------------------
+
+/// Values with one canonical definition, published in several renderings.
+///
+/// See [`Derived`] for why this table exists and what [`Anchor`] cannot do. A
+/// row belongs here rather than in [`CLAIMS`] when the surfaces print the *same
+/// value* in *different forms* -- which is precisely when a shared literal
+/// needle stops cascading and a number can go stale with the gate green.
+pub const DERIVED: &[Derived] = &[
+    Derived {
+        id: "landlock-abi-floor",
+        says: "the Landlock ABI floor this build declares. One constant, four published \
+               renderings of it, and until #172 the four were held by nothing.",
+        issue: "#187 owns what P2.6.3 still does not do. The floor's own value is an owner's \
+                decision (2026-08-15, lowered a rung on 2026-08-16) rather than an issue.",
+        source: Source::File {
+            path: "crates/vitrin-realm-init/src/lib.rs",
+            reads: &[Read {
+                after: "pub const LANDLOCK_MIN_ABI: u32 = ",
+                shape: Shape::Digits,
+            }],
+        },
+        // docs/book/src/isolation-kernels.md renders the same number ("at or
+        // above the floor of 6") and is deliberately NOT here: it is generated
+        // by `cargo xtask isolation-matrix`, which already reads this constant,
+        // so a row would hold the generator to itself. The four below are
+        // hand-written and are the ones that can rot.
+        renderings: &[
+            Rendering {
+                path: README,
+                render: floor_bold_here,
+                context: "** here",
+            },
+            Rendering {
+                path: SECURITY,
+                render: floor_bold_here,
+                context: "** here",
+            },
+            // TWO statements of the floor, six hundred lines apart -- the
+            // startup-refusal bullet and condition 4 of the four-condition
+            // block -- and one context covers both. This is the shape a
+            // first-hit `contains` was blind to: either could have gone stale
+            // behind the other.
+            Rendering {
+                path: LIMITS,
+                render: floor_bold_in_this,
+                context: "** in this",
+            },
+            Rendering {
+                path: SITE,
+                render: floor_strong_in_this_build,
+                context: "</strong> in this build",
+            },
+        ],
+    },
+    Derived {
+        id: "wlcs-counts",
+        says: "the four advisory wlcs conformance counts. shim/wlcs/README.md's fenced block is \
+               the canonical statement; three surfaces quote all four numbers and one renders \
+               two of them as a ratio.",
+        issue: "#157.",
+        source: Source::File {
+            path: WLCS_README,
+            // Each `after` is leading-delimited so it matches the counts LINE
+            // and not the prose about the format. shim/wlcs/README.md also
+            // contains "Prints a `total=/passed=/failed=/skipped=/status=`
+            // summary", and a bare `total=` would match both -- at which point
+            // the first occurrence wins silently, which is what the
+            // exactly-once rule is here to refuse.
+            reads: &[
+                Read {
+                    after: "\ntotal=",
+                    shape: Shape::Digits,
+                },
+                Read {
+                    after: " passed=",
+                    shape: Shape::Digits,
+                },
+                Read {
+                    after: " failed=",
+                    shape: Shape::Digits,
+                },
+                Read {
+                    after: " skipped=",
+                    shape: Shape::Digits,
+                },
+            ],
+        },
+        renderings: &[
+            // The context is `total=`, which is the whole counts register:
+            // every counts line on the page has to be THIS run's four numbers,
+            // not merely one of them somewhere.
+            Rendering {
+                path: LIMITS,
+                render: wlcs_full_counts,
+                context: "total=",
+            },
+            Rendering {
+                path: README,
+                render: wlcs_full_counts,
+                context: "total=",
+            },
+            // #172's task 2, and the reason this row can exist at all. The site
+            // used to quote an undated 3/180 derived from counts it did not
+            // show -- a ratio with no failed, no skipped, no date and no wlcs
+            // version, which shim/wlcs/README.md's own conclusion says means
+            // nothing. It now carries the full four-number form. Note the
+            // direction of the fix: the weaker surface was raised to the
+            // canonical statement, never the canonical statement lowered to
+            // match the weaker one.
+            Rendering {
+                path: SITE,
+                render: wlcs_full_counts,
+                context: "total=",
+            },
+            // The one legitimately different register, and the reason a shared
+            // literal could not have held this claim. shim/wlcs/README.md
+            // states the ratio a second time to compare it against 8/49 on
+            // wlcs 1.7.0, where the four-number form would be noise.
+            //
+            // `wlcs_ratio` renders the two words in front of the ratio as well,
+            // and that is not decoration: a bare `3/180` has no value-free part
+            // except `/`, and a context of `/` would scan every path and every
+            // date on the page. The register is "the same shim SCORES x/y", so
+            // that is what the rendering says.
+            Rendering {
+                path: WLCS_README,
+                render: wlcs_ratio,
+                context: "shim scores ",
+            },
+        ],
+    },
+    Derived {
+        id: "wlcs-version",
+        says: "the wlcs release the advisory counts were measured against. shim/wlcs/README.md's \
+               own conclusion is that a number from this harness means nothing without it, so \
+               the version is load-bearing wherever the counts are quoted.",
+        // #157 asks for the re-measure; the version is what makes the CURRENT
+        // numbers interpretable in the meantime.
+        issue: "#157.",
+        // THE COMPONENT THE COUNTS ROW ABOVE DID NOT HOLD. `wlcs-counts` pins
+        // four numbers on four surfaces, and shim/wlcs/README.md:728 says in
+        // its own words that those numbers "mean nothing" without the version
+        // beside them -- the same shim scores 8/49 against 1.7.0 with no shim
+        // change in between. Until this row the most load-bearing component of
+        // the claim was the one component nothing anchored: every surface could
+        // have kept saying 1.6.1-1 after the runner image moved past it, which
+        // is not a hypothetical (shim/wlcs/README.md predicts that exact day)
+        // and would have left three published pages attributing one run's
+        // numbers to another run's harness.
+        source: Source::File {
+            path: WLCS_README,
+            reads: &[Read {
+                after: "**Provenance.** wlcs ",
+                shape: Shape::UpTo(" —"),
+            }],
+        },
+        renderings: &[
+            // One rendering shared by all three surfaces, deliberately: the
+            // version is a provenance stamp rather than an argued sentence, so
+            // there is no register to preserve here, and one spelling means the
+            // context covers the whole family. The narrower `run, against wlcs`
+            // rather than `against wlcs` is required -- every one of these
+            // surfaces also says "against wlcs 1.7.0" in the very next clause,
+            // and that sentence is true and must not go red.
+            Rendering {
+                path: LIMITS,
+                render: wlcs_against_version,
+                context: "run, against wlcs ",
+            },
+            Rendering {
+                path: README,
+                render: wlcs_against_version,
+                context: "run, against wlcs ",
+            },
+            Rendering {
+                path: SITE,
+                render: wlcs_against_version,
+                context: "run, against wlcs ",
+            },
+        ],
+    },
+    Derived {
+        id: "apparmor-green-run-kernel",
+        says: "the kernel release the AppArmor profile's one green run was on. Six surfaces \
+               state one measurement; on 2026-08-16 three of them said 1022 and three said \
+               1020, and the commit that corrected three was itself under-enumerating.",
+        issue: "#286 shipped the profile and the job. #293 owns installing it.",
+        // THE ROW THIS WHOLE MECHANISM WAS BUILT FOR, and the evidence that
+        // literal anchors were not enough.
+        // `apparmor-profile-is-one-image-and-uninstalled` anchors the artefact
+        // path and the bound sentence on four surfaces and passed green over a
+        // six-way disagreement about which kernel the measurement was taken on,
+        // because the kernel release was never anchored at all. The value is
+        // now read from the profile's own header -- the file that carries the
+        // run's report -- and every surface has to render it.
+        source: Source::File {
+            path: PROFILE,
+            reads: &[Read {
+                after: "#  What it reported on kernel ",
+                shape: Shape::UpTo(","),
+            }],
+        },
+        renderings: &[
+            Rendering {
+                path: README,
+                render: kernel_backticked_it_reported,
+                context: "` it reported",
+            },
+            Rendering {
+                path: SECURITY,
+                render: kernel_backticked_it_took,
+                context: "` it took",
+            },
+            Rendering {
+                path: SITE,
+                render: kernel_coded_that_took,
+                context: "</code> that took",
+            },
+            // `on kernel \`` and not `kernel \``. The limits page also reports a
+            // DIFFERENT, equally real run on `6.17.0-1020-azure` -- the
+            // namespace refusal, 2026-08-14 -- and a context broad enough to
+            // catch both would turn a true sentence red. Two measurements on
+            // two runner images are not drift; the check has to be able to tell
+            // them apart, and the register is what does it.
+            Rendering {
+                path: LIMITS,
+                render: kernel_on_kernel_with,
+                context: "on kernel `",
+            },
+            // The SECOND reading on the limits page, and the one the 2026-08-16
+            // correction missed: the `unconfined_knob=0` paragraph reports the
+            // same job, the same run and the same machine, several hundred
+            // lines further down. A surface can carry a value twice and drift
+            // from itself.
+            Rendering {
+                path: LIMITS,
+                render: kernel_knob_paragraph,
+                context: "`ubuntu-latest` (kernel `",
+            },
+        ],
+    },
+    Derived {
+        id: "kernels-measured",
+        says: "how many distribution kernels have actually been booted with the shipped binary. \
+               The canonical source is the set of checked-in row files, not a number written \
+               down beside it.",
+        issue: "#281.",
+        // Deliberately counted from tests/kernel-matrix/rows/ rather than from
+        // tests/kernel-matrix/kernels.manifest: the manifest says which kernels
+        // are IN THE SET, the rows say which were MEASURED, and every published
+        // sentence here is about the second. A manifest entry with no row is a
+        // kernel nobody booted.
+        source: Source::FileCount {
+            dir: "tests/kernel-matrix/rows",
+            suffix: ".row",
+        },
+        renderings: &[
+            // Two statements on the limits page, both inside this one context:
+            // the page's opening orientation and the floor-exclusion section
+            // six score lines later. The second used to open a sentence with a
+            // capitalised "Five", which normalize does not case-fold and which
+            // therefore rendered it invisible to this scan; it was lowered into
+            // the sentence so BOTH are held rather than one.
+            Rendering {
+                path: LIMITS,
+                render: kernels_distribution_kernels,
+                context: " distribution kernels",
+            },
+            Rendering {
+                path: README,
+                render: kernels_distribution_kernels,
+                context: " distribution kernels",
+            },
+            Rendering {
+                path: SECURITY,
+                render: kernels_distribution_kernels,
+                context: " distribution kernels",
+            },
+            Rendering {
+                path: SITE,
+                render: kernels_distribution_kernels,
+                context: " distribution kernels",
+            },
+            // The site's second register for the same count. The trailing colon
+            // is load-bearing: the site says "one of them" twice about other
+            // things, and ` of them` alone would redden two true sentences.
+            Rendering {
+                path: SITE,
+                render: kernels_on_n_of_them,
+                context: " of them:",
+            },
+        ],
+    },
+];
+
+/// Code-to-code mirrors: a value duplicated in a second file, with a comment
+/// promising the duplicate follows the original.
+///
+/// **Why this is a separate table from [`DERIVED`] and not a separate
+/// mechanism.** [`CLAIMS`] and [`DERIVED`] are about text this project
+/// PUBLISHES; a mirror between two source files is a different property with a
+/// different reader, and collapsing them would make the green line's "published
+/// claims" count mean two things. The machinery underneath is identical because
+/// the shape is identical -- one canonical definition, N renderings of it -- and
+/// duplicating the runner to make the tables feel different would be the worse
+/// error.
+///
+/// **Why it is worth having at all.** On 2026-08-16
+/// `tests/integration/harness.py` carried `LANDLOCK_MIN_ABI = 7` for a day
+/// after the crate moved to 6, under a docstring saying it mirrors the crate,
+/// while `test_real_confinement.py` asserts `obtained_rung >=
+/// LANDLOCK_MIN_ABI` -- so the confinement gate would have gone red on exactly
+/// the ABI-6 machines the lowering existed to serve, and green everywhere the
+/// suite is actually run. A value duplicated with a comment promising it
+/// mirrors another is a drift bug waiting to happen, and nothing checked it.
+///
+/// **What is NOT here, and why the uncovered set is written down rather than
+/// left to be assumed empty:**
+///
+/// * `LANDLOCK_MIN_ABI` / `LANDLOCK_BUILD_MAX_RUNG` -- already held, by
+///   `crates/xtask/src/isolation_matrix.rs`'s `Constants::cross_check_harness`.
+///   Deliberately NOT moved here: that module's own comment argues correctly
+///   that the check belongs with the tool that already reads one of the files,
+///   and moving it would buy tidiness at the cost of a second reader.
+/// * `PROTOCOL_DECODE_CLAIMS` -- held by a completeness assertion inside
+///   `fuzz/tests/seed_corpus_reachability.rs`.
+/// * `PROPERTY_GATES` -- held in line, in `.github/workflows/ci.yml` itself.
+/// * `crates/xtask/src/main.rs`'s `_toml_string_array`, which says it "mirrors
+///   `tests/integration/harness.py`'s". That is a **behavioural** mirror -- two
+///   parsers that must accept the same language -- and no string comparison can
+///   hold it. It is the one known unheld mirror in this list, it can diverge
+///   silently, and closing it means a shared fixture rather than a needle.
+pub const MIRRORS: &[Derived] = &[
+    Derived {
+        id: "shim-core-fd",
+        says: "the file descriptor the core places the shim's end of the identity socketpair on. \
+               shim/include/wire.h names it as a #define and says to keep it in sync with \
+               spawn::SHIM_CORE_FD.",
+        issue: "No issue: this is a mirror the C header asks for in its own comment.",
+        source: Source::File {
+            path: "crates/vitrin-core/src/spawn.rs",
+            reads: &[Read {
+                after: "pub(crate) const SHIM_CORE_FD: RawFd = ",
+                shape: Shape::Digits,
+            }],
+        },
+        renderings: &[Rendering {
+            path: "shim/include/wire.h",
+            render: core_fd_define,
+            context: "#define VITRIN_CORE_FD ",
+        }],
+    },
+    Derived {
+        id: "demo-identity",
+        says: "the demo agent's principal identity. Four files carry it: the launcher that \
+               writes the registry, the shipped example registry, the integration harness and \
+               the demo agent itself.",
+        issue: "No issue: crates/xtask/src/main.rs's comment says it must match \
+                examples/principals.toml and run_demo.py, and nothing checked that.",
+        source: Source::File {
+            path: "crates/xtask/src/main.rs",
+            reads: &[Read {
+                after: "const DEMO_IDENTITY: &str = \"",
+                shape: Shape::UpTo("\""),
+            }],
+        },
+        renderings: &[
+            Rendering {
+                path: "tests/integration/harness.py",
+                render: py_demo_identity,
+                context: "DEMO_IDENTITY = \"",
+            },
+            Rendering {
+                path: "examples/agent-demo/run_demo.py",
+                render: py_demo_identity,
+                context: "DEMO_IDENTITY = \"",
+            },
+            Rendering {
+                path: "examples/principals.toml",
+                render: toml_identity,
+                context: "identity = \"",
+            },
+        ],
+    },
+    Derived {
+        id: "demo-token",
+        says: "the demo agent's pre-shared token, whose length and repeated character the two \
+               Python copies spell as a repetition rather than as the literal.",
+        issue: "No issue: same comment as the identity above.",
+        // THE HONEST BOUND ON THIS ROW, because it is weaker than the others
+        // and must not be read as equal to them. The Python spelling is a
+        // repetition expression, so what can be held is the repeated character
+        // and the length -- not the whole alphabet. Change the Rust token to 64
+        // characters that merely START with the same one and this row stays
+        // green while the copies diverge. It is here anyway because the two
+        // failures it DOES catch (a length change, a different fill character)
+        // are the two ways this constant has any reason to move, and because
+        // the residual hole fails loudly: a mismatched token refuses the
+        // handshake in every real-app gate rather than passing quietly.
+        source: Source::File {
+            path: "crates/xtask/src/main.rs",
+            reads: &[Read {
+                after: "const DEMO_TOKEN: &str = \"",
+                shape: Shape::UpTo("\""),
+            }],
+        },
+        renderings: &[
+            Rendering {
+                path: "tests/integration/harness.py",
+                render: py_demo_token,
+                context: "DEMO_TOKEN = \"",
+            },
+            Rendering {
+                path: "examples/agent-demo/run_demo.py",
+                render: py_demo_token,
+                context: "DEMO_TOKEN = \"",
+            },
+        ],
+    },
+    Derived {
+        id: "max-live-realms-mirrors-the-surface-cap",
+        says: "the per-connection cap on live realm handles, which principal.rs justifies as \
+               mirroring the shim server's surface cap.",
+        issue: "No issue: found while auditing #172. The justification is REAL -- \
+                crates/vitrin-core/src/shim.rs's MAX_LIVE_SURFACES -- and an audit that searched \
+                only the C shim under shim/ concluded it was unbacked. A justification nobody \
+                can locate is one somebody eventually deletes, so it is pinned here and the \
+                comment now names the constant.",
+        source: Source::File {
+            path: "crates/vitrin-core/src/shim.rs",
+            reads: &[Read {
+                after: "pub(crate) const MAX_LIVE_SURFACES: usize = ",
+                shape: Shape::Digits,
+            }],
+        },
+        renderings: &[Rendering {
+            path: "crates/vitrin-core/src/principal.rs",
+            render: max_live_realms,
+            context: "pub(crate) const MAX_LIVE_REALMS: usize = ",
+        }],
+    },
+];
+
+// ---------------------------------------------------------------------------
+// The coverage roll, so a set cannot shrink quietly
+// ---------------------------------------------------------------------------
+
+/// **Every claim this gate covers, named. Deleting a row from [`CLAIMS`] turns
+/// this red.**
+///
+/// # Why a second list rather than a tidier `CLAIMS.len()`
+///
+/// Because until this list existed, *deleting a whole row was green*. Every
+/// surface anchor, every evidence assertion and every test kept passing; the
+/// only thing that moved was a number printed at the end of a passing CI step,
+/// where nobody reads it. That is issue #288's failure mode -- a green check
+/// over a quietly smaller set -- reproduced inside the tool built to prevent it,
+/// and #288's own answer is the standard followed here: a count is acceptable
+/// only when a comment names each thing it counts, so that raising or lowering
+/// it is a **visible decision** in a diff rather than a reflex.
+///
+/// A list of ids is that comment and that count in one object, and it is
+/// strictly better than either alone:
+///
+/// * deleting a row is red, and the failure names the id that vanished rather
+///   than reporting that 24 became 23;
+/// * adding a row is red until the id is written down here, so new coverage is
+///   claimed deliberately;
+/// * renaming an id is red in both directions at once, which a count cannot see
+///   at all;
+/// * the diff of a coverage change is the ids, so a reviewer reads *which*
+///   claim left the gate, which is the only question worth asking.
+///
+/// The order is [`CLAIMS`]'s own, and it is not checked -- reordering a table is
+/// not a coverage change and must not cost a red build. Duplicates ARE checked:
+/// two rows sharing an id would let one masquerade as the other here.
+pub const COVERED_CLAIMS: &[&str] = &[
+    "accessibility-absent",
+    "no-x-server",
+    "no-layer-shell",
+    "no-idle-inhibit",
+    "clipboard-bound",
+    "realm-cardinality",
+    "one-output",
+    "no-touch-no-tablet",
+    "band-witness-headless-only",
+    "drm-ci-compile-only",
+    "no-portals",
+    "shell-crash-loses-window-management",
+    "lock-and-blank-do-not-stop-an-agent",
+    "media-keys-reach-an-app-that-cannot-act",
+    "no-key-repeat-on-drm",
+    "host-must-permit-unprivileged-userns",
+    "apparmor-profile-is-one-image-and-uninstalled",
+    "host-must-have-landlock",
+    // The four #172 names as known to drift, and the two the sweep for them
+    // turned up.
+    "fuzz-soak-never-run",
+    "wlcs-advisory-and-mostly-red",
+    "no-oin-membership-yet",
+    "spdx-coverage-not-machine-checked",
+    "dco-is-executed",
+    "per-kernel-isolation-matrix-exists",
+];
+
+/// Every derived value this gate covers. Same contract as [`COVERED_CLAIMS`],
+/// and the same reason: a `Derived` row is the only thing holding four or five
+/// surfaces to one number, so losing one loses all of them at once and in
+/// silence.
+pub const COVERED_DERIVED: &[&str] = &[
+    "landlock-abi-floor",
+    "wlcs-counts",
+    "wlcs-version",
+    "apparmor-green-run-kernel",
+    "kernels-measured",
+];
+
+/// Every code-to-code mirror this gate covers. Same contract as
+/// [`COVERED_CLAIMS`].
+pub const COVERED_MIRRORS: &[&str] = &[
+    "shim-core-fd",
+    "demo-identity",
+    "demo-token",
+    "max-live-realms-mirrors-the-surface-cap",
+];
+
+/// Hold a table to its coverage roll: same ids, no duplicates, order free.
+///
+/// Both directions are failures and they are different failures, so the message
+/// says which. A **missing** id is coverage that left the gate -- the one this
+/// exists for. An **unlisted** id is coverage that arrived without being
+/// claimed, which is not a defect in the tree but is a decision somebody has to
+/// make explicitly, exactly as raising a count would be.
+/// [`coverage_failures`] over the three shipped tables. Called by the gate and
+/// by its own test, so neither can hold a different set from the other.
+pub fn shipped_coverage_failures() -> Vec<String> {
+    let claims: Vec<&str> = CLAIMS.iter().map(|c| c.id).collect();
+    let derived: Vec<&str> = DERIVED.iter().map(|d| d.id).collect();
+    let mirrors: Vec<&str> = MIRRORS.iter().map(|d| d.id).collect();
+    let mut failures = coverage_failures("COVERED_CLAIMS", "CLAIMS", &claims, COVERED_CLAIMS);
+    failures.extend(coverage_failures(
+        "COVERED_DERIVED",
+        "DERIVED",
+        &derived,
+        COVERED_DERIVED,
+    ));
+    failures.extend(coverage_failures(
+        "COVERED_MIRRORS",
+        "MIRRORS",
+        &mirrors,
+        COVERED_MIRRORS,
+    ));
+    failures
+}
+
+fn coverage_failures(label: &str, table: &str, have: &[&str], listed: &[&str]) -> Vec<String> {
+    let mut failures = Vec::new();
+    for (i, id) in have.iter().enumerate() {
+        if have[..i].contains(id) {
+            failures.push(format!(
+                "[{id}] COVERAGE -- two rows in {table} share this id. One of them is invisible \
+                 in every failure message this gate prints, and either could stand in for the \
+                 other in {label}."
+            ));
+        }
+    }
+    for id in listed {
+        if !have.contains(id) {
+            failures.push(format!(
+                "[{id}] COVERAGE -- {label} lists this id and {table} no longer has a row for \
+                 it.\n    COVERAGE SHRANK. Deleting a row used to be green: every remaining \
+                 check still passed and only a tally printed at the end of a passing step \
+                 moved. That is the failure issue #288 exists for, so it is red here.\n    If \
+                 the claim is genuinely gone from every published surface, remove it from \
+                 {label} in the same commit and say in the message what stopped being \
+                 published. If it is not, restore the row."
+            ));
+        }
+    }
+    for id in have {
+        if !listed.contains(id) {
+            failures.push(format!(
+                "[{id}] COVERAGE -- {table} has a row for this id and {label} does not list \
+                 it.\n    New coverage is claimed deliberately: add the id to {label}. The list \
+                 is what makes a shrinking set visible in a diff instead of in a number nobody \
+                 reads."
+            ));
+        }
+    }
+    failures
+}
+
+// ---------------------------------------------------------------------------
+// Render functions.
+//
+// Named `fn` items rather than closures, because a `const` table cannot hold a
+// closure and because each one is a published surface's own spelling of a
+// value -- worth reading on its own line and worth a test. Every one of them is
+// exercised by `every_rendering_moves_when_the_canonical_value_moves`, which is
+// this mechanism's non-vacuity guard: a render function that ignores its input
+// (returning a constant, or an empty string, both of which `contains` accepts)
+// would make a row silently unable to fail.
+// ---------------------------------------------------------------------------
+
+/// `README.md`, `SECURITY.md`: "... `vitrind --print-floor` -- **6** here ...".
+fn floor_bold_here(v: &[String]) -> String {
+    format!("**{}** here", v[0])
+}
+
+/// `docs/book/src/limits.md`: "... **6** in this build ...".
+fn floor_bold_in_this(v: &[String]) -> String {
+    format!("**{}** in this", v[0])
+}
+
+/// `site/index.html`. Short and tag-free past the one element it owns, so
+/// nothing straddles a boundary.
+fn floor_strong_in_this_build(v: &[String]) -> String {
+    format!("<strong>{}</strong> in this build", v[0])
+}
+
+/// The canonical four-number form, as `shim/wlcs/README.md` prints it.
+fn wlcs_full_counts(v: &[String]) -> String {
+    format!(
+        "total={} passed={} failed={} skipped={}",
+        v[0], v[1], v[2], v[3]
+    )
+}
+
+/// The ratio register: "the same shim scores 3/180 against wlcs 1.6.1".
+///
+/// The two leading words are part of the rendering rather than scenery: a bare
+/// `3/180` has no value-free substring but `/`, and a `Rendering::context` of
+/// `/` would scan every path and date on the page.
+fn wlcs_ratio(v: &[String]) -> String {
+    format!("shim scores {}/{}", v[1], v[0])
+}
+
+/// The provenance register the counts are quoted in: "... on the 2026-07-25
+/// run, against wlcs 1.6.1-1".
+fn wlcs_against_version(v: &[String]) -> String {
+    format!("run, against wlcs {}", v[0])
+}
+
+fn kernel_backticked_it_reported(v: &[String]) -> String {
+    format!("`{}` it reported", v[0])
+}
+
+fn kernel_backticked_it_took(v: &[String]) -> String {
+    format!("`{}` it took", v[0])
+}
+
+fn kernel_coded_that_took(v: &[String]) -> String {
+    format!("<code>{}</code> that took", v[0])
+}
+
+fn kernel_on_kernel_with(v: &[String]) -> String {
+    format!("on kernel `{}` with", v[0])
+}
+
+/// The limits page's second, further-down reading of the same run.
+///
+/// It renders the `ubuntu-latest` clause in front of the parenthesis so the
+/// context can be `` `ubuntu-latest` (kernel ` ``: the page also writes
+/// `` (kernel `7.1.8-arch1-3`, ...) `` about the maintainer's own box, and a
+/// context of `` (kernel ` `` would redden that true sentence.
+fn kernel_knob_paragraph(v: &[String]) -> String {
+    format!("`ubuntu-latest` (kernel `{}`, 2026-08-15)", v[0])
+}
+
+fn kernels_distribution_kernels(v: &[String]) -> String {
+    format!("{} distribution kernels", number_word(&v[0]))
+}
+
+/// The site's second register. The trailing colon is the whole of what makes
+/// `` ` of them:` `` a usable context on a page that says "one of them" twice
+/// about other things.
+fn kernels_on_n_of_them(v: &[String]) -> String {
+    format!("on {} of them:", number_word(&v[0]))
+}
+
+fn core_fd_define(v: &[String]) -> String {
+    format!("#define VITRIN_CORE_FD {}", v[0])
+}
+
+fn py_demo_identity(v: &[String]) -> String {
+    format!("DEMO_IDENTITY = \"{}\"", v[0])
+}
+
+fn toml_identity(v: &[String]) -> String {
+    format!("identity = \"{}\"", v[0])
+}
+
+/// The repeated character and the length, which is all the Python spelling can
+/// carry. See the row's own comment for the bound.
+fn py_demo_token(v: &[String]) -> String {
+    let fill = v[0].chars().next().unwrap_or('?');
+    format!("DEMO_TOKEN = \"{}\" * {}", fill, v[0].chars().count())
+}
+
+fn max_live_realms(v: &[String]) -> String {
+    format!("pub(crate) const MAX_LIVE_REALMS: usize = {};", v[0])
+}
+
+/// A small decimal count as English prose spells it.
+///
+/// Same shape and the same reason as `crates/xtask/src/test_census.rs`'s
+/// `published_count_sentence`: the pages write "five distribution kernels", not
+/// "5". Past twelve the digit is better than a wrong word, and a count that
+/// large is not a sentence this project will be writing by hand anyway.
+fn number_word(count: &str) -> String {
+    match count {
+        "0" => "no",
+        "1" => "one",
+        "2" => "two",
+        "3" => "three",
+        "4" => "four",
+        "5" => "five",
+        "6" => "six",
+        "7" => "seven",
+        "8" => "eight",
+        "9" => "nine",
+        "10" => "ten",
+        "11" => "eleven",
+        "12" => "twelve",
+        other => return other.to_string(),
+    }
+    .to_string()
+}
 
 // ---------------------------------------------------------------------------
 // The check
@@ -1332,7 +2743,15 @@ pub const CLAIMS: &[Claim] = &[
 
 /// Entry point for `cargo xtask limits-check`.
 pub fn limits_check(root: &Path) -> Result<()> {
-    let mut failures = run_claims(root, CLAIMS)?;
+    // Coverage first, and in the gate rather than only in a test: the tally
+    // this used to print is not load-bearing, and a table that lost a row
+    // should fail before anybody reads what the survivors say.
+    let mut failures = shipped_coverage_failures();
+    failures.extend(run_claims(root, CLAIMS)?);
+    let (derived_failures, derived_values) = run_derived(root, DERIVED, "DERIVED");
+    failures.extend(derived_failures);
+    let (mirror_failures, mirror_values) = run_derived(root, MIRRORS, "MIRROR");
+    failures.extend(mirror_failures);
     let (cross, limit_counts) = cross_check_files(root)?;
     let cross_len = cross.len();
     failures.extend(cross);
@@ -1346,11 +2765,24 @@ pub fn limits_check(root: &Path) -> Result<()> {
             .map(|(path, n)| format!("{n} from {path}"))
             .collect::<Vec<_>>()
             .join(", ");
+        // The derived VALUES, not only how many rows there are. A `Derived`
+        // row can go quiet without the count moving -- a rendering satisfied
+        // by accident, a canonical read that started matching something else
+        // -- and the number a human can spot as wrong in a CI log is the value
+        // itself, never the tally.
         println!(
-            "limits-check: {} claims hold across their surfaces and their code evidence, and the \
-             enumerating plan documents ({breakdown}) enumerate the same {total} published limits \
-             as {LIMITS}.",
-            CLAIMS.len()
+            "limits-check: {} claims hold across their surfaces and their code evidence; {} \
+             derived value(s) agree in EVERY published rendering, including a surface's second \
+             rendering of its own ({}); {} mirrored constant(s) match their canonical source \
+             ({}); and the enumerating plan documents ({breakdown}) enumerate the same {total} \
+             published limits as {LIMITS}. Each of the first three counts is held to a named \
+             roll (COVERED_CLAIMS, COVERED_DERIVED, COVERED_MIRRORS), so it cannot shrink \
+             without a red build.",
+            CLAIMS.len(),
+            DERIVED.len(),
+            show_values(&derived_values),
+            MIRRORS.len(),
+            show_values(&mirror_values),
         );
         return Ok(());
     }
@@ -1363,6 +2795,18 @@ pub fn limits_check(root: &Path) -> Result<()> {
          published surfaces now disagree.\n  \
          * EVIDENCE -- the claim no longer matches the code, so what is published is false \
          of `main` in one direction or the other.\n  \
+         * DERIVED  -- one value with one canonical definition is rendered on several surfaces, \
+         and a surface's rendering no longer matches what the canonical source says. This is the \
+         failure a literal anchor CANNOT see, because the surfaces spell the same value \
+         differently (#172).\n  \
+         * MIRROR   -- a constant duplicated in a second file, under a comment promising it \
+         mirrors the first, has stopped mirroring it.\n  \
+         * ISSUE    -- a claim names an issue as its provenance and no surface it is published \
+         on cites that issue.\n  \
+         * SELF-DRIFT -- one surface renders the same derived value twice and the two do not \
+         agree, so a page contradicts itself. The message names both line numbers.\n  \
+         * COVERAGE -- a table and its coverage roll disagree, so the set this gate holds has \
+         changed. Shrinking it is a decision, not a side effect (#288).\n  \
          * SET      -- the enumerating plan documents and docs/book/src/limits.md no longer \
          enumerate the same limits. This one is about the SET, never the wording: reword either \
          document freely, but a limit present in one and absent from the other is drift.\n  \
@@ -1370,14 +2814,146 @@ pub fn limits_check(root: &Path) -> Result<()> {
          malformed, or the region delimiters are gone, so the set comparison above cannot see \
          it.\n\n\
          Fix the page or fix the table in crates/xtask/src/limits.rs -- but do not weaken an \
-         anchor or delete a marker to make this pass. Issue #224 exists because two of its own \
-         body items had gone false this way.\n",
+         anchor, delete a marker, or edit a render function to make this pass. Issue #224 exists \
+         because two of its own body items had gone false this way, and issue #172 exists \
+         because a commit fixing three stale surfaces left three more behind.\n",
         n = failures.len(),
     ));
     for f in &failures {
         msg.push_str(&format!("\n{f}\n"));
     }
     bail!(msg);
+}
+
+// ---------------------------------------------------------------------------
+// The tracker half (#172 acceptance criterion 3) -- ADVISORY, never a PR gate
+// ---------------------------------------------------------------------------
+
+/// The published surfaces a `known-limit` issue could be cited on.
+///
+/// Deliberately the reader-facing three and not every file in the tree: the
+/// question this report answers is *"can somebody who meets this gap on a page
+/// find the thing tracking it"*, and a citation in a plan document or a source
+/// comment does not answer it.
+const TRACKER_SURFACES: &[&str] = &[LIMITS, README, SITE];
+
+/// `cargo xtask limits-check --tracker`: which open `known-limit` issues are
+/// cited on no published surface.
+///
+/// # This is advisory, and saying so is the point
+///
+/// #172's third acceptance criterion asks that `is:open label:known-limit` and
+/// the published limits page describe the same set. It is the one criterion
+/// this repository cannot honestly turn into a pull-request gate, and the
+/// instruction that produced this function was explicit that an offline gate
+/// pretending to check the tracker is **worse than none**. So:
+///
+/// * it **shells out to `gh`** and needs network and credentials, which a
+///   pull-request runner should not depend on for a docs check;
+/// * it **exits 0 whatever it finds**. It reports. It never fails a build. A
+///   gate that goes red because a third party opened an issue is the
+///   *"trains people to weaken the check"* failure #224's risk list names, and
+///   the whole set-equality property is impossible in one direction anyway --
+///   many published limits deliberately have no issue and `README.md` promises
+///   exactly that;
+/// * it is wired into `.github/workflows/honesty-tracker.yml`, on a schedule
+///   and on demand, **never** into `ci.yml`.
+///
+/// The blocking, offline half of the same concern is [`uncited_issues`], which
+/// runs on every pull request and holds the other direction: every issue this
+/// table names must be cited on a surface of its own claim.
+///
+/// If `gh` is missing or unauthenticated this prints why and still exits 0 --
+/// an advisory report that cannot run is a report that did not run, and
+/// dressing that up as a pass would be the same dishonesty in miniature.
+pub fn tracker_report(root: &Path) -> Result<()> {
+    let out = std::process::Command::new("gh")
+        .args([
+            "issue",
+            "list",
+            "--label",
+            "known-limit",
+            "--state",
+            "open",
+            "--limit",
+            "200",
+            "--json",
+            "number,title",
+        ])
+        .current_dir(root)
+        .output();
+    let out = match out {
+        Ok(o) if o.status.success() => o,
+        Ok(o) => {
+            println!(
+                "limits-check --tracker: `gh issue list` failed ({}). This report is ADVISORY \
+                 and exits 0 regardless: it needs network and credentials, which is exactly why \
+                 it is not on the pull-request path.\n{}",
+                o.status,
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            return Ok(());
+        }
+        Err(err) => {
+            println!(
+                "limits-check --tracker: could not run `gh` ({err}). This report is ADVISORY and \
+                 exits 0 regardless. Install and authenticate the GitHub CLI to run it, or read \
+                 the same thing by hand:\n  gh issue list --label known-limit --state open"
+            );
+            return Ok(());
+        }
+    };
+    let body = String::from_utf8_lossy(&out.stdout);
+
+    // A deliberately small hand-parse rather than a serde dependency in xtask:
+    // the shape is `[{"number":N,"title":"..."},...]` and this report is
+    // advisory, so a parse that degrades to "found nothing" costs a printed
+    // line rather than a wrong build result.
+    let mut numbers: Vec<String> = Vec::new();
+    let mut rest = body.as_ref();
+    while let Some(at) = rest.find("\"number\":") {
+        rest = &rest[at + "\"number\":".len()..];
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        if !digits.is_empty() {
+            numbers.push(format!("#{digits}"));
+        }
+    }
+
+    let mut surfaces = String::new();
+    for path in TRACKER_SURFACES {
+        surfaces.push_str(&fs::read_to_string(root.join(path)).unwrap_or_default());
+        surfaces.push('\n');
+    }
+    // `cites`, not `contains`: `#15` is a substring of `#155`, and this report's
+    // whole output is a list of issue numbers, so a bare substring test would
+    // quietly move issues into the "cited" column that no surface names. See
+    // `cites` for why only the right boundary needs checking.
+    let (cited, uncited): (Vec<_>, Vec<_>) =
+        numbers.iter().partition(|number| cites(&surfaces, number));
+
+    println!(
+        "limits-check --tracker (ADVISORY -- this never fails a build):\n  \
+         {} open `known-limit` issue(s); {} cited on at least one of {}; {} cited on none.",
+        numbers.len(),
+        cited.len(),
+        TRACKER_SURFACES.join(", "),
+        uncited.len(),
+    );
+    if !uncited.is_empty() {
+        println!(
+            "  Cited nowhere a reader will look: {}\n  \
+             That is not automatically a defect. A gap can be published with no issue on \
+             purpose, and this project says so in writing. What it IS, is the list to read \
+             before claiming the tracker and the limits page describe the same set -- which is \
+             the claim #172 asks for and the one nothing in this repository can prove.",
+            uncited
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    Ok(())
 }
 
 /// Run every claim and return one string per failure. Split out so the tests
@@ -1402,6 +2978,7 @@ pub fn run_claims(root: &Path, claims: &[Claim]) -> Result<Vec<String>> {
                 claim.id
             ));
         }
+        failures.extend(uncited_issues(root, claim));
         for anchor in claim.surfaces {
             let path = root.join(anchor.path);
             let text = match fs::read_to_string(&path) {
@@ -1480,6 +3057,538 @@ pub fn run_claims(root: &Path, claims: &[Claim]) -> Result<Vec<String>> {
         }
     }
     Ok(failures)
+}
+
+// ---------------------------------------------------------------------------
+// The issue half of #172's third acceptance criterion -- the offline half
+// ---------------------------------------------------------------------------
+
+/// The claim's tracking issue, if it names one and no surface cites it.
+///
+/// # What this property is, and what it deliberately is not
+///
+/// #172's acceptance criterion 3 asks that `is:open label:known-limit` and the
+/// published limits page **describe the same set**. That cannot be a blocking
+/// gate here and it cannot be that property, and both halves of that sentence
+/// are worth writing down rather than quietly shipping something weaker under
+/// the same name:
+///
+/// * **It needs the GitHub API.** A pull-request gate that turns red because
+///   somebody else opened an issue is the *"brittle... which trains people to
+///   weaken the check"* outcome #224's risk list names. The tracker half is
+///   therefore [`tracker_report`], which is advisory, scheduled, and never on
+///   the pull-request path.
+/// * **Set equality is impossible in one direction, by policy.** Many published
+///   limits deliberately have no issue and say so -- `README.md` makes that an
+///   explicit promise (*"Every bullet names the issue behind it, or says
+///   plainly that it has none"*), and [`Claim::issue`] carries several such
+///   statements in full. Demanding an issue per limit would force a tracker
+///   entry for every exclusion this project has decided is permanent.
+///
+/// So what ships is the **offline, blocking half**: if a claim names a tracking
+/// issue, at least one of that claim's own surfaces has to cite it, so a reader
+/// who meets a published gap can find the thing tracking it without leaving the
+/// page. That is strictly weaker than criterion 3, and it is named as weaker
+/// here rather than ticked as if it were the whole.
+///
+/// # Which number is "the tracking issue", and why that is not a guess
+///
+/// Only the **first** `#N` in [`Claim::issue`] is required to be cited, and
+/// only when the field does not open by declaring the claim has none. That is
+/// not a heuristic invented for this check -- it is the convention every row in
+/// [`CLAIMS`] was already written to, unprompted and consistently: a field
+/// either opens with the owning issue (*"#213 (WS-E.2.1, closed). This is the
+/// claim #224's own body got wrong..."*) or opens with *"No issue"* and then
+/// argues why.
+///
+/// Requiring **every** number instead was tried first and is wrong, not merely
+/// strict. These fields are prose, and the later numbers in them are context:
+/// the workstream gate that found the gap, the issue this limit must not be
+/// confused with, the follow-up that would close it one day. Demanding a
+/// citation for each would push a page towards listing issues that are not
+/// what a reader should go and read -- which is the opposite of the property,
+/// dressed as more of it.
+fn uncited_issues(root: &Path, claim: &Claim) -> Vec<String> {
+    let Some(tracking) = tracking_issue(claim.issue) else {
+        return Vec::new();
+    };
+    let mut surfaces = String::new();
+    for anchor in claim.surfaces {
+        if let Ok(text) = fs::read_to_string(root.join(anchor.path)) {
+            surfaces.push_str(&text);
+            surfaces.push('\n');
+        }
+    }
+    if cites(&surfaces, &tracking) {
+        return Vec::new();
+    }
+    vec![format!(
+        "[{}] ISSUE -- this claim names {tracking} as the issue behind it and no surface it is \
+         published on cites that number.\n    The claim: {}\n    Surfaces: {}\n    A reader who \
+         meets this gap cannot find what tracks it without leaving the page, which is the \
+         promise README.md makes in the very section these claims live in -- and which it was \
+         breaking, on its own fuzz and wlcs bullets, until #172. Either cite {tracking} on a \
+         surface, or -- if the claim genuinely has no issue -- open the `issue` field with `No \
+         issue` and say why, as every row here whose `issue` field opens with those two words \
+         already does.",
+        claim.id,
+        claim.says,
+        surface_list(claim),
+    )]
+}
+
+/// Does `text` cite issue `number` (spelled `#N`), rather than merely containing
+/// its digits inside a longer one?
+///
+/// A bare `contains` is wrong here and wrong in the direction that hides work:
+/// `#15` is a substring of `#155`, so a page that mentions the REUSE issue would
+/// have been read as citing a hypothetical `#15` and any claim naming it would
+/// have passed with nothing published. The repository already has issues whose
+/// numbers nest this way -- `#15x`, `#16x`, `#17x`, `#18x` against `#1`, and
+/// `#28x` against `#2` -- so this is a live false-positive rather than a
+/// theoretical one.
+///
+/// Only the right-hand boundary needs checking. A `#` is not a digit, so
+/// `#155`'s digits can never be read as the tail of a longer citation.
+fn cites(text: &str, number: &str) -> bool {
+    text.match_indices(number).any(|(at, _)| {
+        !text[at + number.len()..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_digit())
+    })
+}
+
+/// The first `#N` in `text`, unless `text` opens by declaring there is none.
+fn tracking_issue(text: &str) -> Option<String> {
+    if text.trim_start().starts_with("No issue") {
+        return None;
+    }
+    let at = text.find('#')?;
+    let digits: String = text[at + 1..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    if digits.is_empty() {
+        return None;
+    }
+    Some(format!("#{digits}"))
+}
+
+// ---------------------------------------------------------------------------
+// Derived values (#172, option (b)'s one new concept)
+// ---------------------------------------------------------------------------
+
+/// `(row id, the values it read)`, for the green line.
+type DerivedValues = Vec<(String, Vec<String>)>;
+
+/// Run one derived table. Returns the failures and, for the green line, what
+/// each row actually read.
+///
+/// `label` is the failure prefix and the only difference between running
+/// [`DERIVED`] and [`MIRRORS`]: the mechanism is one mechanism, the property
+/// is two properties, and the message has to say which.
+///
+/// # Every occurrence, not the first one
+///
+/// Matching is [`scan_surface`], never `contains`. `contains` answers *"is this
+/// value somewhere on the page"* and stops at the first yes, which means a page
+/// that states the value twice is held only at whichever statement the search
+/// reaches first -- **a surface can drift from itself with this gate green.**
+/// That is not a hypothetical failure mode, it is the one on the record: the
+/// site asserted the per-kernel matrix "has not been built" in one paragraph and
+/// cited its measurements ninety lines later, and the limits page states both
+/// the AppArmor run's kernel and the Landlock floor in two places each.
+///
+/// So every occurrence of the rendering's [`Rendering::context`] on the surface
+/// must sit inside a full canonical rendering, and a second occurrence that
+/// disagrees is a SELF-DRIFT failure naming the line number of the stale one and
+/// the line number of the one it disagrees with.
+///
+/// # The vacuity guards, and why each one exists
+///
+/// A `contains` test accepts an empty needle and accepts a needle that has
+/// nothing to do with the value, so this mechanism can go quiet in ways the
+/// totals do not show. Five refusals, all of them modelled on
+/// [`cross_check_limit_sets`]'s rule 5:
+///
+/// 1. **A row with no rendering is refused.** A canonical value nobody
+///    publishes is not a published value; the row would read as coverage and
+///    hold nothing.
+/// 2. **A read that finds no value, or finds its literal more than once, is
+///    refused.** The second half matters more than it looks: with two
+///    occurrences the first one wins *silently*, and a canonical value that
+///    silently picks a side is not canonical. This is what lets `\ntotal=`
+///    disambiguate `shim/wlcs/README.md`'s counts line from its prose about the
+///    summary format instead of guessing between them.
+/// 3. **A rendering that produces the empty string is refused**, because
+///    `"anything".contains("")` is true and such a row could never fail.
+///    The stronger half of this guard is not here but in
+///    `every_rendering_moves_when_the_canonical_value_moves`, which perturbs
+///    the canonical value and requires every render function's output to move
+///    -- a render function that ignores its input is the one vacuity a runtime
+///    check cannot see.
+/// 4. **An empty context is refused**, for the same reason as 3: every string
+///    contains it, so every position on the surface would "carry" the value.
+/// 5. **A context that does not occur exactly once in the rendered form is
+///    refused.** Zero occurrences means the table names a register the render
+///    function does not produce, and the scan would hold nothing; two means the
+///    value's offset from the context is ambiguous, and the scan would align
+///    against whichever one it picked. Both are table bugs and both are refused
+///    rather than resolved.
+///
+/// And the green line prints the VALUES, not only a count, for the same reason
+/// the limit-set line prints its size per home: a mechanism can quietly stop
+/// covering something without any total moving.
+pub fn run_derived(root: &Path, table: &[Derived], label: &str) -> (Vec<String>, DerivedValues) {
+    let mut failures = Vec::new();
+    let mut values_out: DerivedValues = Vec::new();
+    for row in table {
+        if row.renderings.is_empty() {
+            failures.push(format!(
+                "[{}] {label} -- this row names no surface that renders the value. A canonical \
+                 value nobody publishes is not a published value, and the row would count \
+                 towards coverage while holding nothing.",
+                row.id
+            ));
+            continue;
+        }
+        let values = match read_source(root, &row.source) {
+            Ok(v) => v,
+            Err(err) => {
+                failures.push(format!("[{}] {label} -- {err}", row.id));
+                continue;
+            }
+        };
+        values_out.push((row.id.to_string(), values.clone()));
+        for rendering in row.renderings {
+            let want = (rendering.render)(&values);
+            if want.trim().is_empty() {
+                failures.push(format!(
+                    "[{}] {label} -- the rendering for {} is empty. Every string contains the \
+                     empty string, so this row could never fail; a render function that drops \
+                     its input is the shape this guard exists for.",
+                    row.id, rendering.path
+                ));
+                continue;
+            }
+            let path = root.join(rendering.path);
+            let text = match fs::read_to_string(&path) {
+                Ok(t) => t,
+                Err(err) => {
+                    failures.push(format!(
+                        "[{}] {label} -- cannot read {}: {err}",
+                        row.id, rendering.path
+                    ));
+                    continue;
+                }
+            };
+            let scan = match scan_surface(&text, &want, rendering.context) {
+                Ok(scan) => scan,
+                Err(err) => {
+                    failures.push(format!(
+                        "[{}] {label} -- the table row for {} is malformed: {err}\n    This is a \
+                         bug in crates/xtask/src/limits.rs, not on the surface. Until it is \
+                         fixed the scan holds nothing at all, which is why it is refused rather \
+                         than skipped.",
+                        row.id, rendering.path
+                    ));
+                    continue;
+                }
+            };
+            if scan.agreeing.is_empty() {
+                failures.push(format!(
+                    "[{}] {label} -- {} does not render the canonical value.\n    Canonical \
+                     source: {}\n    Read: {}\n    This surface must contain: {want:?}\n    The \
+                     value: {}\n    Provenance: {}\n    THE VALUE MOVED AND THIS SURFACE DID \
+                     NOT. Fix the surface. Do NOT fix the render function -- that is the table \
+                     agreeing with the drift, and it is exactly how four published `6`s could \
+                     have gone stale behind a green build.{}",
+                    row.id,
+                    rendering.path,
+                    source_path(&row.source),
+                    values.join(", "),
+                    row.says,
+                    row.issue,
+                    if scan.disagreeing.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            "\n    The register IS on this surface, at line(s) {} -- it is the \
+                             VALUE there that is wrong. That is the whole failure, on one page.",
+                            lines(&scan.disagreeing)
+                        )
+                    },
+                ));
+                continue;
+            }
+            if !scan.disagreeing.is_empty() {
+                failures.push(format!(
+                    "[{}] {label} SELF-DRIFT -- {} disagrees with ITSELF.\n    Line(s) {} render \
+                     the canonical value: {want:?}\n    Line(s) {} carry the same register \
+                     ({:?}) and do not.\n    Canonical source: {}\n    Read: {}\n    The value: \
+                     {}\n    \
+                     Provenance: {}\n    One page, two answers. A check that stopped at the first \
+                     occurrence would call this green, which is exactly what site/index.html did \
+                     while it said the per-kernel matrix `has not been built` in one paragraph \
+                     and cited its measurements ninety lines later. Fix the stale occurrence; do \
+                     not narrow the context to hide it.",
+                    row.id,
+                    rendering.path,
+                    lines(&scan.agreeing),
+                    lines(&scan.disagreeing),
+                    rendering.context,
+                    source_path(&row.source),
+                    values.join(", "),
+                    row.says,
+                    row.issue,
+                ));
+            }
+        }
+    }
+    (failures, values_out)
+}
+
+/// Where a surface renders a derived value, and where it claims to and does not.
+///
+/// Line numbers, 1-based, in the surface's own file -- the only coordinate a
+/// human can act on. Both lists are line numbers of the *context*, so a failure
+/// can put the two occurrences of one disagreement side by side.
+#[derive(Debug, Default)]
+pub struct SurfaceScan {
+    /// Occurrences of the context that sit inside a full canonical rendering.
+    pub agreeing: Vec<usize>,
+    /// Occurrences of the context that do not. Each of these is a place on this
+    /// surface that talks about this value and gets it wrong.
+    pub disagreeing: Vec<usize>,
+}
+
+/// Find **every** place on `surface` that renders this value, and say which of
+/// them agree with `want`.
+///
+/// `context` is the value-free literal that identifies the register (see
+/// [`Rendering::context`]). Because it occurs exactly once inside `want`, its
+/// offset there fixes where the rest of the rendering must sit relative to any
+/// occurrence found on the surface -- so the scan can ask, at each occurrence,
+/// *"is the value here the canonical one"* rather than the far weaker *"does
+/// the canonical value appear anywhere on this page"*.
+///
+/// Returns `Err` only for a malformed table row, never for a drifted surface:
+/// an empty context, or one that does not occur exactly once in `want`. Those
+/// are refused rather than resolved, because either resolution would silently
+/// pick which occurrence to hold.
+pub fn scan_surface(surface: &str, want: &str, context: &str) -> Result<SurfaceScan, String> {
+    let want = normalize(want);
+    let context = normalize(context);
+    if context.is_empty() {
+        return Err(
+            "the context is empty. Every string contains the empty string, so every position on \
+             the surface would count as an occurrence and the scan would hold nothing."
+                .to_string(),
+        );
+    }
+    let in_want: Vec<usize> = want.match_indices(&context).map(|(at, _)| at).collect();
+    if in_want.len() != 1 {
+        return Err(format!(
+            "the context {context:?} occurs {} time(s) in the rendered form {want:?}, and it must \
+             occur exactly once. Zero means the table names a register this render function does \
+             not produce; two means the value's offset from the context is ambiguous and the scan \
+             would align against whichever one it happened to pick.",
+            in_want.len()
+        ));
+    }
+    let offset = in_want[0];
+
+    // Indexed rather than plain `normalize`, because a failure that cannot name
+    // the line is a failure somebody has to go and grep for -- and the whole
+    // point of this scan is that there are two places to look at, not one.
+    let (text, map) = normalize_indexed(surface);
+    let mut scan = SurfaceScan::default();
+    for (at, _) in text.match_indices(&context) {
+        let line = line_at(surface, map[at]);
+        // `checked_sub` and `get`, not indexing: the rendering may start before
+        // the beginning of the surface, and a byte offset computed by
+        // subtraction need not land on a character boundary. Both are simply
+        // "this occurrence is not a canonical rendering".
+        let aligned = at
+            .checked_sub(offset)
+            .and_then(|start| text.get(start..))
+            .is_some_and(|rest| rest.starts_with(&want));
+        if aligned {
+            scan.agreeing.push(line);
+        } else {
+            scan.disagreeing.push(line);
+        }
+    }
+    Ok(scan)
+}
+
+/// [`normalize`], plus a map from each byte of the result to the byte offset in
+/// the input it came from.
+///
+/// The separator this inserts between two words maps to the first byte of the
+/// *following* word, which is the answer that makes a line number useful: a
+/// match starting at a separator is a match on the word after it.
+fn normalize_indexed(text: &str) -> (String, Vec<usize>) {
+    let mut out = String::new();
+    let mut map: Vec<usize> = Vec::new();
+    let mut in_word = false;
+    for (at, ch) in text.char_indices() {
+        if ch.is_whitespace() {
+            in_word = false;
+            continue;
+        }
+        if !in_word && !out.is_empty() {
+            out.push(' ');
+            map.push(at);
+        }
+        in_word = true;
+        let before = out.len();
+        out.push(ch);
+        for _ in before..out.len() {
+            map.push(at);
+        }
+    }
+    debug_assert_eq!(out.len(), map.len());
+    (out, map)
+}
+
+/// The 1-based line `offset` falls on.
+fn line_at(text: &str, offset: usize) -> usize {
+    text[..offset.min(text.len())].matches('\n').count() + 1
+}
+
+/// Line numbers as a human reads them out.
+fn lines(nums: &[usize]) -> String {
+    nums.iter()
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Read a derived row's canonical value(s).
+fn read_source(root: &Path, source: &Source) -> Result<Vec<String>, String> {
+    match source {
+        Source::File { path, reads } => {
+            if reads.is_empty() {
+                return Err(format!(
+                    "the row reads nothing out of {path}. A source with no read yields no value \
+                     and every rendering of it would be a constant."
+                ));
+            }
+            let text = fs::read_to_string(root.join(path))
+                .map_err(|err| format!("cannot read the canonical source {path}: {err}"))?;
+            let mut out = Vec::new();
+            for read in *reads {
+                out.push(read_value(&text, path, read)?);
+            }
+            Ok(out)
+        }
+        Source::FileCount { dir, suffix } => {
+            let full = root.join(dir);
+            let entries = fs::read_dir(&full)
+                .map_err(|err| format!("cannot read the canonical directory {dir}: {err}"))?;
+            let mut count = 0usize;
+            for entry in entries {
+                let entry = entry
+                    .map_err(|err| format!("cannot walk the canonical directory {dir}: {err}"))?;
+                if entry.path().is_file() && entry.file_name().to_string_lossy().ends_with(suffix) {
+                    count += 1;
+                }
+            }
+            if count == 0 {
+                return Err(format!(
+                    "no `*{suffix}` file under {dir}. The published sentences derive their number \
+                     from that set, and a set that has become empty would render as `no` on every \
+                     surface rather than failing -- which is the vacuity this refuses."
+                ));
+            }
+            Ok(vec![count.to_string()])
+        }
+    }
+}
+
+/// One value, out of raw (never [`normalize`]d) text.
+///
+/// Raw on purpose, and this is the opposite choice from [`Anchor`]. A canonical
+/// value lives in a constant declaration, a fenced code block or a `#define` --
+/// none of which reflow -- and reading it raw is what makes a `\n`-prefixed
+/// literal able to pick the counts line out of a file that also contains prose
+/// about the counts format.
+fn read_value(text: &str, path: &str, read: &Read) -> Result<String, String> {
+    let occurrences = text.matches(read.after).count();
+    if occurrences == 0 {
+        return Err(format!(
+            "{path} does not contain {:?}, so there is no canonical value to hold the surfaces \
+             to. Either the definition moved or it was reworded; find it and update this row \
+             rather than deleting it.",
+            read.after
+        ));
+    }
+    if occurrences > 1 {
+        return Err(format!(
+            "{path} contains {:?} {occurrences} times. The first one would win silently, and a \
+             canonical value that silently picks between two candidates is not canonical. Make \
+             the literal more specific -- a leading newline is usually enough to separate a \
+             declaration from prose about it.",
+            read.after
+        ));
+    }
+    let rest = &text[text.find(read.after).expect("counted above") + read.after.len()..];
+    let value = match read.shape {
+        Shape::Digits => rest
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>(),
+        Shape::UpTo(terminator) => match rest.find(terminator) {
+            Some(at) => rest[..at].to_string(),
+            None => {
+                return Err(format!(
+                    "{path} has {:?} but no {terminator:?} after it, so the value has no end.",
+                    read.after
+                ))
+            }
+        },
+    };
+    if value.is_empty() {
+        return Err(format!(
+            "{path} has {:?} but the value after it is empty. An empty value renders into \
+             something every file contains.",
+            read.after
+        ));
+    }
+    Ok(value)
+}
+
+fn source_path(source: &Source) -> &'static str {
+    match source {
+        Source::File { path, .. } => path,
+        Source::FileCount { dir, .. } => dir,
+    }
+}
+
+/// `id=value` pairs for the green line, so a human sees what was compared.
+fn show_values(values: &DerivedValues) -> String {
+    if values.is_empty() {
+        return "none".to_string();
+    }
+    values
+        .iter()
+        .map(|(id, vals)| format!("{id}={}", elide(&vals.join("/"))))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// A value short enough to read in a CI log. A 64-character token printed in
+/// full pushes every other value off the line, which defeats the reason the
+/// line prints values at all.
+fn elide(value: &str) -> String {
+    let count = value.chars().count();
+    if count <= 24 {
+        return value.to_string();
+    }
+    let head: String = value.chars().take(12).collect();
+    format!("{head}...({count} chars)")
 }
 
 // ---------------------------------------------------------------------------
@@ -2798,5 +4907,442 @@ mod tests {
             hits.iter().all(|h| !h.contains("subprojects")),
             "vendored hits leaked: {hits:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // #172: the derived tables, the mirrors, and the issue-citation half.
+    // -----------------------------------------------------------------------
+
+    /// The shipped derived rows hold against the tree they ship with, and the
+    /// mirrors do too. The counterpart of
+    /// `every_shipped_claim_holds_against_this_tree`.
+    #[test]
+    fn every_shipped_derived_value_and_mirror_holds_against_this_tree() {
+        for (table, label) in [(DERIVED, "DERIVED"), (MIRRORS, "MIRROR")] {
+            let (failures, values) = run_derived(&root(), table, label);
+            assert!(
+                failures.is_empty(),
+                "{label} drifted:\n{}",
+                failures.join("\n")
+            );
+            assert_eq!(
+                values.len(),
+                table.len(),
+                "{label} produced no value for some row, so that row held nothing"
+            );
+        }
+    }
+
+    /// **The non-vacuity test for [`DERIVED`], and the one that matters most.**
+    ///
+    /// Perturb the canonical value alone and EVERY rendering must stop
+    /// matching. This is the property `Anchor` does not have: with a literal
+    /// needle, changing the constant and the table's needle together leaves the
+    /// published surfaces stale and the build green, which is how the Landlock
+    /// floor's four published `6`s were unheld and how the AppArmor kernel
+    /// attribution drifted six ways.
+    ///
+    /// It runs the shipped rows against the shipped tree, so a row whose
+    /// renderings are accidentally satisfied by unrelated text is caught here
+    /// rather than the day the value moves.
+    #[test]
+    fn changing_the_canonical_value_alone_fails_every_rendering() {
+        let root = root();
+        for row in DERIVED.iter().chain(MIRRORS.iter()) {
+            let real = read_source(&root, &row.source).expect("shipped row reads");
+            let perturbed: Vec<String> = real.iter().map(|v| perturb(v)).collect();
+            for rendering in row.renderings {
+                let want = (rendering.render)(&perturbed);
+                let text = fs::read_to_string(root.join(rendering.path)).expect("surface exists");
+                let scan = scan_surface(&text, &want, rendering.context).expect("well-formed row");
+                assert!(
+                    scan.agreeing.is_empty(),
+                    "[{}] {} still renders {want:?} at line(s) {} after the canonical value moved \
+                     from {:?} to {:?}. That rendering is satisfied by something other than this \
+                     value, so the row cannot fail and holds nothing.",
+                    row.id,
+                    rendering.path,
+                    lines(&scan.agreeing),
+                    real,
+                    perturbed
+                );
+            }
+        }
+    }
+
+    /// **The second non-vacuity test for [`DERIVED`]:** a render function that
+    /// ignores its input is a row that can never fail, and no runtime check can
+    /// see it -- the output is a perfectly good non-empty string that every
+    /// surface happens to contain.
+    #[test]
+    fn every_rendering_moves_when_the_canonical_value_moves() {
+        for row in DERIVED.iter().chain(MIRRORS.iter()) {
+            let a = vec!["1".to_string(); 8];
+            let b = vec!["2".to_string(); 8];
+            for rendering in row.renderings {
+                let ra = (rendering.render)(&a);
+                let rb = (rendering.render)(&b);
+                assert_ne!(
+                    ra, rb,
+                    "[{}] the rendering for {} produced {ra:?} for both values. It drops its \
+                     input, so this row would pass whatever the canonical source says.",
+                    row.id, rendering.path
+                );
+                assert!(
+                    !ra.trim().is_empty(),
+                    "[{}] the rendering for {} is empty, and every string contains the empty \
+                     string.",
+                    row.id,
+                    rendering.path
+                );
+            }
+        }
+    }
+
+    /// A row whose canonical literal appears twice is refused rather than
+    /// silently taking the first. `shim/wlcs/README.md` contains both the
+    /// counts line and prose about the counts format, and a bare `total=`
+    /// would match both.
+    #[test]
+    fn a_canonical_literal_that_appears_twice_is_refused() {
+        let err = read_value(
+            "x = 1\nlater we mention x = 2 as well\n",
+            "synthetic",
+            &Read {
+                after: "x = ",
+                shape: Shape::Digits,
+            },
+        )
+        .expect_err("two occurrences must be refused");
+        assert!(err.contains("2 times"), "{err}");
+    }
+
+    /// A canonical literal that is gone is a failure, not a pass. Without this
+    /// the whole mechanism degrades to "no value, no renderings checked".
+    #[test]
+    fn a_canonical_literal_that_is_gone_fails() {
+        let err = read_value(
+            "nothing here\n",
+            "synthetic",
+            &Read {
+                after: "x = ",
+                shape: Shape::Digits,
+            },
+        )
+        .expect_err("a missing literal must be refused");
+        assert!(err.contains("does not contain"), "{err}");
+    }
+
+    /// A row with no rendering holds nothing and must say so.
+    #[test]
+    fn a_derived_row_with_no_rendering_is_refused() {
+        static ROW: &[Derived] = &[Derived {
+            id: "synthetic-no-rendering",
+            says: "a value nobody publishes",
+            issue: "No issue: synthetic",
+            source: Source::File {
+                path: "crates/vitrin-realm-init/src/lib.rs",
+                reads: &[Read {
+                    after: "pub const LANDLOCK_MIN_ABI: u32 = ",
+                    shape: Shape::Digits,
+                }],
+            },
+            renderings: &[],
+        }];
+        let (failures, values) = run_derived(&root(), ROW, "DERIVED");
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(
+            failures[0].contains("no surface that renders"),
+            "{failures:?}"
+        );
+        assert!(values.is_empty());
+    }
+
+    /// A rendering the surface does not carry fails, and the message points at
+    /// the surface rather than at the table.
+    #[test]
+    fn a_rendering_a_surface_does_not_carry_fails() {
+        fn never_on_the_page(v: &[String]) -> String {
+            format!("the floor of this build is {} parsecs", v[0])
+        }
+        static ROW: &[Derived] = &[Derived {
+            id: "synthetic-rendering",
+            says: "a rendering no surface uses",
+            issue: "No issue: synthetic",
+            source: Source::File {
+                path: "crates/vitrin-realm-init/src/lib.rs",
+                reads: &[Read {
+                    after: "pub const LANDLOCK_MIN_ABI: u32 = ",
+                    shape: Shape::Digits,
+                }],
+            },
+            renderings: &[Rendering {
+                path: LIMITS,
+                render: never_on_the_page,
+                context: "the floor of this build is",
+            }],
+        }];
+        let (failures, _) = run_derived(&root(), ROW, "DERIVED");
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].contains("does not render"), "{failures:?}");
+    }
+
+    /// A `FileCount` source over an empty set is refused rather than rendering
+    /// as "no", which would quietly turn every published sentence into a
+    /// different true statement.
+    #[test]
+    fn a_file_count_over_an_empty_set_is_refused() {
+        let err = read_source(
+            &root(),
+            &Source::FileCount {
+                dir: "tests/kernel-matrix/rows",
+                suffix: ".this-suffix-matches-nothing",
+            },
+        )
+        .expect_err("an empty count must be refused");
+        assert!(err.contains("no `*"), "{err}");
+    }
+
+    /// **The non-vacuity test for the ISSUE half.** A claim naming an issue no
+    /// surface cites must fail.
+    #[test]
+    fn a_claim_whose_issue_no_surface_cites_fails() {
+        static SURFACES: &[Anchor] = &[Anchor {
+            path: LIMITS,
+            needle: "Where this is honest about its limits",
+        }];
+        static EVIDENCE: &[Evidence] = &[Evidence::Contains {
+            path: "crates/vitrin-core/src/realm.rs",
+            needle: "MAX_REALMS",
+            means: "true, so only the issue half can fail here",
+        }];
+        let claims = &[Claim {
+            id: "synthetic-issue",
+            says: "a claim whose issue nobody published",
+            issue: "#999999 owns this.",
+            surfaces: SURFACES,
+            evidence: EVIDENCE,
+        }];
+        let failures = run_claims(&root(), claims).expect("roots exist");
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].contains("ISSUE"), "{failures:?}");
+    }
+
+    /// ...and a claim that says in words it has none is not required to cite
+    /// one. Fourteen shipped rows depend on this, and forcing an issue on them
+    /// would mean opening a tracker entry for every permanent exclusion.
+    #[test]
+    fn a_claim_that_declares_it_has_no_issue_is_not_asked_to_cite_one() {
+        assert_eq!(
+            tracking_issue("No issue, deliberately: #224 decided..."),
+            None
+        );
+        assert_eq!(
+            tracking_issue("#213 (WS-E.2.1, closed). #224's body got it wrong."),
+            Some("#213".to_string())
+        );
+        assert_eq!(tracking_issue("a sentence with no number"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // The self-drift scan: a surface must not be able to disagree with itself.
+    // -----------------------------------------------------------------------
+
+    /// **The non-vacuity test for [`scan_surface`], and the reason it exists at
+    /// all.** A page that states the value twice, agreeing once and disagreeing
+    /// once, must fail -- and must name both lines, because a failure that says
+    /// only "somewhere on this page" sends a reader to grep.
+    #[test]
+    fn a_surface_that_contradicts_itself_fails_and_names_both_lines() {
+        let surface = "\
+intro line
+the floor is **6** in this build, refused below it
+some prose
+more prose
+and further down the floor is **7** in this build
+";
+        let scan = scan_surface(surface, "**6** in this", "** in this").expect("well-formed row");
+        assert_eq!(scan.agreeing, vec![2], "{scan:?}");
+        assert_eq!(scan.disagreeing, vec![5], "{scan:?}");
+    }
+
+    /// The same surface with both occurrences agreeing is clean, so the test
+    /// above isolates the disagreement rather than the shape.
+    #[test]
+    fn a_surface_that_states_the_value_twice_and_agrees_is_clean() {
+        let surface = "\
+the floor is **6** in this build
+and further down the floor is **6** in this build
+";
+        let scan = scan_surface(surface, "**6** in this", "** in this").expect("well-formed row");
+        assert_eq!(scan.agreeing, vec![1, 2], "{scan:?}");
+        assert!(scan.disagreeing.is_empty(), "{scan:?}");
+    }
+
+    /// A first-hit `contains` calls the contradicting surface green. This test
+    /// exists so the weaker check cannot be reintroduced as a simplification
+    /// without a red build saying what it costs.
+    #[test]
+    fn the_check_this_replaced_would_have_passed_that_surface() {
+        let surface = "the floor is **6** in this build\nand later **7** in this build\n";
+        assert!(
+            normalize(surface).contains(&normalize("**6** in this")),
+            "the old containment test passes this surface, which is the point"
+        );
+        let scan = scan_surface(surface, "**6** in this", "** in this").expect("well-formed row");
+        assert!(!scan.disagreeing.is_empty(), "{scan:?}");
+    }
+
+    /// A rendering wrapped across a line break is still one occurrence: the
+    /// scan runs over normalized text, exactly as [`Anchor`] matching does, so
+    /// a 76-column reflow cannot turn the build red.
+    #[test]
+    fn a_rendering_wrapped_across_lines_is_still_one_agreeing_occurrence() {
+        let surface = "the floor is **6**\nin this build\n";
+        let scan = scan_surface(surface, "**6** in this", "** in this").expect("well-formed row");
+        assert_eq!(scan.agreeing, vec![1], "{scan:?}");
+        assert!(scan.disagreeing.is_empty(), "{scan:?}");
+    }
+
+    /// A context the rendered form does not contain exactly once is a table bug
+    /// and is refused, because either resolution silently picks which
+    /// occurrence to hold.
+    #[test]
+    fn a_context_that_is_not_exactly_once_in_the_rendering_is_refused() {
+        let err = scan_surface("anything", "**6** in this", "not in the rendering")
+            .expect_err("a context absent from the rendering must be refused");
+        assert!(err.contains("occurs 0 time(s)"), "{err}");
+        let err = scan_surface("anything", "6 and 6", "6")
+            .expect_err("an ambiguous context must be refused");
+        assert!(err.contains("occurs 2 time(s)"), "{err}");
+        let err =
+            scan_surface("anything", "**6**", " ").expect_err("an empty context must be refused");
+        assert!(err.contains("empty"), "{err}");
+    }
+
+    /// Every shipped context is **value-free**: rendering a different value
+    /// leaves it in place, exactly once. A context that moved with the value
+    /// would find only occurrences that already agree, which is the first-hit
+    /// check wearing a scan's clothes.
+    #[test]
+    fn every_context_is_value_free() {
+        for row in DERIVED.iter().chain(MIRRORS.iter()) {
+            for rendering in row.renderings {
+                let context = normalize(rendering.context);
+                assert!(
+                    !context.is_empty(),
+                    "[{}] the context for {} is empty",
+                    row.id,
+                    rendering.path
+                );
+                for probe in [vec!["1".to_string(); 8], vec!["2".to_string(); 8]] {
+                    let rendered = normalize(&(rendering.render)(&probe));
+                    assert_eq!(
+                        rendered.matches(&context).count(),
+                        1,
+                        "[{}] the context {context:?} occurs a number of times other than once \
+                         in {} rendered from {probe:?} ({rendered:?}). A context has to survive \
+                         the value changing, and has to pin exactly one offset.",
+                        row.id,
+                        rendering.path,
+                    );
+                }
+            }
+        }
+    }
+
+    /// The indexed normalizer must agree with [`normalize`] byte for byte, and
+    /// its map must cover every byte -- a map that disagreed would print line
+    /// numbers pointing at the wrong paragraph, which is worse than none.
+    #[test]
+    fn the_indexed_normalizer_agrees_with_the_plain_one() {
+        for text in [
+            "one two\tthree\n\n  four  ",
+            "",
+            "   ",
+            "a\u{2014}b \u{2014} c\nd",
+            "trailing\n",
+        ] {
+            let (out, map) = normalize_indexed(text);
+            assert_eq!(out, normalize(text), "{text:?}");
+            assert_eq!(out.len(), map.len(), "{text:?}");
+            for (i, at) in map.iter().enumerate() {
+                assert!(*at < text.len(), "{text:?} byte {i} maps past the end");
+            }
+        }
+    }
+
+    /// Line numbers are 1-based and count the input's own newlines.
+    #[test]
+    fn line_numbers_are_the_ones_an_editor_shows() {
+        let text = "a\nbb\nccc\n";
+        assert_eq!(line_at(text, 0), 1);
+        assert_eq!(line_at(text, 2), 2);
+        assert_eq!(line_at(text, 5), 3);
+        assert_eq!(line_at(text, 9999), 4);
+    }
+
+    // -----------------------------------------------------------------------
+    // The coverage roll: a set that shrinks must turn something red.
+    // -----------------------------------------------------------------------
+
+    /// The shipped tables match their shipped rolls. This is the assertion that
+    /// makes `cargo test` red the moment a row is deleted without the roll.
+    #[test]
+    fn every_shipped_table_matches_its_coverage_roll() {
+        let failures = shipped_coverage_failures();
+        assert!(
+            failures.is_empty(),
+            "the tables and their coverage rolls disagree:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    /// **The non-vacuity test for the roll.** Deleting a row must fail, adding
+    /// one must fail, and a duplicated id must fail -- all three, because the
+    /// property is "the set is exactly this" and not "the set is at least this".
+    #[test]
+    fn a_table_that_lost_a_row_fails_and_names_the_id_that_left() {
+        let listed = &["a", "b", "c"];
+
+        let failures = coverage_failures("ROLL", "TABLE", &["a", "c"], listed);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].contains("[b] COVERAGE"), "{failures:?}");
+        assert!(failures[0].contains("COVERAGE SHRANK"), "{failures:?}");
+
+        let failures = coverage_failures("ROLL", "TABLE", &["a", "b", "c", "d"], listed);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].contains("[d] COVERAGE"), "{failures:?}");
+        assert!(failures[0].contains("does not list it"), "{failures:?}");
+
+        let failures = coverage_failures("ROLL", "TABLE", &["a", "b", "c", "c"], listed);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].contains("share this id"), "{failures:?}");
+
+        assert!(coverage_failures("ROLL", "TABLE", &["c", "b", "a"], listed).is_empty());
+    }
+
+    /// A nested issue number is not a citation. `#15` is a substring of `#155`,
+    /// and this repository has both shapes in its tracker, so a bare `contains`
+    /// would report a claim as cited by a page that never names it.
+    #[test]
+    fn a_longer_issue_number_does_not_cite_a_shorter_one() {
+        assert!(!cites("closed by #155 and #156", "#15"));
+        assert!(cites("closed by #155 and #156", "#155"));
+        assert!(cites("see #15.", "#15"));
+        assert!(cites("see #15", "#15"));
+        assert!(!cites("see #1550", "#155"));
+    }
+
+    /// Change one character of a value so a rendering of it cannot match by
+    /// accident. Digits move to a different digit; anything else gains a
+    /// character that no surface here contains.
+    fn perturb(value: &str) -> String {
+        if value.chars().all(|c| c.is_ascii_digit()) {
+            // 7 -> 8, everything else -> 7. Never a no-op, and never a value
+            // some other row publishes.
+            return if value == "7" { "8" } else { "7" }.to_string();
+        }
+        format!("{value}-zzq")
     }
 }

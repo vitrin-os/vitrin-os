@@ -347,10 +347,14 @@ grant.pointer.click(640, 84)</pre>
       namespaces, an identity uid/gid map, zero capabilities and a private
       mount table, all verified by the core from outside, and since P2.6.3 a
       Landlock ruleset with an enumerated read set, plus a generated matrix of
-      the ABI that ruleset requires. P2.6.3 is still not finished: that matrix
-      is a table about the build and measures no kernel, and the per-kernel one
-      its criteria ask for has not been built. There is still no seccomp
-      filter, so a realm is filesystem-confined but not syscall-confined
+      the ABI that ruleset requires. That matrix is a table about the build and
+      measures no kernel; the per-kernel half its criteria ask for now exists
+      separately and is <strong>measured</strong> &mdash;
+      <a href="docs/isolation-kernels.html">five distribution kernels</a> booted
+      under QEMU with the shipped <code>vitrind</code>, reporting ABI 1, 2, 4, 6
+      and 7. P2.6.3 is still not finished for a different reason: there is still
+      no seccomp filter, so a realm is filesystem-confined but not
+      syscall-confined
       &mdash; and it keeps the invoking user's supplementary groups, which the
       kernel gives no window to drop.
       Environment hygiene confines the well-behaved; it does not contain the
@@ -453,9 +457,18 @@ grant.pointer.click(640, 84)</pre>
       Landlock ABI. Which distributions ship the third condition unset has
       <strong>not been surveyed</strong> here either.</p>
       <p>Do not run untrusted applications, or untrusted agents, against this.
-      <a href="docs/limits.html">Every other known gap is listed here</a> —
-      the 24-hour fuzz soak that has never been run, wlcs conformance at
-      3/180, and the rest.</p>
+      <a href="docs/limits.html">Every other known gap is listed here</a> &mdash;
+      the 24-hour fuzz soak that has never been run
+      (<a href="https://github.com/vitrin-os/vitrin-os/issues/156">issue
+      #156</a>), advisory wlcs conformance at
+      <code>total=180 passed=3 failed=145 skipped=32</code> on the 2026-07-25
+      run, against wlcs 1.6.1-1
+      (<a href="https://github.com/vitrin-os/vitrin-os/issues/157">issue
+      #157</a>), and the rest. Those counts are quoted here in the same
+      four-number form the canonical statement uses, with its date and the wlcs
+      version beside them, because a bare ratio from this harness means nothing
+      without them &mdash; the same shim scores 8/49 against wlcs 1.7.0 with no
+      shim change in between.</p>
     </div>
   </section>
 

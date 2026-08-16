@@ -16,12 +16,13 @@ Companion files in this directory:
 ## 1. The pin
 
 **Firefox ESR 140.12.0**, as a Mozilla tarball, sha256
-`3323ee13ac6fe4877fa2e1f4a3aa6b8009f65a620c7bbca96fe86f1a6f433d92`.
+`3323ee13ac6fe4877fa2e1f4a3aa6b8009f65a620c7bbca96fe86f1a6f433d92`, unpacking
+to `application.ini` BuildID `20260609153453`.
 
 The single source of truth is
 [`../tests/firefox/firefox-esr.pin`](../tests/firefox/firefox-esr.pin), which
 is shell-sourceable so the fetch script, CI and a human all read the same
-three values.
+four values.
 
 ```bash
 bash shim/tests/firefox/fetch-esr.sh          # fetch if absent, verify always
@@ -43,10 +44,74 @@ a pin, so `fetch-esr.sh` hashes into a temporary name and only moves the file
 into place after the comparison passes — there is no path through it that
 leaves an unverified browser on disk.
 
-**Upgrading is a deliberate act.** Change the three values in the pin file,
-re-run the fetch, re-run the acceptance script, and **regenerate the checked-in
-ledger** — a new Firefox may want different globals, and that log is what the
-global set is argued from.
+### Why the pin is checked twice
+
+A checksum over the tarball answers *what was downloaded*. It does not answer
+*what is installed*, and the two are separate facts, because Firefox ships an
+updater that rewrites the unpacked tree in place and never touches the
+tarball.
+
+That is not hypothetical here. On **2026-07-22** the updater ran on the
+development machine and replaced the unpacked `140.12.0esr` with
+`140.13.0esr`. The tarball on disk still hashed to the pin, so
+`fetch-esr.sh --verify-only` reported the pin intact — a true statement about
+a file nobody was executing — until issue #298 found it on **2026-08-16**.
+Anything that took `--verify-only` as its attestation in that window was
+attributing its results to a build it was not running: the real-core Firefox
+gate
+([`tests/integration/test_real_firefox.py`](../../tests/integration/test_real_firefox.py))
+and the CI step that runs it. The frames were real; the version they were
+filed under was not.
+
+One check did see it, narrowly:
+[`../tests/acceptance/firefox_bringup.sh`](../tests/acceptance/firefox_bringup.sh)
+compares `firefox --version` against the pin itself and would have failed on
+this update. It is version-only, so a respin would still have passed it, and
+it guards that one script — which is why the check below lives in
+`fetch-esr.sh`, where every caller gets it.
+
+So `--verify-only` now makes **two** checks and the fetch applies **one
+prevention**:
+
+| | What it holds | How |
+|---|---|---|
+| Check 1 | what was **downloaded** | the tarball's sha256 against the pin (or, once the tarball is reclaimed, the provenance stamp the unpack wrote) |
+| Check 2 | what is **installed** | `firefox/application.ini`'s `[App]` `Version` and `BuildID` against the pin, plus `firefox --version` |
+| Prevention | that check 2 keeps passing | `firefox/distribution/policies.json` with `DisableAppUpdate`, and the whole unpacked tree left non-writable |
+
+`BuildID` as well as `Version`, because a respin carries the same version
+number and different bytes. `firefox --version` as well as `application.ini`,
+because the `.ini` is a text file next to the binary and only the third check
+reads the executable itself.
+
+**What check 2 does not claim.** It attests the identity the tree states about
+itself and the identity the binary reports — the things Mozilla's updater
+moves. It is not a hash of the unpacked tree, so it would not detect a
+byte-level tamper that left both untouched. The tarball checksum plus a
+re-extract is what covers that, and the fetch script does exactly that
+automatically: a tree that fails check 2 is thrown away and re-extracted from
+the already-verified tarball, offline.
+
+**Of the two prevention mechanisms, the permission bits are the load-bearing
+one.** `policies.json` is installation-scoped, which the `app.update.*` prefs
+in [`../tests/firefox/profile.user.js`](../tests/firefox/profile.user.js) are
+not — and that scope is the gap those prefs leave: they bind runs that use the
+acceptance profile, the tree moved anyway, so something reached the updater
+from outside their reach. (Which run, this repository did not observe and does
+not claim.) But `policies.json` is still a *request* to Firefox. The
+non-writable tree is not: the updater's write fails in the kernel. It is also
+the only half this repository can *measure* offline — `--verify-only` reads
+the mode bits, whereas "the policy was obeyed" cannot be observed without the
+network the test profile forbids, so this page does not claim it was. Both are
+re-applied on every `fetch-esr.sh` run, so they survive a re-extract, and both
+are verified, so losing one is a red check rather than a silent one.
+
+**Upgrading is a deliberate act.** Change the four values in the pin file
+(`VITRIN_FIREFOX_BUILDID` is read out of the new tarball, not typed from a
+release page: `tar -xJOf <tarball> firefox/application.ini`), re-run the
+fetch, re-run the acceptance script, and **regenerate the checked-in ledger**
+— a new Firefox may want different globals, and that log is what the global
+set is argued from.
 
 ---
 

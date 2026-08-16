@@ -312,6 +312,19 @@ stays dormant; otherwise (e.g. CI) the pinned checkout is built from source.
 The wrap is the source of truth for the version; budget one wlroots upgrade
 task per phase.
 
+**How strong that pin is, exactly.** `revision = 0.19.3` is a *tag name* on
+`gitlab.freedesktop.org`, not a commit hash, and the wrap carries no
+`source_hash`. So the wrap fixes what Meson **asks for**, not what it
+receives: a moved tag would be fetched without complaint, and nothing
+re-checks `subprojects/wlroots/` after the clone. That is a weaker pin than
+the Firefox one, which since issue #298 verifies the download *and* the
+installed tree ([`docs/firefox.md`](docs/firefox.md) section 1), and weaker
+than [`tests/kernel-matrix/kernels.manifest`](../tests/kernel-matrix/kernels.manifest),
+which hashes both the `.deb` and the `vmlinuz` extracted from it. It is
+recorded here rather than fixed in passing: closing it means a commit-sha
+revision and a decision about the system-first path, which is not pinned at
+all.
+
 ```bash
 meson setup build            # uses system wlroots-0.19 if available
 ninja -C build
@@ -471,9 +484,15 @@ redden this test**.
 | the ledger | — | the advertised v0 set is exactly the contract; the probe mechanism fired; every demand is in `docs/firefox-refused-globals.txt` |
 
 ```bash
-bash tests/firefox/fetch-esr.sh          # pinned + sha256-verified, gitignored
+bash tests/firefox/fetch-esr.sh          # pinned, verified twice, gitignored
 BUILD_DIR=./build bash tests/acceptance/firefox_bringup.sh
 ```
+
+Twice, because a checksum over the tarball says what was *downloaded* and
+Firefox's own updater rewrites what is *installed*: the fetch script checks
+the tarball's sha256 **and** the unpacked tree's `application.ini`
+Version/BuildID, and leaves the tree non-writable with the updater switched
+off (issue #298, [`docs/firefox.md`](docs/firefox.md) section 1).
 
 The pin, the Wayland environment, the software-WebRender rationale, the
 profile, and the full record of what Firefox touched are in

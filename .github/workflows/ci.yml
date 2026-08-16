@@ -1812,6 +1812,14 @@ jobs:
         with:
           # Keyed on the pin: a new firefox-esr.pin (a deliberate ESR bump)
           # invalidates the cache and re-fetches, exactly as intended.
+          #
+          # NOTE what this caches: shim/.firefox holds the UNPACKED browser as
+          # well as the tarball, so a restored cache is an installed tree, not
+          # just verified bytes. Issue #298 is what happens when the two are
+          # confused. The fetch step below re-checks the unpacked tree against
+          # the pin's application.ini Version/BuildID on every run and
+          # re-extracts if it has moved, so a cache entry that carried a
+          # self-updated browser is repaired rather than believed.
           path: shim/.firefox
           key: firefox-esr-${{ hashFiles('shim/tests/firefox/firefox-esr.pin') }}
 

@@ -175,13 +175,21 @@ done
 # re-downloads whenever the tarball is missing, which is a normal state for a
 # developer who reclaimed 75 MB and kept the unpacked browser -- and a test
 # that silently fetches from a CDN is a test a network flake can redden.
+#
+# Since issue #298 `--verify-only` checks the UNPACKED tree as well as the
+# tarball (application.ini's Version and BuildID), which is the check that
+# catches Firefox updating itself in place. The `--version` comparison below
+# is NOT redundant with it: fetch-esr.sh verifies the tree it manages, while
+# $FIREFOX_BIN is overridable from the environment, so this is what holds a
+# caller-supplied browser to the pin the rest of this script's evidence is
+# attributed to.
 source "$FF_DIR/firefox-esr.pin"
 bash "$FF_DIR/fetch-esr.sh" --verify-only >/dev/null \
 	|| fail "the pinned Firefox failed verification (run: bash shim/tests/firefox/fetch-esr.sh)"
 reported="$("$FIREFOX_BIN" --version 2>/dev/null || true)"
 [[ "$reported" == *"$VITRIN_FIREFOX_VERSION"* ]] \
 	|| fail "pinned $VITRIN_FIREFOX_VERSION but the binary reports '$reported'"
-ok "Firefox pin verified: $reported (sha256 $VITRIN_FIREFOX_SHA256)"
+ok "Firefox pin verified: $reported (sha256 $VITRIN_FIREFOX_SHA256, build $VITRIN_FIREFOX_BUILDID)"
 
 export WLR_BACKENDS=headless
 export WLR_RENDERER=pixman

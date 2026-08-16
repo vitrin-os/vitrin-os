@@ -105,6 +105,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
+use crate::build_output::BuildOutput;
 use crate::skip_census::{attrs_before, is_ident, mask_code, word_positions};
 
 /// One `cargo test` invocation `.github/workflows/ci.yml` really performs.
@@ -903,6 +904,12 @@ fn child_dir(file: &Path) -> std::path::PathBuf {
 /// Every `#[test]` in the tree, with its target, its libtest path and the
 /// `cfg` conjunction that gates it.
 fn collect_tests(root: &Path) -> Result<Vec<TestItem>> {
+    // Build output is not a cargo package and not a test target, whatever it
+    // is called (issue #295). This walk and `skip_census`'s flat scan are
+    // cross-checked against each other, so they have to drop the same files:
+    // one of them alone dropping a directory would be reported as a defect in
+    // the tree instead of as what it is, a directory CI will never see.
+    let built = BuildOutput::of_tree(root)?;
     // package name -> package directory
     let mut packages: Vec<(String, std::path::PathBuf)> = Vec::new();
     let crates_dir = root.join("crates");
@@ -913,6 +920,9 @@ fn collect_tests(root: &Path) -> Result<Vec<TestItem>> {
             .collect::<std::result::Result<_, _>>()?;
         entries.sort();
         for path in entries {
+            if built.covers(&path) {
+                continue;
+            }
             if path.join("Cargo.toml").is_file() {
                 let name = path.file_name().unwrap_or_default().to_string_lossy();
                 packages.push((name.into_owned(), path));
@@ -948,6 +958,9 @@ fn collect_tests(root: &Path) -> Result<Vec<TestItem>> {
                 .collect::<std::result::Result<_, _>>()?;
             entries.sort();
             for path in entries {
+                if built.covers(&path) {
+                    continue;
+                }
                 if path.extension().is_some_and(|e| e == "rs") {
                     let name = path
                         .file_stem()
@@ -967,7 +980,12 @@ fn collect_tests(root: &Path) -> Result<Vec<TestItem>> {
         }
 
         for (root_file, target) in roots {
-            // Depth-first over the module tree of this target.
+            // Depth-first over the module tree of this target. NOT filtered by
+            // `built`, deliberately: a `mod x;` is a source-level statement
+            // that the file is part of the crate, and it outranks any ignore
+            // rule -- a crate that compiles from a file CI will not have is
+            // broken, and the disagreement with the flat scan is how that
+            // gets said out loud rather than skipped quietly.
             let mut queue = vec![(root_file, String::new(), Vec::<Pred>::new())];
             while let Some((file, prefix, inherited)) = queue.pop() {
                 let text = std::fs::read_to_string(&file)
@@ -1496,6 +1514,7 @@ fn check_ci_test_runs(root: &Path, problems: &mut Vec<String>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testtree::TestTree;
 
     fn features(list: &[&str]) -> Build {
         Build {
@@ -1826,6 +1845,45 @@ mod tests {
             "{} test-coverage problem(s):\n{}",
             problems.len(),
             problems.join("\n")
+        );
+    }
+
+    /// **#295 in this walk's units.** Where `skip_census` reads files, this
+    /// reads *packages* -- one per directory under `crates/` holding a
+    /// `Cargo.toml` -- and test targets, one per `.rs` file under `tests/`.
+    /// Both enumerations are `read_dir` over a directory that build output
+    /// can appear in, so both can name a package cargo will never build and a
+    /// test target CI will never check out.
+    ///
+    /// It has to drop exactly what the flat scan drops. The two lists are
+    /// cross-checked against each other, so a directory only one of them
+    /// skips is reported as a defect in the tree -- the same false report,
+    /// wearing the other scan's wording.
+    #[test]
+    fn an_ignored_package_directory_is_not_a_package() {
+        let tree = TestTree::new("census-build-output");
+        tree.write(".gitignore", "builddir/\nscratch.rs\n");
+        tree.write("crates/real/Cargo.toml", "[package]\nname = \"real\"\n");
+        tree.write("crates/real/src/lib.rs", "#[test]\nfn a_real_test() {}\n");
+        tree.write("crates/real/tests/kept.rs", "#[test]\nfn an_it_test() {}\n");
+        tree.write(
+            "crates/real/tests/scratch.rs",
+            "#[test]\nfn a_scratch_test() {}\n",
+        );
+        tree.write("crates/builddir/Cargo.toml", "[package]\nname = \"gen\"\n");
+        tree.write(
+            "crates/builddir/src/lib.rs",
+            "#[test]\nfn a_stale_test() {}\n",
+        );
+        tree.git_init();
+
+        let found = collect_tests(tree.path()).expect("the census walks this tree");
+        let mut paths: Vec<&str> = found.iter().map(|t| t.file.as_str()).collect();
+        paths.sort_unstable();
+        assert_eq!(
+            paths,
+            ["crates/real/src/lib.rs", "crates/real/tests/kept.rs"],
+            "only the tracked package's targets are targets"
         );
     }
 

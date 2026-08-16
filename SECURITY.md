@@ -161,9 +161,14 @@ does not spend a weekend on something the project already says out loud:
   also that P2.6.3 is **not finished**: the ruleset landed, and so did a
   generated ladder table with a CI staleness gate — the
   [Landlock ABI matrix](docs/book/src/isolation-matrix.md), which states what
-  this build requires of a kernel — but it measures **no** kernel, the
-  per-kernel table the task's criteria ask for does not exist, and exactly two
-  machines have ever been asked for their Landlock ABI.
+  this build requires of a kernel — but it measures **no** kernel. The
+  per-kernel table the task's criteria ask for is a separate artefact,
+  [which kernels this build starts on](docs/book/src/isolation-kernels.md):
+  five distribution kernels booted under QEMU with the shipped `vitrind`,
+  reporting ABI 1, 2, 4, 6 and 7, three of them refused below the floor. Those
+  are **kernel** readings taken in a bare initramfs — the number of
+  *distributions* whose policy this repository has measured is still one, and
+  the suite itself has still only ever run on two machines.
 
   One consequence is worth knowing before you report it as a bug: a Landlock
   domain denies **every mount-topology change** to the process and its
@@ -206,9 +211,14 @@ does not spend a weekend on something the project already says out loud:
   the feature. Note that anything reproduced under `--isolation=off` is a
   finding about an explicitly unconfined session and is triaged as such.
   **`packaging/apparmor/vitrind` is the per-binary grant for such a host, and
-  it has never been loaded by anyone who wrote it** — authored on a machine
-  with AppArmor compiled out, so unparsed, unloaded and unobserved; the
-  `apparmor-profile` CI job is the instrument that will say. Two things about
+  the `apparmor-profile` CI job measures it working** — on kernel
+  `6.17.0-1022-azure` it took `mount.in_userns` from
+  `restricted-by-policy(errno=13)` to `available` and `tier` from `none` to
+  `per-uid`, spawned a real realm, and failed again with the profile removed.
+  That is **one kernel on one CI image**; nobody has loaded it on an installed
+  Ubuntu system, and nothing in the repository installs it
+  ([#293](https://github.com/vitrin-os/vitrin-os/issues/293)) — a build not at
+  the paths the profile names is not covered by it. Two things about
   it are worth a reporter's attention rather than a report. First, a profile of
   that shape (`flags=(unconfined)` carrying a `userns` rule) is a **name any
   local user may try to borrow** with `aa-exec -p vitrind`. Whether that borrow

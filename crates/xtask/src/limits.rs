@@ -1021,25 +1021,36 @@ pub const CLAIMS: &[Claim] = &[
         ],
     },
     Claim {
-        id: "apparmor-profile-is-unproven",
+        id: "apparmor-profile-is-one-image-and-uninstalled",
         says: "an AppArmor profile for the requirement above EXISTS in the tree \
-               (`packaging/apparmor/vitrind`) and has NEVER BEEN LOADED by anyone who wrote it. \
-               Every surface says both halves: that the profile is there, and that its state of \
-               evidence is zero. A CI job is what will settle it, and it has not reported yet.",
-        issue: "#286 -- and this row exists precisely because #286 is NOT closed by the profile \
-                landing. The profile is the artefact; the `apparmor-profile` job is the \
-                deliverable that can say anything about it.",
+               (`packaging/apparmor/vitrind`) and is MEASURED WORKING on exactly one kernel on \
+               one CI image. Every surface says both halves: that the profile is there and \
+               measured, and that NOBODY HAS LOADED IT ON AN INSTALLED UBUNTU SYSTEM and \
+               nothing in this repository installs it outside the job that measures it.",
+        issue: "#286 closed the profile's own axis -- it shipped the profile AND the job that \
+                measures it, and the job reported green on a stock runner. #293 owns what \
+                remains: nothing installs the profile or the binaries whose paths it attaches \
+                to, so `we ship a profile` is true of the repository and false of any \
+                installation of it.",
         // TWO anchors per surface, and the second one is again the
         // load-bearing half. The first pins the ARTEFACT (a page that stopped
         // naming the profile's path has stopped telling a reader where to
-        // look). The second pins the BOUND -- and this is the anchor a later
-        // editor is most likely to delete, because "has never been loaded" is
-        // exactly the sentence that reads like it needs tidying once the job
-        // has run once. Deleting it without a measurement turns four pages
-        // into a claim that a profile works, which is the single overclaim
-        // this whole task was shaped to avoid. When the job HAS run green,
-        // rewrite the pages against what it reported and change this row's
-        // anchors deliberately, in the same commit.
+        // look). The second pins the BOUND.
+        //
+        // The bound moved on 2026-08-16 and the move is the shape this row is
+        // for. It used to be "has never been loaded", and its own comment said
+        // that sentence was the one a later editor would delete the first time
+        // the job ran green. The job HAS run green -- so the pages were
+        // rewritten against what it reported and this row's anchors changed in
+        // the same commit, which is exactly what that comment instructed and
+        // NOT the same act as deleting the anchor to make a gate quiet.
+        //
+        // The new bound is the boundary that survived the measurement, and it
+        // is now the sentence most likely to be tidied away: one green CI job
+        // reads like general availability, and it is not. A page that keeps
+        // "measured" and drops "nobody has loaded it on an installed Ubuntu
+        // system" is claiming the profile works for its readers, which no run
+        // in this repository has ever shown.
         surfaces: &[
             Anchor {
                 path: LIMITS,
@@ -1047,7 +1058,7 @@ pub const CLAIMS: &[Claim] = &[
             },
             Anchor {
                 path: LIMITS,
-                needle: "has never been loaded",
+                needle: "on an installed Ubuntu system",
             },
             Anchor {
                 path: README,
@@ -1055,7 +1066,7 @@ pub const CLAIMS: &[Claim] = &[
             },
             Anchor {
                 path: README,
-                needle: "has never been loaded",
+                needle: "on an installed Ubuntu system",
             },
             Anchor {
                 path: SECURITY,
@@ -1063,7 +1074,7 @@ pub const CLAIMS: &[Claim] = &[
             },
             Anchor {
                 path: SECURITY,
-                needle: "has never been loaded",
+                needle: "on an installed Ubuntu system",
             },
             Anchor {
                 path: SITE,
@@ -1071,7 +1082,7 @@ pub const CLAIMS: &[Claim] = &[
             },
             Anchor {
                 path: SITE,
-                needle: "has never been loaded",
+                needle: "on an installed Ubuntu system",
             },
         ],
         evidence: &[
@@ -1139,20 +1150,25 @@ pub const CLAIMS: &[Claim] = &[
             },
             Evidence::Contains {
                 path: "packaging/apparmor/vitrind",
-                needle: "THIS PROFILE HAS NEVER BEEN LOADED",
-                means: "the profile's own header still states its evidence as zero. This is the \
-                        forcing function for the four pages above: the day somebody has a \
-                        measurement, this sentence is what they have to delete, and deleting it \
-                        fails this gate until the pages are rewritten too. A file that quietly \
-                        became authoritative while every page still called it unproven is drift \
-                        in the direction nobody notices.",
+                needle: "NOBODY HAS LOADED THIS PROFILE ON AN INSTALLED UBUNTU SYSTEM",
+                means: "the profile's own header still states the bound its measurement did NOT \
+                        clear. This is the forcing function for the four pages above, and it \
+                        has already fired once: the header used to say the profile had never \
+                        been loaded at all, and the day the `apparmor-profile` job reported \
+                        green that sentence had to be deleted -- which failed this gate until \
+                        all four pages were rewritten against what the job actually reported. \
+                        The bound this needle now holds is the next one an editor will want to \
+                        tidy: one green CI job on one image reads like general availability. A \
+                        file that quietly became authoritative for every host while the pages \
+                        still cited one runner is drift in the direction nobody notices.",
             },
             Evidence::Contains {
                 path: ".github/workflows/ci.yml",
                 needle: "apparmor-profile:",
                 means: "the job the pages point at still exists. Every one of those four \
-                        surfaces says 'a job exists that will say', and a page promising an \
-                        instrument that was deleted is worse than a page promising nothing.",
+                        surfaces cites what it reported, and a page citing a measurement whose \
+                        instrument was deleted is worse than a page citing nothing -- the \
+                        numbers stay readable and stop being re-checkable on the next run.",
             },
             Evidence::Contains {
                 path: ".github/workflows/ci.yml",

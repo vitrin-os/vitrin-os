@@ -106,10 +106,10 @@ stated plainly rather than left to be inferred from the table.
 
 PR #290 added an AppArmor profile for `vitrind` (`packaging/apparmor/vitrind`), because
 Ubuntu 24.04 denies the capabilities `vitrind` needs *inside a user namespace it has
-already granted* — issue #286. **Whether that profile works has not been measured**:
-[the limits page](limits.md) records that it has never been loaded by anyone who wrote
-it, and the `apparmor-profile` CI job is the instrument that will say. Nothing below
-assumes it does work.
+already granted* — issue #286. **That profile is measured working on one kernel on one
+CI image** — [the limits page](limits.md) carries what the `apparmor-profile` job
+reported, and the bound it did not clear. Nothing below depends on which way that
+went.
 
 **What this page adds is that the profile cannot be sufficient on Ubuntu 24.04's own
 GA kernel, whatever the job reports.** That kernel is `6.8.0-139-generic`, measured
@@ -137,7 +137,7 @@ it in the `host-must-have-landlock` entry.
 - **`6.1.0-50-amd64`** — Debian 12 (bookworm) (6.1-lts). The previous Debian stable, and the row that shows the floor is not satisfied by "a recent LTS" — 6.1 is a long-term kernel and it is still four rungs short.
 - **`6.8.0-139-generic`** — Ubuntu 24.04 LTS (GA kernel) (6.8-lts). The kernel PR #290's AppArmor profile was written for, and the reason that profile cannot be sufficient on its own: the profile is aimed at the namespace refusal, and this kernel is refused at the next gate anyway, on the Landlock floor. The page's "AppArmor profile" section is about this row.
 - **`6.12.101+deb13-amd64`** — Debian 13 (trixie), current stable (6.12-stable). The row the floor was lowered for (owner's decision, 2026-08-16). Under the previous floor of 7 this kernel was refused; it reports ABI 6, and the domain this build enforces at rung 6 is identical to the one it enforces at rung 7.
-- **`6.17.0-1020-azure`** — Ubuntu (azure kernel) — what this repository's CI runners boot (ci-runner-kernel). The cross-validation row. It is the same kernel release the CI runner reports, so booting it here says whether this harness reproduces that machine — and, on the policy cells, whether it does not.
+- **`6.17.0-1020-azure`** — Ubuntu (azure kernel) — what this repository's CI runners boot (ci-runner-kernel). The cross-validation row. It is the kernel release the CI runner reported ON THE COLLECTION DATE, so booting it here says whether this harness reproduces that machine — and, on the policy cells, whether it does not. **The runner's kernel moves:** it reported `6.17.0-1020-azure` on 2026-08-14 and `6.17.0-1022-azure` by 2026-08-16. Both are ABI 7, so the rung this row cross-validates is unaffected, but do not read the row as naming whatever the runner boots today. GitHub bumps that image with no commit here, which is why this table is dated rather than presented as current.
 
 ## Provenance, per row
 

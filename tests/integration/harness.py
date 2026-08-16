@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 import unittest
 
 REPO = pathlib.Path(os.environ.get("VITRIN_REPO", pathlib.Path(__file__).resolve().parents[2]))
@@ -145,7 +146,16 @@ LANDLOCK_BUILD_MAX_RUNG = 9
 #: obtained at least this rung -- which is the only mock-free check that the
 #: declared floor is the one a real realm actually got. `vitrind --print-floor`
 #: prints it as `build.landlock_min_abi`.
-LANDLOCK_MIN_ABI = 7
+#:
+#: **Held to the crate by `cargo xtask isolation-matrix`**, which reads both
+#: numbers out of `vitrin-realm-init` and refuses to render if this file
+#: disagrees. Before that check existed this constant sat at 7 for a day after
+#: commit e7b5514 lowered the crate's floor to 6, which would have taken
+#: `test_real_confinement.py`'s `obtained_rung >= LANDLOCK_MIN_ABI` assertion
+#: RED on any ABI-6 kernel -- that is, on the exact machine class the floor was
+#: lowered *for*. A mirrored constant nothing checks is a gate that fails on
+#: the deployment target and nowhere else.
+LANDLOCK_MIN_ABI = 6
 
 #: A suite-wide `--landlock` argument for every core that does not name one.
 #:
@@ -1147,6 +1157,7 @@ class Core:
             physical_theirs.close()
         if wait:
             self.await_socket()
+            self.await_realms()
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -1179,6 +1190,86 @@ class Core:
                 return
             time.sleep(0.05)
         raise CoreFailed(f"core never bound {self.socket} within {timeout}s:\n{self.output()}")
+
+    def autostart_realms(self) -> tuple[str, ...]:
+        """The realm ids this session's config says startup must fork.
+
+        Read back out of the `realm.toml` the core is pointed at rather than
+        recomposed from this object's constructor arguments: it is the same
+        file the core's loader reads, so the two cannot drift, and a caller
+        that wrote its own tree (`write_config=False`) is covered by the same
+        code path as one that let the harness write it.
+
+        Templates (`autostart = false`, WS-E.1.1) are excluded, because
+        `start_realm_in` skips them — waiting on one would wait forever.
+        Returns `()` for a config this cannot read, which degrades
+        :meth:`await_realms` to a no-op rather than to a spurious failure.
+        """
+        try:
+            parsed = tomllib.loads(self.realm.read_text())
+        except (OSError, tomllib.TOMLDecodeError):
+            return ()
+        return tuple(
+            table["id"]
+            for table in parsed.get("realm", [])
+            if "id" in table and table.get("autostart", True)
+        )
+
+    def await_realms(self, timeout: float = BOOT_TIMEOUT_S) -> None:
+        """Block until every autostarting realm has been forked and journalled.
+
+        **This is not redundant with :meth:`await_socket`, and the gap between
+        them is a real one that cost a ~30%-per-run flake** (issue #292).
+        `run_session` binds the core socket long before the backend exists;
+        the realms are forked much later, one at a time, by
+        `session::start_realm_in` running *between* `install()` and
+        `event_loop.run()`. So the socket file appears first and the realm
+        trees follow it over the next few milliseconds — measured here at
+        +1.9 ms for the first realm and +8.4 ms (median) for the last of
+        three, against `await_socket`'s 50 ms poll. A test that walked
+        `$XDG_RUNTIME_DIR/vitrin-0/` the instant `await_socket` returned saw
+        a half-populated tree roughly one run in four.
+
+        **No conformant client can see that window**, which is why the fix is
+        here and not in the core: the loop is not running yet, so the bound
+        listener accepts nothing and connections merely queue in the backlog.
+        Only a filesystem observer outside the protocol — this harness — can
+        catch the session mid-startup. Moving the bind after the fork loop
+        would trade this test-side race for a real one (a second core could
+        take the socket meanwhile) and would break issue #77's trap T1, which
+        requires `install()` before the fork.
+
+        Waits on the **flight recorder**, deliberately, rather than on the
+        realm directories: `spawn_realm` creates the tree and its `<id>.lock`
+        and *then* journals `realm_spawned`, synchronously, in the parent. So
+        the entry is strictly later than the tree, and a test can still assert
+        on the tree afterwards without that assertion being a restatement of
+        what was waited for. A realm that was journalled but got no directory
+        still fails the test it should fail.
+        """
+        expected = set(self.autostart_realms())
+        if not expected:
+            return
+        deadline = time.monotonic() + timeout
+        seen: set[str] = set()
+        while time.monotonic() < deadline:
+            if self.proc is not None and self.proc.poll() is not None:
+                raise CoreFailed(
+                    f"core exited {self.proc.returncode} while forking its realms "
+                    f"(journalled {sorted(seen)} of {sorted(expected)}):\n{self.output()}"
+                )
+            seen = {
+                entry["realm"]
+                for entry in self.entries()
+                if entry["kind"] == "realm_spawned"
+            }
+            if expected <= seen:
+                return
+            time.sleep(0.02)
+        raise CoreFailed(
+            f"core never journalled a realm_spawned for {sorted(expected - seen)} "
+            f"within {timeout}s:\n{self.output()}"
+        )
 
     def await_exit(self, timeout: float = 30.0) -> int:
         assert self.proc is not None

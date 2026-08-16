@@ -122,9 +122,14 @@ const KERNELS: &[KernelNote] = &[
     KernelNote {
         id: "ubuntu-azure-6.17",
         distribution: "Ubuntu (azure kernel) — what this repository's CI runners boot",
-        why: "The cross-validation row. It is the same kernel release the CI runner reports, so \
-              booting it here says whether this harness reproduces that machine — and, on the \
-              policy cells, whether it does not.",
+        why: "The cross-validation row. It is the kernel release the CI runner reported ON THE \
+              COLLECTION DATE, so booting it here says whether this harness reproduces that \
+              machine — and, on the policy cells, whether it does not. **The runner's kernel \
+              moves:** it reported `6.17.0-1020-azure` on 2026-08-14 and `6.17.0-1022-azure` by \
+              2026-08-16. Both are ABI 7, so the rung this row cross-validates is unaffected, \
+              but do not read the row as naming whatever the runner boots today. GitHub bumps \
+              that image with no commit here, which is why this table is dated rather than \
+              presented as current.",
     },
 ];
 
@@ -674,10 +679,10 @@ fn render(rows: &[Row], constants: &Constants, crossval: &str) -> String {
          stated plainly rather than left to be inferred from the table.\n\n\
          PR #290 added an AppArmor profile for `vitrind` (`packaging/apparmor/vitrind`), because\n\
          Ubuntu 24.04 denies the capabilities `vitrind` needs *inside a user namespace it has\n\
-         already granted* — issue #286. **Whether that profile works has not been measured**:\n\
-         [the limits page](limits.md) records that it has never been loaded by anyone who wrote\n\
-         it, and the `apparmor-profile` CI job is the instrument that will say. Nothing below\n\
-         assumes it does work.\n\n\
+         already granted* — issue #286. **That profile is measured working on one kernel on one\n\
+         CI image** — [the limits page](limits.md) carries what the `apparmor-profile` job\n\
+         reported, and the bound it did not clear. Nothing below depends on which way that\n\
+         went.\n\n\
          **What this page adds is that the profile cannot be sufficient on Ubuntu 24.04's own\n\
          GA kernel, whatever the job reports.** That kernel is `6.8.0-139-generic`, measured\n\
          above at `landlock.abi=4` — below this build's floor of {floor}. So on a stock 24.04,\n\

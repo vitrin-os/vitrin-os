@@ -184,8 +184,13 @@ convinces you of more than it should.
   since P2.6.3 it also gets a [Landlock](https://landlock.io/) ruleset with an
   enumerated read set, enforced before the shim's `execve`, and a generated
   [ABI matrix](docs/book/src/isolation-matrix.md) of what this build requires
-  of a kernel — but not the *per-kernel* table that task's criteria ask for,
-  and no third kernel has been measured. There is still no
+  of a kernel. The *per-kernel* half the task's criteria ask for now exists
+  separately and is measured — [which kernels this build starts
+  on](docs/book/src/isolation-kernels.md) boots five distribution kernels under
+  QEMU with the shipped `vitrind` (reported ABI 1, 2, 4, 6 and 7; three refused
+  below the floor, two admitted) — but those are **kernel** readings taken in a
+  bare initramfs, so the number of *distributions* measured as such is still
+  one. There is still no
   [seccomp](https://man7.org/linux/man-pages/man2/seccomp.2.html) filter
   (P2.6.4), so the realm's syscall surface is the kernel's whole surface —
   Landlock gates filesystem operations, not syscalls in general. The realm also keeps
@@ -535,8 +540,14 @@ That is the complete list of what confines a realm right now.
   own source and the ABI floor out of the crate that declares it, because a
   page carrying the ABI of the machine that generated it could not be
   byte-identical on this project's two machines. The per-kernel row set the
-  task's restated criteria ask for still does not exist, and no third kernel
-  has been measured. Do not read P2.6.3 as a finished task.
+  task's restated criteria ask for landed separately, as
+  [the kernel page](docs/book/src/isolation-kernels.md): five distribution
+  kernels booted under QEMU with the shipped binary, held by
+  `cargo xtask kernel-matrix --check` against the boot rows checked in under
+  `tests/kernel-matrix/rows/`. Do not read P2.6.3 as a finished task even so —
+  every one of those rows is a kernel reading in a bare initramfs rather than a
+  distribution, the per-rung *behavioural* statements are still measured on one
+  box, and nobody but the collector's author has re-run its failure levers.
 
   The rung the ruleset was **obtained** at is what the realm's
   `applied_profile` names, with the rung the session asked for and the ABI the
@@ -610,18 +621,23 @@ That is the complete list of what confines a realm right now.
   [#281](https://github.com/vitrin-os/vitrin-os/issues/281). `vitrind
   --print-isolation` answers for the machine in front of you, and
   `--isolation=off` is not a remedy — it starts an unconfined session.
-  **There is now an AppArmor profile for this, at `packaging/apparmor/vitrind`,
-  and it has never been loaded by anyone who wrote it.** It is the per-binary
+  **There is an AppArmor profile for this, at `packaging/apparmor/vitrind`, and
+  it works — measured on one kernel, on one CI image.** It is the per-binary
   grant Ubuntu ships a mechanism for — the shape Chromium, Firefox and flatpak
   already use — chosen over asking operators to weaken a system-wide default.
-  It was authored on a machine with AppArmor compiled out, so it has not been
-  parsed, loaded, attached or observed to grant anything; **do not install it
-  expecting it to work.** The `apparmor-profile` CI job is what will say: it
+  The `apparmor-profile` CI job is what says so: it
   runs on a runner whose userns sysctl it never touches (the only job in that
   workflow that does not; installing the `apparmor` package does load the
   distro's own profiles, so "unmodified" is about that knob, not the machine),
   loads the profile, spawns a real realm, and then
-  removes the profile and requires the spawn to fail again. It also has a cost
+  removes the profile and requires the spawn to fail again. On kernel
+  `6.17.0-1022-azure` it reported `mount.in_userns` moving from
+  `restricted-by-policy(errno=13)` to `available`, `tier` from `none` to
+  `per-uid`, a real realm spawning, and the lever both ways
+  (`lever_without=refused`, `lever_restored=ok`). **Nobody has loaded it on an
+  installed Ubuntu system**, and nothing here installs it for you — that is
+  packaging, which is
+  [#293](https://github.com/vitrin-os/vitrin-os/issues/293). It also has a cost
   worth knowing before you install it — the profile's *name* is borrowable via
   `aa-exec`, and whether that borrow actually yields a user namespace turns on
   `kernel.apparmor_restrict_unprivileged_unconfined` — at `1` AppArmor stacks

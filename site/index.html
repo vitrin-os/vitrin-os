@@ -352,8 +352,13 @@ grant.pointer.click(640, 84)</pre>
       separately and is <strong>measured</strong> &mdash;
       <a href="docs/isolation-kernels.html">five distribution kernels</a> booted
       under QEMU with the shipped <code>vitrind</code>, reporting ABI 1, 2, 4, 6
-      and 7. P2.6.3 is still not finished for a different reason: there is still
-      no seccomp filter, so a realm is filesystem-confined but not
+      and 7. Since P2.6.4
+      (<a href="https://github.com/vitrin-os/vitrin-os/issues/188">#188</a>)
+      there is also a seccomp filter, and it is a
+      <strong>deny-list</strong>: it closes the 13 denied syscall rows
+      <code>vitrind --print-seccomp</code> prints and leaves the rest of the
+      kernel's syscall surface unenumerated, so a realm is filesystem-confined
+      and filtered against a named list but not
       syscall-confined
       &mdash; and it keeps the invoking user's supplementary groups, which the
       kernel gives no window to drop.
@@ -449,7 +454,8 @@ grant.pointer.click(640, 84)</pre>
       kernel (ABI 4) are refused. Those are <em>kernel</em> rows, taken with no
       distribution policy loaded, and they are not distribution rows &mdash;
       <a href="docs/isolation-kernels.html">the kernel page</a> has the rows and
-      says why the difference matters. <strong>Do not cross the two
+      says why the difference matters.
+      <strong>Do not cross the two
       remedies</strong>: the
       refusal names the mechanism it could not get &mdash;
       <code>namespaces</code> for the paragraph above, <code>landlock</code>

@@ -190,12 +190,20 @@ convinces you of more than it should.
   QEMU with the shipped `vitrind` (reported ABI 1, 2, 4, 6 and 7; three refused
   below the floor, two admitted) — but those are **kernel** readings taken in a
   bare initramfs, so the number of *distributions* measured as such is still
-  one. There is still no
-  [seccomp](https://man7.org/linux/man-pages/man2/seccomp.2.html) filter
-  (P2.6.4), so the realm's syscall surface is the kernel's whole surface —
-  Landlock gates filesystem operations, not syscalls in general. The realm also keeps
-  the invoking user's supplementary groups, which the kernel gives no window to
-  drop. Environment hygiene confines the well-behaved; it does not contain the
+  one. Since P2.6.4
+  ([#188](https://github.com/vitrin-os/vitrin-os/issues/188)) there is also a
+  [seccomp](https://man7.org/linux/man-pages/man2/seccomp.2.html) filter, and
+  it is a **deny-list** — a named-class claim, never a completeness one. It
+  closes the 13 denied syscall rows `vitrind --print-seccomp` prints, each
+  naming the escape class it answers and the errno it returns, and leaves the
+  rest of the
+  kernel's syscall surface **unenumerated**. So a realm is path-confined and
+  *filtered against a named list*; it is **not** syscall-confined. 11 of the
+  13 denied syscall rows are demonstrated against a positive control on the
+  kernel this was measured on; two are already denied by a sysctl there and are reported
+  *not demonstrated* rather than counted. The realm also keeps the invoking
+  user's supplementary groups, which the kernel gives no window to drop.
+  Environment hygiene confines the well-behaved; it does not contain the
   hostile. This is still the big one — see
   [Security notes](#security-notes--what-the-mvp-does-and-does-not-confine).
 - **The 24-hour fuzz soak has not been run**
@@ -601,9 +609,20 @@ That is the complete list of what confines a realm right now.
   every right on `/` does *not* repair the mount denial — is on the
   [limits page](docs/book/src/limits.md).
 
-  Still absent: **no seccomp filter** (P2.6.4). A realm can therefore issue any
-  syscall it likes; it simply has few paths to reach and, now, few rights on
-  what is left. Three things also survive the namespaces: the invoking
+  Since P2.6.4 there is a **seccomp deny-list**, and the word is load-bearing:
+  a realm can still issue any syscall that is not one of the 13 denied syscall
+  rows `vitrind --print-seccomp` prints. The residual surface is **unenumerated** —
+  this build does not know Firefox's syscall set, and an allow-list without a
+  measured trace would fail closed against the project's own acceptance app.
+  The filter is installed by `vitrin-realm-init` immediately before the shim's
+  `execve`, so the shim and every process it forks inherit it and cannot remove
+  it, and a kernel that cannot accept one now **refuses to start a session**
+  rather than running unfiltered. Two costs are published rather than implied:
+  a realm cannot execute a 32-bit binary on a 64-bit host (syscall numbers are
+  per-ABI, and the filter kills a foreign ABI rather than passing it), and the
+  `ptrace` row breaks the pinned Firefox's crash reporter — which the
+  acceptance gate does not exercise, so its green tick is not evidence for that
+  row. Three things also survive the namespaces: the invoking
   user's **supplementary groups** (the kernel offers no window in which an
   unprivileged process can both drop them and write a single-id `gid_map`), a
   **read-write GPU render node** with its ioctl surface and cross-realm

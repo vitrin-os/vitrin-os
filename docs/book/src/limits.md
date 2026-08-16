@@ -125,11 +125,72 @@ binding, and `test_real_confinement.py` holds that denial as a gate — but a
 reader sizing residual risk should size it at a handful of empty directories,
 not at a filesystem.
 
-What is **not** there yet: **no seccomp filter** (P2.6.4). The realm's
-*syscall* surface is still the kernel's whole surface — Landlock gates
-filesystem operations, not `syscall(2)` in general — restricted only by having
-no capabilities, no path to most of the filesystem, and now no Landlock right
-to most of what is left.
+<!-- limit: seccomp-is-a-deny-list -->
+**Since P2.6.4 ([#188](https://github.com/vitrin-os/vitrin-os/issues/188))
+there is a seccomp filter, and it is a DENY-LIST — a
+named-class claim, never a completeness claim.** `vitrin-realm-init` installs
+a classic-BPF program immediately before the shim's `execve`, so the shim and
+every process it forks inherit it and cannot remove it. What it closes is the
+list `vitrind --print-seccomp` prints: **13 denied syscall rows** today, each
+naming the PRD Doc 2 §15 escape class it answers and the errno it returns. What it leaves
+open is **everything else, unenumerated** — this build does not know Firefox's
+syscall surface, and an allow-list built without a measured trace would fail
+closed against the project's own acceptance app. So a realm is now
+*syscall-filtered against a named list* and is **not** "syscall-confined": the
+residual surface is the kernel's whole surface minus 13 denied syscall rows,
+and nobody here has counted what that leaves.
+
+Read that beside the Landlock sentence above, because the two are the same
+shape and P2.9.4's cross-check compares them: **Landlock's read set is
+enumerated and denies a handful of empty directories; seccomp's deny set is
+enumerated and denies thirteen syscalls.** Neither is a boundary around
+"everything an app might do". Both are lists, and a list is exactly as large
+as it is.
+
+Four things about that filter that a reader must not have to infer:
+
+- **It answers two of §15's eight actor rows, and part of a third.** The two
+  are *Compromised shim* — the only §15 row that names seccomp at all — and
+  *Malicious app in a shim*, at its kernel-attack-surface half. The third is
+  *Reachable-service lateral escape*, and it is answered at **two services PRD
+  Doc 2 §4.5's own "there is simply nothing to reach" sentence does not
+  cover**: the operator's kernel keyring, and `AF_VSOCK`. The remaining five
+  rows — ransomware, hijacked agent, malicious agent client, malicious relying
+  app, impersonating publisher — are answered by mechanisms that are not
+  seccomp, and by nothing in this filter.
+- **11 of the 13 denied syscall rows are DEMONSTRATED on the kernel this was
+  measured on; two are not.** `tests/integration/test_real_seccomp.py` runs
+  the same probe binary inside a realm and at `--isolation=off`, and a row
+  whose syscall already fails outside a realm is reported *not demonstrated*
+  rather than counted as confinement. `bpf` and `userfaultfd` land there on a
+  box with `kernel.unprivileged_bpf_disabled` or
+  `vm.unprivileged_userfaultfd` set — the denial is real, and on that machine
+  it is not confinement *this filter* adds. Which rows are demonstrated is a
+  property of the kernel, so it is measured per run and printed, never
+  declared.
+- **A realm cannot execute a foreign-ABI binary.** Syscall numbers are
+  per-ABI, so a process running under i386 or x32 on an x86-64 kernel meets a
+  table whose numbers mean other syscalls. The filter kills it
+  (`SECCOMP_RET_KILL_PROCESS`) rather than passing it unfiltered. A 32-bit app
+  in a realm dies with `SIGSYS` on its first syscall.
+- **The crash reporter is the acceptance app's casualty, and the gate does not
+  cover it.** The `ptrace` row denies the pinned Firefox's minidump writer.
+  `test_real_firefox.py` sets `MOZ_CRASHREPORTER_DISABLE=1`, so that gate goes
+  green *without exercising the path this row breaks*. The green tick is not
+  evidence for that row, and this bullet exists so nobody reads it as one.
+
+**Timing, measured rather than asserted (R2.8).** Three acceptance gates, 7
+runs each, on Arch `7.1.8-arch1-3`, 2026-08-16, against a control build
+identical except that it does not install the filter: `test_real_app.py`
+2.139 s vs 2.154 s, `test_real_gtk.py` 1.722 s vs 1.717 s,
+`test_real_firefox.py` 2.943 s vs 2.947 s (medians). Every difference is
+smaller than the run-to-run spread of either arm, so the honest statement is
+**no change measurable at this resolution** — not "negligible", which is a
+claim about magnitude this measurement cannot make. Note also what is *not*
+measured here: installing a seccomp filter enables the kernel's speculative
+store bypass mitigation for the process unless `SECCOMP_FILTER_FLAG_SPEC_ALLOW`
+is passed, which this build does not pass. On hardware where that mitigation
+costs, the cost is real and no gate here would see it.
 
 What that ruleset is, and what it is not, stated rather than left to be
 inferred from the word "Landlock":
@@ -1543,12 +1604,13 @@ spawn.
 **And little bounds what a launched app then does.** A launch grant is
 authority to start a process confined exactly as much as the session is — at
 `--isolation=off`, an *unconfined* one with the core's own uid and filesystem
-view; at `--isolation=default`, one that is path-confined and not
-syscall-confined. P2.6.2 narrowed this and did not close it: the launched
-process still gets a full syscall surface, the operator's supplementary groups
-and a read-write render node, so the confinement limits above apply to it
-unchanged, one authority level up. P2.6.3 and P2.6.4 are what narrow it
-further.
+view; at `--isolation=default`, one that is path-confined and **filtered
+against a named list of thirteen syscalls, which is not the same as
+syscall-confined**. P2.6.2, P2.6.3 and P2.6.4 each narrowed this and none
+closed it: the launched process still gets the kernel's whole syscall surface
+minus that list, the operator's supplementary groups and a read-write render
+node, so the confinement limits above apply to it unchanged, one authority
+level up.
 
 **A launched realm cannot be closed, by anybody, ever.** This is the sharper
 half of the point below and it is worth stating on its own: there is no wire

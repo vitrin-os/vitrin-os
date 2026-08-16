@@ -184,10 +184,20 @@ does not spend a weekend on something the project already says out loud:
   rather than at a `mount(2)` they do not expect to fail. See the
   [limits page](docs/book/src/limits.md).
 
-  **What is still missing is the syscall boundary**: no seccomp filter
-  (P2.6.4). Landlock gates filesystem operations, not `syscall(2)` in general,
-  so treat a realm as *path-confined and filesystem-rights-confined, but not
-  syscall-confined*. Three residues are published in full on the
+  **The syscall boundary is a DENY-LIST, which is not the same as a
+  boundary**: since P2.6.4
+  ([#188](https://github.com/vitrin-os/vitrin-os/issues/188))
+  `vitrin-realm-init` installs a seccomp-bpf filter
+  immediately before the shim's `execve`, inherited by every process the shim
+  forks and removable by none of them. It closes the 13 denied syscall rows
+  `vitrind --print-seccomp` prints — each naming the PRD Doc 2 §15 escape class
+  it answers and the errno it returns — and leaves the rest of the kernel's
+  syscall surface **unenumerated**. So treat a realm as *path-confined,
+  filesystem-rights-confined and filtered against a named list, but **not**
+  syscall-confined*. 11 of the 13 denied syscall rows are demonstrated against
+  a positive control on the kernel this was measured on; two (`bpf`, `userfaultfd`) are
+  already denied by a sysctl there and are reported *not demonstrated* rather
+  than counted. Three residues are published in full on the
   [limits page](docs/book/src/limits.md): the invoking user's supplementary
   groups survive into the realm because the kernel gives no window to drop
   them, the GPU render node is bound read-write with its ioctl surface intact

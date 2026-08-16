@@ -353,7 +353,7 @@
 //! is a *confinement of the well-behaved*, not a containment of the hostile,
 //! and the session warns about it every sixty seconds for its whole life.
 //!
-//! ### `--isolation=default`: namespaces and Landlock, and not seccomp
+//! ### `--isolation=default`: namespaces, Landlock, and a seccomp deny-list
 //!
 //! The realm gets its own user, mount, PID, IPC, UTS and network namespaces,
 //! an identity uid/gid map, zero capabilities, `no_new_privs`, a read-only
@@ -365,10 +365,22 @@
 //! writable hierarchies above, an *enumerated* read+exec set for the
 //! read-only runtime paths, and nothing else.
 //!
+//! Since P2.6.4 (#188) it also gets a **seccomp-bpf deny-list**, installed by
+//! the same helper immediately after the ruleset and immediately before the
+//! `execve`, and unremovable thereafter. **Deny-list is the operative word.**
+//! It closes the rows `vitrind --print-seccomp` prints -- each naming the PRD
+//! Doc 2 §15 escape class it answers and the errno it returns -- and leaves
+//! the rest of the kernel's syscall surface unenumerated. So the realm is
+//! filtered against a named list and is *not* syscall-confined, and this
+//! module may not describe it as the latter.
+//!
 //! PRD Doc 2 §4.1 describes the child as spawned "in an unprivileged sandbox
-//! (namespaces/seccomp)"; **this build does two thirds of that.** Seccomp is
-//! P2.6.4 (#188), so the journal says `applied_profile=namespaces+landlock-abiN`
-//! rather than any tier name -- `intra-user` is *defined* as all three.
+//! (namespaces/seccomp)"; **this build now does both, with the deny-list
+//! caveat above.** The journal still says
+//! `applied_profile=namespaces+landlock-abiN` rather than any tier name,
+//! because that string names *which Landlock rung was obtained* and nothing
+//! else -- `intra-user` is a measurement of the machine, and a profile is a
+//! per-spawn fact about one realm.
 //!
 //! **The `N` is the rung the realm obtained, not the rung it asked for**, so a
 //! ladder that fell from 9 to 1 is visible in the field named for what was
@@ -939,6 +951,21 @@ pub(crate) struct IsolationFacts {
     /// What `landlock_create_ruleset(NULL, 0,
     /// LANDLOCK_CREATE_RULESET_VERSION)` answered *inside the realm*.
     pub landlock_kernel_abi: Option<u32>,
+    /// How many deny-list rows the realm's PID 1 said it compiled, and how
+    /// many classic-BPF instructions that came to (P2.6.4, #188).
+    ///
+    /// Two numbers for the same reason the Landlock pair is two: neither is
+    /// derivable from the other, and a table that grew beside a program that
+    /// did not is an assembler that dropped something. Both are `None` at
+    /// `--isolation=off`, where no helper runs.
+    ///
+    /// **This is a size, not a policy.** It says a filter of a stated shape
+    /// was installed; it does not say what it denies. The table itself is a
+    /// build constant (`vitrind --print-seccomp`), and what the realm actually
+    /// refuses is measured from inside by
+    /// `tests/integration/test_real_seccomp.py`.
+    pub seccomp_rows: Option<u32>,
+    pub seccomp_instructions: Option<u32>,
 }
 
 impl IsolationFacts {
@@ -971,6 +998,8 @@ impl IsolationFacts {
             mount_fingerprint: None,
             landlock_rung: None,
             landlock_kernel_abi: None,
+            seccomp_rows: None,
+            seccomp_instructions: None,
         }
     }
 
@@ -1225,6 +1254,16 @@ pub(crate) enum ConfinementFault {
     /// exists; this class is what catches the case where the *realm's* view
     /// differs from the core's.
     Landlock,
+    /// The seccomp-bpf deny-list could not be compiled or installed inside
+    /// the realm (P2.6.4, #188).
+    ///
+    /// Its own class for the same reason [`ConfinementFault::Landlock`] is:
+    /// the remedy is specific and different. A kernel built without
+    /// `CONFIG_SECCOMP_FILTER` answers here and nowhere else, and so does a
+    /// realm that somehow reached the filter without `PR_SET_NO_NEW_PRIVS`.
+    /// **There is no `--seccomp=off`**, so this class is always a refusal and
+    /// never a degradation.
+    Seccomp,
 }
 
 impl ConfinementFault {
@@ -1248,6 +1287,7 @@ impl ConfinementFault {
             ConfinementFault::RootView => "root_view",
             ConfinementFault::ExecShim => "exec_shim",
             ConfinementFault::Landlock => "landlock",
+            ConfinementFault::Seccomp => "seccomp",
         }
     }
 }
@@ -2162,6 +2202,8 @@ where
         landlock_rung: Some(handshake.landlock_rung),
         landlock_kernel_abi: (handshake.landlock_kernel_abi > 0)
             .then_some(handshake.landlock_kernel_abi),
+        seccomp_rows: Some(handshake.seccomp_rows),
+        seccomp_instructions: Some(handshake.seccomp_instructions),
     };
 
     Ok(SpawnedRealm {
@@ -2401,6 +2443,15 @@ struct Handshake {
     /// `tests/integration/test_real_confinement.py` measures from inside.
     landlock_rung: u32,
     landlock_kernel_abi: u32,
+    /// How many deny-list rows PID 1 said it compiled, and how many classic-BPF
+    /// instructions that came to (P2.6.4, #188). **Child-asserted, both.**
+    /// `/proc/<pid>/status` reports `Seccomp: 2` -- the mode -- and no kernel
+    /// interface reports a process's *rules*, so the parent can corroborate
+    /// that a filter exists and never which one. What cannot be forged is the
+    /// realm's behaviour, which `tests/integration/test_real_seccomp.py`
+    /// measures from inside with a positive control per row.
+    seccomp_rows: u32,
+    seccomp_instructions: u32,
     elapsed: Duration,
 }
 
@@ -2585,11 +2636,15 @@ fn handshake(
     // silent degradation the whole floor exists to forbid. At
     // `--landlock=off` the helper still sends the frame, carrying rung 0.
     let mut landlock: Option<(u32, u32)> = None;
+    let mut seccomp: Option<(u32, u32)> = None;
     loop {
         match recv_frame_or_eof(cfg, deadline)? {
             None => break,
             Some(Frame::Landlocked { rung, kernel_abi }) if landlock.is_none() => {
                 landlock = Some((rung, kernel_abi));
+            }
+            Some(Frame::Filtered { rows, instructions }) if seccomp.is_none() => {
+                seccomp = Some((rows, instructions));
             }
             Some(frame) => return Err(unexpected(frame)),
         }
@@ -2617,6 +2672,40 @@ fn handshake(
         ));
     }
 
+    // P21c. **The seccomp frame, on the same terms** (P2.6.4, #188). PID 1
+    // reports how many table rows it compiled and how many BPF instructions
+    // that came to, immediately after installing the filter and before its
+    // `execve`.
+    //
+    // Its ABSENCE is a refusal, not a downgrade, for exactly the reason the
+    // Landlock frame's is -- and the case is stronger here, because there is
+    // no `--seccomp=off`. Every confined session installs a filter, so a
+    // helper that exec'd the shim without reporting one either never reached
+    // K13b or is not this build's helper. `rows == 0` is refused beside the
+    // absence: a filter that denies nothing is a session that would journal
+    // confinement it does not have.
+    let (seccomp_rows, seccomp_instructions) = seccomp.ok_or_else(|| {
+        refuse(
+            ConfinementFault::HelperProtocol,
+            "the confinement helper exec'd the shim without reporting a seccomp filter. The \
+             row and instruction counts are child-asserted and are not what licenses the \
+             spawn, but their ABSENCE is this core's only signal that the helper never reached \
+             K13b -- and a realm whose filter may not exist is refused rather than journaled \
+             as confined. Unlike Landlock there is no flag that legitimately produces this: \
+             there is no `--seccomp=off`",
+        )
+    })?;
+    if seccomp_rows == 0 || seccomp_instructions == 0 {
+        return Err(refuse(
+            ConfinementFault::Seccomp,
+            format!(
+                "the confinement helper reported a seccomp filter of {seccomp_rows} rows and \
+                 {seccomp_instructions} instructions. An empty filter denies nothing, and a \
+                 session that journaled it would be publishing confinement it does not apply"
+            ),
+        ));
+    }
+
     // The last thing that binds the *verified* pid to the process that
     // actually `execve`'d. Everything above proved that `shim_host_pid` is
     // the supervisor's child and is PID 1 of a nested namespace whose root is
@@ -2637,6 +2726,8 @@ fn handshake(
         mount_fingerprint,
         landlock_rung,
         landlock_kernel_abi,
+        seccomp_rows,
+        seccomp_instructions,
         elapsed: started.elapsed(),
     })
 }
@@ -2843,6 +2934,19 @@ fn from_helper_stage(stage: Stage, errno: i32) -> SpawnError {
                  check `vitrind --print-isolation` against the same kernel, and note that a \
                  grant on an in-realm path the mount table did not create fails here as \
                  ENOENT rather than as a mount-table error"
+            ),
+        ),
+        Stage::Seccomp => refuse(
+            ConfinementFault::Seccomp,
+            format!(
+                "the realm's seccomp-bpf deny-list could not be installed ({os}). The startup \
+                 preflight already found seccomp filter mode and `no_new_privs` available -- \
+                 both are floor mechanisms since #188, so a session that got this far was \
+                 admitted on that reading -- which means this core and this realm disagree. \
+                 EACCES here means the realm reached the filter without PR_SET_NO_NEW_PRIVS, \
+                 which K10 sets; EINVAL means the kernel rejected the program itself. There is \
+                 no `--seccomp=off`: a session that cannot filter its realms is refused rather \
+                 than started unfiltered"
             ),
         ),
     }
@@ -5982,13 +6086,40 @@ pub(crate) mod tests {
         ] {
             assert!(line.contains(needle), "missing {needle} in {line}");
         }
-        // The claim the entry may never make. Still true at #187: the tier
-        // means namespaces plus Landlock plus SECCOMP, and the filter is
-        // #188's.
+        // The claim the entry may never make, and the REASON changed at #188
+        // while the assertion did not. Until this task the argument was "the
+        // tier means seccomp too and this build has no filter". It has one
+        // now -- and `applied_profile` still may not say `intra-user`,
+        // because a TIER is a measurement of the MACHINE and a profile is a
+        // per-spawn fact about ONE REALM. A realm can be confined exactly as
+        // this build confines realms on a machine whose tier is something
+        // else entirely (an operator's `--landlock=abi:2`, for one), so the
+        // two vocabularies stay apart even now that FLOOR and the tier
+        // predicate coincide in value.
         assert!(
             !line.contains("intra-user"),
-            "a build that applies namespaces and Landlock may not journal a tier that also \
-             means seccomp: {line}"
+            "a per-realm profile named a TIER. `intra-user` is what the MACHINE measured, and \
+             `applied_profile` is what THIS SPAWN obtained; the day they happen to agree is \
+             not the day one may be printed for the other: {line}"
+        );
+        // #188's pair, on the same terms as the Landlock pair above: a SIZE,
+        // never a policy. The counts say a filter of a stated shape was
+        // installed and say nothing about what it denies -- which is measured
+        // from inside the realm by `tests/integration/test_real_seccomp.py`.
+        for needle in ["seccomp", "rows", "instructions"] {
+            assert!(line.contains(needle), "missing {needle} in {line}");
+        }
+        // Non-vacuous against the three needles above, each of which is a
+        // common word: the object has to carry the counts the helper reported,
+        // not merely the keys.
+        assert!(
+            line.contains("Num(13.0)") && line.contains("Num(38.0)"),
+            "the seccomp object does not carry this build's row and instruction counts: {line}"
+        );
+        assert!(
+            !line.contains("not-applied"),
+            "the journal still says the filter is not applied, and the helper installs one: \
+             {line}"
         );
         // And the rung is a number that was reported, never a hopeful
         // default: rung 0 is what `--landlock=off` journals, and this spawn

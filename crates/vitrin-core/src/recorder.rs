@@ -2234,11 +2234,13 @@ fn key(out: &mut String, k: &str) {
 /// exactly why nothing in it is what licensed the spawn -- and why a reader
 /// must be able to tell the two apart without knowing this code.
 ///
-/// `seccomp` is written as an explicit `not-applied` rather than omitted, on
-/// this file's own rule: absent information is an explicit value, never a
-/// missing key. `landlock` was such a string until P2.6.3 (#187) made it an
-/// object with a requested rung, an obtained rung, the kernel's own ABI, and
-/// whether this build's ladder is what held the rung down.
+/// `seccomp` was written as an explicit `not-applied` string rather than
+/// omitted, on this file's own rule: absent information is an explicit value,
+/// never a missing key. `landlock` was such a string until P2.6.3 (#187) made
+/// it an object, and `seccomp` became one at P2.6.4 (#188) when a filter
+/// started being installed -- carrying a row count and an instruction count,
+/// which are a SIZE and not a policy. At `--isolation=off` it is `null`, which
+/// is the same rule applied to a session where no helper ran.
 ///
 /// # The one field above the line that the child supplied
 ///
@@ -2328,7 +2330,36 @@ fn write_isolation(out: &mut String, facts: &crate::spawn::IsolationFacts) {
         out.push_str("null");
     }
     out.push('}');
-    out.push_str(",\"seccomp\":\"not-applied (P2.6.4)\"");
+    // Seccomp (P2.6.4, #188) is an object rather than a string, on the same
+    // reasoning that made `landlock` one at #187 and with one extra warning
+    // attached, because this is the field most likely to be misread.
+    //
+    // **It reports a SIZE, never a policy.** `rows` is how many entries of the
+    // deny-list table the realm's PID 1 compiled and `instructions` is what
+    // that came to in classic BPF; neither says what the filter denies, and no
+    // number here is a completeness claim. The table is a build constant --
+    // `vitrind --print-seccomp` prints it, one row per denied syscall with the
+    // PRD Doc 2 §15 escape class it closes -- and what a realm actually
+    // refuses is measured from inside by
+    // `tests/integration/test_real_seccomp.py`, with a positive control per
+    // row. A reader who takes `rows: 13` for "syscall-confined" has read a
+    // deny-list as an allow-list.
+    //
+    // Until #188 this key was the string `not-applied (P2.6.4)`, which was the
+    // honest value while nothing installed a filter. It is written as an
+    // explicit `null` at `--isolation=off` on this file's own rule -- absent
+    // information is an explicit value, never a missing key.
+    out.push_str(",\"seccomp\":");
+    match (facts.seccomp_rows, facts.seccomp_instructions) {
+        (Some(rows), Some(instructions)) => {
+            out.push_str(&format!(
+                "{{\"rows\":{rows},\"instructions\":{instructions},\"evidence\":"
+            ));
+            push_json_string(out, "child-asserted");
+            out.push('}');
+        }
+        _ => out.push_str("null"),
+    }
 
     out.push_str(",\"parent_observed\":{");
     let mut first = true;
@@ -3687,6 +3718,8 @@ pub(crate) mod tests {
             mount_fingerprint: Some(0xdead_beef_cafe_f00d),
             landlock_rung: Some(9),
             landlock_kernel_abi: Some(9),
+            seccomp_rows: Some(13),
+            seccomp_instructions: Some(38),
         }
     }
 

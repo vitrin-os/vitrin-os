@@ -68,13 +68,22 @@
 //!   and this provisioning would permit, and it may never read a build
 //!   constant.
 //! - **[`FLOOR`] is a property of the *build*.** It is the set of mechanisms
-//!   *this binary actually applies*, so it grows one entry per task: `#186
-//!   {Namespaces}`, `#187 +{Landlock}` (**landed**), `#188 +{Seccomp,
-//!   NoNewPrivs}`. After #188 it coincides exactly with [`Report::tier`]'s
-//!   base predicate, and
-//!   [`the_floor_is_a_subset_of_the_intra_user_predicate`] asserts
-//!   subset-until-then so the day they coincide is a checked fact rather than
-//!   a coincidence somebody notices later.
+//!   *this binary actually applies*, so it grew one entry per task: `#186
+//!   {Namespaces}`, `#187 +{Landlock}`, `#188 +{Seccomp, NoNewPrivs}` — all
+//!   three **landed**. The schedule is finished, and its last step is the one
+//!   the schedule promised would be *checked* rather than noticed:
+//!   [`FLOOR`] now **equals** [`Report::tier`]'s base predicate, and
+//!   [`the_floor_is_a_subset_of_the_intra_user_predicate`] asserts set
+//!   equality where it asserted a proper subset before. The day they met is
+//!   therefore a red build if anything moves either side of it, which is what
+//!   the assertion was written at #186 to guarantee.
+//!
+//!   The consequence a reader must not miss: **the two vocabularies still may
+//!   not merge.** They coincide in *value* on this build and remain different
+//!   *kinds* — `Tier` reads the machine, `FLOOR` reads this binary — and
+//!   D-020(3)'s per-uid tier is the case that pulls them apart again. Nothing
+//!   below reads one from the other; [`admit`] still iterates `FLOOR`, and
+//!   [`Report::tier`] still never consults a build constant.
 //!
 //! Gating `--isolation=default` on `Tier::meets(Tier::IntraUser)` was
 //! available and is refused, and #187 is exactly why the distinction earns
@@ -86,13 +95,24 @@
 //! floor moved when the applier landed, not before it, and that ordering is
 //! the whole rule.
 //!
-//! [`Tier::meets`] does get its first non-test caller, as the **forecast**
-//! rather than the gate ([`forecast`]): on a machine that meets this build's
-//! floor but not `Tier::IntraUser`, the core warns and starts, naming the
-//! build that will refuse there. That is the only real answer to "how does
-//! the floor move without a silent behaviour change" — every floor move is
+//! [`Tier::meets`] got its first non-test caller as the **forecast** rather
+//! than the gate ([`forecast`]): on a machine that met this build's floor but
+//! not `Tier::IntraUser`, the core warned and started, naming the build that
+//! would refuse there. That is the only real answer to "how does the floor
+//! move without a silent behaviour change" — every floor move is
 //! pre-announced on the machines it will break, by the build that still works
 //! on them.
+//!
+//! **Since #188 the forecast is silent, and that is the mechanism working
+//! rather than the mechanism gone.** With `FLOOR` equal to the tier's base
+//! predicate there is no scheduled move left to announce: every machine the
+//! next mechanism would break is already refused by [`admit`], and warning
+//! about a session that cannot exist would be noise. [`forecast`] is kept
+//! whole — it is the shape the *next* floor move needs, and D-020(3)'s per-uid
+//! tier is the next one — and
+//! [`the_forecast_warns_only_where_a_later_build_will_refuse`] now asserts the
+//! silence, so a mechanism added to [`Tier`]'s predicate without an applier
+//! turns the warning back on instead of arriving unannounced.
 //!
 //! It does not generate the per-kernel matrix. [`Report::render`] emits
 //! the deterministic one-machine rows the matrix is *built from*; collecting
@@ -251,13 +271,21 @@ impl Tier {
 ///
 /// [`APPLIED`] is what this build *does* to a confined realm. [`FLOOR`] is
 /// what it *refuses to start without*, checked at startup against a probe.
-/// `FLOOR` is a subset of `APPLIED` and may be a proper one: a mechanism can
-/// be applied without being a startup gate, and `PR_SET_NO_NEW_PRIVS` is
-/// exactly that case. The helper sets it on every confined spawn (a spawn
-/// where it failed is refused), but it is not in `FLOOR`, because D-036(6)
-/// schedules it to arrive as a *gate* with the seccomp filter it protects at
-/// #188 -- and adding it early would refuse whole sessions on a probe for a
-/// mechanism whose reason for being checked does not exist yet.
+/// `FLOOR` is a subset of `APPLIED` and was a **proper** one until #188: a
+/// mechanism can be applied without being a startup gate, and
+/// `PR_SET_NO_NEW_PRIVS` was exactly that case. The helper set it on every
+/// confined spawn while D-036(6) held it out of `FLOOR`, because it was
+/// scheduled to arrive as a *gate* with the seccomp filter it protects, and
+/// adding it early would have refused whole sessions on a probe for a
+/// mechanism whose reason for being checked did not exist yet.
+///
+/// **The two lists are equal on this build**, since #188 landed the filter and
+/// promoted both of its mechanisms. That equality is a fact about today and
+/// not a new invariant: [`the_floor_is_a_subset_of_what_the_build_applies`]
+/// still asserts the subset in the direction that matters -- a gate for
+/// something nothing applies -- and states the equality separately, so the
+/// next mechanism this build applies before it gates has somewhere honest to
+/// sit.
 ///
 /// Until an adversarial review caught it, `--print-floor` rendered its
 /// `applies.*` rows straight off `FLOOR`, so it printed
@@ -281,10 +309,28 @@ pub enum Mechanism {
     /// mount table alone. Every machine this breaks was warned by
     /// [`forecast`] in the build before it.
     Landlock,
-    /// The seccomp filter (P2.6.4, #188) -- **not applied yet**.
+    /// The seccomp-bpf deny-list `vitrin-realm-init` installs immediately
+    /// before the shim's `execve` (P2.6.4, #188).
+    ///
+    /// In [`FLOOR`] since #188, which is a **startup behaviour change by
+    /// design**: a kernel without `CONFIG_SECCOMP_FILTER` now refuses
+    /// `--isolation=default` rather than starting a session whose realms are
+    /// path-confined and not filtered at all. [`forecast`] pre-announced it on
+    /// every machine it breaks, in the build before this one.
+    ///
+    /// The mechanism name is deliberately not a completeness claim. The filter
+    /// is a **deny-list**: it closes the classes
+    /// `vitrin_realm_init::seccomp::ROWS` names and leaves the residual
+    /// surface unenumerated, which `docs/book/src/limits.md` states in as many
+    /// words.
     Seccomp,
-    /// `PR_SET_NO_NEW_PRIVS`, which arrives with the filter it protects
-    /// (P2.6.4, #188).
+    /// `PR_SET_NO_NEW_PRIVS`, which arrived as a gate with the filter it
+    /// protects (P2.6.4, #188).
+    ///
+    /// It is what makes an unprivileged `seccomp(2)` legal at all, so a
+    /// machine that cannot set it is a machine where the row above cannot be
+    /// applied -- which is why the two moved into [`FLOOR`] together rather
+    /// than one at a time.
     NoNewPrivs,
 }
 
@@ -302,27 +348,42 @@ impl fmt::Display for Mechanism {
 /// What **this build** applies at `--isolation=default`, and therefore what
 /// it refuses to start without.
 ///
-/// Two entries. It grows with the tasks that add the appliers, never ahead
+/// Four entries. It grew with the tasks that added the appliers, never ahead
 /// of them: a floor naming a mechanism nothing applies would refuse sessions
 /// in exchange for nothing, which is exactly the trade this module declined
 /// at #185.
 ///
-/// `Landlock` joined at #187, on the schedule this module's docs published at
-/// #186 and that [`forecast`] has been pre-announcing on every machine the
-/// move would break. **It changes startup behaviour**: a kernel that answers
-/// the ABI query with `ENOSYS` used to start and now refuses. That is the
-/// trade D-020(6) makes explicitly -- the alternative is a session whose
-/// realms are confined one mechanism less than its own documentation says.
-pub const FLOOR: &[Mechanism] = &[Mechanism::Namespaces, Mechanism::Landlock];
+/// `Landlock` joined at #187 and `Seccomp` + `NoNewPrivs` at #188, on the
+/// schedule this module's docs published at #186 and that [`forecast`]
+/// pre-announced on every machine each move would break. **Each one changed
+/// startup behaviour**: a kernel that answers the Landlock ABI query with
+/// `ENOSYS`, or that has no `CONFIG_SECCOMP_FILTER`, used to start and now
+/// refuses. That is the trade D-020(6) makes explicitly -- the alternative is
+/// a session whose realms are confined one mechanism less than its own
+/// documentation says.
+///
+/// **This list is now complete against [`Report::tier`]'s base predicate**,
+/// which is the checked fact
+/// [`the_floor_is_a_subset_of_the_intra_user_predicate`] holds. It is not
+/// complete against confinement: `Tier::PerUid` and the microVM tier are both
+/// above it and neither has an applier, so a fifth entry would still be a
+/// refusal bought for nothing.
+pub const FLOOR: &[Mechanism] = &[
+    Mechanism::Namespaces,
+    Mechanism::Landlock,
+    Mechanism::Seccomp,
+    Mechanism::NoNewPrivs,
+];
 
 /// What **this build** actually applies to a confined realm, gate or not.
 ///
 /// A superset of [`FLOOR`] (asserted by
-/// [`the_floor_is_a_subset_of_what_the_build_applies`]). The two differ by
-/// `PR_SET_NO_NEW_PRIVS` today: `vitrin-realm-init` sets it before the shim's
-/// `execve` on every confined spawn -- `/proc/<shim>/status` reads
-/// `NoNewPrivs: 1`, and the confinement suite asserts it -- but it is not a
-/// startup gate until #188 brings the seccomp filter it exists to protect.
+/// [`the_floor_is_a_subset_of_what_the_build_applies`]), and **equal to it**
+/// since #188. The two differed by `PR_SET_NO_NEW_PRIVS` until then:
+/// `vitrin-realm-init` set it before the shim's `execve` on every confined
+/// spawn -- `/proc/<shim>/status` reads `NoNewPrivs: 1`, and the confinement
+/// suite asserts it -- while it was not yet a startup gate, because the
+/// seccomp filter it exists to protect had not landed.
 ///
 /// This list is what `--print-floor`'s `applies.*` rows are rendered from. A
 /// build that applies a mechanism and prints `not-yet` for it is a build
@@ -331,6 +392,7 @@ pub const FLOOR: &[Mechanism] = &[Mechanism::Namespaces, Mechanism::Landlock];
 pub const APPLIED: &[Mechanism] = &[
     Mechanism::Namespaces,
     Mechanism::Landlock,
+    Mechanism::Seccomp,
     Mechanism::NoNewPrivs,
 ];
 
@@ -761,6 +823,19 @@ pub fn render_floor() -> String {
 /// `None` when there is nothing to forecast -- the machine already reaches
 /// `Tier::IntraUser`, so no scheduled floor move will break it.
 pub fn forecast(report: &Report) -> Option<String> {
+    forecast_against(report, FLOOR)
+}
+
+/// [`forecast`] against a stated floor rather than against [`FLOOR`].
+///
+/// The parameter exists for **one** reason, and it is not configurability:
+/// since #188 `FLOOR` equals the tier predicate, so `forecast` answers `None`
+/// on every input and a test of it would be vacuous. The floor is a parameter
+/// so [`the_forecast_warns_only_where_a_later_build_will_refuse`] can hold a
+/// hypothetical pre-#188 floor against the same function the core calls,
+/// rather than against a reimplementation of it that could drift. There is
+/// exactly one non-test caller and it passes `FLOOR`.
+fn forecast_against(report: &Report, floor: &[Mechanism]) -> Option<String> {
     if report.tier().meets(Tier::IntraUser) {
         return None;
     }
@@ -771,7 +846,7 @@ pub fn forecast(report: &Report) -> Option<String> {
         Mechanism::Seccomp,
         Mechanism::NoNewPrivs,
     ] {
-        if FLOOR.contains(&mechanism) {
+        if floor.contains(&mechanism) {
             continue;
         }
         let support = report.mechanism(mechanism);
@@ -787,7 +862,7 @@ pub fn forecast(report: &Report) -> Option<String> {
          meet the `{}` tier ({}), so a build that adds those mechanisms will REFUSE to start \
          here. Every floor move is announced by the build that still works on the machines it \
          will break -- this is that announcement",
-        FLOOR
+        floor
             .iter()
             .map(|m| m.to_string())
             .collect::<Vec<_>>()
@@ -2174,12 +2249,15 @@ mod tests {
 
     #[test]
     fn the_floor_is_a_subset_of_the_intra_user_predicate() {
-        // Clause 6's schedule, as a checked fact. `FLOOR` grows one entry per
-        // task (#186 namespaces, #187 landlock, #188 seccomp + nnp); at #188
-        // it coincides with `tier()`'s base predicate and the assertion below
-        // flips from subset to equality. Two of the four are in it now, so
-        // the subset is still proper -- and the two that are missing are
-        // named below rather than left to be inferred from a length.
+        // Clause 6's schedule, as a checked fact, **on the day it completes**.
+        // `FLOOR` grew one entry per task (#186 namespaces, #187 landlock,
+        // #188 seccomp + nnp), and this assertion was written at #186 to flip
+        // from subset to EQUALITY when the last applier landed -- so that the
+        // day the two coincide is a red build if either side moves, rather
+        // than a coincidence somebody notices later. #188 is that day; the
+        // name is kept because the subset direction is still the property that
+        // must never break, and renaming it would lose the link from three
+        // documents that cite it.
         let base = [
             Mechanism::Namespaces,
             Mechanism::Landlock,
@@ -2192,18 +2270,42 @@ mod tests {
                 "{mechanism} is in FLOOR but is not part of the intra-user predicate"
             );
         }
-        assert!(
-            FLOOR.len() <= base.len(),
-            "FLOOR has outgrown the tier predicate it must stay inside"
+        // EQUALITY, both directions, and each direction fails for a different
+        // reason. A `FLOOR` larger than the predicate would refuse machines
+        // the tier calls confined; a `FLOOR` smaller than it would start
+        // sessions on machines missing something this build applies.
+        for mechanism in base {
+            assert!(
+                FLOOR.contains(&mechanism),
+                "{mechanism} is part of the intra-user predicate and is not in FLOOR. Since \
+                 #188 the two coincide: this build applies all four, so a machine missing any \
+                 one of them cannot run a session whose realms are confined as documented"
+            );
+        }
+        assert_eq!(
+            FLOOR.len(),
+            base.len(),
+            "FLOOR and the intra-user predicate must have the same size as well as the same \
+             members, or a duplicate entry would satisfy both loops above"
         );
-        // The two entries #187 leaves for #188, named. A `len()` comparison
-        // alone would pass for a `FLOOR` that had picked up the wrong two.
+        // The entries, named. A `len()` comparison alone would pass for a
+        // `FLOOR` that had picked up the wrong four.
         assert!(FLOOR.contains(&Mechanism::Namespaces), "#186's entry");
         assert!(FLOOR.contains(&Mechanism::Landlock), "#187's entry");
+        assert!(FLOOR.contains(&Mechanism::Seccomp), "#188's entry");
         assert!(
-            !FLOOR.contains(&Mechanism::Seccomp) && !FLOOR.contains(&Mechanism::NoNewPrivs),
-            "seccomp and no-new-privs are #188's move: the filter has to arrive with the gate \
-             that requires it, or whole sessions are refused for a mechanism nothing applies"
+            FLOOR.contains(&Mechanism::NoNewPrivs),
+            "#188's second entry"
+        );
+        // And the vocabularies still do not merge. Equal VALUES, different
+        // KINDS: `tier()` may not read a build constant, and the way that
+        // would first show up is this function's own name appearing in it.
+        let source = include_str!("isolation.rs");
+        assert!(
+            !source.contains("fn tier(&self) -> Tier {\n        if FLOOR"),
+            "`tier()` began reading FLOOR. The two coincide in value on this build and are \
+             still a measurement and a build constant; D-020(3)'s per-uid tier pulls them apart \
+             again"
         );
 
         // A truth table over synthetic reports, one row per mechanism absent:
@@ -2242,17 +2344,31 @@ mod tests {
                 "{mechanism} is a startup gate but nothing in this build applies it"
             );
         }
-        // Non-vacuous in the other direction too: the two lists are not
-        // required to be equal today and this states which entry differs, so
-        // #188 moving `no-new-privs` into `FLOOR` has to come here and say so.
+        // Non-vacuous in the other direction too. Until #188 the two lists
+        // differed by exactly `no-new-privs`, and this assertion named it so
+        // the promotion had to come here and say so. It has: the helper
+        // installs the filter that mechanism exists to protect, so both are
+        // gates now and the lists are equal.
         assert!(
             APPLIED.contains(&Mechanism::NoNewPrivs),
             "the helper sets PR_SET_NO_NEW_PRIVS on every confined spawn"
         );
         assert!(
-            !FLOOR.contains(&Mechanism::NoNewPrivs),
-            "no-new-privs became a startup gate: that is #188's move, and it needs the seccomp \
-             filter it protects to arrive with it"
+            FLOOR.contains(&Mechanism::NoNewPrivs),
+            "no-new-privs is a startup gate since #188: without it an unprivileged \
+             `seccomp(2)` is refused, so a machine that cannot set it is a machine where the \
+             filter cannot be installed"
+        );
+        // The equality is stated rather than left to be inferred from two
+        // subset loops, because it is the fact a reader of `--print-floor`
+        // needs: every `applies.*=yes` row is also a `floor.mechanism=` row on
+        // this build, and no mechanism is applied without being required.
+        assert_eq!(
+            FLOOR.len(),
+            APPLIED.len(),
+            "FLOOR and APPLIED are equal on this build. They are NOT required to stay equal -- \
+             a mechanism may be applied before it is gated, which is how `no-new-privs` spent \
+             #187 -- but a change to either has to come here and restate which"
         );
         // #187's entry is in BOTH, which is what makes it a floor rather than
         // a behaviour: the helper enforces a ruleset before every shim's
@@ -2262,19 +2378,36 @@ mod tests {
             "Landlock is applied by the helper and gated at startup; a build with one and not \
              the other either refuses for nothing or applies something it does not require"
         );
-        // And the one this build still does not apply, so `--print-floor`
-        // cannot print `applies.seccomp=yes` before #188 writes the filter.
+        // #188's entry is in BOTH, on the same terms as #187's: the helper
+        // installs the deny-list before every shim's `execve`, and a kernel
+        // that cannot accept a filter refuses the session.
         assert!(
-            !APPLIED.contains(&Mechanism::Seccomp),
-            "nothing in this build installs a seccomp filter"
+            APPLIED.contains(&Mechanism::Seccomp) && FLOOR.contains(&Mechanism::Seccomp),
+            "the seccomp filter is applied by the helper and gated at startup; a build with \
+             one and not the other either refuses for nothing or applies something it does not \
+             require"
         );
     }
 
     #[test]
     fn every_floor_mechanism_refuses_when_its_probe_fails() {
-        // Both directions, and the second half is what makes the first
-        // non-vacuous: a `FLOOR` that refused on everything would pass a
-        // one-directional check.
+        // **Non-vacuity first, because #188 took the old control away.** Until
+        // this task, `FLOOR` was a proper subset of the four mechanisms below
+        // and the `else` arm in the loop -- "a mechanism outside FLOOR must
+        // NOT refuse" -- was what stopped a `FLOOR` that refused on everything
+        // from passing. `FLOOR` is now all four, so that arm is unreachable
+        // and the loop alone would be exactly the one-directional check it was
+        // written to avoid. This is the replacement: a machine with nothing
+        // missing must start.
+        assert!(
+            admit(Isolation::Default, LandlockRequest::Highest, &full_report()).is_ok(),
+            "a machine that supplies every floor mechanism was refused. Every assertion below \
+             would still pass for a build that refused every machine"
+        );
+        // Both directions. The `else` arm is kept rather than deleted: it is
+        // the arm a fifth mechanism (D-020(3)'s per-uid tier) lands in on the
+        // day it is applied before it is gated, and deleting it would remove
+        // the check that catches a floor moving ahead of its applier.
         let all = [
             Mechanism::Namespaces,
             Mechanism::Landlock,
@@ -2503,15 +2636,24 @@ mod tests {
                  appear in another mechanism's copy: {generic}"
             );
         }
-        // And the separate fact the assertion below actually holds, stated as
-        // what it is: seccomp is not in `FLOOR`, so its absence does not
-        // refuse a session. This is about `admit`'s membership test, not
-        // about the remedy text.
+        // And the separate fact the assertion below actually holds. **It
+        // inverted at #188**: seccomp is in `FLOOR` now, so its absence
+        // refuses. The generic-copy control above still exercises
+        // `remedy_for`'s un-remedied branch, which is what that half is for --
+        // `Mechanism::Seccomp` has no remedy paragraph of its own, so a kernel
+        // with no `CONFIG_SECCOMP_FILTER` gets the generic copy *and* a
+        // refusal, which is the pair a reader needs.
         let mut seccomp_gone = full_report();
         seccomp_gone.seccomp_filter = Support::Absent(libc::EINVAL);
+        let refusal = admit(Isolation::Default, LandlockRequest::Highest, &seccomp_gone)
+            .expect_err("a kernel with no seccomp filter mode must refuse since #188");
+        assert_eq!(refusal.mechanism, Mechanism::Seccomp);
+        // `--landlock=off` names ONE mechanism. A session that waived seccomp
+        // by using it would be a silent degradation of a different mechanism
+        // than the flag mentions.
         assert!(
-            admit(Isolation::Default, LandlockRequest::Highest, &seccomp_gone).is_ok(),
-            "seccomp is not in FLOOR yet, so its absence may not refuse a session"
+            admit(Isolation::Default, LandlockRequest::Off, &seccomp_gone).is_err(),
+            "`--landlock=off` waived the seccomp floor, which it does not name"
         );
     }
 
@@ -2607,9 +2749,15 @@ mod tests {
         // it stopped being true is the day this line had to change.
         assert!(floor.contains("floor.mechanism=landlock\n"), "{floor}");
         assert!(floor.contains("applies.landlock=yes\n"), "{floor}");
-        // The one still owed, so the verb cannot start claiming #188 early.
-        assert!(floor.contains("applies.seccomp=not-yet\n"), "{floor}");
-        assert!(!floor.contains("floor.mechanism=seccomp\n"), "{floor}");
+        // #188's move, in both row families for the same reason. It printed
+        // `applies.seccomp=not-yet` for the whole of #186 and #187, and the
+        // day the helper started installing a filter is the day this line had
+        // to change -- in both directions at once, because a gate without a
+        // behaviour refuses for nothing and a behaviour without a gate is a
+        // session that reads as confined on a machine where it is not.
+        assert!(floor.contains("floor.mechanism=seccomp\n"), "{floor}");
+        assert!(floor.contains("applies.seccomp=yes\n"), "{floor}");
+        assert!(!floor.contains("=not-yet\n"), "{floor}");
         // #187's build constant. It is the number a kernel newer than this
         // build gets clamped down to, and until it was printed the clamp was
         // computed for every realm and read by nobody -- so an operator on an
@@ -2634,12 +2782,32 @@ mod tests {
             "{floor}"
         );
         // The gate rows and the behaviour rows are two families, and the
-        // difference is visible: `no-new-privs` is applied to every confined
-        // realm and is not a startup gate until #188. It printed `not-yet`
-        // while the helper was setting it, which is a false row about this
-        // build even though it errs the safe way.
+        // difference used to be visible here: `no-new-privs` was applied to
+        // every confined realm and was not a startup gate until #188. It
+        // printed `not-yet` while the helper was setting it, which was a false
+        // row about this build even though it erred the safe way.
+        //
+        // **The two families coincide on this build**, so what this assertion
+        // now holds is that both rows exist for the mechanism -- and the
+        // verb still prints them separately, because the day a fifth
+        // mechanism is applied before it is gated the difference comes back.
         assert!(floor.contains("applies.no-new-privs=yes\n"), "{floor}");
-        assert!(!floor.contains("floor.mechanism=no-new-privs\n"), "{floor}");
+        assert!(floor.contains("floor.mechanism=no-new-privs\n"), "{floor}");
+        // Non-vacuity for the separation itself: the two families are still
+        // rendered from two different constants, not from one. A
+        // `render_floor` that printed each mechanism twice off `FLOOR` would
+        // satisfy every assertion above and would be the exact defect an
+        // adversarial review caught at #187, in the other direction.
+        let source = include_str!("isolation.rs");
+        assert!(
+            source.contains("for mechanism in FLOOR {\n        out.push_str(&format!(\"floor.mechanism={mechanism}\\n\"));"),
+            "the gate rows are no longer rendered from FLOOR"
+        );
+        assert!(
+            source.contains("let applied = APPLIED.contains(&mechanism);"),
+            "the behaviour rows are no longer rendered from APPLIED. They are equal today; \
+             rendering both from one constant is what makes a future divergence invisible"
+        );
         let isolation = full_report().render();
         assert!(!isolation.contains("floor"), "{isolation}");
         assert!(!isolation.contains("applies."), "{isolation}");
@@ -2650,34 +2818,70 @@ mod tests {
         // A machine that already reaches the tier has nothing to be warned
         // about; one that meets today's floor and misses a scheduled one is
         // exactly who the announcement is for.
-        let mut report = full_report();
+        let report = full_report();
         assert_eq!(forecast(&report), None, "a full machine needs no forecast");
 
-        // The forecast is now #188's, because #187 promoted Landlock out of
-        // it: a machine with no Landlock is refused outright by `admit`, so
-        // warning about it would be describing a session that cannot exist.
-        // This is what "every floor move is announced by the build that still
-        // works on the machines it will break" looks like on the far side of
-        // a move -- the announcement retires when the refusal lands.
-        report.landlock_abi = Err(Support::Absent(libc::ENOSYS));
-        assert!(
-            admit(Isolation::Default, LandlockRequest::Highest, &report).is_err(),
-            "a machine with no Landlock is refused since #187, not warned"
-        );
-        assert!(
-            forecast(&report).is_none_or(|w| !w.contains("landlock=")),
-            "a mechanism in FLOOR must not also be forecast; it is already a hard refusal"
-        );
+        // **The forecast is silent since #188, and the silence is the
+        // mechanism working.** #187 promoted Landlock out of it and #188
+        // promoted the last two, so every mechanism the tier predicate names
+        // is now a hard refusal -- and warning about a session that cannot
+        // exist would be noise. This is what "every floor move is announced by
+        // the build that still works on the machines it will break" looks like
+        // once the last announced move has landed: the announcement retires
+        // when the refusal does.
+        for absent in [
+            Mechanism::Landlock,
+            Mechanism::Seccomp,
+            Mechanism::NoNewPrivs,
+            Mechanism::Namespaces,
+        ] {
+            let mut report = full_report();
+            match absent {
+                Mechanism::Namespaces => {
+                    report.namespaces_combined = Support::RestrictedByPolicy(libc::EPERM)
+                }
+                Mechanism::Landlock => report.landlock_abi = Err(Support::Absent(libc::ENOSYS)),
+                Mechanism::Seccomp => report.seccomp_filter = Support::Absent(libc::EINVAL),
+                Mechanism::NoNewPrivs => report.no_new_privs = Support::Absent(libc::EINVAL),
+            }
+            assert!(
+                admit(Isolation::Default, LandlockRequest::Highest, &report).is_err(),
+                "a machine missing {absent} is refused since #188, not warned"
+            );
+            assert_eq!(
+                forecast(&report),
+                None,
+                "{absent} is in FLOOR, so it must not also be forecast; it is already a hard \
+                 refusal and a warning beside it describes a session that cannot start"
+            );
+        }
 
-        let mut report = full_report();
-        report.seccomp_filter = Support::Absent(libc::EINVAL);
-        let warning = forecast(&report).expect("a machine that #188 will break");
+        // **Non-vacuity, and it is what keeps `forecast` from rotting into a
+        // function that returns `None` unconditionally.** The forecast's shape
+        // is what the NEXT floor move needs -- D-020(3)'s per-uid tier is the
+        // next one -- so it is exercised through `forecast_against`, the same
+        // function the core calls, with #187's floor passed in. A machine
+        // missing seccomp must be WARNED by that floor and REFUSED by this
+        // one, which is exactly the transition #188 performed.
+        let mut half = full_report();
+        half.seccomp_filter = Support::Absent(libc::EINVAL);
+        let pre_188 = [
+            Mechanism::Namespaces,
+            Mechanism::Landlock,
+            Mechanism::NoNewPrivs,
+        ];
+        let warning = forecast_against(&half, &pre_188)
+            .expect("#187's floor warned about the machines #188 would break");
         assert!(warning.contains("seccomp"), "{warning}");
         assert!(warning.contains("REFUSE"), "{warning}");
-        // The mechanisms this build *does* gate are not in the forecast: they
-        // are already hard refusals, not warnings.
+        // The mechanisms that floor DID gate are not in its forecast: they
+        // were already hard refusals, not warnings.
         assert!(!warning.contains("namespaces="), "{warning}");
         assert!(!warning.contains("landlock="), "{warning}");
+        // And with the same floor on a complete machine there is nothing to
+        // warn about, so the assertion above is about the missing row rather
+        // than about the function being talkative.
+        assert_eq!(forecast_against(&full_report(), &pre_188), None);
     }
 
     #[test]

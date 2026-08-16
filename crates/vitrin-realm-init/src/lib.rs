@@ -85,6 +85,8 @@
 //! the spawn is the core's own reads of `/proc/<pid>/ns/*`,
 //! `/proc/<pid>/root` and the canary set -- see `vitrin_core::spawn`.
 
+pub mod seccomp;
+
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -547,6 +549,7 @@ const TAG_CHILD: u8 = 0x21;
 const TAG_MOUNTED: u8 = 0x22;
 const TAG_FAIL: u8 = 0x23;
 const TAG_LANDLOCKED: u8 = 0x24;
+const TAG_FILTERED: u8 = 0x25;
 
 /// Where in the sequence the helper gave up.
 ///
@@ -596,6 +599,18 @@ pub enum Stage {
     /// refusal, never a downgrade** -- the helper does not fall back to "no
     /// ruleset" when it cannot build the one it was asked for.
     Landlock = 10,
+    /// The seccomp-bpf filter could not be compiled or installed
+    /// (P2.6.4, issue #188).
+    ///
+    /// Its own stage rather than [`Stage::Internal`] for the same reason
+    /// [`Stage::Landlock`] is: the operator's remedy is specific. A kernel
+    /// built without `CONFIG_SECCOMP_FILTER` answers here and nowhere else,
+    /// and so does a realm that somehow reached K12c without
+    /// `PR_SET_NO_NEW_PRIVS` -- which are two different repairs.
+    /// **Reaching it is a refusal, never a downgrade**: there is no
+    /// `--seccomp=off`, so the helper does not fall back to "no filter" when
+    /// it cannot install the one the table describes.
+    Seccomp = 11,
 }
 
 impl Stage {
@@ -611,6 +626,7 @@ impl Stage {
             8 => Stage::Exec,
             9 => Stage::Internal,
             10 => Stage::Landlock,
+            11 => Stage::Seccomp,
             _ => return None,
         })
     }
@@ -671,6 +687,23 @@ pub enum Frame {
     /// `tests/integration/test_real_confinement.py` measures from inside the
     /// realm.
     Landlocked { rung: u32, kernel_abi: u32 },
+    /// helper -> core, **child-asserted**, sent by PID 1 after the seccomp
+    /// filter is installed and before the shim's `execve` (P2.6.4, issue
+    /// #188).
+    ///
+    /// Two numbers on the same terms as [`Frame::Landlocked`], and for the
+    /// same reason neither is derivable from the other: `rows` is how many
+    /// entries of the deny-list table this build compiled, and `instructions`
+    /// is what that came to in classic BPF. A build whose table grew and whose
+    /// program did not is a build whose assembler dropped something.
+    ///
+    /// **Asserted, not evidence.** There is no `/proc` file that lists a
+    /// process's seccomp *rules* -- `/proc/<pid>/status` reports only
+    /// `Seccomp: 2`, the mode -- so the parent can corroborate that a filter
+    /// exists and never which one. What a substituted helper cannot forge is
+    /// the realm's *behaviour*, which is what
+    /// `tests/integration/test_real_seccomp.py` measures from inside.
+    Filtered { rows: u32, instructions: u32 },
     /// helper -> core. A refusal, at a named stage, with the kernel's errno.
     Fail { stage: Stage, errno: i32 },
 }
@@ -798,6 +831,9 @@ impl Frame {
             Frame::Landlocked { rung, kernel_abi } => {
                 fixed(TAG_LANDLOCKED, i64::from(*rung), u64::from(*kernel_abi), 0)
             }
+            Frame::Filtered { rows, instructions } => {
+                fixed(TAG_FILTERED, i64::from(*rows), u64::from(*instructions), 0)
+            }
             Frame::Fail { stage, errno } => fixed(TAG_FAIL, i64::from(*errno), 0, *stage as u8),
         })
     }
@@ -828,6 +864,10 @@ impl Frame {
             TAG_LANDLOCKED => Frame::Landlocked {
                 rung: a as u32,
                 kernel_abi: b as u32,
+            },
+            TAG_FILTERED => Frame::Filtered {
+                rows: a as u32,
+                instructions: b as u32,
             },
             TAG_FAIL => Frame::Fail {
                 stage: Stage::from_u8(bytes[1]).ok_or(CodecError::Stage(bytes[1]))?,
@@ -1095,6 +1135,10 @@ mod tests {
                 rung: 3,
                 kernel_abi: 9,
             },
+            Frame::Filtered {
+                rows: 13,
+                instructions: 38,
+            },
             Frame::Fail {
                 stage: Stage::Unshare,
                 errno: libc::EPERM,
@@ -1104,6 +1148,26 @@ mod tests {
             assert_eq!(bytes.len(), FRAME_LEN, "{frame:?} is not a fixed frame");
             assert_eq!(Frame::decode(&bytes).expect("decodes"), frame);
         }
+        // The two fields are DIFFERENT numbers on the wire, which one
+        // round-trip of equal values could not show: `Filtered { 13, 38 }` and
+        // a codec that wrote one field twice both decode to themselves when
+        // the two are equal. Held here rather than trusted, because the core
+        // journals both and a swapped pair would publish a plausible wrong
+        // size.
+        let bytes = Frame::Filtered {
+            rows: 1,
+            instructions: 2,
+        }
+        .encode()
+        .expect("encodes");
+        assert_eq!(
+            Frame::decode(&bytes).expect("decodes"),
+            Frame::Filtered {
+                rows: 1,
+                instructions: 2
+            },
+            "the row and instruction counts crossed on the wire"
+        );
     }
 
     #[test]
@@ -1122,11 +1186,30 @@ mod tests {
             Stage::Exec,
             Stage::Internal,
             Stage::Landlock,
+            Stage::Seccomp,
         ] {
             let frame = Frame::Fail { stage, errno: 13 };
             let bytes = frame.encode().expect("encodes");
             assert_eq!(Frame::decode(&bytes).expect("decodes"), frame);
         }
+        // **The list above is written by hand, so it can silently stop being
+        // every stage** -- which is the failure this test exists to prevent,
+        // one level up. A stage added to the enum and forgotten here would
+        // decode to `CodecError::Stage` in the field and be reported to the
+        // core as a protocol error rather than as the refusal it is. So the
+        // discriminants are walked instead of trusted: every `u8` the enum
+        // could occupy either decodes or is genuinely unassigned, and the
+        // highest assigned one is named.
+        assert!(
+            Stage::from_u8(Stage::Seccomp as u8).is_some(),
+            "#188's stage does not decode"
+        );
+        let assigned = (0u8..=32).filter(|v| Stage::from_u8(*v).is_some()).count();
+        assert_eq!(
+            assigned, 11,
+            "the wire vocabulary changed size. Add the new stage to the loop above as well as \
+             to `from_u8`, or a realm's real refusal reaches the core as `helper_protocol`"
+        );
     }
 
     #[test]

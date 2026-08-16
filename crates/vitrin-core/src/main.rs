@@ -343,8 +343,9 @@ mod shim;
 /// that names only that realm's own socket. Read its module docs before
 /// believing any confinement claim: what `--isolation=off` still leaves off
 /// (no namespaces, no Landlock, no seccomp), what `--isolation=default`
-/// applies (namespaces since #186, a Landlock ruleset since #187, and still
-/// no seccomp filter), and the session-D-Bus hole are stated there in full. Called at runtime by `session::start_realm`, which
+/// applies (namespaces since #186, a Landlock ruleset since #187, and a
+/// seccomp DENY-LIST since #188 -- a named-class claim and not a completeness
+/// one), and the session-D-Bus hole are stated there in full. Called at runtime by `session::start_realm`, which
 /// runs it only after `session::install` has put the loop's sources in
 /// place: a shim spawned into a loop that is not yet servicing its
 /// socketpair blocks on `configure` forever, with no timeout on its side.
@@ -760,6 +761,18 @@ USAGE:
                                 matrix, and a build constant among them would
                                 invalidate the matrix over a row that is not a
                                 kernel fact.
+    vitrind --print-seccomp     Print the seccomp deny-list this build
+                                compiles -- one row per denied syscall or
+                                syscall+argument predicate, each carrying the
+                                PRD Doc 2 section 15 escape class it closes and
+                                the errno it returns -- then exit. A build
+                                constant like --print-floor: it says what this
+                                binary would install, never what a kernel did
+                                with it. The filter is a DENY-LIST, so the
+                                table is a named-class claim and never a
+                                completeness one; the residual syscall surface
+                                is unenumerated and docs/book/src/limits.md
+                                says so in as many words.
     vitrind --print-isolation   Probe this kernel's confinement facilities --
                                 namespaces, the Landlock ABI, seccomp filter
                                 mode, no_new_privs, the distro sysctls that
@@ -1101,6 +1114,23 @@ enum Action {
     /// own first rule and would invalidate #185's four-kernel matrix over a
     /// row that is not a kernel fact.
     PrintFloor,
+    /// `--print-seccomp`: print the seccomp deny-list table this build
+    /// compiles, then exit (P2.6.4, #188).
+    ///
+    /// A **third** print verb, and the split from [`Action::PrintFloor`] is
+    /// the same one again at a finer grain. `--print-floor` says *that* this
+    /// build applies a seccomp filter and refuses to start without one; this
+    /// says *what the filter denies* -- one line per row, each carrying the
+    /// PRD Doc 2 §15 escape class it closes and the errno it returns.
+    ///
+    /// It exists because a deny-list's contents are the claim. "This build
+    /// applies seccomp" is a sentence a reader will complete as
+    /// "syscall-confined"; the table is what makes the real, narrower
+    /// statement checkable, and `tests/integration/test_real_seccomp.py`
+    /// reads this output to learn the row set -- which is what makes "a row
+    /// added without a case fails the test" true without a second
+    /// hand-maintained list.
+    PrintSeccomp,
 }
 
 /// The session's confinement selection and the helper that implements it
@@ -1438,6 +1468,10 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
             // so it must not depend on a command line that would otherwise
             // have run.
             "--print-floor" => return Ok(Action::PrintFloor),
+            // Same posture as the two verbs above: a question about this
+            // binary, answered before anything else on the command line can
+            // fail to parse.
+            "--print-seccomp" => return Ok(Action::PrintSeccomp),
             // Returns immediately, on the `--print-isolation` precedent above:
             // it answers a question about a file format rather than about a
             // session, so it must not depend on a command line that would
@@ -2618,6 +2652,13 @@ fn main() -> ExitCode {
             print!("{}", spawn::isolation::render_floor());
             ExitCode::SUCCESS
         }
+        Action::PrintSeccomp => {
+            // Upstream of `init_tracing` for the same reason, and a build
+            // constant like `--print-floor`: it prints the table this binary
+            // would install, never what any kernel did with it.
+            print!("{}", vitrin_realm_init::seccomp::render_table());
+            ExitCode::SUCCESS
+        }
         Action::RunNested {
             consent,
             principals,
@@ -3553,12 +3594,16 @@ fn admit_isolation(
                 landlock = %applied.landlock(),
                 kernel = %report.kernel_release,
                 "realms will be confined: each gets its own user, mount, PID, IPC, UTS and \
-                 network namespace, an identity uid/gid map, zero capabilities, and a Landlock \
-                 ruleset enforced before the shim's execve. No `applied_profile` is printed \
-                 here on purpose: it names the rung a realm OBTAINED, and no realm exists yet \
-                 -- the ladder's landing is per-spawn. Whatever it says, it is not a tier \
-                 name, because `intra-user` means namespaces PLUS Landlock PLUS seccomp and \
-                 the seccomp filter (P2.6.4) is not applied by this build"
+                 network namespace, an identity uid/gid map, zero capabilities, a Landlock \
+                 ruleset enforced before the shim's execve, and a seccomp-bpf DENY-LIST \
+                 installed immediately after it. The deny-list is a named-class claim and not \
+                 a completeness one: `vitrind --print-seccomp` prints every row it closes, and \
+                 the rest of the kernel's syscall surface is unenumerated -- a realm is \
+                 filtered against a named list, NOT syscall-confined. No `applied_profile` is \
+                 printed here on purpose: it names the rung a realm OBTAINED, and no realm \
+                 exists yet -- the ladder's landing is per-spawn. Whatever it says, it is not \
+                 a tier name either, because `intra-user` means namespaces PLUS Landlock PLUS \
+                 seccomp and a profile string names only the Landlock rung"
             );
             // **Loud, and at WARN**, because every one of these is a session
             // that will journal something weaker than a reader of the default

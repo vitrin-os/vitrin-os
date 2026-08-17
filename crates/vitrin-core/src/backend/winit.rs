@@ -1537,7 +1537,15 @@ pub(crate) struct NestedView {
 ///    bytes across a realm boundary and this only reads; above the attention
 ///    hook, for the clipboard's own reason (a modifier matcher inside it would
 ///    never see a Super press).
-/// 6. [`crate::attention::AttentionHook`] — innermost, therefore suppressible
+/// 6. [`crate::backlight::BacklightHook`] — D-041. Consumes the two
+///    `XF86MonBrightness*` keys when a session passed `--backlight`, and
+///    delivers them untouched when it did not. Its position is unobservable
+///    and says so: the two keysyms it consumes are not modifiers and are in no
+///    chord's vocabulary, so no matcher above or below it can have its state
+///    changed by what this takes. Below the lock for the reason the screenshot
+///    hook is — the lock's rule is that somebody who is not the human cannot
+///    operate the machine, and "operate" must not acquire an exception list.
+/// 7. [`crate::attention::AttentionHook`] — innermost, therefore suppressible
 ///    by everything above, which is the correct posture for a mechanism whose
 ///    worst failure is a focus change that does not happen.
 ///
@@ -1548,7 +1556,11 @@ pub(crate) type NestedHook = crate::lock::LockGate<
     ConsentGate<
         DeadManHook<
             crate::clipboard::ClipboardHook<
-                crate::screenshot::ScreenshotHook<crate::attention::AttentionHook<input::NoopHook>>,
+                crate::screenshot::ScreenshotHook<
+                    crate::backlight::BacklightHook<
+                        crate::attention::AttentionHook<input::NoopHook>,
+                    >,
+                >,
             >,
         >,
     >,
@@ -1923,12 +1935,17 @@ fn run_inner(
                         Rc::clone(&clipboard_signal),
                         crate::screenshot::ScreenshotHook::new(
                             Rc::clone(&screenshot_signal),
-                            crate::attention::AttentionHook::new(
-                                Rc::new(RefCell::new(crate::attention::AttentionSignal::new(
-                                    attention,
+                            crate::backlight::BacklightHook::new(
+                                Rc::new(RefCell::new(crate::session::backlight_signal(
+                                    seed.as_ref(),
                                 ))),
-                                Rc::clone(&now),
-                                input::NoopHook,
+                                crate::attention::AttentionHook::new(
+                                    Rc::new(RefCell::new(crate::attention::AttentionSignal::new(
+                                        attention,
+                                    ))),
+                                    Rc::clone(&now),
+                                    input::NoopHook,
+                                ),
                             ),
                         ),
                     ),

@@ -1218,6 +1218,12 @@ impl<H: PreemptionHook> PreemptionHook for DeadManHook<H> {
     ) -> Option<std::rc::Rc<std::cell::RefCell<crate::screenshot::ScreenshotSignal>>> {
         self.inner.screenshot()
     }
+
+    fn backlight(
+        &self,
+    ) -> Option<std::rc::Rc<std::cell::RefCell<crate::backlight::BacklightSignal>>> {
+        self.inner.backlight()
+    }
 }
 
 /// Paint the hold indicator onto **human-visible** output.

@@ -1619,6 +1619,23 @@ correction is followed here and not the issue.
   > and the work is [#303](https://github.com/vitrin-os/vitrin-os/issues/303).
   > **Nothing is built yet**, so the sentence above — the human presses
   > brightness and nothing happens — is still true of every checkout today.
+
+  > **BUILT 2026-08-17, AND UNPROVEN ON HARDWARE.** #303 landed
+  > `crates/vitrin-core/src/backlight.rs`: on `--drm --backlight` the core
+  > consumes `XF86MonBrightnessUp`/`Down` and writes
+  > `/sys/class/backlight/<device>/brightness`, 5% of `max_brightness` per press
+  > with a floor at 5%, bounded exactly the way `status/battery.rs`'s read is,
+  > every failure collapsing to the key doing nothing and journalled as
+  > `backlight_stepped`. **The paragraph above is therefore no longer true of a
+  > session that passes the flag**, and it remains true of every other session:
+  > without `--backlight`, and on `--nested`/`--headless` where the flag is a
+  > startup error, both keys are still delivered to an app that cannot act on
+  > them. The honest status is **landed in the tree, unproven on hardware** —
+  > D-041 says CI structurally cannot test the actuation (no seat, no ACPI, no
+  > `/sys/class/backlight` on any runner), so the evidence that would change
+  > this sentence is rung 16 of [`docs/drm-bringup.md`](../drm-bringup.md), which
+  > is **written and NOT YET RUN**. The volume half of the same published limit
+  > did not move.
 - **Preparing for suspend** (logind `PrepareForSleep`). Stands on the no-D-Bus-in-
   the-TCB decision. **Reopened by:** evidence that post-hoc resume detection is
   insufficient — specifically, a reproducible corrupted or lost frame across a
@@ -2157,20 +2174,40 @@ The limit set follows.
   `docs/book/src/limits.md`.
 
 - <!-- limit: media-keys-reach-an-app-that-cannot-act -->
-  **The media and brightness keys now reach an app that cannot act on them**
-  (created by WS-E.4.3, and an honest half-fix rather than a fix). The XF86 rows
-  stop those keys being dropped at intake with a trace line — but a delivered
-  `XF86MonBrightnessUp` reaches the focused realm's shim seat, and no confined
-  app can write `/sys/class/backlight`. So the human still presses brightness and
-  nothing happens; what changed is *where* it stops. **Backlight actuation is
-  deferred**, reopened by a shell client holding a named verb or by an explicit
-  owner decision to let the core write `/sys/class/backlight` — which D-030
-  already names as a display-power interface DRM master does not gate.
-  **Published by WS-E.4.4/#224** on `docs/book/src/limits.md` beside the idle and
-  blank entries, and as one bullet on `README.md`; omitted from `site/index.html`
-  by the stated-subset decision above, because at one line it reads as a fix. It
-  has **no issue**, and the reason is that the decision it waits on has never
-  been put to the owner rather than that nobody cares.
+  **The media keys reach an app that cannot act on them** (created by WS-E.4.3,
+  and an honest half-fix rather than a fix). The XF86 rows stop those keys being
+  dropped at intake with a trace line — but a delivered `XF86AudioRaiseVolume`
+  reaches the focused realm's shim seat, and no confined app can open a mixer.
+  So the human still presses volume and nothing happens; what changed is *where*
+  it stops. **Volume actuation is deferred**, reopened by a shell client holding
+  a named verb — which [D-039](20-decision-log.md) makes newly plausible — or by
+  an explicit owner decision of the kind D-041 records for the backlight. There
+  is no one-file sysfs equivalent for a mixer and every route to one runs through
+  a sound server, a bus or socket client inside the TCB, which is the dependency
+  D-033(4) refused for logind. **Published by WS-E.4.4/#224** on
+  `docs/book/src/limits.md` beside the idle and blank entries, and as one bullet
+  on `README.md`; omitted from `site/index.html` by the stated-subset decision
+  above, because at one line it reads as a fix. The volume half has **no issue**,
+  and the reason is that the decision it waits on has never been put to the owner
+  rather than that nobody cares.
+
+  > **THE BRIGHTNESS HALF CLOSED 2026-08-17** by D-041 and
+  > [#303](https://github.com/vitrin-os/vitrin-os/issues/303), which is the only
+  > issue this limit has ever had. On `--drm --backlight` the core consumes both
+  > brightness keys and writes `/sys/class/backlight` itself — so the sentence
+  > above is now about **volume**, and the anchor id is kept rather than renamed
+  > because the limit it points at did not go away, it halved. What did **not**
+  > change, and is published in the same words on both surfaces: it does nothing
+  > for an external display, nothing on a session without the flag, nothing on
+  > nested or headless, and it costs the two keys reaching apps at all. The
+  > register above is deliberately **not** rewritten as "the media keys work
+  > now"; that sentence would be wrong in three directions at once.
+  >
+  > It also **widens the core's future self-sandbox from read to write** — the
+  > first write rule `#187`'s Landlock ruleset will owe — which is recorded here,
+  > in `crates/vitrin-core/src/backlight.rs`'s module docs and in the
+  > `status-strip-reads-sysfs` bullet of `docs/book/src/limits.md`, on
+  > `battery.rs:32-39`'s three-surface precedent.
 
 - <!-- limit: no-key-repeat-on-drm -->
   **A held key does not repeat on `--drm`** (pre-existing since WS-E.3.1 and

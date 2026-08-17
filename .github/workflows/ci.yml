@@ -922,6 +922,7 @@ jobs:
             -- --show-output backend::drm:: the_drm_refusal_table \
             the_vt_escape_reserves_the_function_keys_on_bare_metal \
             a_raised_consent_prompt_does_not_swallow_the_vt_escape \
+            the_backlight_flag_resolves_on_bare_metal \
             vt::tests::
 
   shim:

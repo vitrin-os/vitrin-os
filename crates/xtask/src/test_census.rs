@@ -233,6 +233,9 @@ pub const CI_TEST_RUNS: &[CiTestRun] = &[
             "the_drm_refusal_table",
             "the_vt_escape_reserves_the_function_keys_on_bare_metal",
             "a_raised_consent_prompt_does_not_swallow_the_vt_escape",
+            // D-041's `--backlight` resolves only on `Action::RunDrm`, so its
+            // parse test is `drm-backend`-gated and no other job selects it.
+            "the_backlight_flag_resolves_on_bare_metal",
             "vt::tests::",
         ],
         exact: false,

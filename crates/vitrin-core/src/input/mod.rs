@@ -180,13 +180,14 @@
 //!
 //! Both sides are now taken, and the nested backend's router is
 //! [`crate::backend::winit::NestedHook`] —
-//! `InputRouter<LockGate<ConsentGate<DeadManHook<ClipboardHook<AttentionHook<NoopHook>>>>>>`,
+//! `InputRouter<LockGate<ConsentGate<DeadManHook<ClipboardHook<ScreenshotHook<BacklightHook<AttentionHook<NoopHook>>>>>>>>`,
 //! the stacking this hook point was designed for, reached without restructuring
 //! anything. That alias is the **one** place the order is written down, because
 //! the order is the decision and a decision written twice drifts. A consent
 //! prompt consumes an event before the dead-man's *gate* half sees it, both are
-//! outside the clipboard and attention keys, and a raised lock is outside all
-//! four — so the human's off-switch and the human's security question each
+//! outside the clipboard, screenshot, brightness and attention keys, and a
+//! raised lock is outside every one of them — so the human's off-switch and the
+//! human's security question each
 //! short-circuit a mechanism whose worst failure is a convenience that does not
 //! happen, and none of them can be answered by somebody who is not at the
 //! keyboard.
@@ -204,8 +205,8 @@
 //! state, so no other policy can stop the human's off-switch from firing;
 //! `gate` only decides what the confined app sees, withholding the chord key's
 //! press until a tap can be told from a hold. It therefore *does* consume a
-//! release — one of the two places in this core that do, the other being the
-//! attention hook below — and that is sound only because it consumed that
+//! release — one of the three places in this core that do, the others being the
+//! attention hook below and the brightness gate beside it — and that is sound only because it consumed that
 //! release's press too, so the pair is atomic and the app's accounting is never
 //! split. The router's per-keysym pairing is what
 //! proves it: the reconciliation finds no delivered press and does nothing.
@@ -217,6 +218,16 @@
 //! trait for the whole argument, which is that the human's off-switch detects
 //! in a tap nothing may be allowed to blind, and the sharpest possible way for
 //! a lock to be wrong is to blind it.
+//!
+//! [`crate::backlight::BacklightHook`] (D-041, issue #303) sits between the
+//! screenshot key and the attention hook, and it is `gate`-only too. It
+//! consumes both halves of `XF86MonBrightnessUp`/`Down` — the same sound
+//! exception, for a third core-owned key — but **only on a session that passed
+//! `--backlight`**; without the flag it decides nothing and both keys reach the
+//! app exactly as WS-E.4.3 left them. Its position is deliberately
+//! unobservable: neither keysym is a modifier or a member of any chord's
+//! vocabulary, so nothing above or below it can have its matcher state changed
+//! by what it takes.
 //!
 //! [`crate::attention::AttentionHook`] (WS-E.1.7, issue #232) is innermost, and
 //! it implements `gate` **only**. It consumes the human's attention chord —
@@ -883,11 +894,14 @@ pub(crate) enum Gate {
 /// consumed a press may consume that press's release, because then nothing
 /// is stranded — the app never saw the press begin, so it is not left
 /// holding anything. Exactly two gates take it, each for its own core-owned
-/// chord key and nothing else: [`crate::deadman`] for the dead-man chord, and
+/// chord key and nothing else: [`crate::deadman`] for the dead-man chord,
 /// [`crate::attention`] for the attention chord (which consumes *both* halves
 /// unconditionally, so the pair is atomic by construction rather than by a
-/// classification). The rule above is otherwise absolute: a gate must not
-/// consume a release whose press the *router* delivered.
+/// classification), and [`crate::backlight`] for the two `XF86MonBrightness*`
+/// keys on a session that passed `--backlight`, which takes the exception the
+/// same way the attention hook does and for the same reason. The rule above is
+/// otherwise absolute: a gate must not consume a release whose press the
+/// *router* delivered.
 ///
 /// **[`SeatInputKind::GestureEnd`] is a release for this purpose**
 /// (WS-E.4.2, issue #222), and the rule is word for word the same. A gate
@@ -1006,6 +1020,21 @@ pub(crate) trait PreemptionHook {
     fn screenshot(
         &self,
     ) -> Option<std::rc::Rc<std::cell::RefCell<crate::screenshot::ScreenshotSignal>>>;
+
+    /// The brightness-key queue this stack carries, if any (D-041, issue #303).
+    ///
+    /// The same wiring accessor the three above are, for the same reason and
+    /// with the same **deliberate absence of a default**: a wrapping hook that
+    /// forgot to forward its inner hook's answer would silently report "no
+    /// brightness keys", `Runtime::new` would fall back to a detached signal,
+    /// and the human's brightness key would be consumed by a gate whose presses
+    /// nothing ever drains — a key that went from *doing nothing* to *doing
+    /// nothing and no longer reaching the app*, with every test still green.
+    /// That is `PresenceHook`'s failure exactly, and a defaulted method here
+    /// would re-open it a fifth time.
+    fn backlight(
+        &self,
+    ) -> Option<std::rc::Rc<std::cell::RefCell<crate::backlight::BacklightSignal>>>;
 }
 
 /// A policy that may **only** consume, and is never handed the observe tap
@@ -1112,6 +1141,13 @@ impl<G: ConsumingGate, H: PreemptionHook> PreemptionHook for GateOnlyHook<G, H> 
     ) -> Option<std::rc::Rc<std::cell::RefCell<crate::screenshot::ScreenshotSignal>>> {
         self.inner.screenshot()
     }
+
+    /// Forwarded, for the reason above.
+    fn backlight(
+        &self,
+    ) -> Option<std::rc::Rc<std::cell::RefCell<crate::backlight::BacklightSignal>>> {
+        self.inner.backlight()
+    }
 }
 
 /// The terminal hook: observes nothing, consumes nothing.
@@ -1152,6 +1188,18 @@ impl PreemptionHook for NoopHook {
     fn screenshot(
         &self,
     ) -> Option<std::rc::Rc<std::cell::RefCell<crate::screenshot::ScreenshotSignal>>> {
+        None
+    }
+
+    /// The terminal hook owns no brightness keys either, and says so out loud
+    /// for the reason above. A stack that bottoms out here and is not wrapped
+    /// by a [`BacklightHook`](crate::backlight::BacklightHook) delivers both
+    /// `XF86MonBrightness*` keys to the app, which is every checkout's
+    /// behaviour before D-041 and every session that did not pass
+    /// `--backlight`.
+    fn backlight(
+        &self,
+    ) -> Option<std::rc::Rc<std::cell::RefCell<crate::backlight::BacklightSignal>>> {
         None
     }
 }
@@ -1771,6 +1819,16 @@ impl<H: PreemptionHook> InputRouter<H> {
         &self,
     ) -> Option<std::rc::Rc<std::cell::RefCell<crate::screenshot::ScreenshotSignal>>> {
         self.hook.screenshot()
+    }
+
+    /// The brightness-key queue this router's hook stack carries (D-041), on
+    /// the same terms as [`Self::attention`]: `Runtime::new` takes it *out of
+    /// the router it is handed*, so the embedder that actuates the presses and
+    /// the hook that consumed the keys cannot be two different signals.
+    pub fn backlight(
+        &self,
+    ) -> Option<std::rc::Rc<std::cell::RefCell<crate::backlight::BacklightSignal>>> {
+        self.hook.backlight()
     }
 
     /// Set the presence tap's clock to this dispatch turn's instant.
@@ -3125,15 +3183,28 @@ pub(crate) fn invariant_keysym(evdev_code: u32) -> Option<u32> {
         // NESTED, where winit reports them as `Key::Named` so `host_keysym`
         // answers `None` and `resolve_key_seat` falls through to here.
         //
-        // **And the honest residual**: a delivered `XF86MonBrightnessUp` reaches
-        // the focused realm's shim seat, and no confined app can write
-        // `/sys/class/backlight`. So this converts "the key is dropped at
-        // intake" into "the key is delivered to an app that cannot act on it".
-        // Backlight and volume actuation are DEFERRED, and the evidence that
-        // would reopen them is either a shell client holding a named verb
-        // (WS-E Stage 2's design) or an owner decision to let the core write
-        // `/sys/class/backlight` -- which D-030 already names as a display-power
-        // interface DRM master does not gate.
+        // **And the honest residual, which is now half the size it was**
+        // (D-041, issue #303). The owner decided that the core writes
+        // `/sys/class/backlight`, so the two BRIGHTNESS rows below are no
+        // longer delivered on a session that passed `--backlight`: they are
+        // consumed by [`crate::backlight`] and turned into a bounded write.
+        // The rows stay here because that is where the keysym comes from --
+        // the gate matches on it, and `backlight::tests::
+        // the_gate_matches_the_scancode_table` pins the two together.
+        //
+        // The rest of this block is unchanged and the residual is unchanged
+        // for it:
+        // **The volume keys are still delivered to an app that cannot act on them.**
+        // There is no one-file sysfs equivalent for a mixer and every route to
+        // one runs through a sound server -- a bus or
+        // socket client inside the TCB, which is the dependency D-033(4)
+        // refused for logind. Volume actuation stays DEFERRED, reopened by a
+        // shell client holding a named verb (WS-E Stage 2's design, which
+        // D-039 makes newly plausible) or by an owner decision of the kind
+        // D-041 records for the backlight. And on a session WITHOUT
+        // `--backlight` -- which is every nested and headless one, where the
+        // flag is refused -- the brightness rows behave exactly as they did
+        // before: delivered, and unactionable.
         113 => 0x1008ff12, // KEY_MUTE          -> XF86AudioMute
         114 => 0x1008ff11, // KEY_VOLUMEDOWN    -> XF86AudioLowerVolume
         115 => 0x1008ff13, // KEY_VOLUMEUP      -> XF86AudioRaiseVolume
@@ -4323,6 +4394,11 @@ pub(crate) mod tests {
         ) -> Option<std::rc::Rc<std::cell::RefCell<crate::screenshot::ScreenshotSignal>>> {
             None
         }
+        fn backlight(
+            &self,
+        ) -> Option<std::rc::Rc<std::cell::RefCell<crate::backlight::BacklightSignal>>> {
+            None
+        }
         fn gate(&mut self, input: &SeatInput) -> Gate {
             self.log.borrow_mut().push(("gate", input.origin()));
             if self.consume.get() {
@@ -5030,6 +5106,12 @@ pub(crate) mod tests {
         fn screenshot(
             &self,
         ) -> Option<std::rc::Rc<std::cell::RefCell<crate::screenshot::ScreenshotSignal>>> {
+            None
+        }
+
+        fn backlight(
+            &self,
+        ) -> Option<std::rc::Rc<std::cell::RefCell<crate::backlight::BacklightSignal>>> {
             None
         }
 

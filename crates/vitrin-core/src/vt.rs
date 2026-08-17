@@ -406,6 +406,10 @@ impl<H: PreemptionHook> PreemptionHook for VtHook<H> {
     fn screenshot(&self) -> Option<Rc<RefCell<crate::screenshot::ScreenshotSignal>>> {
         self.inner.screenshot()
     }
+
+    fn backlight(&self) -> Option<Rc<RefCell<crate::backlight::BacklightSignal>>> {
+        self.inner.backlight()
+    }
 }
 
 /// This session's own virtual terminal, or `None` if it cannot be resolved.
@@ -568,6 +572,10 @@ mod tests {
             None
         }
         fn screenshot(&self) -> Option<Rc<RefCell<crate::screenshot::ScreenshotSignal>>> {
+            None
+        }
+
+        fn backlight(&self) -> Option<Rc<RefCell<crate::backlight::BacklightSignal>>> {
             None
         }
     }

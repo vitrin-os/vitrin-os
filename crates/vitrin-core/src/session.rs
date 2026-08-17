@@ -225,6 +225,16 @@ pub(crate) struct RuntimeSeed {
     /// core itself resolved before any client existed. Since issue #240 the
     /// descriptor is not even on this thread -- see [`crate::screenshot`].
     pub screenshot_writer: Option<crate::screenshot::ScreenshotWriter>,
+    /// **The session's backlight**, or `None` when the operator did not pass
+    /// `--backlight` (D-041, issue #303).
+    ///
+    /// Built once in `run_session` from the flag, probed once for the startup
+    /// log, and carried here so that the one thing which decides whether the
+    /// gate is armed -- this being `Some` -- is also the one thing that can
+    /// actuate. A backend reads it out of the seed to arm its
+    /// [`crate::backlight::BacklightHook`], so a session cannot come up
+    /// consuming a key it has nowhere to send.
+    pub backlight: Option<crate::backlight::Backlight>,
 }
 
 /// Everything one running session owns that is not presentation, living in
@@ -362,6 +372,28 @@ struct CachedView {
     rgba: Vec<u8>,
 }
 
+/// The [`crate::backlight::BacklightSignal`] a backend hands its
+/// [`crate::backlight::BacklightHook`] (D-041, issue #303).
+///
+/// **One rule, in one place, read by all three backends.** The gate is armed
+/// **iff** this session was given a device to write to, and that is derived
+/// from the seed rather than threaded through each backend's `run` as a second
+/// boolean — so "the operator passed `--backlight`" and "the keys are consumed"
+/// cannot become two facts that disagree. A session that consumed the keys and
+/// had nowhere to send them would have taken them away from the app and given
+/// them to nobody, which is strictly worse than either end of D-041.
+///
+/// `--backlight` is refused outside `--drm` at parse time, so on the nested and
+/// headless backends this is always the detached signal today. They call it
+/// anyway, because the rule belongs to the seed and not to a backend.
+pub(crate) fn backlight_signal(seed: Option<&RuntimeSeed>) -> crate::backlight::BacklightSignal {
+    if seed.is_some_and(|seed| seed.backlight.is_some()) {
+        crate::backlight::BacklightSignal::armed()
+    } else {
+        crate::backlight::BacklightSignal::detached()
+    }
+}
+
 /// The capability kernel's state: one verifier, one petition registry, one
 /// grant table, one realm registry, one recorder, for the whole session.
 pub(crate) struct Kernel {
@@ -446,6 +478,23 @@ pub(crate) struct Kernel {
     /// single-uid, so moving a `ScreenshotDir` between threads takes nothing
     /// away from either. See [`crate::screenshot`]'s module docs.
     pub screenshot_writer: Option<crate::screenshot::ScreenshotWriter>,
+    /// **The human's brightness keys** (D-041, issue #303): the queue the gate
+    /// writes a press into and [`drain_backlight_steps`] drains.
+    ///
+    /// Taken out of the router on the same terms as `screenshot` above, and for
+    /// the same reason: a kernel draining a signal the hook does not write is a
+    /// brightness key that has been taken away from the app and given to
+    /// nobody.
+    pub backlight: std::rc::Rc<std::cell::RefCell<crate::backlight::BacklightSignal>>,
+    /// **Where a brightness step goes**, or `None` when the operator passed no
+    /// `--backlight` and the feature is therefore off.
+    ///
+    /// Kernel state rather than router state for `clipboard_slot`'s reason: the
+    /// gate runs on the input path and must not touch a filesystem, so it
+    /// records *that the human pressed the key* and this half owns the device.
+    /// The dead-man switch deliberately does **not** clear it -- the off-switch
+    /// destroys authority, and a human's own brightness key is not authority.
+    pub backlight_device: Option<crate::backlight::Backlight>,
 }
 
 /// The realm's live shim session: the protocol server, the out-of-band send
@@ -974,6 +1023,18 @@ impl<H: PreemptionHook> Runtime<H> {
                 crate::screenshot::ScreenshotSignal::detached(),
             ))
         });
+        // ...and the brightness keys (D-041), on identical terms. A detached
+        // signal is the honest answer for a backend with no physical input
+        // device, and it is *also* what a session that did not pass
+        // `--backlight` gets: a detached gate delivers both keys to the app
+        // exactly as every checkout did before D-041, so the two absences --
+        // "this build can press the key" and "this session may write the
+        // panel" -- collapse to the same, correct, do-nothing.
+        let backlight = router.backlight().unwrap_or_else(|| {
+            std::rc::Rc::new(std::cell::RefCell::new(
+                crate::backlight::BacklightSignal::detached(),
+            ))
+        });
         let RuntimeSeed {
             listener,
             verifier,
@@ -989,6 +1050,7 @@ impl<H: PreemptionHook> Runtime<H> {
             indicator: _,
             capture_dump,
             screenshot_writer,
+            backlight: backlight_device,
         } = seed;
         Self {
             kernel: Kernel {
@@ -1003,6 +1065,8 @@ impl<H: PreemptionHook> Runtime<H> {
                 clipboard_slot: crate::clipboard::ClipboardSlot::new(),
                 screenshot,
                 screenshot_writer,
+                backlight,
+                backlight_device,
             },
             listener: Some(listener),
             conns: BTreeMap::new(),
@@ -3617,6 +3681,12 @@ pub(crate) fn route_physical_turn<H: crate::input::PreemptionHook>(
     // its latency, an attention window and a clipboard gesture from the same
     // turn are already resolved before a `write(2)` is attempted.
     drain_screenshot_gestures(runtime, scenes, view);
+    // ...and the brightness keys, after all four (D-041, issue #303). Last
+    // because it is the only one of them that writes to a **kernel** file and
+    // nothing else in this turn depends on it: an attention window, a clipboard
+    // gesture and a queued screenshot are all resolved before this process
+    // touches the human's panel.
+    drain_backlight_steps(runtime);
 }
 
 /// **The seat has taken this session's input devices away** — a VT switch on
@@ -3906,6 +3976,59 @@ fn drain_screenshot_gestures<H: PreemptionHook>(
         if let Err(reason) = writer.submit(realm_id, gesture, rgba, width, height) {
             fail(kernel, Some(realm_id), reason);
         }
+    }
+}
+
+/// Turn the human's gated brightness presses into a bounded sysfs write
+/// (D-041, issue #303).
+///
+/// **The hook could not do any of this and must never be able to**, exactly as
+/// [`drain_screenshot_gestures`] explains, and here for a second reason on top
+/// of that one: the gate runs inside `InputRouter::route_physical`, once per
+/// key event of the session, so a gate that opened a file would put a
+/// filesystem call on the input path. It records *that the human pressed the
+/// key*; this function -- which owns the recorder and the configured device --
+/// decides what that is worth.
+///
+/// **Every branch is journalled, including the ones that did nothing**, and
+/// that is the whole diagnostic story for this feature. A human whose
+/// brightness key appears dead has no other instrument: the entry says
+/// `no_device`, `unreadable` or `not_writable`, which are three different
+/// machine problems with three different fixes, and none of them is a thing
+/// this core can act on for them.
+///
+/// It is a `for` loop over the drained presses rather than a coalesce, because
+/// twenty presses are twenty steps and collapsing them would make a held key
+/// move the panel less than a tapped one.
+fn drain_backlight_steps<H: PreemptionHook>(runtime: &mut Runtime<H>) {
+    let steps = runtime.kernel.backlight.borrow_mut().take_pending();
+    if steps.is_empty() {
+        return;
+    }
+    let kernel = &mut runtime.kernel;
+    for step in steps {
+        // `None` is not reachable while the gate is armed only for a session
+        // that has a device -- and it is journalled rather than asserted
+        // anyway, because a panic on the input path is the one outcome this
+        // whole feature must never have.
+        let outcome = match kernel.backlight_device.as_ref() {
+            Some(backlight) => backlight.step(step),
+            None => crate::backlight::Outcome::NotConfigured,
+        };
+        if !matches!(outcome, crate::backlight::Outcome::Stepped { .. }) {
+            tracing::debug!(
+                direction = step.label(),
+                outcome = outcome.label(),
+                "the brightness key did nothing"
+            );
+        }
+        kernel
+            .recorder
+            .record(crate::recorder::Event::BacklightStepped {
+                direction: step.label(),
+                outcome: outcome.label(),
+                percent: outcome.percent(),
+            });
     }
 }
 
@@ -5365,15 +5488,18 @@ mod tests {
     /// The rig's hook stack: the two real hooks whose signals the kernel reads
     /// back out of the router, and nothing above them.
     ///
-    /// Not `NoopHook`, and for one reason stated twice. `Runtime::new` takes
-    /// the attention signal (WS-E.1.7) and the screenshot signal (WS-E.2.4)
-    /// *out of the router it is handed*; a rig whose stack carried neither
+    /// Not `NoopHook`, and for one reason stated three times. `Runtime::new`
+    /// takes the attention signal (WS-E.1.7), the screenshot signal (WS-E.2.4)
+    /// and the brightness-key queue (D-041)
+    /// *out of the router it is handed*; a rig whose stack carried none of them
     /// would get detached signals nothing ever writes, and every test of either
     /// mechanism would be asserting against a rig that structurally cannot do
     /// the thing under test. The consent grab, the dead-man watcher and the
     /// lock stay out, exactly as they were: this rig has no display to raise a
     /// prompt on.
-    type RigHook = crate::screenshot::ScreenshotHook<crate::attention::AttentionHook<NoopHook>>;
+    type RigHook = crate::screenshot::ScreenshotHook<
+        crate::backlight::BacklightHook<crate::attention::AttentionHook<NoopHook>>,
+    >;
 
     struct TestHost {
         runtime: Runtime<RigHook>,
@@ -5659,6 +5785,11 @@ mod tests {
                 indicator: crate::consent::TrustedIndicator::for_test(),
                 capture_dump: None,
                 screenshot_writer: None,
+                // The rig's gate is armed (below) and its device is set
+                // per-test, so this stays `None`: the seed's copy is what
+                // `backlight_signal` reads in a real backend, and a rig that
+                // set it here would be claiming a device it has not built.
+                backlight: None,
             };
             let event_loop: EventLoop<'static, TestHost> =
                 EventLoop::try_new().expect("event loop");
@@ -5689,17 +5820,29 @@ mod tests {
                                 )
                                 .expect("one binding is never a duplicate"),
                             )),
-                            crate::attention::AttentionHook::new(
+                            crate::backlight::BacklightHook::new(
+                                // **Armed**, for `RigHook`'s stated reason: a
+                                // detached signal here would make every
+                                // brightness test assert against a rig that
+                                // structurally cannot do the thing under test.
+                                // Which device it writes to is set per-test on
+                                // `kernel.backlight_device`, and is `None`
+                                // until one is.
                                 std::rc::Rc::new(std::cell::RefCell::new(
-                                    crate::attention::AttentionSignal::new(
-                                        crate::attention::AttentionChord::parse(
-                                            crate::attention::DEFAULT_CHORD,
-                                        )
-                                        .expect("the default attention chord parses"),
-                                    ),
+                                    crate::backlight::BacklightSignal::armed(),
                                 )),
-                                now,
-                                NoopHook,
+                                crate::attention::AttentionHook::new(
+                                    std::rc::Rc::new(std::cell::RefCell::new(
+                                        crate::attention::AttentionSignal::new(
+                                            crate::attention::AttentionChord::parse(
+                                                crate::attention::DEFAULT_CHORD,
+                                            )
+                                            .expect("the default attention chord parses"),
+                                        ),
+                                    )),
+                                    now,
+                                    NoopHook,
+                                ),
                             ),
                         ),
                     )
@@ -5921,6 +6064,154 @@ mod tests {
             crate::recorder::tests::cleanup(&self.log);
             std::fs::remove_dir_all(&self.dir).ok();
         }
+    }
+
+    /// **A physical brightness press moves the panel and is never delivered to
+    /// the app; an agent's identical keysym does neither** (D-041, issue #303).
+    ///
+    /// The whole chain in one process, through the production entry points:
+    /// real physical key events (from `input::physical_key`, the only
+    /// physical-tagging path in the crate) into [`route_physical_turn`],
+    /// through the rig's real
+    /// [`BacklightHook`](crate::backlight::BacklightHook), out of
+    /// [`drain_backlight_steps`], onto a real file in a **fixture tree** — never
+    /// `/sys`, which this suite must not write on any machine — and into the
+    /// real flight recorder.
+    ///
+    /// What each assertion is evidence *from*:
+    ///
+    /// 1. **The value on disk moved by one step, up and then back down**, read
+    ///    off the file rather than off a counter.
+    /// 2. **The app saw neither half of either key.** A negative, so it is
+    ///    paired with the positive above: a run in which nothing happened at all
+    ///    would satisfy it alone.
+    /// 3. **One `backlight_stepped` per press**, carrying the direction and the
+    ///    percentage that was written.
+    /// 4. **An emulated key carrying the same keysym actuates nothing and is
+    ///    delivered.** This is the whole of the "no agent can do this" claim,
+    ///    driven through the same router.
+    #[test]
+    fn a_physical_brightness_press_moves_the_panel_and_never_reaches_the_app() {
+        use vitrin_protocol::generated::vitrin_shim_seat::KeyState;
+
+        let _fd = crate::capture::tests::fd_lock();
+        let mut rig = Rig::new(
+            "backlight-keys",
+            ConsentPolicyArg {
+                policy: crate::petitions::ConsentPolicy::AutoApprove,
+                config: PetitionConfig::default(),
+            },
+        );
+        rig.start_realms(&[("realm-a", &["--serve", "--seat"])]);
+        rig.pump(Duration::from_millis(400));
+
+        // A fixture tree under the rig's own directory. **Never `/sys`**: the
+        // production root is a constant and `Backlight::with_root` exists so a
+        // test can point somewhere else, which is the only reason any of this
+        // is testable at all.
+        let root = rig.dir.join("backlight");
+        let device = root.join("intel_backlight");
+        std::fs::create_dir_all(&device).expect("fixture device");
+        std::fs::write(device.join("max_brightness"), "96000\n").expect("fixture ceiling");
+        std::fs::write(device.join("brightness"), "48000\n").expect("fixture value");
+        rig.host.runtime.kernel.backlight_device = Some(crate::backlight::Backlight::with_root(
+            Box::leak(root.clone().into_boxed_path()),
+            None,
+        ));
+        let value = |device: &std::path::Path| -> u32 {
+            std::fs::read_to_string(device.join("brightness"))
+                .expect("the fixture is readable")
+                .trim()
+                .parse()
+                .expect("the fixture holds a number")
+        };
+
+        let switch = std::cell::RefCell::new(crate::deadman::DeadManSwitch::new(
+            crate::deadman::DeadManConfig::default(),
+        ));
+        let press = |rig: &mut Rig, evdev: u32, state: KeyState| {
+            route_physical_turn(
+                &mut rig.host.runtime,
+                &rig.host.view.scenes,
+                Some(&switch),
+                crate::input::physical_key(evdev, None, state),
+                VIEW,
+                Instant::now(),
+            );
+        };
+        // **The control**, so the negative below is not vacuous: an ordinary
+        // key through this exact rig, at this exact moment, DOES reach the
+        // app's seat. Without this, "no seat_delivered entries" would be
+        // satisfied by a rig that delivers nothing at all.
+        press(&mut rig, 57, KeyState::Pressed); // KEY_SPACE
+        press(&mut rig, 57, KeyState::Released);
+        assert_eq!(
+            crate::recorder::tests::of_kind(&rig.entries(), "seat_delivered").len(),
+            2,
+            "the rig must deliver an ordinary key, or the assertion below proves nothing"
+        );
+
+        // 225 = KEY_BRIGHTNESSUP, 224 = KEY_BRIGHTNESSDOWN.
+        press(&mut rig, 225, KeyState::Pressed);
+        press(&mut rig, 225, KeyState::Released);
+        assert_eq!(value(&device), 52800, "one Up press is one 5% step");
+        press(&mut rig, 224, KeyState::Pressed);
+        press(&mut rig, 224, KeyState::Released);
+        assert_eq!(value(&device), 48000, "...and one Down press undoes it");
+
+        // 2. The app saw nothing. The realm's seat is the mock shim's, and the
+        // journal's `seat_delivered` entries are what the app was actually
+        // sent -- so an entry for either keysym would mean the gate did not
+        // consume.
+        let entries = rig.entries();
+        let of_kind = |kind: &str| -> Vec<&crate::recorder::tests::Json> {
+            crate::recorder::tests::of_kind(&entries, kind)
+        };
+        assert_eq!(
+            of_kind("seat_delivered").len(),
+            2,
+            "a consumed key must never reach the app's seat: the two entries above are the \
+             control key's press and release, and four presses of the brightness keys added \
+             none. Got: {:?}",
+            of_kind("seat_delivered")
+        );
+
+        // 3. One journal entry per press, with the direction and the percent.
+        let stepped = of_kind("backlight_stepped");
+        assert_eq!(stepped.len(), 2, "one entry per press, not per event");
+        assert_eq!(stepped[0].str("direction"), "up");
+        assert_eq!(stepped[0].str("outcome"), "stepped");
+        assert_eq!(stepped[0].u64("percent"), 55);
+        assert_eq!(stepped[1].str("direction"), "down");
+        assert_eq!(stepped[1].str("outcome"), "stepped");
+        assert_eq!(stepped[1].u64("percent"), 50);
+
+        // 4. **An agent cannot do this.** The same keysym, emulated, through
+        // the same router: nothing is written, nothing is journalled as a
+        // step, and the event is delivered rather than consumed.
+        let before = value(&device);
+        let emulated = crate::input::SeatInput::emulated(crate::input::SeatInputKind::Key {
+            source: crate::input::KeySource::Keysym,
+            keysym: crate::backlight::KEYSYM_UP,
+            state: KeyState::Pressed,
+        });
+        let realm = RealmId::new("realm-a");
+        rig.host
+            .runtime
+            .router
+            .route_emulated(&realm, emulated, VIEW, None)
+            .expect("an emulated key is delivered, not consumed");
+        drain_backlight_steps(&mut rig.host.runtime);
+        assert_eq!(
+            value(&device),
+            before,
+            "no message an agent can send may change the human's brightness"
+        );
+        assert_eq!(
+            crate::recorder::tests::of_kind(&rig.entries(), "backlight_stepped").len(),
+            2,
+            "...and it queues nothing for the drain either"
+        );
     }
 
     /// **The human's screenshot chord writes exactly one file of the focused

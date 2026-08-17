@@ -1197,6 +1197,36 @@ D-033 already examined writing `/sys/class/backlight` and refused it. The bullet
 
 **What cannot be known here, and is therefore not claimed.** **Nothing in this entry is built.** No code writes any backlight file, no issue is closed, no brightness has been changed by this core on any machine, and no measurement exists behind any sentence above. When it is built, CI cannot help: runners have no DRM device, no seat, no ACPI and **no backlight**, D-030's and D-033's bound unchanged. `battery.rs` can point its reader at a fixture tree because a read is satisfiable by a directory; **a write has no fixture equivalent** — writing into a temp directory proves the bounds and the failure collapse, and proves exactly nothing about a panel. So *"the key changes the brightness"* is a hardware rung on [`docs/drm-bringup.md`](../drm-bringup.md) or [`docs/book/src/recovery.md`](../book/src/recovery.md), on the one machine that has the hardware, and it must be **written before it can be executed** — D-033's own lesson, learned when its suspend, lid and blank rungs turned out not to exist yet. The honest status of this entry today is **decided and unbuilt**; the best it can reach on the day it merges is **landed in the tree, unproven on hardware**, and it does not improve until the owner pastes a dated result into that rung's record block.
 
+> **AMENDED 2026-08-17 BY THE WORK THIS ENTRY DECIDED.** The paragraph above is
+> left as written, because it is the honest status *of this entry* on the day it
+> was accepted and a decision log that edits its own past is worth nothing —
+> D-033's own amendment above sets that precedent and this follows it. Exactly
+> one clause of its opening sentence has stopped being true, and the others are
+> named here rather than left for a reader to re-check.
+>
+> **False as of 2026-08-17: *"no code writes any backlight file"*.**
+> [#303](https://github.com/vitrin-os/vitrin-os/issues/303) is built —
+> `crates/vitrin-core/src/backlight.rs`, commit `c78ba46` — and with it
+> *"nothing in this entry is built"*. One function (`write_value`) reached from
+> one call site writes `/sys/class/backlight/<device>/brightness`, on
+> `--drm --backlight` and a physically-originated key press only, with a floor
+> of 5% of `max_brightness` and every failure collapsing to the key doing
+> nothing. The surface list this entry enumerates above — *"And this file"*
+> included — was executed with that work.
+>
+> **Still true, and unchanged: *"no issue is closed"*, *"no brightness has been
+> changed by this core on any machine"* and *"no measurement exists"*.** #303 is
+> open on this date and stays open, because its acceptance criterion is a paste
+> of literal before/after values from the one machine that has the hardware, and
+> nobody has produced one. Every test in the workspace drives a temp-directory
+> fixture; CI has no backlight to write; the evidence that would falsify the
+> hardware clause is rung 16 of [`docs/drm-bringup.md`](../drm-bringup.md),
+> which is **written and not yet run** and whose record block is still empty.
+> The status of this entry today is therefore exactly the one its last sentence
+> names as the best it could reach — **landed in the tree, unproven on
+> hardware** — and it does not improve until the owner pastes a dated result
+> into that record block.
+
 ## Part B — Open questions (PRD §20), with owners and decide-by gates
 
 Each row: the PRD §20 question (kept verbatim there; summarized here), the epic(s) it blocks, and the milestone or moment by which a decision must exist. Epic IDs refer to [02-phase-2-semantic-epochs.md](02-phase-2-semantic-epochs.md) and [03-phase-3-network-x11-fleet.md](03-phase-3-network-x11-fleet.md); milestones to [00-roadmap.md](00-roadmap.md).

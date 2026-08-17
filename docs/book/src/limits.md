@@ -1347,23 +1347,42 @@ fourth core-owned gesture for a status bar. Four further limits belong with it:
   rather than a guess. When Landlock over the core's own process lands, this
   becomes a rule the core must grant itself, i.e. this widens that future
   sandbox. **And `--backlight` widens it further, in the direction that
-  matters**: the brightness keys above are a *write* to
-  `/sys/class/backlight/*/brightness`, bounded the same way (one fixed root, 16
-  entries sorted before they are capped, 24 bytes per read, every failure a
-  no-op), which makes it the first rule in that future ruleset with a write bit
-  in it. Recorded here rather than left for whoever writes the ruleset
+  matters**: the brightness keys described below are a *write* to
+  `/sys/class/backlight/*/brightness`, bounded the same way (one fixed root,
+  names sorted before the 16-entry cap is applied, and the cap bounds the
+  auto-pick — a device you name with `--backlight-device` is matched against
+  the whole directory, or the flag would silently stop working on a class with
+  seventeen entries in it — 24 bytes per read, every failure a no-op), which
+  makes it the first rule in that future ruleset with a write bit in it.
+  Recorded here rather than left for whoever writes the ruleset
   ([#187](https://github.com/vitrin-os/vitrin-os/issues/187)) to discover. It is
-  **not** a `--status` fact and does not need the strip: the two are listed
-  together because they are the only two sysfs paths the trusted core has.
+  **not** a `--status` fact and does not need the strip; the two are listed
+  together because they are the two sysfs *class* trees the core walks, and
+  because the second is the one that turns a read-only future ruleset into a
+  read-write one. They are **not** the only sysfs paths the trusted core
+  touches. There are four, and the other two are single files read once rather
+  than directories walked on a timer: `/sys/class/tty/tty0/active`, which the
+  bare-metal backend reads to learn which VT it is on, and
+  `/sys/module/apparmor/parameters/enabled`, which the spawn path reads to
+  decide whether an AppArmor label means anything on this kernel — the same
+  file this page already cites in the confinement section above.
 
 <!-- limit: principal-has-no-hotkey -->
 **A principal cannot receive physical input either, so no client has a
 hotkey.** There is no `observe_input` verb and none is designed. The core owns
-five physical gestures — the dead-man switch, the attention key, the two
-clipboard chords, the lock chord and the screenshot key — and owns them
-*precisely because* the human's off-switch, the human's attention gesture, a
-cross-realm transfer, the act of locking a screen and a picture of one's own
-screen must not depend on a client being alive and correct. A
+**eight** physical gestures — the dead-man chord, the attention chord, the two
+clipboard chords (Ctrl-Shift-Insert and Shift-Insert), the lock chord, the
+screenshot chord, and, on a `--drm` session started with `--backlight` and only
+then, the two brightness keys — and owns them *precisely because* the human's
+off-switch, the human's attention gesture, a cross-realm transfer, the act of
+locking a screen, a picture of one's own screen and a panel you can actually
+read must not depend on a client being alive and correct. (On `--drm` the core
+also consumes the twelve `Ctrl-Alt-F<N>` chords, which is a different thing
+again: they hand the seat to another console rather than doing anything inside
+this session, so they are not on that list and are described under VT switching
+below.) The count was **five** before D-041 and that was already one short of
+its own list; it is written out in full here so the next entry has to change a
+number as well as add a clause. A
 convenience hotkey is not in that class and must not borrow that warrant, so
 "Super+Tab switches windows" is not a missing feature: it would mean the core
 reserving a chord on behalf of whichever client asked first, which is
@@ -1901,7 +1920,9 @@ dependency this core refuses for logind. **No issue tracks the volume half.**
 The **brightness** half closed, and it closed *narrowly*. On `--drm` only, and
 only when the session was started with `--backlight`, the core consumes
 `XF86MonBrightnessUp`/`Down` and writes `/sys/class/backlight` itself, one step
-of 5% of that device's `max_brightness` per press (D-041, issue
+of 5% of that device's `max_brightness` per press — rounded *up*, and never
+smaller than one raw unit, so a ceiling of 10 moves by 1 rather than by nothing
+(D-041, issue
 [#303](https://github.com/vitrin-os/vitrin-os/issues/303)). Five things about
 that are limits rather than features, and all five are permanent until somebody
 files work against them:
@@ -1927,7 +1948,9 @@ files work against them:
   blank state machine knows about one of them.** Blanked-but-bright and
   unblanked-at-an-illegible-brightness are both reachable, and nothing makes the
   two paths agree. The mitigation is one-sided and stated as such: this core
-  will never write a brightness below 5% of the device's maximum, because a
+  will never write a brightness below 5% of the device's maximum — the
+  percentage is rounded up, so that is a floor and not an approximation of one
+  — because a
   black panel is indistinguishable from a blanked one — but that bounds the
   accidental case and not a buggy one.
 
@@ -1976,7 +1999,8 @@ server, remain beyond it. **And since D-041 the core is one of the things that
 can dim your panel without the blank knowing** — `--backlight` writes
 `/sys/class/backlight` from a path that has no idea whether a cover is up, so
 blanked-but-bright and unblanked-at-a-brightness-you-cannot-read are both
-reachable. The core will never write below 5% of the device's maximum, which
+reachable. The core will never write below 5% of the device's maximum (rounded
+up, so the published number is the floor rather than a truncation of it), which
 bounds the accidental case and not a buggy one. So a consent card can still in principle be raised —
 and recorded as shown to you — while you are looking at a screen something *else*
 turned off. What `vitrind` does hold back is a prompt while its own blank is up,

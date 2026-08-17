@@ -1619,12 +1619,23 @@ correction is followed here and not the issue.
   > and the work is [#303](https://github.com/vitrin-os/vitrin-os/issues/303).
   > **Nothing is built yet**, so the sentence above — the human presses
   > brightness and nothing happens — is still true of every checkout today.
+  >
+  > **SUPERSEDED THE SAME DAY, 2026-08-17, BY THE BLOCK BELOW.** It is left
+  > standing on the precedent this page sets for its 2026-08-11 amendment: the
+  > paragraph is the honest status of the moment it records, and a plan document
+  > that edits its own past is worth nothing. Its last two sentences are the
+  > ones that went stale — #303 *is* built, so *"nothing is built yet"* is false
+  > and the sentence above is no longer true of a checkout that passes
+  > `--backlight` on `--drm`. It remains true of every other session, which is
+  > what the next block says and this one does not.
 
   > **BUILT 2026-08-17, AND UNPROVEN ON HARDWARE.** #303 landed
   > `crates/vitrin-core/src/backlight.rs`: on `--drm --backlight` the core
   > consumes `XF86MonBrightnessUp`/`Down` and writes
   > `/sys/class/backlight/<device>/brightness`, 5% of `max_brightness` per press
-  > with a floor at 5%, bounded exactly the way `status/battery.rs`'s read is,
+  > with a floor at 5% — both rounded *up* and never below one raw unit, so the
+  > published floor is literally 5% and not `floor(max/20)` — bounded exactly
+  > the way `status/battery.rs`'s read is,
   > every failure collapsing to the key doing nothing and journalled as
   > `backlight_stepped`. **The paragraph above is therefore no longer true of a
   > session that passes the flag**, and it remains true of every other session:

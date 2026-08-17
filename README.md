@@ -380,7 +380,10 @@ is a different promise from one that is scheduled.
   ([#303](https://github.com/vitrin-os/vitrin-os/issues/303)): on `--drm` and
   only when started with `--backlight`, the core consumes both brightness keys
   and writes `/sys/class/backlight` itself, 5% of `max_brightness` per press and
-  never below 5%. It does nothing for an external display, nothing without the
+  **never below 5%** — both rounded *up* and never smaller than one raw unit, so
+  a panel whose ceiling is 10 moves by 1 (which is 10%) rather than by nothing,
+  and the floor is a floor rather than a number the arithmetic rounds through.
+  It does nothing for an external display, nothing without the
   flag, nothing on nested or headless (where the flag is refused), and the two
   keys stop reaching your apps as the price. No agent can trigger it: there is
   no verb and no wire message, only a physical key press.

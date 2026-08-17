@@ -870,13 +870,13 @@ inside the session, which has no terminal you can trust for this.
 | Rung | Expected [inferred] | Failure | What it means |
 |---|---|---|---|
 | 16-i | The startup log carries `brightness keys armed` and names the `device`, its `max` and its `current` | It carries `brightness keys armed but there is nothing to write` | `no_device` = this machine exposes no panel under the fixed root; `not_writable` = this uid is not in `video` and no udev rule tagged the seat. Neither is a bug in this core, and neither refuses the session |
-| 16-ii | **Press Up: the panel visibly brightens**, and `brightness` on the other VT has risen by 5% of `max_brightness` | Nothing changes, log quiet | Read the journal: `grep backlight_stepped` in the recorder gives `no_device`, `unreadable`, `not_writable` or `at_limit`, which are four different machine problems |
-| 16-ii | | The value changes but the panel does not | The auto-pick chose the wrong device (`acpi_video0` on Intel hardware is the classic). Re-run with `--backlight-device` |
-| 16-iii | **Press Down repeatedly: the panel never goes black.** It stops at 5% of `max_brightness` and further presses do nothing | It reaches 0 | The floor failed, and that is the one defect on this rung that is a **safety** defect: a black panel is indistinguishable from a blanked one. Stop and file it |
-| 16-iv | The app in the realm **does not see the keys**. Run `wev`, `xev` or a nested compositor in the realm and press brightness: nothing arrives | The app receives `XF86MonBrightnessUp` | The gate is not consuming, so two actors share one interface. D-041's consume clause is not met |
-| 16-v | Each press writes **exactly one** `backlight_stepped` entry, with `direction`, `outcome` and `percent` | Several per press, or none | Key repeat reached the core (it does not on `--drm` today), or the drain is not running |
-| 16-vi | **Without** `--backlight`, on a session started from step 6's line, pressing brightness does nothing **and the app receives the key** | The key is consumed anyway | The gate armed without the flag, which charges D-041's cost to a session that gets nothing for it |
-| 16-vii | On an **external** display: pressing brightness does nothing at all, and that is correct and published | It changes the internal panel's brightness while you look at the external one | Also correct, also published, and worth writing down as the thing a human will find confusing |
+| 16-ii | **Press Up: the panel visibly brightens**, and `brightness` on the other VT has risen by **one step**, which is `max_brightness × 5%` rounded **up** and never less than 1 raw unit. Work it out from the number step 16's first command printed, before you press: 96000 → 4800, 255 → 13, 100 → 5, **15 → 1, 10 → 1**. On a small-`max` device (`acpi_video0` is usually 10–15) a correct build therefore moves by **1 unit, which is 7–10% and not 5%** — that is the floor of one raw unit doing its job, not a failure | Nothing changes, log quiet | Read the journal: `grep backlight_stepped` in the recorder gives `no_device`, `unreadable`, `not_writable` or `at_limit`, which are four different machine problems |
+| 16-iii | **The panel itself moved, not only the number.** Look at the screen, not at the file | The value changes but the panel does not | The auto-pick chose the wrong device (`acpi_video0` on Intel hardware is the classic). Re-run with `--backlight-device` |
+| 16-iv | **Press Down repeatedly: the panel never goes black.** It stops at the floor — `max_brightness × 5%` rounded **up**, at least 1 raw unit, the same number as 16-ii's step — and further presses do nothing | It reaches 0 | The floor failed, and that is the one defect on this rung that is a **safety** defect: a black panel is indistinguishable from a blanked one. Stop and file it |
+| 16-v | The app in the realm **does not see the keys**. Run `wev`, `xev` or a nested compositor in the realm and press brightness: nothing arrives | The app receives `XF86MonBrightnessUp` | The gate is not consuming, so two actors share one interface. D-041's consume clause is not met |
+| 16-vi | Each press writes **exactly one** `backlight_stepped` entry, with `direction`, `outcome` and `percent` | Several per press, or none | Key repeat reached the core (it does not on `--drm` today), or the drain is not running |
+| 16-vii | **Without** `--backlight`, on a session started from step 6's line, pressing brightness does nothing **and the app receives the key** | The key is consumed anyway | The gate armed without the flag, which charges D-041's cost to a session that gets nothing for it |
+| 16-viii | On an **external** display: pressing brightness does nothing at all, and that is correct and published | It changes the internal panel's brightness while you look at the external one | Also correct, also published, and worth writing down as the thing a human will find confusing |
 
 **Paste the literal before/after values and the device's `max_brightness` onto
 [#303](https://github.com/vitrin-os/vitrin-os/issues/303).** That paste is the
@@ -885,13 +885,14 @@ issue's acceptance criterion and nothing else can stand in for it.
 **Record block — empty on purpose. Do not fill it in from reasoning.**
 
 ```text
-16-i    date: ____  device: ____  max: ____  current: ____
-16-ii   date: ____  before: ____  after: ____
-16-iii  date: ____  floor reached: ____  went black: yes/no
-16-iv   date: ____  app saw the key: yes/no
-16-v    date: ____  entries per press: ____
-16-vi   date: ____  app saw the key without the flag: yes/no
-16-vii  date: ____  external display: ____
+16-i     date: ____  device: ____  max: ____  current: ____
+16-ii    date: ____  before: ____  after: ____  step expected from max: ____
+16-iii   date: ____  panel visibly moved: yes/no
+16-iv    date: ____  floor reached: ____  went black: yes/no
+16-v     date: ____  app saw the key: yes/no
+16-vi    date: ____  entries per press: ____
+16-vii   date: ____  app saw the key without the flag: yes/no
+16-viii  date: ____  external display: ____
 ```
 
 ---

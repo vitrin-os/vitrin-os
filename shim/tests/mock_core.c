@@ -710,17 +710,30 @@ static void handle_get_seat(struct core *c, const uint8_t *f, size_t len) {
 
 /* `vitrin_shim_session.idle_inhibit` (WS-E.4.4, issue #306).
  *
- * VALIDATED THE WAY THE REAL CORE VALIDATES IT, which is this file's standing
- * discipline: `crates/vitrin-core/src/shim.rs` answers a surface id this
+ * TWO OF THE CHECKS BELOW MATCH THE REAL CORE AND THREE ARE DELIBERATELY
+ * STRICTER THAN IT. Which is which is written down rather than left to a reader,
+ * because a mock that claims parity it does not have turns "this shim is
+ * conformant" into "this shim satisfies this file".
+ *
+ * MATCHING: `crates/vitrin-core/src/shim.rs` answers a surface id this
  * connection never minted with fatal `invalid_object`, and the generated decoder
  * answers an out-of-range `state` with fatal `invalid_argument`. Both present as
  * a named FAIL line here and as log-and-close there.
  *
- * The ONE-BIT-PER-REALM aggregation is asserted rather than assumed: a `held`
- * while already holding, or a `released` with nothing held, would mean the shim
- * is relaying levels instead of edges, and the wire's own idempotence rule makes
- * that invisible to the real core. Only a peer that counts can see it, which is
- * exactly why this check lives here. */
+ * STRICTER, ON PURPOSE, AND IT FOLLOWS THAT A CONFORMANT SHIM CAN PASS `vitrind`
+ * AND FAIL THIS FILE:
+ *
+ *  - A `held` carrying a NULL surface. The IDL's MUST forbids it, but the IDL
+ *    also now specifies what a peer does with it — record it, hold nothing
+ *    extra, raise NO error — and the real core does exactly that
+ *    (`crates/vitrin-core/src/backend/blank.rs`, `held: BTreeMap<RealmId,
+ *    Option<u32>>`). This file fails it instead, because a shim under test that
+ *    forgets to name its surface has a bug the real core is specified to swallow
+ *    and no other instrument would ever see.
+ *  - A `held` while already holding, or a `released` with nothing held. The wire
+ *    promises idempotence in both directions, so the real core folds these in
+ *    silently and by design. They still mean the shim is relaying LEVELS instead
+ *    of EDGES, which is a real defect, and only a peer that counts can see it. */
 static void handle_idle_inhibit(struct core *c, const uint8_t *f, size_t len) {
 	uint32_t oid = 0;
 	vitrin_shim_session_req_idle_inhibit_t req;

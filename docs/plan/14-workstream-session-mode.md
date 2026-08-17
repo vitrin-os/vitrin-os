@@ -1955,6 +1955,22 @@ the plan document" is a rule this task could not follow from memory either:
 2. **#224's item (8)** asked to publish *"no lock screen and no idle
    inhibition"*. WS-E.2.2/#214 shipped the lock screen. Only the
    idle-inhibition half was true, and only that half is published.
+
+   > **AMENDED 2026-08-17 by WS-E.4.4 (#306).** The sentence above is left as
+   > written, because it is the honest record of what this sweep found and a
+   > correction list that edits its own findings teaches the next sweep nothing.
+   > What has changed since: **neither half of #224's item (8) is true any
+   > more.** #306 served idle inhibition, so "and no idle inhibition" went the
+   > same way "no lock screen" already had — which makes this the *second* time
+   > a #224 item was overtaken between being written and being published, and
+   > that is the pattern worth carrying forward rather than either instance.
+   > What is published in its place is a **bound**, never an absence: only the
+   > realm the human's output is bound to holds the blank, the blank alone is
+   > suppressed and never the idle lock, and no run on real hardware has
+   > confirmed a video keeping a panel lit. The `limits-check` row
+   > `idle-inhibit-bounded` gates that wording on all three surfaces, and
+   > [D-042](20-decision-log.md#d-042--an-idle-inhibit-is-a-property-of-the-realm-the-human-is-looking-at-not-an-authority-a-grant-confers-it-suppresses-the-blank-and-never-the-lock)
+   > is the decision.
 3. **`limits.md`'s own DRM bullet** read *"Not even a compile-check, yet… **no
    such rung exists and no such feature exists** — the backend itself is
    unwritten (#218)"*. #218 landed. `.github/workflows/ci.yml` now carries a job

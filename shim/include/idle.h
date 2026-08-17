@@ -66,6 +66,30 @@
  * death.
  *
  * ====================================================================
+ * A NAMED GAP: THIS FILE COUNTS OBJECTS, NOT VISIBLE SURFACES
+ * ====================================================================
+ *
+ * Wayland's own advice is that "inhibitors should only be in effect while this
+ * surface is visible". This file does not implement that sentence, and the core's
+ * realm gate does not discharge it either -- the gate asks whether the human is
+ * looking at this REALM, never whether a surface is visible.
+ *
+ * What is counted is live inhibitor OBJECTS. There is no map/unmap listener:
+ * wlroots destroys an inhibitor when its surface is DESTROYED, and this file
+ * hears that, but a surface that is merely unmapped and still alive keeps its
+ * inhibitor and keeps this count above zero. So an app that hides the window it
+ * was playing in, without destroying it or its inhibitor, still holds the blank
+ * off inside a realm the human is watching.
+ *
+ * Documented rather than fixed, deliberately. Wiring `map`/`unmap` would add a
+ * second lifetime per object to a file whose whole correctness argument is that
+ * there is exactly one, and no app in this repo's bring-up evidence
+ * (`shim/docs/firefox.md`) has been observed doing it. The IDL states the same
+ * gap on the wire, which is where a third-party shim author will read it; this
+ * comment states it for whoever changes this file. Reopens on an app measured
+ * doing it.
+ *
+ * ====================================================================
  * A WLROOTS DETAIL THAT IS NOT OPTIONAL
  * ====================================================================
  *

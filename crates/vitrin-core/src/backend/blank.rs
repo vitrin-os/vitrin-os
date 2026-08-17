@@ -733,9 +733,12 @@ pub(crate) struct IdleInhibitTable {
     /// The surface is recorded rather than acted on: gating is per realm today
     /// (the IDL says so), and the value is here so a later per-surface gate has
     /// the fact it needs and so the log can name it. `None` is a shim that sent
-    /// `held` with a null surface, which the IDL forbids; it is tolerated
-    /// rather than fatal, because a null object is legal wire and refusing it
-    /// would kill an app's shim over a decoration.
+    /// `held` with a null surface, which the IDL's MUST forbids — and whose
+    /// consequence the IDL now *specifies* rather than leaving open: record it,
+    /// hold exactly what any other `held` holds, raise no error. Tolerating it
+    /// is therefore conformance and not laxity; a null object is legal wire, and
+    /// refusing it would kill an app's shim over a decoration.
+    /// `shim/tests/mock_core.c` is deliberately stricter and says so.
     held: BTreeMap<RealmId, Option<u32>>,
 }
 

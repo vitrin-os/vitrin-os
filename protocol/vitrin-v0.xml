@@ -1664,6 +1664,18 @@
         Wayland's own advice ("inhibitors should only be in effect while this
         surface is visible") says in the compositor's voice.
 
+        THAT GATE BOUNDS WAYLAND'S ADVICE AND DOES NOT DISCHARGE IT, stated
+        plainly so no shim author reads the realm gate as more than it is.
+        The gate asks whether the human is looking at this REALM, never
+        whether this SURFACE is visible. A shim aggregates its app's
+        inhibitor objects, and nothing here requires it to stop counting one
+        whose surface has been unmapped but not destroyed - so an app holding
+        a live inhibitor over a surface it has hidden still holds off the
+        blank, for as long as the human is looking at that realm. That is
+        per-realm gating's accepted cost, the same cost the surface paragraph
+        below records, and it is a named gap rather than a defect in either
+        side's implementation.
+
         IT SUPPRESSES THE BLANK AND NEVER THE LOCK. The two are separate
         mechanisms that share one activity clock, and this message writes no
         clock: it adds a term to the blank's own decision and nothing else,
@@ -1673,15 +1685,39 @@
         hidden: a film longer than the idle-lock timeout gets a lock screen
         over it, exactly as it would with no inhibit at all.
 
-        THE RECORD IS THE CORE'S, AND THE CORE DROPS IT on every path it
-        already tears down a realm's other state on: the realm dying, the
-        seat being handed to another session, the human's dead-man chord.
-        The shim's own release is driven by OBJECT DESTRUCTION rather than
-        by app cooperation, so an app that exits without destroying its
-        inhibitor still releases it. Both halves exist because a leaked
-        inhibit that pins a human's panel awake forever is the worst failure
-        this message can cause, and one layer of defence against it is a
-        layer that can be forgotten.
+        THE RECORD IS THE CORE'S, AND EXACTLY TWO PATHS DROP IT: this
+        message carrying released, and the realm dying (the teardown funnel
+        every death path reaches, so an app killed mid-film needs nobody to
+        send anything). There are no others. The two absences are specified
+        HERE rather than left for a shim author to find by experiment,
+        because a shim author reads this document and nothing else.
+
+        A SEAT HANDOVER DOES NOT DROP IT, and this is the one place the
+        message departs from pointer_constraint, which the core withdraws on
+        a pause. The difference is RECOVERABILITY: a withdrawal is announced
+        on the wire by pointer_constraint_state and the app may ask again,
+        while this message has no verdict event, so a core-side drop would be
+        silent AND permanent - the app's inhibitor object is still alive, its
+        count never changes again, and no further held would ever follow.
+        Nothing is decided by keeping the record: while the seat is away the
+        core suppresses the blank countdown for the whole pause and holds the
+        screen lit, so a retained inhibit changes no outcome.
+
+        THE HUMAN'S DEAD-MAN CHORD DOES NOT DROP IT EITHER, for that reason
+        plus one: the chord destroys AUTHORITY, and an inhibit is not
+        authority - no grant confers it and no revocation reaches it. The
+        chord is also physical input, so pressing it stamps the activity
+        clock and holds the screen lit whatever this record says. A human
+        taking their session back therefore never has to get past an inhibit
+        to see their own screen, which is why dropping the record would buy
+        nothing and cost the app its only ask.
+
+        THE SHIM'S OWN RELEASE IS DRIVEN BY OBJECT DESTRUCTION rather than by
+        app cooperation, so an app that exits without destroying its
+        inhibitor still releases it. Two layers exist - that release and the
+        realm's death - because a leaked inhibit that pins a human's panel
+        awake forever is the worst failure this message can cause, and one
+        layer of defence against it is a layer that can be forgotten.
 
         surface MUST be null when state is released, and MUST name a surface
         this connection minted when it is held; the core ignores it in the
@@ -1692,6 +1728,17 @@
         forever, nothing in this protocol hard-codes one surface per shim,
         and per-surface gating could not be added later without a whole new
         message.
+
+        A HELD CARRYING A NULL SURFACE violates that MUST, and the
+        consequence is SPECIFIED rather than left open, because an
+        unspecified consequence is the one thing two conformant
+        implementations can disagree about while both believing they are
+        right: the core RECORDS the ask with no surface named, that realm
+        holds the blank exactly as any other held would, and NO error is
+        raised. Null is legal wire for a nullable argument, and killing an
+        app's shim over a missing decoration would answer a recoverable
+        mistake fatally. A peer MAY log it; it MUST NOT answer it with
+        invalid_object or invalid_argument.
 
         ERRORS. What is fatal is unchanged decode-level ground: a surface id
         this connection never minted, or one at or below its watermark, is

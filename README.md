@@ -371,12 +371,22 @@ is a different promise from one that is scheduled.
   that paired IDL-and-prose edit is what reopens it
   ([#223](https://github.com/vitrin-os/vitrin-os/issues/223)). A *not yet* with a
   named condition, not a refusal.
-- **The brightness and volume keys reach an app that cannot act on them.** They
-  are no longer dropped at intake, which changed *where they stop* and not what
-  they do: a confined app cannot write `/sys/class/backlight` or open a mixer, so
-  pressing brightness still does nothing. Backlight and volume actuation are
-  deferred behind either a shell verb or an owner decision to let the core write
-  `/sys/class/backlight`; **no issue tracks it.**
+- **The volume keys reach an app that cannot act on them; the brightness keys
+  now work, narrowly.** Neither is dropped at intake any more. For volume that
+  changed *where they stop* and not what they do — a confined app cannot open a
+  mixer, so pressing volume still does nothing, and mixer actuation stays
+  deferred behind a shell verb or an owner decision, with **no issue tracking
+  it.** Brightness closed with D-041
+  ([#303](https://github.com/vitrin-os/vitrin-os/issues/303)): on `--drm` and
+  only when started with `--backlight`, the core consumes both brightness keys
+  and writes `/sys/class/backlight` itself, 5% of `max_brightness` per press and
+  **never below 5%** — both rounded *up* and never smaller than one raw unit, so
+  a panel whose ceiling is 10 moves by 1 (which is 10%) rather than by nothing,
+  and the floor is a floor rather than a number the arithmetic rounds through.
+  It does nothing for an external display, nothing without the
+  flag, nothing on nested or headless (where the flag is refused), and the two
+  keys stop reaching your apps as the price. No agent can trigger it: there is
+  no verb and no wire message, only a physical key press.
 - **A held key does not repeat on `--drm`.** The shim's repeat timer is set to
   zero on purpose — repeat is seat-wide and this seat carries an agent's
   actuations beside yours — but the core-side repeat that decision assumes was

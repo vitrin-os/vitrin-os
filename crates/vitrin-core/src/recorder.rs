@@ -1324,6 +1324,39 @@ pub(crate) enum Event<'a> {
         /// other field.
         locked: bool,
     },
+    /// **The human pressed a brightness key and the core acted on it**
+    /// (D-041, issue #303).
+    ///
+    /// One entry per gated press, and that rate is a replacement rather than
+    /// an addition: before D-041 the same press produced a
+    /// [`Event::SeatDelivered`] line, because the key was delivered to the
+    /// focused realm. It is consumed now, so this entry takes that one's place
+    /// and the journal's volume on the brightness path is unchanged.
+    ///
+    /// **Journalled at all** because a *write* is not a read. `status::battery`
+    /// states that its sysfs read is never journalled -- the reading goes to
+    /// the strip's raster and nowhere else -- and this is the other case: an
+    /// actuation on the human's own display, by the trusted core, on a second
+    /// display-power interface the blank state machine knows nothing about.
+    /// D-041 says the human's press is *"a fact the core acts on and
+    /// journals"*, and `screen_blanked`/`screen_woke` are the precedent for
+    /// recording a display-power change rather than inferring one.
+    BacklightStepped {
+        /// Which way the human asked, from
+        /// [`crate::backlight::Step::label`] -- `up` or `down`.
+        direction: &'static str,
+        /// What happened, from the closed vocabulary
+        /// [`crate::backlight::Outcome::label`] mints: `stepped`, `at_limit`,
+        /// `not_configured`, `no_device`, `unreadable` or `not_writable`.
+        /// Never an errno and never an OS string, for the reason
+        /// [`Event::ClipboardRefused`]'s reason field gives.
+        outcome: &'static str,
+        /// The percentage of `max_brightness` that was written, or `null` when
+        /// nothing was. **A percentage rather than the raw value**, because the
+        /// raw ceiling varies by four orders of magnitude between panels and a
+        /// journal reader has no way to know this machine's.
+        percent: Option<u8>,
+    },
     RealmDied {
         realm: &'a RealmId,
         /// The shim that was serving the realm. It may already be reaped.
@@ -1404,6 +1437,7 @@ impl Event<'_> {
             Event::VtSwitchStalled { .. } => "vt_switch_stalled",
             Event::ScreenBlanked { .. } => "screen_blanked",
             Event::ScreenWoke { .. } => "screen_woke",
+            Event::BacklightStepped { .. } => "backlight_stepped",
             Event::RealmDied { .. } => "realm_died",
             Event::RealmExited { .. } => "realm_exited",
             Event::ConnectionTeardown { .. } => "connection_teardown",
@@ -1871,6 +1905,20 @@ impl Event<'_> {
                 // The other end of the pair: one sample cannot describe a window
                 // a lock can raise or lower inside.
                 field_bool(out, "locked", locked);
+            }
+            Event::BacklightStepped {
+                direction,
+                outcome,
+                percent,
+            } => {
+                field_str(out, "direction", direction);
+                field_str(out, "outcome", outcome);
+                // An explicit `null` rather than a missing key, on this
+                // emitter's rule: absent information is said, never omitted.
+                match percent {
+                    Some(percent) => field_u64(out, "percent", u64::from(percent)),
+                    None => field_null(out, "percent"),
+                }
             }
             Event::RealmDied { realm, pid, cause } => {
                 field_display(out, "realm", realm);

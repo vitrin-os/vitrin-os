@@ -659,6 +659,10 @@ impl<H: PreemptionHook> PreemptionHook for ScreenshotHook<H> {
     fn screenshot(&self) -> Option<Rc<RefCell<ScreenshotSignal>>> {
         Some(Rc::clone(&self.signal))
     }
+
+    fn backlight(&self) -> Option<Rc<RefCell<crate::backlight::BacklightSignal>>> {
+        self.inner.backlight()
+    }
 }
 
 /// Encode one realm view and write it, or say why not.

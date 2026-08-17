@@ -193,12 +193,13 @@ const INVENTORY: &[Sanctioned] = &[
         test: "vitrind::spawn::tests::a_leaked_directory_descriptor_does_not_survive_the_second_execve",
         why: "the kernel refuses the six namespaces a confined realm needs (ns.all=false)",
     },
-    // ---- host-tooling: two host-layout preconditions ---------------------
+    // ---- host-tooling: three host-layout preconditions --------------------
     //
-    // Both are required in CI (`VITRIN_REQUIRE_HOST_TOOLING=1`), because both
-    // would otherwise fire after an unrelated change with no other symptom:
-    // a slimmer container image without /usr/bin/env, or a CARGO_TARGET_DIR
-    // move that leaves the build directory with no bindable ancestor.
+    // All three are required in CI (`VITRIN_REQUIRE_HOST_TOOLING=1`), because
+    // each would otherwise fire after an unrelated change with no other
+    // symptom: a slimmer container image without /usr/bin/env, a
+    // CARGO_TARGET_DIR move that leaves the build directory with no bindable
+    // ancestor, or a container that runs the suite as root.
     Sanctioned {
         class: "host-tooling",
         test: "vitrind::spawn::tests::a_canary_the_realm_really_can_reach_is_refused",
@@ -209,6 +210,16 @@ const INVENTORY: &[Sanctioned] = &[
         test: "vitrind::spawn::tests::a_stub_the_mount_table_had_to_create_is_not_a_reachable_canary",
         why: "the build directory has no bindable ancestor outside /usr and /etc, so the mount \
               table has no stub to create",
+    },
+    Sanctioned {
+        class: "host-tooling",
+        test: "vitrind::backlight::tests::a_read_only_brightness_file_is_not_writable",
+        why: "this uid can open a mode-444 file for writing -- it is root, or holds \
+              CAP_DAC_OVERRIDE -- so `Outcome::NotWritable` is unreachable and the \
+              permission half of D-041's failure collapse cannot be observed on this \
+              machine. An honest limit rather than a broken job: GitHub's runners are \
+              ordinary users, so the class is REQUIRED in CI and a container that ran the \
+              suite as root goes red here instead of green-having-measured-nothing",
     },
     // ---- landlock-abi: six rung measurements -----------------------------
     //

@@ -80,6 +80,15 @@
 /// at every level — see that module's "neighbour, never sibling" table.
 mod attention;
 mod backend;
+/// The human's **brightness keys** (D-041, issue #303): the one filesystem
+/// *write* the trusted core makes on its own behalf. `--backlight` opts a
+/// bare-metal session in; the two `XF86MonBrightness*` keys are then consumed
+/// by the core and turned into a bounded write to `/sys/class/backlight`,
+/// physical origin only, with no verb, no wire surface and no path that can
+/// reach a black panel. Bounded exactly the way `status::battery`'s read is,
+/// which is the owner's accepted implementation constraint rather than a
+/// resemblance.
+mod backlight;
 /// The general **modifier-aware chord matcher** (WS-E.2.1, issue #213):
 /// modifier state tracked from the keysyms `input` already delivers, exact
 /// set-equality matching, and the physical-origin razor at both halves. Shared
@@ -595,6 +604,62 @@ USAGE:
                                 in its hook stack, so nothing would ever write
                                 the activity clock a wake reads -- the session
                                 would go dark and stay dark).
+    vitrind [--backlight]       `--drm` ONLY (D-041): let the core WRITE
+                                /sys/class/backlight so XF86MonBrightnessUp and
+                                Down actuate. Off by default -- a write into a
+                                kernel-owned tree from the trusted core is not
+                                something a session should pay for without
+                                asking, which is --status's argument applied to
+                                a stronger authority. One press moves the panel
+                                by 5% of that device's max_brightness, rounded
+                                up and never by less than 1 raw unit (so a
+                                ceiling of 10 moves by 1, which is 10%).
+
+                                *** THE TWO KEYS ARE CONSUMED. ***
+                                They stop reaching the focused realm's app
+                                entirely, which is a REVERSAL of what WS-E.4.3
+                                shipped. A nested compositor, a VM viewer or a
+                                remote-desktop client inside a realm loses both
+                                keys, with no pass-through and no way to ask for
+                                one -- the price D-023 paid for Super and D-024
+                                for Shift-Insert, paid again for two more keys.
+                                Without this flag they are delivered exactly as
+                                before.
+
+                                *** IT DOES NOT BLANK, AND IT NEVER REACHES 0. ***
+                                The backlight is not this core's blanking
+                                mechanism and D-033's refusal of it as one
+                                stands: --blank-idle powers the panel down, this
+                                only dims it, and the two paths do not know
+                                about each other. The lowest value this core
+                                will ever write is 5% of max_brightness --
+                                rounded UP, so it is a floor and not a number the
+                                arithmetic rounds through -- because a black
+                                panel is indistinguishable from a blanked one and
+                                the core already owns the blank.
+
+                                *** IT DOES NOTHING FOR AN EXTERNAL DISPLAY, ***
+                                and nothing for volume. No agent can trigger it:
+                                physical key presses only, no verb, no wire
+                                message, nothing to grant and nothing to refuse.
+                                Every failure -- no device, an unreadable value,
+                                a file this uid cannot write -- is the key doing
+                                nothing, journalled and never fatal. Whether it
+                                works at all is a property of this machine's udev
+                                rules (a `video` group membership or a seat tag),
+                                not of this build. See docs/book/src/limits.md.
+    vitrind --backlight-device NAME
+                                Which device under /sys/class/backlight to
+                                write, e.g. `intel_backlight`. A NAME, never a
+                                path: it must be an immediate child of that
+                                directory. Default: the sorted-first device with
+                                a readable max_brightness -- which is
+                                deterministic and can be the WRONG one, because
+                                a laptop with both `acpi_video0` and
+                                `intel_backlight` sorts the first of those first
+                                and on a lot of hardware that one does nothing.
+                                The startup log names the device it chose. Needs
+                                `--backlight`.
     vitrind --status            Draw the status strip: the focused realm's
                                 name, the battery and a clock, in a reserved
                                 band of rows immediately BELOW the trusted
@@ -1061,6 +1126,21 @@ enum Action {
         /// stays unlocked (Taha, 2026-08-10); locking is `--lock-idle` and the
         /// lock chord, and the two are coupled by nothing but a shared clock.
         blank_idle: Option<Duration>,
+        /// `--backlight` (D-041, issue #303): the human's brightness keys are
+        /// consumed by the core and turned into a bounded write to
+        /// `/sys/class/backlight`, with `--backlight-device NAME` naming which
+        /// device when the sorted-first one is the wrong one.
+        ///
+        /// **Bare metal only, and there is no field for it on the other two
+        /// variants** -- the flag is refused with `--nested` and `--headless`
+        /// at parse time, naming the reason
+        /// ([`crate::backlight::BACKLIGHT_NEEDS_THE_PANEL`]), on `blank_idle`'s
+        /// posture and for a reason that is sharper: a nested run's write would
+        /// *succeed*, on a panel this core does not own.
+        ///
+        /// `None` is the ordinary session: both keys keep reaching the focused
+        /// realm's shim seat, exactly as they have since WS-E.4.3.
+        backlight: Option<backlight::BacklightConfig>,
         /// `--keymap PATH`: the compiled xkb keymap this session resolves
         /// libinput scancodes through (WS-E.3.1, D-028).
         ///
@@ -1243,6 +1323,12 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
     #[cfg(feature = "drm-backend")]
     let mut keymap: Option<PathBuf> = None;
     let mut status_enabled = false;
+    // The opt-in half is a bare `bool` and the device half an `Option`, on
+    // `--status` / `--status-height`'s precedent: a switch repeated says the
+    // same thing twice, where a valued flag's second value would have to win or
+    // lose silently.
+    let mut backlight_enabled = false;
+    let mut backlight_device: Option<backlight::DeviceName> = None;
     let mut status_height: Option<u32> = None;
     let mut status_offset: Option<status::UtcOffset> = None;
     #[cfg(feature = "consent-injector")]
@@ -1400,6 +1486,14 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
             "--agent-cursor" => agent_cursor = true,
             // Idempotent for the same reason `--agent-cursor` is.
             "--status" => status_enabled = true,
+            // Idempotent for the same reason again (D-041, issue #303).
+            "--backlight" => backlight_enabled = true,
+            "--backlight-device" => {
+                let value = args.next().ok_or(
+                    "`--backlight-device` requires a device name                      (e.g. `--backlight-device intel_backlight`)",
+                )?;
+                set_backlight_device(&mut backlight_device, value)?;
+            }
             "--status-height" => {
                 let value = args.next().ok_or(
                     "`--status-height` requires a number of rows (e.g. `--status-height 20`)",
@@ -1534,6 +1628,8 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
                         screenshot::DEFAULT_SCREENSHOT_CHORD,
                         value,
                     )?;
+                } else if let Some(value) = other.strip_prefix("--backlight-device=") {
+                    set_backlight_device(&mut backlight_device, value)?;
                 } else if let Some(value) = other.strip_prefix("--lock-chord=") {
                     set_lock_chord(&mut lock_chord, value)?;
                 } else if let Some(value) = other.strip_prefix("--lock-idle=") {
@@ -2035,6 +2131,37 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
                 .into(),
         );
     }
+    // `--backlight-device` without `--backlight` is refused for the reason
+    // above, one notch sharper: it would name a panel this session has decided
+    // not to touch, so the operator's command line states a preference nothing
+    // will ever read.
+    if !backlight_enabled && backlight_device.is_some() {
+        return Err(
+            "`--backlight-device` needs `--backlight`: without it the brightness keys are \
+             delivered to the app and no device is ever written, so the name would be stored \
+             and never used."
+                .into(),
+        );
+    }
+    let backlight = backlight_enabled.then_some(backlight::BacklightConfig {
+        device: backlight_device,
+    });
+
+    // **`--backlight` is `--drm` only** (D-041, issue #303), refused on both
+    // other backends at parse time on `--blank-idle`'s predicate -- "this run
+    // drives the panel itself" is the same fact for both flags.
+    //
+    // The reason is sharper here than for `--blank-idle`, and it is not that
+    // the write would fail: it would *succeed*. A nested `vitrind` writing
+    // `/sys/class/backlight` would be changing the brightness of a screen it
+    // does not own, while the host compositor acts on the same key -- two
+    // actors on one panel with no arbitration, which is the exact failure
+    // D-041's consume clause exists to prevent, arriving through the other
+    // door. A headless run has no panel and no human looking at one.
+    if !blank_has_an_output && backlight.is_some() {
+        return Err(backlight::BACKLIGHT_NEEDS_THE_PANEL.into());
+    }
+
     let status = status::StatusConfig {
         enabled: status_enabled,
         height: status_height.unwrap_or(status::DEFAULT_HEIGHT),
@@ -2112,6 +2239,7 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
             screenshot,
             status,
             blank_idle,
+            backlight,
             keymap,
         }),
         // A headless core has no display to draw the consent prompt on and no
@@ -2454,6 +2582,27 @@ fn set_status_height(slot: &mut Option<u32>, value: &str) -> Result<(), String> 
     Ok(())
 }
 
+/// Record `--backlight-device` (D-041, issue #303), rejecting a repeat flag and
+/// anything that is not an immediate child of `/sys/class/backlight`.
+///
+/// **Validated here rather than at first use**, on this parser's standing rule.
+/// The *device* is a different question and is deliberately not asked here: a
+/// name that is not a name is a configuration error the operator can fix from
+/// the message, while a device that is missing or unwritable is a fact about
+/// the machine at this instant, and refusing to start a display server over it
+/// would be a far worse failure than the key doing nothing
+/// ([`backlight::Backlight::probe`]).
+fn set_backlight_device(
+    slot: &mut Option<backlight::DeviceName>,
+    value: &str,
+) -> Result<(), String> {
+    if slot.is_some() {
+        return Err("`--backlight-device` given more than once".into());
+    }
+    *slot = Some(backlight::DeviceName::parse(value)?);
+    Ok(())
+}
+
 /// Record the `--attention-chord` key (WS-E.1.7), rejecting a repeat flag and
 /// any key this build's input intake could not deliver.
 fn set_attention_chord(
@@ -2684,6 +2833,11 @@ fn main() -> ExitCode {
                 shim,
                 capture_dump,
                 screenshot.dir,
+                // `--backlight` is refused outside `--drm` at parse time, so
+                // this arm can only ever pass `None`. Spelled at the call
+                // rather than defaulted, so a later mode gaining the flag is a
+                // compile error here instead of a silent omission.
+                None,
                 isolation,
                 // `--consent-injector-fd` is refused with `--nested` at parse
                 // time (issue #138), so a nested run is never instrumented.
@@ -2717,6 +2871,7 @@ fn main() -> ExitCode {
             screenshot,
             status,
             blank_idle,
+            backlight,
             keymap,
         } => {
             init_tracing();
@@ -2740,6 +2895,8 @@ fn main() -> ExitCode {
                 shim,
                 capture_dump,
                 screenshot.dir,
+                // The one arm that carries it: `--backlight` is `--drm` only.
+                backlight,
                 isolation,
                 // Both injector channels are refused with `--drm` at parse
                 // time, so a bare-metal run is never instrumented.
@@ -2799,6 +2956,11 @@ fn main() -> ExitCode {
                 shim,
                 capture_dump,
                 screenshot.dir,
+                // `--backlight` is refused outside `--drm` at parse time, so
+                // this arm can only ever pass `None`. Spelled at the call
+                // rather than defaulted, so a later mode gaining the flag is a
+                // compile error here instead of a silent omission.
+                None,
                 isolation,
                 instrumented,
                 move |seed| {
@@ -3057,6 +3219,7 @@ fn run_session<R>(
     shim_path: Option<PathBuf>,
     capture_dump: Option<PathBuf>,
     screenshot_dir: Option<PathBuf>,
+    backlight: Option<backlight::BacklightConfig>,
     isolation: IsolationOptions,
     consent_injector: bool,
     backend: R,
@@ -3416,6 +3579,48 @@ where
         None => None,
     };
 
+    // **The backlight, probed once and never refused** (D-041, issue #303).
+    //
+    // Unlike `--screenshot-dir` above, nothing here can be fatal, and that is
+    // the decision rather than an omission: a screenshot key with nowhere to
+    // write would silently drop the human's evidence, where a brightness key
+    // with nothing to write to merely does what it did in every checkout before
+    // D-041. The operator is told which device was chosen -- the auto-pick is
+    // sorted-first and can be the wrong panel on a laptop with both
+    // `acpi_video0` and `intel_backlight` -- and told loudly when there is
+    // nothing to write, because "the brightness key works" is a property of
+    // this machine's udev rules rather than of this checkout.
+    let backlight = backlight.map(|config| {
+        let light = backlight::Backlight::new(config.device);
+        match light.probe() {
+            backlight::Probe::Ready {
+                device,
+                max,
+                current,
+            } => tracing::info!(
+                device,
+                max,
+                current,
+                step_percent = backlight::STEP_PERCENT,
+                floor_percent = backlight::FLOOR_PERCENT,
+                "brightness keys armed: XF86MonBrightnessUp/Down are CONSUMED by this core \
+                 and no longer reach any app. They write /sys/class/backlight and nothing \
+                 else -- they do not blank, they do nothing for an external display, and \
+                 there is a floor below which this core will not drive the panel"
+            ),
+            backlight::Probe::Absent(reason) => tracing::warn!(
+                reason = reason.label(),
+                root = backlight::SYSFS_ROOT,
+                "brightness keys armed but there is nothing to write: the keys are CONSUMED \
+                 and will do nothing. `not_writable` usually means this uid is not in the \
+                 `video` group and no udev rule tagged the seat; `no_device` means this \
+                 machine has no internal panel this core can see. Drop `--backlight` to give \
+                 the keys back to the app"
+            ),
+        }
+        light
+    });
+
     let seed = session::RuntimeSeed {
         listener,
         verifier,
@@ -3428,6 +3633,7 @@ where
         indicator,
         capture_dump,
         screenshot_writer,
+        backlight,
     };
 
     let (mut recorder, result) = backend(seed);
@@ -5842,6 +6048,9 @@ mod tests {
             // guard, and a screenshot directory would be a second thing that
             // could fail the startup it is measuring.
             None,
+            // No backlight, for the reason above and one more: probing sysfs
+            // here would read the machine running the suite.
+            None,
             // The confinement selector this fixture runs under. `off`
             // deliberately: the assertion is about the auto-approve refusal,
             // and a machine whose kernel refuses namespaces would otherwise
@@ -5890,6 +6099,10 @@ mod tests {
             Some(realm),
             None,
             None,
+            None,
+            // No backlight: this test never reaches an input path, and a
+            // session that probed sysfs here would be reading the machine
+            // running the suite.
             None,
             // `off`, for the same reason as the fixture above: this test is
             // about auto-approve's admission, not about the kernel's.
@@ -6587,6 +6800,151 @@ mod tests {
             "the headless refusal must name the missing activity clock, not only the missing \
              display: a reader who fixes the display half would still ship a session that \
              goes dark and never comes back. Got: {err}"
+        );
+    }
+
+    /// The backlight configuration a bare-metal run resolved (D-041, #303).
+    #[cfg(feature = "drm-backend")]
+    fn backlight_of(action: &Action) -> Option<backlight::BacklightConfig> {
+        match action {
+            Action::RunDrm { backlight, .. } => backlight.clone(),
+            other => panic!("not a bare-metal run action: {other:?}"),
+        }
+    }
+
+    /// **`--backlight` is refused on every backend that does not drive the
+    /// human's panel** (D-041, issue #303), and refused rather than accepted as
+    /// a silent no-op.
+    ///
+    /// `--blank-idle`'s posture with a different reason, and the difference is
+    /// worth the test: a nested write would not be inert, it would **succeed**,
+    /// on a panel this core does not own and while the host compositor acts on
+    /// the same key.
+    ///
+    /// Asserted in a build **without** `drm-backend` too, where there is no
+    /// mode the flag could be valid in at all.
+    #[test]
+    fn backlight_is_refused_on_every_backend_without_the_panel() {
+        for args in [
+            vec!["--nested", "--backlight"],
+            vec!["--headless", "--consent=auto-approve", "--backlight"],
+            vec![
+                "--nested",
+                "--backlight",
+                "--backlight-device",
+                "intel_backlight",
+            ],
+        ] {
+            let err = parse_args(args.clone())
+                .expect_err("a backend that does not drive the panel cannot dim it");
+            assert!(
+                err.contains("--backlight") && err.contains("--drm"),
+                "the refusal must name the flag and the one backend it is valid on: {err}"
+            );
+        }
+        // In `USAGE` rather than `DRM_USAGE`, for `--blank-idle`'s reason: the
+        // parser has an arm for the flag in every build and answers a *reason*
+        // rather than `unknown argument`.
+        assert!(USAGE.contains("--backlight"));
+        assert!(USAGE.contains("--backlight-device"));
+        assert!(
+            USAGE.contains("THE TWO KEYS ARE CONSUMED"),
+            "the help must say, where an operator will actually read it, that the brightness \
+             keys stop reaching their apps. That is a reversal of what the previous release \
+             shipped and it is published rather than softened"
+        );
+        assert!(
+            USAGE.contains("IT DOES NOTHING FOR AN EXTERNAL DISPLAY"),
+            "...and that it does nothing for an external display, which is the half of this \
+             feature a human is most likely to meet first"
+        );
+        assert!(
+            USAGE.contains("NEVER REACHES 0"),
+            "...and that there is a floor, because a black panel is indistinguishable from a \
+             blanked one"
+        );
+    }
+
+    /// **The keys are not taken from the app unless the operator asked**, and
+    /// the device name needs the opt-in that makes it readable.
+    #[test]
+    fn the_backlight_flags_default_off_and_the_device_needs_the_switch() {
+        let err = parse_args(["--nested", "--backlight-device", "intel_backlight"])
+            .expect_err("a device name with no feature to use it must not be stored");
+        assert!(err.contains("--backlight-device"), "{err}");
+        assert!(err.contains("needs `--backlight`"), "{err}");
+
+        let err = parse_args([
+            "--nested",
+            "--backlight",
+            "--backlight-device",
+            "intel_backlight",
+            "--backlight-device",
+            "acpi_video0",
+        ])
+        .expect_err("a valued flag repeated must not silently pick a winner");
+        assert!(
+            err.contains("--drm") || err.contains("given more than once"),
+            "{err}"
+        );
+        assert!(
+            parse_args(["--nested", "--backlight-device"]).is_err(),
+            "a bare valued flag takes the next argument; there is none"
+        );
+    }
+
+    /// A device name is a **name**, never a path, and that is refused at parse
+    /// time rather than discovered by a `join` that left the fixed root.
+    #[test]
+    fn a_backlight_device_is_never_a_path() {
+        for bad in ["../../etc", "a/b", ".", "..", "intel backlight", ""] {
+            let err = parse_args(["--nested", "--backlight", "--backlight-device", bad])
+                .expect_err("a path must not be accepted as a device name");
+            assert!(
+                err.contains("--backlight-device") || err.contains("--drm"),
+                "{bad:?}: {err}"
+            );
+        }
+    }
+
+    /// The flag resolves on `--drm`, in both spellings, and is `None` by
+    /// default -- which is the state in which both keys still reach the app.
+    #[cfg(feature = "drm-backend")]
+    #[test]
+    fn the_backlight_flag_resolves_on_bare_metal() {
+        assert_eq!(
+            backlight_of(&parse_args(["--drm"]).expect("defaults parse")),
+            None,
+            "off by default: without the flag the brightness keys are delivered as before"
+        );
+        assert_eq!(
+            backlight_of(&parse_args(["--drm", "--backlight"]).expect("the flag parses")),
+            Some(backlight::BacklightConfig { device: None }),
+            "`--backlight` alone means the auto-pick"
+        );
+        for args in [
+            vec![
+                "--drm",
+                "--backlight",
+                "--backlight-device",
+                "intel_backlight",
+            ],
+            vec!["--drm", "--backlight", "--backlight-device=intel_backlight"],
+        ] {
+            assert_eq!(
+                backlight_of(&parse_args(args.clone()).unwrap_or_else(|e| panic!("{args:?}: {e}"))),
+                Some(backlight::BacklightConfig {
+                    device: Some(
+                        backlight::DeviceName::parse("intel_backlight").expect("a name is a name")
+                    ),
+                }),
+            );
+        }
+        // Idempotent, on `--status`'s precedent: a switch repeated says the
+        // same thing twice.
+        assert_eq!(
+            backlight_of(&parse_args(["--drm", "--backlight", "--backlight"]).expect("idempotent")),
+            Some(backlight::BacklightConfig { device: None })
         );
     }
 

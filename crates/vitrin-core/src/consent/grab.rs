@@ -1036,6 +1036,12 @@ impl<H: PreemptionHook> PreemptionHook for ConsentGate<H> {
     ) -> Option<std::rc::Rc<std::cell::RefCell<crate::screenshot::ScreenshotSignal>>> {
         self.inner.screenshot()
     }
+
+    fn backlight(
+        &self,
+    ) -> Option<std::rc::Rc<std::cell::RefCell<crate::backlight::BacklightSignal>>> {
+        self.inner.backlight()
+    }
 }
 
 #[cfg(test)]
@@ -2381,6 +2387,12 @@ mod tests {
             fn screenshot(
                 &self,
             ) -> Option<std::rc::Rc<std::cell::RefCell<crate::screenshot::ScreenshotSignal>>>
+            {
+                None
+            }
+            fn backlight(
+                &self,
+            ) -> Option<std::rc::Rc<std::cell::RefCell<crate::backlight::BacklightSignal>>>
             {
                 None
             }

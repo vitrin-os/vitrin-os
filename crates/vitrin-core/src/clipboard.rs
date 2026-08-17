@@ -613,6 +613,10 @@ impl<H: PreemptionHook> PreemptionHook for ClipboardHook<H> {
     fn screenshot(&self) -> Option<Rc<RefCell<crate::screenshot::ScreenshotSignal>>> {
         self.inner.screenshot()
     }
+
+    fn backlight(&self) -> Option<Rc<RefCell<crate::backlight::BacklightSignal>>> {
+        self.inner.backlight()
+    }
 }
 
 #[cfg(test)]

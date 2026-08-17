@@ -1183,17 +1183,25 @@ pub const CLAIMS: &[Claim] = &[
     },
     Claim {
         id: "media-keys-reach-an-app-that-cannot-act",
-        says: "The brightness and volume keys are delivered to the focused realm rather than \
-               dropped at intake, and a confined app cannot write /sys/class/backlight -- so \
-               the human presses brightness and nothing happens.",
-        issue: "No issue. It is a residual named in the input router's own comments and in \
-                docs/plan/14-workstream-session-mode.md §6; the decision it waits on (a shell \
-                verb, or letting the core write /sys/class/backlight, which D-030 notes DRM \
-                master does not gate) has not been filed.",
+        says: "The VOLUME keys are delivered to the focused realm rather than dropped at \
+               intake, and a confined app cannot open a mixer -- so the human presses volume \
+               and nothing happens. The brightness half of this claim CLOSED with D-041 \
+               (#303): on `--drm --backlight` the core consumes both brightness keys and \
+               writes /sys/class/backlight itself. It still does nothing for an external \
+               display, nothing without the flag, and nothing for volume.",
+        issue: "#303 closed the brightness half and is the only issue this claim has ever \
+                had. The volume half stays deferred with no issue: the decision it waits on \
+                (a shell client holding a named verb, which D-039 makes newly plausible, or \
+                an owner decision of D-041's kind) has not been filed, and every route to a \
+                mixer runs through a sound server -- a bus or socket client inside the TCB, \
+                which D-033(4) refused for logind.",
         // Not on site/index.html: the site carries a stated subset and the plan
         // document's surface table records this omission by name. That is a
         // decision about a landing page's length, not a claim the site is
-        // allowed to contradict.
+        // allowed to contradict. It stays omitted after D-041 for the SAME
+        // reason it was omitted before -- at one line it would read as "the
+        // media keys work", which is now wrong in three directions at once
+        // (volume, external displays, and every session without the flag).
         surfaces: &[
             Anchor {
                 path: LIMITS,
@@ -1204,14 +1212,25 @@ pub const CLAIMS: &[Claim] = &[
                 needle: "/sys/class/backlight",
             },
         ],
-        evidence: &[Evidence::Contains {
-            path: "crates/vitrin-core/src/input/mod.rs",
-            needle: "the key is delivered to an app that cannot act on it",
-            means: "the router still records the honest residual in its own words: delivery \
-                    changed WHERE the key stops, not what it does. If this comment goes away \
-                    because actuation landed, the published half-fix has become a fix and both \
-                    surfaces are stale in the pessimistic direction.",
-        }],
+        evidence: &[
+            Evidence::Contains {
+                path: "crates/vitrin-core/src/input/mod.rs",
+                needle: "The volume keys are still delivered to an app that cannot act on them",
+                means: "the router still records the honest residual in its own words for the \
+                        half that did NOT close. It used to name both keys; D-041 took the \
+                        brightness half and this sentence is what is left. If it goes away \
+                        because a mixer landed, the published half-fix has become a fix and \
+                        both surfaces are stale in the pessimistic direction.",
+            },
+            Evidence::Contains {
+                path: "crates/vitrin-core/src/backlight.rs",
+                needle: "pub(crate) const SYSFS_ROOT: &str = \"/sys/class/backlight\";",
+                means: "the brightness half really did close, in the one module that owns the \
+                        bound. If this file loses its root the pages above are stale in the \
+                        OPTIMISTIC direction, which is the failure a cross-surface check \
+                        cannot see and this repo's docs are written to avoid.",
+            },
+        ],
     },
     Claim {
         id: "no-key-repeat-on-drm",

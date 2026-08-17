@@ -190,7 +190,9 @@ use crate::input::{InputRouter, NoopHook, PhysicalPresenceMap};
 /// unit-test property, exactly as the attention key's equivalent does.
 #[cfg(feature = "physical-input-injector")]
 type HeadlessHook = crate::clipboard::ClipboardHook<
-    crate::screenshot::ScreenshotHook<crate::attention::AttentionHook<NoopHook>>,
+    crate::screenshot::ScreenshotHook<
+        crate::backlight::BacklightHook<crate::attention::AttentionHook<NoopHook>>,
+    >,
 >;
 #[cfg(not(feature = "physical-input-injector"))]
 type HeadlessHook = NoopHook;
@@ -221,12 +223,22 @@ fn headless_hook(
                 crate::screenshot::ScreenshotSignal::new(screenshot)
                     .expect("the screenshot chord was validated at startup"),
             )),
-            crate::attention::AttentionHook::new(
+            crate::backlight::BacklightHook::new(
+                // Always detached here: `--backlight` is refused outside
+                // `--drm` at parse time, so a headless session has no device
+                // and must not consume the keys. Spelled through the same
+                // constructor the other two backends use rather than as a
+                // literal, so there is one rule and not three.
                 std::rc::Rc::new(std::cell::RefCell::new(
-                    crate::attention::AttentionSignal::new(attention),
+                    crate::backlight::BacklightSignal::detached(),
                 )),
-                std::rc::Rc::clone(now),
-                NoopHook,
+                crate::attention::AttentionHook::new(
+                    std::rc::Rc::new(std::cell::RefCell::new(
+                        crate::attention::AttentionSignal::new(attention),
+                    )),
+                    std::rc::Rc::clone(now),
+                    NoopHook,
+                ),
             ),
         ),
     )

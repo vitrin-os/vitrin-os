@@ -1316,8 +1316,9 @@ globals, and never maps a surface; rofi and wofi are the same class. So
 the trusted band, and it shows **three facts**: the focused realm's name, the
 battery, and a clock. There is no tray, no notifications, no workspace
 switcher, and no click targets — it is not interactive at all, because a
-principal cannot receive physical input (above) and the core does not want a
-fourth core-owned gesture for a status bar. Four further limits belong with it:
+principal cannot receive physical input (above) and the core does not want
+another core-owned gesture for a status bar (it already owns eight; they are
+enumerated under `principal-has-no-hotkey` below). Four further limits belong with it:
 
 - **The strip is unspoofable in pixels but is not self-authenticating.** It
   always wins the composite, so a confined app cannot cover it — but an app
@@ -1346,16 +1347,43 @@ fourth core-owned gesture for a status bar. Four further limits belong with it:
   no battery, a desktop, a machine mid-suspend — collapsing to an **empty slot**
   rather than a guess. When Landlock over the core's own process lands, this
   becomes a rule the core must grant itself, i.e. this widens that future
-  sandbox.
+  sandbox. **And `--backlight` widens it further, in the direction that
+  matters**: the brightness keys described below are a *write* to
+  `/sys/class/backlight/*/brightness`, bounded the same way (one fixed root,
+  names sorted before the 16-entry cap is applied, and the cap bounds the
+  auto-pick — a device you name with `--backlight-device` is matched against
+  the whole directory, or the flag would silently stop working on a class with
+  seventeen entries in it — 24 bytes per read, every failure a no-op), which
+  makes it the first rule in that future ruleset with a write bit in it.
+  Recorded here rather than left for whoever writes the ruleset
+  ([#187](https://github.com/vitrin-os/vitrin-os/issues/187)) to discover. It is
+  **not** a `--status` fact and does not need the strip; the two are listed
+  together because they are the two sysfs *class* trees the core walks, and
+  because the second is the one that turns a read-only future ruleset into a
+  read-write one. They are **not** the only sysfs paths the trusted core
+  touches. There are four, and the other two are single files read once rather
+  than directories walked on a timer: `/sys/class/tty/tty0/active`, which the
+  bare-metal backend reads to learn which VT it is on, and
+  `/sys/module/apparmor/parameters/enabled`, which the spawn path reads to
+  decide whether an AppArmor label means anything on this kernel — the same
+  file this page already cites in the confinement section above.
 
 <!-- limit: principal-has-no-hotkey -->
 **A principal cannot receive physical input either, so no client has a
 hotkey.** There is no `observe_input` verb and none is designed. The core owns
-five physical gestures — the dead-man switch, the attention key, the two
-clipboard chords, the lock chord and the screenshot key — and owns them
-*precisely because* the human's off-switch, the human's attention gesture, a
-cross-realm transfer, the act of locking a screen and a picture of one's own
-screen must not depend on a client being alive and correct. A
+**eight** physical gestures — the dead-man chord, the attention chord, the two
+clipboard chords (Ctrl-Shift-Insert and Shift-Insert), the lock chord, the
+screenshot chord, and, on a `--drm` session started with `--backlight` and only
+then, the two brightness keys — and owns them *precisely because* the human's
+off-switch, the human's attention gesture, a cross-realm transfer, the act of
+locking a screen, a picture of one's own screen and a panel you can actually
+read must not depend on a client being alive and correct. (On `--drm` the core
+also consumes the twelve `Ctrl-Alt-F<N>` chords, which is a different thing
+again: they hand the seat to another console rather than doing anything inside
+this session, so they are not on that list and are described under VT switching
+below.) The count was **five** before D-041 and that was already one short of
+its own list; it is written out in full here so the next entry has to change a
+number as well as add a clause. A
 convenience hotkey is not in that class and must not borrow that warrant, so
 "Super+Tab switches windows" is not a missing feature: it would mean the core
 reserving a chord on behalf of whichever client asked first, which is
@@ -1876,23 +1904,63 @@ window would be painting a black rectangle and calling it a dark screen, which
 asserts something about a display it does not own.
 
 <!-- limit: media-keys-reach-an-app-that-cannot-act -->
-**The brightness and volume keys now reach an app that cannot act on them, and
-that is an honest half-fix rather than a fix.** The keymap fallback learned the
-`XF86` media and brightness rows, so those keys are no longer dropped at intake
-on a bare-metal session without `--keymap` or on a nested one — but what changed
-is *where they stop*, not what they do. A delivered `XF86MonBrightnessUp` lands
-on the focused realm's shim seat, and a confined application cannot write
-`/sys/class/backlight` or open a mixer, so **the human presses brightness and
-nothing happens, exactly as before**. State it that way rather than reporting
-that the keys were fixed. Backlight and volume actuation are **deferred, with
-named reopening evidence**: either a shell client holding a verb for it, which
-WS-E Stage 2 sketched and did not build, or an owner decision to let the core
-write `/sys/class/backlight` — a display-power interface that D-030 already
-notes DRM master does **not** gate, which is why it is an authority question
-rather than a plumbing one. **No issue tracks it**; it is a residual named in
-the input router's own comments and in
-[the workstream plan](https://github.com/vitrin-os/vitrin-os/blob/main/docs/plan/14-workstream-session-mode.md), and nobody has
-filed the decision it waits on.
+**The volume keys still reach an app that cannot act on them. The brightness
+keys now work, on one backend, behind a flag, on the internal panel only.** The
+keymap fallback learned the `XF86` media and brightness rows, so none of these
+keys is dropped at intake — but for the media half, what changed is *where they
+stop*, not what they do: a delivered `XF86AudioRaiseVolume` lands on the focused
+realm's shim seat, and a confined application cannot open a mixer, so **the
+human presses volume and nothing happens**. State it that way rather than
+reporting that the media keys were fixed. Volume actuation stays **deferred,
+with named reopening evidence**: a shell client holding a verb for it, which
+WS-E Stage 2 sketched and did not build, or an explicit owner decision. There is
+no one-file sysfs equivalent for a mixer and every route to one runs through a
+sound server — a bus or socket client inside the TCB, which is exactly the
+dependency this core refuses for logind. **No issue tracks the volume half.**
+
+The **brightness** half closed, and it closed *narrowly*. On `--drm` only, and
+only when the session was started with `--backlight`, the core consumes
+`XF86MonBrightnessUp`/`Down` and writes `/sys/class/backlight` itself, one step
+of 5% of that device's `max_brightness` per press — rounded *up*, and never
+smaller than one raw unit, so a ceiling of 10 moves by 1 rather than by nothing
+(D-041, issue
+[#303](https://github.com/vitrin-os/vitrin-os/issues/303)). Five things about
+that are limits rather than features, and all five are permanent until somebody
+files work against them:
+
+- **It does nothing for an external display.** The write reaches the internal
+  panel this machine exposes under `/sys/class/backlight` and nothing else, so
+  the behaviour now *varies by which screen you are looking at* — which is a
+  worse thing to learn than the uniform nothing it replaces.
+- **It is off unless you ask, and it is off on nested and headless entirely**,
+  where the flag is a startup error rather than a silent no-op.
+- **The two keys stop reaching your applications.** That is a reversal of what
+  the previous release shipped: a nested compositor, a VM viewer or a
+  remote-desktop client inside a realm loses both keys, with no pass-through and
+  no way to ask for one. The core takes them because an app that both cannot act
+  on the key and can *time* the human's presses is worse than an app that never
+  sees it.
+- **Whether it works at all is a property of your machine, not of this
+  checkout.** The write is reachable through a `video`-group membership or a
+  logind/udev tag this project does not own. Every failure — no device, an
+  unreadable value, a file this uid cannot open — is the key doing nothing, said
+  once at startup and journalled on every press, and never a startup refusal.
+- **The core now has a second way to change what your panel shows, and the
+  blank state machine knows about one of them.** Blanked-but-bright and
+  unblanked-at-an-illegible-brightness are both reachable, and nothing makes the
+  two paths agree. The mitigation is one-sided and stated as such: this core
+  will never write a brightness below 5% of the device's maximum — the
+  percentage is rounded up, so that is a floor and not an approximation of one
+  — because a
+  black panel is indistinguishable from a blanked one — but that bounds the
+  accidental case and not a buggy one.
+
+**No agent can touch any of it.** There is no verb, no wire message and no
+request: the write happens on a physically-originated key press or not at all,
+so an agent has nothing to ask for and nothing to be refused. **It also is not
+the blanking mechanism** — `--blank-idle` powers the panel down through the
+display controller, this only dims it, and the two paths do not know about each
+other.
 
 <!-- limit: blank-does-not-stop-observation -->
 **A dark screen is not evidence that nothing is watching, either — and this is
@@ -1928,7 +1996,13 @@ that a blank timeout and unattended agent work do not currently mix.
 **And `vitrind` still cannot see a panel that went dark for any other reason.**
 It knows about the darkness it caused itself, and that is all: your monitor's own
 power button, and the backlight controls your laptop exposes outside the display
-server, remain beyond it. So a consent card can still in principle be raised —
+server, remain beyond it. **And since D-041 the core is one of the things that
+can dim your panel without the blank knowing** — `--backlight` writes
+`/sys/class/backlight` from a path that has no idea whether a cover is up, so
+blanked-but-bright and unblanked-at-a-brightness-you-cannot-read are both
+reachable. The core will never write below 5% of the device's maximum (rounded
+up, so the published number is the floor rather than a truncation of it), which
+bounds the accidental case and not a buggy one. So a consent card can still in principle be raised —
 and recorded as shown to you — while you are looking at a screen something *else*
 turned off. What `vitrind` does hold back is a prompt while its own blank is up,
 and a prompt while the *seat* is taken away from it, which is what happens when

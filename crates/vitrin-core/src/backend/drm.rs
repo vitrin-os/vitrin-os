@@ -2450,12 +2450,17 @@ fn run_inner(
                             Rc::clone(&clipboard_signal),
                             crate::screenshot::ScreenshotHook::new(
                                 Rc::clone(&screenshot_signal),
-                                crate::attention::AttentionHook::new(
-                                    Rc::new(RefCell::new(crate::attention::AttentionSignal::new(
-                                        attention,
+                                crate::backlight::BacklightHook::new(
+                                    Rc::new(RefCell::new(crate::session::backlight_signal(
+                                        seed.as_ref(),
                                     ))),
-                                    Rc::clone(&now),
-                                    input::NoopHook,
+                                    crate::attention::AttentionHook::new(
+                                        Rc::new(RefCell::new(
+                                            crate::attention::AttentionSignal::new(attention),
+                                        )),
+                                        Rc::clone(&now),
+                                        input::NoopHook,
+                                    ),
                                 ),
                             ),
                         ),

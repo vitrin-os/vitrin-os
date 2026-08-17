@@ -2480,8 +2480,9 @@ The limit set follows.
   surface interface in the IDL, so no client can put a pixel on the output —
   which is why the shipped switcher is a line-oriented host-side program and
   not a placeholder for a graphical one. There is no `observe_input` verb and
-  none is designed, so no client has a hotkey; the core owns two physical
-  chords and owns both because they must not depend on a client. The
+  none is designed, so no client has a hotkey; the core owns eight physical
+  gestures and owns every one of them because they must not depend on a client
+  (enumerated in `docs/book/src/limits.md` under `principal-has-no-hotkey`). The
   consequence for a daily driver is blunt: **every layout change starts as a
   line typed into a terminal that must be somewhere the human can reach.** The
   eventual shape #211's decision 2 names — the shell running *as a realm*,

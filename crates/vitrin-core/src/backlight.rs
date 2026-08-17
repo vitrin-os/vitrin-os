@@ -1368,7 +1368,8 @@ mod tests {
     /// and a row of `card0-*-backlight` DRM devices do exactly that on real
     /// hardware — made `--backlight-device intel_backlight` resolve to nothing
     /// and every press journal `no_device`, with the device sitting right
-    /// there. Sixteen decoys is one more than the cap can hold beside it.
+    /// there. `MAX_ENTRIES + 8` decoys is comfortably more than the cap can hold
+    /// beside it, so a truncation that ran before the filter would lose it.
     #[test]
     fn a_named_device_is_found_past_the_entry_cap() {
         let decoys: Vec<String> = (0..MAX_ENTRIES + 8)

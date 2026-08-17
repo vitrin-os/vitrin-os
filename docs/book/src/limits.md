@@ -1316,8 +1316,9 @@ globals, and never maps a surface; rofi and wofi are the same class. So
 the trusted band, and it shows **three facts**: the focused realm's name, the
 battery, and a clock. There is no tray, no notifications, no workspace
 switcher, and no click targets — it is not interactive at all, because a
-principal cannot receive physical input (above) and the core does not want a
-fourth core-owned gesture for a status bar. Four further limits belong with it:
+principal cannot receive physical input (above) and the core does not want
+another core-owned gesture for a status bar (it already owns eight; they are
+enumerated under `principal-has-no-hotkey` below). Four further limits belong with it:
 
 - **The strip is unspoofable in pixels but is not self-authenticating.** It
   always wins the composite, so a confined app cannot cover it — but an app

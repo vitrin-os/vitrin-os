@@ -1786,7 +1786,7 @@ mod tests {
         let blanked_at = t0 + Duration::from_secs(60);
         {
             let mut a = activity.borrow_mut();
-            assert!(a.tick(blanked_at));
+            assert!(a.tick(blanked_at, false));
             a.note_frame_queued();
             a.went_dark();
         }
@@ -1922,7 +1922,7 @@ mod tests {
         let screen = LockScreen::new(chord(), idle, None, Rc::clone(&activity));
         {
             let mut a = activity.borrow_mut();
-            assert!(a.tick(now + Duration::from_secs(60)));
+            assert!(a.tick(now + Duration::from_secs(60), false));
             a.note_frame_queued();
             a.went_dark();
             assert_eq!(a.phase(), Phase::Dark);
@@ -2014,7 +2014,7 @@ mod tests {
         let _ = s.take_journal();
         {
             let mut a = activity.borrow_mut();
-            assert!(a.tick(t0 + Duration::from_secs(60)));
+            assert!(a.tick(t0 + Duration::from_secs(60), false));
             a.note_frame_queued();
             a.went_dark();
         }
@@ -2070,7 +2070,9 @@ mod tests {
             );
         }
         assert!(
-            activity.borrow_mut().tick(t0 + Duration::from_secs(60)),
+            activity
+                .borrow_mut()
+                .tick(t0 + Duration::from_secs(60), false),
             "an agent's actuations must not hold the screen awake for a human who went home: \
              it spends the machine's battery and lights an empty room under no authority"
         );
@@ -2156,10 +2158,14 @@ mod tests {
             let mut s = LockScreen::new(chord(), None, None, Rc::clone(&activity));
             s.judge(input, t0 + Duration::from_secs(59));
             assert!(
-                !activity.borrow_mut().tick(t0 + Duration::from_secs(118)),
+                !activity
+                    .borrow_mut()
+                    .tick(t0 + Duration::from_secs(118), false),
                 "{input:?} must postpone the blank"
             );
-            assert!(activity.borrow_mut().tick(t0 + Duration::from_secs(119)));
+            assert!(activity
+                .borrow_mut()
+                .tick(t0 + Duration::from_secs(119), false));
 
             // Wake: from dark, this one event wakes the screen. **Presses are
             // swallowed and releases are not** -- this gate's own pairing
@@ -2231,7 +2237,7 @@ mod tests {
         // ...and the human keeps holding it until the idle timer fires.
         {
             let mut a = activity.borrow_mut();
-            assert!(a.tick(t0 + Duration::from_secs(60)));
+            assert!(a.tick(t0 + Duration::from_secs(60), false));
             a.note_frame_queued();
             a.went_dark();
         }
@@ -2275,7 +2281,9 @@ mod tests {
 
         // The screen goes dark at 300 and the session is still UNLOCKED, which
         // is the published consequence of the decision rather than a bug.
-        assert!(activity.borrow_mut().tick(t0 + Duration::from_secs(300)));
+        assert!(activity
+            .borrow_mut()
+            .tick(t0 + Duration::from_secs(300), false));
         activity.borrow_mut().note_frame_queued();
         activity.borrow_mut().went_dark();
         assert!(
@@ -2297,6 +2305,76 @@ mod tests {
             Phase::Dark,
             "and locking behind the cover does not itself wake anything"
         );
+    }
+
+    /// **An idle inhibit holds the blank and not the lock** (WS-E.4.4, issue
+    /// #306, D-042).
+    ///
+    /// The sibling of the test above, from the other direction and with a
+    /// sharper stake: that one holds that a *short* blank must not switch off a
+    /// *long* lock, and this one holds that a **confined app** must not be able
+    /// to switch off the lock at all. An app playing a film asks the core not to
+    /// blank; the core honours that and locks anyway, because `--lock-idle` is a
+    /// security control and an app's comfort request is not authority over one.
+    ///
+    /// The property is structural rather than checked: the inhibit is a
+    /// parameter of `SessionActivity::tick` and writes nothing, so
+    /// `LockScreen::tick`'s only input — `last_activity()` — cannot see it. This
+    /// test is what stops a later "simpler" implementation from moving the
+    /// suppression into the clock, where it would silently postpone both.
+    #[test]
+    fn an_idle_inhibit_holds_the_blank_and_not_the_lock() {
+        let t0 = Instant::now();
+        let activity = Rc::new(RefCell::new(SessionActivity::new(
+            Some(Duration::from_secs(300)),
+            t0,
+        )));
+        let mut s = LockScreen::new(
+            chord(),
+            Some(Duration::from_secs(600)),
+            None,
+            Rc::clone(&activity),
+        );
+
+        // The app is holding an inhibit, so the blank does not fire at 300 --
+        // and does not fire at 599 either.
+        assert!(
+            !activity
+                .borrow_mut()
+                .tick(t0 + Duration::from_secs(300), true),
+            "an inhibit held by the realm the human is looking at holds the blank off"
+        );
+        assert!(!activity
+            .borrow_mut()
+            .tick(t0 + Duration::from_secs(599), true));
+        assert_eq!(activity.borrow().phase(), Phase::Lit);
+
+        // ...and the lock fires at 600 regardless. This is the assertion the
+        // whole feature is bounded by.
+        assert!(
+            s.tick(t0 + Duration::from_secs(600)),
+            "an idle inhibit must not hold the idle LOCK: a confined app that could suppress \
+             `--lock-idle` would be a comfort feature disabling a security control, which \
+             D-033(1) forbids"
+        );
+        assert_eq!(s.cause(), Some(LockCause::Idle));
+        assert_eq!(
+            activity.borrow().phase(),
+            Phase::Lit,
+            "and the lock raising did not blank anything either -- the two remain uncoupled in \
+             both directions"
+        );
+
+        // Releasing it hands the countdown straight back: the deadline is
+        // measured from the last physical event, not from the release, so a
+        // session that has been idle throughout blanks on the very next round.
+        assert!(
+            activity
+                .borrow_mut()
+                .tick(t0 + Duration::from_secs(601), false),
+            "releasing an inhibit restores the countdown rather than restarting it"
+        );
+        assert_eq!(activity.borrow().phase(), Phase::Covering);
     }
 
     #[test]

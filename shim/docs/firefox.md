@@ -277,13 +277,14 @@ so they composite into the same buffer and travel upstream as ordinary damage.
 
 ### What Firefox asked for and did not get
 
-Twelve interfaces. The list is mirrored in
+Eleven interfaces. The list is mirrored in
 [`firefox-refused-globals.txt`](firefox-refused-globals.txt), which the
 acceptance script enforces. Firefox degrades gracefully on every one — it
 renders, repaints, scrolls and navigates without them, which is the empirical
 part of "no more than is genuinely needed".
 
-It was fifteen until WS-E.4.2 (issue #222), and it is now twelve. Protocol
+It was fifteen until WS-E.4.2 (issue #222), twelve after it, and eleven since
+WS-E.4.4 (issue #306). Protocol
 version 2 grew `relative_motion` and the four gesture events, so
 `zwp_relative_pointer_manager_v1` and `zwp_pointer_gestures_v1` entered the v0
 set — each added on the evidence rule, citing the `globals-demand` lines this
@@ -305,6 +306,19 @@ that the objection was wrong: it is that the answer moved to the core, which is
 the only party that can weigh an app's ask against a human's screen. See
 [`../include/constraint.h`](../include/constraint.h) for the shim's half and
 `docs/plan/20-decision-log.md` D-032 for the decision.
+
+**`zwp_idle_inhibit_manager_v1` left the list the same way, one workstream
+later** (WS-E.4.4, issue #306, seq=83). It is the second *ask* here, and the row
+that used to stand against it read: "A realm has no screen and no idle timer;
+the host's screen is the core's, and inhibiting it from inside a confined app is
+a decision for the core." Every clause of that is still true, and none of it was
+the objection — the objection was that a global with no wire verb behind it
+would be a promise the shim could not keep. Version 2 now carries
+`vitrin_shim_session.idle_inhibit`, so the ask reaches the party that owns the
+screen and the decision stays exactly where that row said it belonged. See
+[`../include/idle.h`](../include/idle.h) for the shim's half and
+`docs/plan/20-decision-log.md` D-042 for the decision, including why holding one
+needs no grant.
 
 **Not every row below is a refusal, and the two registers are kept apart on
 purpose.** Most are genuine decisions against a capability. Two —
@@ -330,7 +344,6 @@ than about this hardware.
 | `xdg_activation_v1` | Cross-app focus transfer and startup notification. Explicitly *between* applications, which is exactly what a realm boundary exists to mediate. If it ever lands it belongs to the core, not to a per-app shim. |
 | `zxdg_exporter_v2` | xdg-foreign: hands another process a handle to your surface so it can parent a window to it. A capability-native display server does not get to hand out ambient cross-app surface handles. |
 | `zxdg_output_manager_v1` | Logical output geometry. Superseded by `wl_output` v4, which the shim advertises and Firefox binds; the information is already available. |
-| `zwp_idle_inhibit_manager_v1` | "Do not blank the screen while this video plays." A realm has no screen and no idle timer; the host's screen is the core's, and inhibiting it from inside a confined app is a decision for the core. |
 
 Five catalogue entries went **untouched** by Firefox — no demand at all:
 `wp_single_pixel_buffer_manager_v1`, `wp_content_type_manager_v1`,

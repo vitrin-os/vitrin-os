@@ -522,6 +522,18 @@ pub(crate) struct RealmTeardown<'a, 'v, H: PreemptionHook> {
     /// exiting -- while D-024(5), `limits.md` and `clipboard.rs` all published
     /// it as a mitigation.
     pub clipboard: &'a mut crate::clipboard::ClipboardSlot,
+    /// **Which realms are holding an idle inhibit** (WS-E.4.4, issue #306), so a
+    /// dying realm stops holding the human's panel awake.
+    ///
+    /// Here for exactly [`Self::clipboard`]'s reason — this is the funnel every
+    /// death reaches, and the `SIGCHLD` reap path never runs `close_realm` — and
+    /// it matters more here than for anything else in this struct: an app can be
+    /// killed without ever destroying its `zwp_idle_inhibitor_v1`, and a record
+    /// left behind would suppress the blank forever on behalf of a realm that no
+    /// longer exists. That is the one failure mode `idle_inhibit`'s IDL calls
+    /// the worst it can cause, and the shim's own release (driven by object
+    /// destruction) is the *other* layer against it, not a substitute.
+    pub idle_inhibits: &'a mut crate::backend::blank::IdleInhibitTable,
     /// The core's single realm registry: where the terminal state lands,
     /// and through it the single vacancy predicate.
     pub realms: &'a mut RealmRegistry,
@@ -1105,6 +1117,26 @@ impl RealmLifecycle {
             );
         }
 
+        // 1d. ...and this realm's idle inhibit, if it held one (WS-E.4.4, issue
+        //     #306). Same shape as the clipboard above and the same reason it is
+        //     here rather than at the connection-close site: a realm reaped
+        //     through `SIGCHLD` never reaches `close_realm`, and an app killed
+        //     mid-film is exactly the case that leaves an inhibitor undestroyed.
+        //     A record left behind holds the human's panel awake on behalf of a
+        //     realm that no longer exists -- and unlike a stale grant there is
+        //     no chokepoint that would refuse it later, because the blank's
+        //     suppression term is not an authority check.
+        //
+        //     Unconditional call, `forget` decides -- so a sibling's death
+        //     cannot drop the inhibit of the realm the human is watching.
+        if teardown.idle_inhibits.forget(&self.realm_id) {
+            tracing::info!(
+                realm = %self.realm_id,
+                "idle inhibit dropped: the realm holding it died. The blank's countdown is live \
+                 again"
+            );
+        }
+
         if let Some(retained) = teardown.retained.take() {
             if let Err(err) = retained.scrub_retained_frame() {
                 tracing::error!(
@@ -1534,6 +1566,7 @@ mod tests {
         router: InputRouter<NoopHook>,
         retained: FakeRetained,
         clipboard: crate::clipboard::ClipboardSlot,
+        idle_inhibits: crate::backend::blank::IdleInhibitTable,
         realms: RealmRegistry,
     }
 
@@ -1549,6 +1582,7 @@ mod tests {
                 router: InputRouter::detached(NoopHook),
                 retained: FakeRetained::new(),
                 clipboard: crate::clipboard::ClipboardSlot::default(),
+                idle_inhibits: crate::backend::blank::IdleInhibitTable::new(),
                 realms: crate::realm::tests::registry_with(&["realm-0"]),
             }
         }
@@ -1562,6 +1596,7 @@ mod tests {
                 router: &mut self.router,
                 retained: Some(&mut self.retained),
                 clipboard: &mut self.clipboard,
+                idle_inhibits: &mut self.idle_inhibits,
                 realms: &mut self.realms,
                 recorder: &mut self.recorder,
             }

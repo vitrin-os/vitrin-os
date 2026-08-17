@@ -1893,15 +1893,24 @@ comfortable with; nothing in the blank will do it for you, and the two timers do
 not know about each other beyond sharing the answer to *"when did a human last
 touch this?"*.
 
-<!-- limit: no-idle-inhibit -->
-Two smaller things that come with it. **Idle inhibition is not yet served**, so
-full-screen video will blank the screen — the client-side protocol for saying
-"don't blank, I'm playing a film" (`zwp_idle_inhibit_manager_v1`) needs both a
-new shim global and a new wire verb, and neither exists. That is a *not yet*
-with a named condition for changing, not a refusal. And **`--blank-idle` is
-refused on `--nested`**: a `vitrind` running inside your real compositor's
-window would be painting a black rectangle and calling it a dark screen, which
-asserts something about a display it does not own.
+<!-- limit: idle-inhibit-bounded -->
+Two smaller things that come with it. **Idle inhibition is served now, with
+three bounds worth knowing before you rely on it** (issue
+[#306](https://github.com/vitrin-os/vitrin-os/issues/306), D-042). An app that
+says "don't blank, I'm playing a film" over `zwp_idle_inhibit_manager_v1` is
+relayed to the core, and the core holds the blank off — but only while your
+output is on *that* realm, so a video in a realm you are not looking at stops
+holding anything the moment you look away; it holds off the **blank** and never
+the **lock**, so a film longer than your `--lock-idle` still gets a lock screen
+over it, exactly as it would with no inhibit at all; and **nobody has yet
+watched a video on real hardware and confirmed the panel stayed lit.** The
+core-side guard, the shim relay and the cleanup on realm death are all tested,
+but a blank needs a display controller and CI has none — so the claim you can
+rely on today is "the ask reaches the core", not "your film will not be
+interrupted". And **`--blank-idle` is refused on `--nested`**: a `vitrind`
+running inside your real compositor's window would be painting a black rectangle
+and calling it a dark screen, which asserts something about a display it does
+not own.
 
 <!-- limit: media-keys-reach-an-app-that-cannot-act -->
 **The volume keys still reach an app that cannot act on them. The brightness

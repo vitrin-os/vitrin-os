@@ -406,6 +406,17 @@ pub(crate) struct ShimServer {
     /// the same answer the table itself gives a second ask, so the two cannot
     /// disagree about which one won.
     pointer_constraint_ask: Option<crate::input::PointerConstraintAsk>,
+    /// The `idle_inhibit` request this shim sent and the runtime has not yet
+    /// drained (WS-E.4.4, issue #306).
+    ///
+    /// Parked for the reason its two siblings above are: this type knows about
+    /// one connection's object graph and nothing about the realm registry, the
+    /// blank's activity clock, or the table that records which realms are
+    /// holding an inhibit. A second ask before the drain replaces the first,
+    /// which is exactly what the table itself does with a second ask — the
+    /// message is level-triggered, so the later one is the whole truth and the
+    /// earlier one has nothing left to say.
+    idle_inhibit_ask: Option<crate::backend::blank::IdleInhibitAsk>,
 }
 
 /// One shim's answer to a `request_selection`, waiting for the runtime.
@@ -434,6 +445,7 @@ impl ShimServer {
             copy_meter: CopyMeter::default(),
             selection_answer: None,
             pointer_constraint_ask: None,
+            idle_inhibit_ask: None,
         }
     }
 
@@ -447,6 +459,13 @@ impl ShimServer {
     /// drained on the same turn by the same dispatch path.
     pub fn take_pointer_constraint_ask(&mut self) -> Option<crate::input::PointerConstraintAsk> {
         self.pointer_constraint_ask.take()
+    }
+
+    /// Take this shim's pending `idle_inhibit` ask, if it sent one (WS-E.4.4,
+    /// issue #306). The third sibling of [`Self::take_selection_answer`],
+    /// drained on the same turn by the same dispatch path.
+    pub fn take_idle_inhibit_ask(&mut self) -> Option<crate::backend::blank::IdleInhibitAsk> {
+        self.idle_inhibit_ask.take()
     }
 
     /// Send `vitrin_shim_session.pointer_constraint_state` — the core's verdict
@@ -708,6 +727,38 @@ impl ShimServer {
                             width: req.width,
                             height: req.height,
                         },
+                    });
+                    Ok(false)
+                }
+                session::requests::IdleInhibit::OPCODE => {
+                    // Decoding enforces the razor's second clause: an
+                    // out-of-range `state` is fatal `invalid_argument` before a
+                    // byte of this reaches the core's own state.
+                    let (_, req) = session::requests::IdleInhibit::decode(&msg.bytes, msg.fd)
+                        .map_err(ShimViolation::from)?;
+                    // ...and the first clause, which decoding cannot reach: a
+                    // surface id this connection never minted is the shim
+                    // violating its own object graph. Identical to
+                    // `pointer_constraint`'s check, deliberately — two
+                    // app-asked requests naming a surface must not disagree
+                    // about what naming a surface means.
+                    if let Some(surface) = req.surface {
+                        if !self.surfaces.contains_key(&surface) {
+                            return Err(ShimViolation::InvalidObject {
+                                object_id: surface,
+                                detail: "idle_inhibit names a surface this connection never \
+                                         minted",
+                            }
+                            .into());
+                        }
+                    }
+                    // Parked, never acted on here (field docs). Whether the
+                    // human's screen may blank is a question about the output,
+                    // the bound realm and a clock, none of which this type
+                    // knows anything about.
+                    self.idle_inhibit_ask = Some(crate::backend::blank::IdleInhibitAsk {
+                        surface: req.surface,
+                        state: req.state,
                     });
                     Ok(false)
                 }
@@ -3176,6 +3227,76 @@ pub(crate) mod tests {
         assert!(
             server.take_pointer_constraint_ask().is_none(),
             "a violating ask must not reach the constraint table"
+        );
+    }
+
+    fn send_idle_inhibit(
+        shim: &mut Connection,
+        surface: Option<u32>,
+        state: session::IdleInhibitState,
+    ) {
+        let req = session::requests::IdleInhibit { surface, state };
+        shim.send_message(&req.encode(SHIM_SESSION_ID), None)
+            .expect("send idle_inhibit");
+    }
+
+    /// **An `idle_inhibit` is parked, never acted on** (WS-E.4.4, issue #306) —
+    /// the same discipline as its two siblings, and the reason is if anything
+    /// clearer here: whether the human's screen may blank depends on the output,
+    /// the bound realm and a clock, and this type knows about none of the three.
+    #[test]
+    fn an_idle_inhibit_ask_is_parked_for_the_runtime_to_drain() {
+        let (mut server, mut scene, mut core, mut shim) = setup();
+        let create = session::requests::CreateSurface {
+            surface: SURFACE_ID,
+        };
+        shim.send_message(&create.encode(SHIM_SESSION_ID), None)
+            .expect("create_surface");
+        send_idle_inhibit(&mut shim, Some(SURFACE_ID), session::IdleInhibitState::Held);
+        process_n(&mut server, &mut scene, &mut core, 2).expect("both are legal");
+
+        let ask = server
+            .take_idle_inhibit_ask()
+            .expect("the ask is parked for the runtime");
+        assert_eq!(ask.surface, Some(SURFACE_ID));
+        assert_eq!(ask.state, session::IdleInhibitState::Held);
+        assert!(
+            server.take_idle_inhibit_ask().is_none(),
+            "the drain empties the slot: an ask is folded in exactly once"
+        );
+
+        // The release arrives with a null surface, and it is legal — the
+        // object-graph check must not fire on the withdrawal.
+        send_idle_inhibit(&mut shim, None, session::IdleInhibitState::Released);
+        process_n(&mut server, &mut scene, &mut core, 1).expect("a release is legal");
+        let ask = server.take_idle_inhibit_ask().expect("parked");
+        assert_eq!(ask.state, session::IdleInhibitState::Released);
+        assert_eq!(ask.surface, None);
+    }
+
+    /// **An `idle_inhibit` naming a surface this connection never minted is
+    /// fatal `invalid_object`** — the razor's first clause, identical to
+    /// `pointer_constraint`'s, deliberately: two app-asked requests that name a
+    /// surface must not disagree about what naming a surface means.
+    #[test]
+    fn an_idle_inhibit_over_an_unminted_surface_is_fatal() {
+        let (mut server, mut scene, mut core, mut shim) = setup();
+        send_idle_inhibit(&mut shim, Some(4242), session::IdleInhibitState::Held);
+        let err = process_n(&mut server, &mut scene, &mut core, 1)
+            .expect_err("a surface this connection never minted is a violation");
+        assert!(
+            matches!(
+                err,
+                ShimFault::Violation(ShimViolation::InvalidObject {
+                    object_id: 4242,
+                    ..
+                })
+            ),
+            "expected invalid_object, got {err}"
+        );
+        assert!(
+            server.take_idle_inhibit_ask().is_none(),
+            "a violating ask must not reach the inhibit table"
         );
     }
 

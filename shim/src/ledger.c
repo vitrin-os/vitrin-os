@@ -301,6 +301,12 @@ static const char *const vitrin_v0_contract[] = {
 	"zwp_relative_pointer_manager_v1",
 	"zwp_pointer_gestures_v1",
 	"zwp_pointer_constraints_v1",
+	/* And the idle inhibitor (WS-E.4.4, issue #306), here for exactly the
+	 * reason the three above are: it is a former probe interface that became
+	 * real, so leaving it out would let the catalogue advertise a second,
+	 * inert copy beside the working one -- and the teardown wire check would
+	 * report `globals-contract-drift` for it besides. */
+	"zwp_idle_inhibit_manager_v1",
 	"wl_data_device_manager",
 	"zxdg_decoration_manager_v1",
 	"zwp_linux_dmabuf_v1", /* only with --dmabuf; see is_optional below */

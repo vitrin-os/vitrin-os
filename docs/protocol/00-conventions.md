@@ -20,6 +20,14 @@ version-1 signature is byte-identical at version 2:
   already-allocated `layout_focus` and `layout_arrange` verbs are exercised;
 - the `layout_held` entry on `vitrin_grant.outcome`.
 
+Those three are the version-2 additions that mint an **interface page**, which
+is why they are the ones listed beside the page index above. They are **not** the
+whole of version 2 — the cross-realm clipboard, the pointer constraint, the idle
+inhibit and the seat's relative-motion and gesture events all landed at version 2
+on interfaces that already existed. The complete, normative enumeration is
+[§7.3](#73-version-semantics), and this list deliberately does not duplicate it:
+two closed lists of the same facts is how one of them goes stale.
+
 Statements below that say "version 1" are statements about version 1 and
 stay accurate; where version 2 differs, it is named.
 
@@ -796,15 +804,16 @@ else:
 | `vitrin_launcher` | request `launch`, event `launched` |
 | `vitrin_layout_focus` | request `focus` |
 | `vitrin_layout_arrange` | request `set_fullscreen` |
-| `vitrin_shim_session` | events `request_selection`, `offer_selection`, `pointer_constraint_state`; requests `selection`, `pointer_constraint` |
+| `vitrin_shim_session` | events `request_selection`, `offer_selection`, `pointer_constraint_state`; requests `selection`, `pointer_constraint`, `idle_inhibit` |
 | `vitrin_shim_seat` | events `relative_motion`, `gesture_begin`, `gesture_swipe_update`, `gesture_pinch_update`, `gesture_end` |
 
-Plus, at the same version and for the same reason, six enums that carry
+Plus, at the same version and for the same reason, seven enums that carry
 arguments of those messages and are defined nowhere else:
 `vitrin_shim_session.selection_status`,
 `vitrin_shim_session.pointer_constraint_kind`,
 `vitrin_shim_session.pointer_constraint_lifetime`,
 `vitrin_shim_session.pointer_constraint_status`,
+`vitrin_shim_session.idle_inhibit_state`,
 `vitrin_shim_seat.gesture_kind` and
 `vitrin_shim_seat.gesture_state`. Enum entries carry no `since` of their own
 (see [§7.4](#74-growth-rules-wayland-style)), so the version a new enum belongs
@@ -828,6 +837,14 @@ to is recorded here or nowhere.
 > were each made in the edit that landed them, which is what the rule asks for.
 > Three enums in one change is the largest single addition this paragraph has
 > taken, and therefore the likeliest to be dropped next time.
+>
+> **It did not go stale a third time.** WS-E.4.4 (issue #306) appended
+> `vitrin_shim_session.idle_inhibit` and its `idle_inhibit_state` enum, and both
+> rows above were extended in that same edit — the first addition since the rule
+> below was written down that had the warning above already in front of it. The
+> enum count in the paragraph *above* is stated as a number ("seven") *and* as a
+> list on purpose: the number is what a reader checks the list against, and a
+> disagreement between the two is the cheapest possible way to notice a drop.
 
 A version-1
 connection is served exactly as before: it never sees a `since="2"` event, and
@@ -856,7 +873,7 @@ recoverable).
 
 - **New messages** are appended with `since` attributes. Opcodes are implicit
   document order; **requests and events are numbered separately from 0**.
-- **The version enumeration in [§7.3](#73-versioning-and-negotiation) is
+- **The version enumeration in [§7.3](#73-version-semantics) is
   normative and MUST be extended in the same edit** as any `since=` addition.
   It is a closed list of what separates one protocol version from another, so a
   message appended without it makes the document state something false about

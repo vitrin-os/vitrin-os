@@ -1336,7 +1336,7 @@
       fd, and drops the realm's surface - agents' next captures refuse
       "no_surface". Version 1 has no restart policy.
 
-      VERSION 2 ADDS TWO CONVERSATIONS TO THIS OBJECT, and both are here
+      VERSION 2 ADDS THREE CONVERSATIONS TO THIS OBJECT, and each is here
       for the same structural reason rather than by accumulation. The
       cross-realm clipboard (request_selection, selection, offer_selection)
       is here because the CORE is the party that asks, and it must be able
@@ -1346,9 +1346,21 @@
       because the APP is the party that asks, and vitrin_shim_seat can
       carry neither half: it defines no requests at all, and every event on
       it ends with an origin tag naming a human's device or a principal's
-      actuator, which a confined app is neither. So this object carries the
-      only two exchanges in the protocol whose asking party is not the one
-      the interface it would otherwise belong to was built around.
+      actuator, which a confined app is neither. The idle inhibit
+      (idle_inhibit) is here for that second reason and one further: it is
+      app-asked, and what it asks about is not input at all but the
+      human's own panel, which no other interface in this protocol
+      addresses from the app's side. So this object carries every exchange
+      in the protocol whose asking party is not the one the interface it
+      would otherwise belong to was built around.
+
+      THIS PARAGRAPH SAID "THE ONLY TWO" UNTIL WS-E.4.4 (issue #306), and
+      it is corrected here rather than left standing: a closed count in a
+      normative description is the same tripwire 00-conventions.md 7.3
+      records going stale twice, and a third conversation makes a shipped
+      count false. It is now written as a rule ("every exchange whose
+      asking party is inverted") rather than as a number, so the next
+      addition satisfies it instead of falsifying it.
     </description>
 
     <event name="configure">
@@ -1606,6 +1618,146 @@
       <arg name="state" type="uint" enum="pointer_constraint_status" summary="what the core did with that ask, and what is in force now"/>
     </event>
 
+    <request name="idle_inhibit" since="2">
+      <description summary="ask the core not to blank this realm's screen while it is being watched">
+        The confined app's ask, relayed by its shim: "do not blank the
+        screen while this plays". THE APP ASKS AND THE CORE DECIDES, the
+        same direction pointer_constraint runs in and the opposite of
+        request_selection - a reader who carries the clipboard's direction
+        over to this message will read every rule below backwards.
+
+        THE SHIM AGGREGATES; THE WIRE CARRIES ONE BIT PER REALM. An app may
+        hold any number of zwp_idle_inhibitor_v1 objects at once, and the
+        core has no use for the count: it is deciding one question about one
+        panel. So the shim sends held when its live-inhibitor count rises
+        from zero and released when it falls back to zero, and nothing in
+        between. That places the per-object bookkeeping on the side that can
+        see object lifetimes and leaves the core holding a fact it can
+        actually evaluate.
+
+        ONE MESSAGE IS THE WHOLE STATE, and released is the WITHDRAWAL -
+        pointer_constraint's kind none discipline, for its reason: there is
+        no separate unset message a withdrawal could race a set against, and
+        no order in which the two could be applied wrongly. Repetition is
+        legal and idempotent: a second held while held changes nothing, so a
+        shim that resends after a reconnect or a surface change is correct
+        rather than merely tolerated.
+
+        NO SERIAL AND NO VERDICT EVENT, and both absences are argued rather
+        than left to look like omissions. A serial names the answer an ask
+        expects, and this ask has none. There is no verdict because there is
+        nowhere to deliver one: zwp_idle_inhibitor_v1 defines no events at
+        all, so an app's only observable is whether its screen blanked, and
+        a refusal is therefore unobservable AND harmless - a deployment that
+        blanks nothing has satisfied the ask vacuously. That is why the
+        razor's recoverable half has nothing to carry here, and it is the
+        one place this pair differs from pointer_constraint, whose app IS
+        waiting for an activation and would latch forever without one.
+
+        WHAT THE CORE HONOURS, stated on the wire because an app must not
+        have to discover it by experiment: an inhibit holds off the blank
+        only while the human's output is bound to the realm that holds it.
+        An inhibit from a realm the human is not looking at holds nothing,
+        and stops holding the moment they look elsewhere - no new ask, and no
+        message saying so. A background realm able to pin the human's panel
+        awake would be an ambient power-and-attention channel, which is what
+        Wayland's own advice ("inhibitors should only be in effect while this
+        surface is visible") says in the compositor's voice.
+
+        THAT GATE BOUNDS WAYLAND'S ADVICE AND DOES NOT DISCHARGE IT, stated
+        plainly so no shim author reads the realm gate as more than it is.
+        The gate asks whether the human is looking at this REALM, never
+        whether this SURFACE is visible. A shim aggregates its app's
+        inhibitor objects, and nothing here requires it to stop counting one
+        whose surface has been unmapped but not destroyed - so an app holding
+        a live inhibitor over a surface it has hidden still holds off the
+        blank, for as long as the human is looking at that realm. That is
+        per-realm gating's accepted cost, the same cost the surface paragraph
+        below records, and it is a named gap rather than a defect in either
+        side's implementation.
+
+        IT SUPPRESSES THE BLANK AND NEVER THE LOCK. The two are separate
+        mechanisms that share one activity clock, and this message writes no
+        clock: it adds a term to the blank's own decision and nothing else,
+        so an idle lock still raises on time with an inhibit held. A comfort
+        request from a confined app must not be able to disable a security
+        control - and the consequence for the human is named rather than
+        hidden: a film longer than the idle-lock timeout gets a lock screen
+        over it, exactly as it would with no inhibit at all.
+
+        THE RECORD IS THE CORE'S, AND EXACTLY TWO PATHS DROP IT: this
+        message carrying released, and the realm dying (the teardown funnel
+        every death path reaches, so an app killed mid-film needs nobody to
+        send anything). There are no others. The two absences are specified
+        HERE rather than left for a shim author to find by experiment,
+        because a shim author reads this document and nothing else.
+
+        A SEAT HANDOVER DOES NOT DROP IT, and this is the one place the
+        message departs from pointer_constraint, which the core withdraws on
+        a pause. The difference is RECOVERABILITY: a withdrawal is announced
+        on the wire by pointer_constraint_state and the app may ask again,
+        while this message has no verdict event, so a core-side drop would be
+        silent AND permanent - the app's inhibitor object is still alive, its
+        count never changes again, and no further held would ever follow.
+        Nothing is decided by keeping the record: while the seat is away the
+        core suppresses the blank countdown for the whole pause and holds the
+        screen lit, so a retained inhibit changes no outcome.
+
+        THE HUMAN'S DEAD-MAN CHORD DOES NOT DROP IT EITHER, for that reason
+        plus one: the chord destroys AUTHORITY, and an inhibit is not
+        authority - no grant confers it and no revocation reaches it. The
+        chord is also physical input, so pressing it stamps the activity
+        clock and holds the screen lit whatever this record says. A human
+        taking their session back therefore never has to get past an inhibit
+        to see their own screen, which is why dropping the record would buy
+        nothing and cost the app its only ask.
+
+        THE SHIM'S OWN RELEASE IS DRIVEN BY OBJECT DESTRUCTION rather than by
+        app cooperation, so an app that exits without destroying its
+        inhibitor still releases it. Two layers exist - that release and the
+        realm's death - because a leaked inhibit that pins a human's panel
+        awake forever is the worst failure this message can cause, and one
+        layer of defence against it is a layer that can be forgotten.
+
+        surface MUST be null when state is released, and MUST name a surface
+        this connection minted when it is held; the core ignores it in the
+        released case rather than treating a decorated withdrawal as data.
+        The core records which surface was named and gates per REALM today,
+        not per surface - a named cost, carried for the reason
+        pointer_constraint carries lifetime: a signature is immutable
+        forever, nothing in this protocol hard-codes one surface per shim,
+        and per-surface gating could not be added later without a whole new
+        message.
+
+        A HELD CARRYING A NULL SURFACE violates that MUST, and the
+        consequence is SPECIFIED rather than left open, because an
+        unspecified consequence is the one thing two conformant
+        implementations can disagree about while both believing they are
+        right: the core RECORDS the ask with no surface named, that realm
+        holds the blank exactly as any other held would, and NO error is
+        raised. Null is legal wire for a nullable argument, and killing an
+        app's shim over a missing decoration would answer a recoverable
+        mistake fatally. A peer MAY log it; it MUST NOT answer it with
+        invalid_object or invalid_argument.
+
+        ERRORS. What is fatal is unchanged decode-level ground: a surface id
+        this connection never minted, or one at or below its watermark, is
+        invalid_object (the shim violating its OWN object graph), and an
+        out-of-range state is invalid_argument - on a shim connection both
+        mean log-and-close. This request adds NO log-only condition of its
+        own: an inhibit naming a surface that has never committed is a
+        legitimate ask that simply holds nothing, not a bad_order.
+
+        NAME IT idle_inhibit, never bare "inhibit": Wayland has a second
+        inhibitor (keyboard shortcuts) which this protocol does not serve,
+        and an identifier that did not say which one it meant would be a
+        collision waiting for the day it does - the same rule
+        pointer_constraint states for the word "constraint".
+      </description>
+      <arg name="surface" type="object" interface="vitrin_shim_surface" allow-null="true" summary="the surface whose content asks to stay visible; MUST be null when state is released"/>
+      <arg name="state" type="uint" enum="idle_inhibit_state" summary="whether this realm is holding an idle inhibit"/>
+    </request>
+
     <enum name="selection_status">
       <description summary="why a selection answer carries no data">
         Answers are exhaustive rather than optional: every request_selection
@@ -1682,6 +1834,26 @@
       <entry name="withdrawn" value="2" summary="the record is gone: the shim withdrew it, or what it named went away"/>
       <entry name="refused" value="3" summary="not recorded at all; the app's object stays inert and this serial is not re-asked"/>
       <entry name="superseded" value="4" summary="a later ask on this connection replaced it; this serial gets nothing further"/>
+    </enum>
+
+    <enum name="idle_inhibit_state">
+      <description summary="whether a realm is holding an idle inhibit">
+        Two entries, because the shim aggregates however many
+        zwp_idle_inhibitor_v1 objects its app holds into one bit (see
+        idle_inhibit). There is no count on the wire and there is deliberately
+        no room for one: a count would make the core the bookkeeper of object
+        lifetimes it cannot see.
+
+        THE ZERO VALUE IS "NOT INHIBITED", on pointer_constraint_status'
+        rule and for its reason: zero is where a mis-decode and a zeroed
+        struct both land, and the safe reading of a byte nobody can trust is
+        that the human's screen may blank. "Hold this panel awake" must
+        never be what a zero means.
+
+        Entries are appended, never renumbered, like every enum here.
+      </description>
+      <entry name="released" value="0" summary="this realm holds no inhibit; surface MUST be null"/>
+      <entry name="held" value="1" summary="this realm asks that the screen not blank while its output is on the panel"/>
     </enum>
   </interface>
 

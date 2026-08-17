@@ -92,6 +92,7 @@ type RequestSelection = gen::vitrin_shim_session::events::RequestSelection;
 type OfferSelection = gen::vitrin_shim_session::events::OfferSelection;
 type SessionPointerConstraint = gen::vitrin_shim_session::requests::PointerConstraint;
 type SessionPointerConstraintState = gen::vitrin_shim_session::events::PointerConstraintState;
+type SessionIdleInhibit = gen::vitrin_shim_session::requests::IdleInhibit;
 type Attach = gen::vitrin_shim_surface::requests::Attach;
 type Damage = gen::vitrin_shim_surface::requests::Damage;
 type Commit = gen::vitrin_shim_surface::requests::Commit;
@@ -260,6 +261,7 @@ impl_decode_msg_no_fd!(
     OfferSelection,
     SessionPointerConstraint,
     SessionPointerConstraintState,
+    SessionIdleInhibit,
 );
 // The two fd-bearing messages in v0.xml (grep for an `fd`-typed arg),
 // matching tests/roundtrip.rs's dedicated-block split.
@@ -324,6 +326,7 @@ static DECODERS: &[Decoder] = decoder_table!(
     OfferSelection,
     SessionPointerConstraint,
     SessionPointerConstraintState,
+    SessionIdleInhibit,
     Attach,
     Damage,
     Commit,

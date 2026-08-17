@@ -97,8 +97,15 @@ _Static_assert(VITRIN_SHIM_SEAT_EVT_GESTURE_END_OPCODE < VITRIN_SEAT_EVENT_SLOTS
  * new last opcode and add its `_Static_assert` above -- BEFORE any replay
  * indexes delivered[] with it. The core's own `session.rs` pins the same
  * constant for the same reason, so a message added to the IDL turns two
- * unrelated files red on purpose. */
-_Static_assert(VITRIN_MESSAGE_COUNT == 47,
+ * unrelated files red on purpose.
+ *
+ * Re-pinned 47 -> 48 by WS-E.4.4 (issue #306), with the check the paragraph
+ * above asks for actually made: the added message is
+ * `vitrin_shim_session.idle_inhibit`, a REQUEST on the session bootstrap object.
+ * It is not a `vitrin_shim_seat` event, so `VITRIN_SEAT_EVENT_SLOTS` is
+ * unchanged, `gesture_end` is still that interface's last event, and
+ * `delivered[]` is untouched. */
+_Static_assert(VITRIN_MESSAGE_COUNT == 48,
 	"a message was appended to the IDL -- read the paragraph above before touching "
 	"delivered[]");
 

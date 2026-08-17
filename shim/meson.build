@@ -328,6 +328,44 @@ if client_protocols_missing.length() > 0
     ' unaffected.')
 endif
 
+# --- WS-E.4.4 (#306): idle inhibition, from the app's side ---------------
+# `idle-probe` binds `zwp_idle_inhibit_manager_v1` and holds an inhibitor, which
+# is the only way to exercise this seam at all: an inhibit is REQUESTED by the
+# app, so no injector line and no core-side stimulus can produce one.
+#
+# Its own resolution check and its own gate, deliberately NOT a row in
+# `client_protocols` above: that list gates `gesture-probe`, and coupling the two
+# would mean a machine missing one protocol stops building a client that never
+# needed it. The same reasoning that list's own comment gives for existence
+# checking applies here -- a bare `wl_protocol_dir / ...` makes a moved XML a
+# Meson *missing input* error that takes `vitrin-shim` itself down with it.
+idle_client_headers = []
+idle_client_code = []
+idle_inhibit_client_xml = wl_protocol_dir / 'unstable/idle-inhibit/idle-inhibit-unstable-v1.xml'
+have_idle_client = fs.exists(idle_inhibit_client_xml)
+if have_idle_client
+  idle_client_headers += custom_target(
+    'idle-inhibit-unstable-v1-client-header',
+    input: idle_inhibit_client_xml,
+    output: 'idle-inhibit-unstable-v1-client-protocol.h',
+    command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+  )
+  # Its own `private-code`, on the pointer clients' precedent above: a client
+  # executable links only what it lists, so this is a second object file rather
+  # than a duplicate of the probe catalogue's symbol.
+  idle_client_code += custom_target(
+    'idle-inhibit-unstable-v1-client-private-code',
+    input: idle_inhibit_client_xml,
+    output: 'idle-inhibit-unstable-v1-client-protocol.c',
+    command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+  )
+else
+  warning('idle-probe: no XML found for unstable/idle-inhibit -- idle-probe will' +
+    ' NOT be built and the idle-inhibit acceptance test will not run. The shim' +
+    ' itself is unaffected, but note that the same XML feeds the probe catalogue,' +
+    ' so a machine missing it also probes one interface fewer.')
+endif
+
 inc = include_directories('include')
 shim_deps = [wlroots, wayland_server, pixman, xkbcommon, drm]
 
@@ -342,6 +380,7 @@ shim_exe = executable(
     'src/seat.c',
     'src/clipboard.c',
     'src/constraint.c',
+    'src/idle.c',
     'src/wire.c',
     'src/upstream.c',
     'src/ledger.c',
@@ -399,6 +438,7 @@ if wlcs_opt.enabled() or (wlcs_opt.auto() and wlcs_dep.found())
       'src/seat.c',
       'src/clipboard.c',
       'src/constraint.c',
+      'src/idle.c',
       'src/wire.c',
       'src/upstream.c',
       'src/ledger.c',
@@ -563,6 +603,40 @@ if client_protocols_missing.length() == 0
     pointer_client_code,
     include_directories: inc,
     dependencies: [wayland_client],
+  )
+endif
+
+# --- WS-E.4.4 (#306): the idle-inhibit relay, driven from the app's side --
+# `idle-probe` is the only way to make an inhibit happen at all (see its header:
+# an inhibit is REQUESTED by the app, so nothing core-side can produce one), and
+# the acceptance script beside it is a COMPONENT test against `mock_core.c` --
+# never milestone acceptance, per CLAUDE.md.
+#
+# A `meson test` for xdg-conformance's reason: the shim, the mock core and this
+# client, all built here, headless, pixman, no GPU, no DRM and no seat device.
+if have_idle_client
+  idle_probe = executable(
+    'idle-probe',
+    files('tests/idle_probe.c'),
+    idle_client_headers,
+    idle_client_code,
+    include_directories: inc,
+    dependencies: [wayland_client],
+  )
+
+  test(
+    'idle-inhibit',
+    find_program('bash'),
+    args: [
+      files('tests/acceptance/idle_inhibit.sh'),
+    ],
+    env: {
+      'BUILD_DIR': meson.current_build_dir(),
+    },
+    depends: [shim_exe, mock_core, idle_probe],
+    # Two scenarios, each bounded by the mock core's own --run-ms; the budget is
+    # for the shim's bring-up, which the script polls for rather than racing.
+    timeout: 60,
   )
 endif
 

@@ -601,11 +601,14 @@ grant.pointer.click(640, 84)</pre>
           screen.</td>
         </tr>
         <tr>
-          <td>Idle inhibition is not served</td>
-          <td>Full-screen video will blank the screen.
-          <code>zwp_idle_inhibit_manager_v1</code> needs a new shim global and a
-          new wire verb; that paired change is what reopens it. A <em>not
-          yet</em> with a named condition, not a refusal.</td>
+          <td>Idle inhibition: served, bounded, unproven on hardware</td>
+          <td><code>zwp_idle_inhibit_manager_v1</code> is advertised and relayed
+          to the core, so an app can ask the screen not to blank. Three bounds:
+          only the realm your output is on can hold one, it holds off the
+          <strong>blank</strong> and never the <strong>lock</strong>, and
+          <strong>nobody has watched a video on real hardware and confirmed the
+          panel stayed lit</strong> — blanking needs a display controller and CI
+          has none.</td>
         </tr>
         <tr>
           <td>The band's witness: one backend</td>

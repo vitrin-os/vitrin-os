@@ -42,6 +42,14 @@
 # global would have been a promise the shim could not keep, which is the
 # half-serving this whole mechanism exists to prevent.
 #
+# A FOURTH ENTRY LEFT IN WS-E.4.4 (issue #306), on exactly that precedent and
+# for the same structural reason: `zwp_idle_inhibit_manager_v1` is an ASK, not a
+# class, so it could not be served until the wire grew a verb for the core to
+# hear it on (`vitrin_shim_session.idle_inhibit`). It is now in the v0 set in
+# shim/src/globals.c, citing the `globals-demand` line at
+# globals-touched-firefox-140.12.0esr.log:158, and is removed from here rather
+# than left as a stale entry claiming a refusal that is no longer true.
+#
 # Evidence: globals-touched-firefox-140.12.0esr.log
 
 wp_cursor_shape_manager_v1
@@ -49,7 +57,6 @@ wp_fractional_scale_manager_v1
 wp_presentation
 wp_viewporter
 xdg_activation_v1
-zwp_idle_inhibit_manager_v1
 zwp_keyboard_shortcuts_inhibit_manager_v1
 zwp_primary_selection_device_manager_v1
 zwp_tablet_manager_v2

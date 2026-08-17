@@ -710,7 +710,7 @@ static void handle_get_seat(struct core *c, const uint8_t *f, size_t len) {
 
 /* `vitrin_shim_session.idle_inhibit` (WS-E.4.4, issue #306).
  *
- * TWO OF THE CHECKS BELOW MATCH THE REAL CORE AND THREE ARE DELIBERATELY
+ * TWO OF THE CHECKS BELOW MATCH THE REAL CORE AND FOUR ARE DELIBERATELY
  * STRICTER THAN IT. Which is which is written down rather than left to a reader,
  * because a mock that claims parity it does not have turns "this shim is
  * conformant" into "this shim satisfies this file".
@@ -733,7 +733,13 @@ static void handle_get_seat(struct core *c, const uint8_t *f, size_t len) {
  *  - A `held` while already holding, or a `released` with nothing held. The wire
  *    promises idempotence in both directions, so the real core folds these in
  *    silently and by design. They still mean the shim is relaying LEVELS instead
- *    of EDGES, which is a real defect, and only a peer that counts can see it. */
+ *    of EDGES, which is a real defect, and only a peer that counts can see it.
+ *  - A `released` DECORATED with a non-null surface. The real core ignores the
+ *    field in the released case rather than letting a decorated withdrawal mean
+ *    something else by it (`blank.rs`, and the IDL says so normatively), so a
+ *    shim that names its surface on the way out is conformant. This file fails
+ *    it, because relaying a surface on a withdrawal is a sign the shim is
+ *    reporting state it does not have. */
 static void handle_idle_inhibit(struct core *c, const uint8_t *f, size_t len) {
 	uint32_t oid = 0;
 	vitrin_shim_session_req_idle_inhibit_t req;

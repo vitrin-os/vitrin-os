@@ -102,7 +102,7 @@ def frame(object_id: int, opcode: int, payload: bytes, *, size_override: int | N
 
 SEL_HELLO = 0
 SEL_FRAME_READY = 15
-SEL_ATTACH = 28
+SEL_ATTACH = 29
 
 
 def protocol_decode_seeds() -> dict[str, bytes]:

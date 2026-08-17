@@ -611,7 +611,9 @@ USAGE:
                                 something a session should pay for without
                                 asking, which is --status's argument applied to
                                 a stronger authority. One press moves the panel
-                                by 5% of that device's max_brightness.
+                                by 5% of that device's max_brightness, rounded
+                                up and never by less than 1 raw unit (so a
+                                ceiling of 10 moves by 1, which is 10%).
 
                                 *** THE TWO KEYS ARE CONSUMED. ***
                                 They stop reaching the focused realm's app
@@ -630,9 +632,11 @@ USAGE:
                                 stands: --blank-idle powers the panel down, this
                                 only dims it, and the two paths do not know
                                 about each other. The lowest value this core
-                                will ever write is 5% of max_brightness, because
-                                a black panel is indistinguishable from a blanked
-                                one and the core already owns the blank.
+                                will ever write is 5% of max_brightness --
+                                rounded UP, so it is a floor and not a number the
+                                arithmetic rounds through -- because a black
+                                panel is indistinguishable from a blanked one and
+                                the core already owns the blank.
 
                                 *** IT DOES NOTHING FOR AN EXTERNAL DISPLAY, ***
                                 and nothing for volume. No agent can trigger it:
@@ -2133,7 +2137,9 @@ fn parse_args<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Action, St
     // will ever read.
     if !backlight_enabled && backlight_device.is_some() {
         return Err(
-            "`--backlight-device` needs `--backlight`: without it the brightness keys are              delivered to the app and no device is ever written, so the name would be stored              and never used."
+            "`--backlight-device` needs `--backlight`: without it the brightness keys are \
+             delivered to the app and no device is ever written, so the name would be stored \
+             and never used."
                 .into(),
         );
     }
@@ -3597,12 +3603,19 @@ where
                 current,
                 step_percent = backlight::STEP_PERCENT,
                 floor_percent = backlight::FLOOR_PERCENT,
-                "brightness keys armed: XF86MonBrightnessUp/Down are CONSUMED by this core and                  no longer reach any app. They write /sys/class/backlight and nothing else --                  they do not blank, they do nothing for an external display, and there is no                  floor below which this core will drive the panel"
+                "brightness keys armed: XF86MonBrightnessUp/Down are CONSUMED by this core \
+                 and no longer reach any app. They write /sys/class/backlight and nothing \
+                 else -- they do not blank, they do nothing for an external display, and \
+                 there is a floor below which this core will not drive the panel"
             ),
             backlight::Probe::Absent(reason) => tracing::warn!(
                 reason = reason.label(),
                 root = backlight::SYSFS_ROOT,
-                "brightness keys armed but there is nothing to write: the keys are CONSUMED                  and will do nothing. `not_writable` usually means this uid is not in the                  `video` group and no udev rule tagged the seat; `no_device` means this                  machine has no internal panel this core can see. Drop `--backlight` to give                  the keys back to the app"
+                "brightness keys armed but there is nothing to write: the keys are CONSUMED \
+                 and will do nothing. `not_writable` usually means this uid is not in the \
+                 `video` group and no udev rule tagged the seat; `no_device` means this \
+                 machine has no internal panel this core can see. Drop `--backlight` to give \
+                 the keys back to the app"
             ),
         }
         light
@@ -6836,15 +6849,19 @@ mod tests {
         assert!(USAGE.contains("--backlight-device"));
         assert!(
             USAGE.contains("THE TWO KEYS ARE CONSUMED"),
-            "the help must say, where an operator will actually read it, that the brightness              keys stop reaching their apps. That is a reversal of what the previous release              shipped and it is published rather than softened"
+            "the help must say, where an operator will actually read it, that the brightness \
+             keys stop reaching their apps. That is a reversal of what the previous release \
+             shipped and it is published rather than softened"
         );
         assert!(
             USAGE.contains("IT DOES NOTHING FOR AN EXTERNAL DISPLAY"),
-            "...and that it does nothing for an external display, which is the half of this              feature a human is most likely to meet first"
+            "...and that it does nothing for an external display, which is the half of this \
+             feature a human is most likely to meet first"
         );
         assert!(
             USAGE.contains("NEVER REACHES 0"),
-            "...and that there is a floor, because a black panel is indistinguishable from a              blanked one"
+            "...and that there is a floor, because a black panel is indistinguishable from a \
+             blanked one"
         );
     }
 

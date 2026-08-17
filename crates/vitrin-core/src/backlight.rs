@@ -29,8 +29,12 @@
 //! - **One fixed root**, [`SYSFS_ROOT`], never composed from anything a client
 //!   or an agent can influence. The root is a field only so the unit tests can
 //!   point it at a fixture tree, and it is a `&'static Path` — not a `PathBuf`
-//!   — so the only values it can ever hold are compile-time constants and
-//!   there is no field a later edit could make settable from the wire. The
+//!   — so there is no field a later edit could make settable from the wire.
+//!   In a shipped build the only value it can hold is a compile-time constant,
+//!   and that is true of the *build* rather than of the type: a test leaks a
+//!   `PathBuf` to get a `&'static Path`, which is why the constructor that
+//!   takes one is `#[cfg(test)]` and [`Backlight::new`] does not go through it.
+//!   The
 //!   *leaf* may be named by the operator (`--backlight-device`), and that is
 //!   why [`DeviceName`] exists: a name with a separator, a dot, or anything
 //!   outside `[A-Za-z0-9_.:-]` in it cannot be constructed at all, so the join
@@ -68,7 +72,9 @@
 //! brightness of zero is a dark panel the blank state machine does not know is
 //! dark, produced by the core's own hand. So this module has **no path that
 //! reaches zero**: every value it writes is in `[floor, max]`, where the floor
-//! is [`FLOOR_PERCENT`] of `max_brightness` and never less than 1 raw unit, and
+//! is [`FLOOR_PERCENT`] of `max_brightness` **rounded up** ([`percent_of_max`],
+//! so the published *"never below 5%"* is a floor and not an approximation of
+//! one) and never less than 1 raw unit, and
 //! a step that would go below the floor from *at or below* it is refused
 //! outright ([`Outcome::AtLimit`]) rather than clamped upward. Refusing rather
 //! than clamping is deliberate: clamping would let a `Down` press *raise* a
@@ -161,7 +167,13 @@ pub(crate) const STEP_PERCENT: u32 = 5;
 /// **Equal to [`STEP_PERCENT`] on purpose**: the ladder of reachable values is
 /// then exactly 5%, 10%, … 100%, the floor is one step rather than a separate
 /// number, and "the lowest reachable value is one step above off" is true by
-/// construction rather than by arithmetic. It is a *floor above zero* because
+/// construction rather than by arithmetic. **The percentage is taken with
+/// [`percent_of_max`], which rounds *up*** — so *"never below 5%"*, which this
+/// project publishes in `README.md`, `docs/book/src/limits.md`, `--help` and
+/// rung 16 of `docs/drm-bringup.md`, is literally true and not true-to-within-
+/// a-rounding-error. Truncating would make the real floor `floor(max/20)`:
+/// 4.71% on a `max_brightness` of 255 and 4.04% on one of 99. It is a *floor
+/// above zero* because
 /// D-041 makes that a constraint on the implementation rather than an option
 /// within it: a black panel is indistinguishable from a blanked one, and the
 /// core already owns the blank.
@@ -273,7 +285,10 @@ impl Outcome {
 /// precedent, so the message the operator reads and the message the test
 /// asserts are one string.
 pub(crate) const BACKLIGHT_NEEDS_THE_PANEL: &str =
-    "`--backlight` requires `--drm`: on a nested session the write would succeed and dim a      panel this core does not own, while the host compositor acts on the same key -- two      actors on one backlight with no arbitration. A headless session has no panel at all.      Drop the flag, or run the bare-metal backend";
+    "`--backlight` requires `--drm`: on a nested session the write would succeed and dim a \
+     panel this core does not own, while the host compositor acts on the same key -- two \
+     actors on one backlight with no arbitration. A headless session has no panel at all. \
+     Drop the flag, or run the bare-metal backend";
 
 /// What `--backlight` and `--backlight-device` were parsed into.
 ///
@@ -381,16 +396,30 @@ impl Backlight {
     /// The production constructor: the constant root, and the operator's
     /// device if they named one.
     pub(crate) fn new(device: Option<DeviceName>) -> Self {
-        Self::with_root(Path::new(SYSFS_ROOT), device)
+        Self {
+            root: Path::new(SYSFS_ROOT),
+            device,
+        }
     }
 
-    /// The test constructor. Production has exactly one root and it is a
-    /// constant; this exists so this module's tests can drive a fixture tree,
+    /// The test constructor, and **`#[cfg(test)]` rather than
+    /// `allow(dead_code)`**. Production has exactly one root and it is a
+    /// constant; this exists so this crate's tests can drive a fixture tree,
     /// which is the only way any of the bounds here can be exercised at all —
     /// **CI has no `/sys/class/backlight`, and a temp directory proves the
     /// bounds and the failure collapse and proves exactly nothing about a
     /// panel** (D-041's own statement of what cannot be known).
-    #[cfg_attr(not(test), allow(dead_code))]
+    ///
+    /// The distinction is not tidiness. A test points this at a `PathBuf` it
+    /// leaks (`session.rs`'s rig does, and so does `at` below), so while this
+    /// function is compiled the module doc's *"the only values that field can
+    /// ever hold are compile-time constants"* is false — `Box::leak` turns any
+    /// runtime path into a `&'static Path`. Under `#[cfg(test)]` the claim is
+    /// exactly true of every build this project ships, and the escape hatch
+    /// does not exist in the binary at all. `Backlight::new` therefore
+    /// constructs the struct directly rather than delegating here, because a
+    /// production caller would put it back in the release build.
+    #[cfg(test)]
     pub(crate) fn with_root(root: &'static Path, device: Option<DeviceName>) -> Self {
         Self { root, device }
     }
@@ -411,6 +440,18 @@ impl Backlight {
     /// A function of its own rather than four lines inside [`Self::resolve`],
     /// so `the_entry_cap_is_applied_after_the_sort` can assert the exact list
     /// instead of inferring the order from which device happened to win.
+    ///
+    /// **[`MAX_ENTRIES`] bounds the auto-pick and nothing else.** When the
+    /// operator named a device the filter runs against the *whole*
+    /// length-filtered set, before the cap, because the cap is there to bound
+    /// how much work an unbounded directory can cause and a named device is
+    /// already a bound of one. Applying it the other way round was a defect
+    /// with the same shape as `battery.rs`'s: on a class holding seventeen
+    /// entries whose seventeenth is the one the operator asked for by name,
+    /// `--backlight-device` resolved to nothing and every press journalled
+    /// `no_device` — a flag that silently did not work, on a machine where the
+    /// device is right there. A different device is still never a fallback:
+    /// the filter can only ever leave the named one or leave nothing.
     fn candidate_names(&self) -> Vec<std::ffi::OsString> {
         let Ok(entries) = std::fs::read_dir(self.root) else {
             return Vec::new();
@@ -421,6 +462,11 @@ impl Backlight {
             .filter(|name| name.as_encoded_bytes().len() <= MAX_NAME)
             .collect();
         names.sort();
+        if let Some(chosen) = self.device.as_ref() {
+            // At most one name survives this, so the truncate below is a no-op
+            // on the named path and the cap on the auto-pick path is unchanged.
+            names.retain(|name| name.as_encoded_bytes() == chosen.as_str().as_bytes());
+        }
         names.truncate(MAX_ENTRIES);
         names
     }
@@ -439,15 +485,12 @@ impl Backlight {
     /// chose, and why this is written down here instead of being discovered
     /// from a key that appears not to work.
     fn resolve(&self) -> Option<(PathBuf, u32)> {
+        // The operator's choice, if they made one, was applied by
+        // `candidate_names` — before the entry cap, and in exactly one place.
+        // A different device is not a fallback: silently driving a panel they
+        // did not ask for is worse than the key doing nothing, which is what
+        // an absent named device collapses to.
         for name in self.candidate_names() {
-            if let Some(chosen) = self.device.as_ref() {
-                // The operator named one. A different device is not a fallback:
-                // silently driving a panel they did not ask for is worse than
-                // the key doing nothing, which is what this collapses to.
-                if name.as_encoded_bytes() != chosen.as_str().as_bytes() {
-                    continue;
-                }
-            }
             let dir = self.root.join(&name);
             // `max_brightness` first, and a device without a legible one is
             // SKIPPED rather than fatal — the difference from `battery.rs`,
@@ -524,41 +567,9 @@ impl Backlight {
         else {
             return Outcome::Unreadable;
         };
-        // Both derived from `max` and both **at least 1**, so neither a panel
-        // whose `max_brightness` is 10 nor one whose ceiling is 96000 can
-        // produce a step of nothing or a floor of zero. Widened to `u64` before
-        // the multiply and divided last: `max / 100 * 5` throws away the
-        // remainder first and turns a `max_brightness` of 255 into a 3.9% step,
-        // and `max * 5` in `u32` would overflow at ceilings this type can hold
-        // even though no panel has one.
-        let percent_of_max =
-            |percent: u32| -> u32 { ((u64::from(max) * u64::from(percent)) / 100).max(1) as u32 };
-        let delta = percent_of_max(STEP_PERCENT);
-        let floor = percent_of_max(FLOOR_PERCENT);
-        let target = match step {
-            Step::Up => current.saturating_add(delta).min(max),
-            Step::Down => {
-                // At or below the floor, `Down` does NOTHING. Clamping upward
-                // here would make a "dim" press brighten a panel somebody else
-                // dimmed, and clamping downward would reach a value D-041
-                // forbids this core from writing at all.
-                if current <= floor {
-                    return Outcome::AtLimit;
-                }
-                current.saturating_sub(delta).max(floor)
-            }
-        };
-        // Up at full, and any step whose arithmetic lands where it started.
-        // Skipping the write is not an optimisation: a write that changes
-        // nothing would still be a journal line claiming the panel moved.
-        if target == current {
+        let Some(target) = step_target(step, current, max, STEP_PERCENT, FLOOR_PERCENT) else {
             return Outcome::AtLimit;
-        }
-        // The floor is a property of every value this module writes, not of the
-        // `Down` arm alone, and this is where that is true. Reaching it from
-        // the `Up` arm needs `current < floor`, which happens when something
-        // outside this core dimmed the panel first.
-        let target = target.max(floor).min(max);
+        };
         if !write_value(&path, target) {
             return Outcome::NotWritable;
         }
@@ -569,6 +580,80 @@ impl Backlight {
             percent: ((u64::from(target) * 100) / u64::from(max)) as u8,
         }
     }
+}
+
+/// `percent` of `max`, **rounded up**, and never less than 1 raw unit.
+///
+/// **Rounding up is what makes [`FLOOR_PERCENT`] a true statement rather than
+/// an approximate one.** Truncating divides the published claim in the wrong
+/// direction: `(255 * 5) / 100` is `12`, which is 4.71% of 255, and
+/// `(99 * 5) / 100` is `4`, which is 4.04% of 99 — so a core that published
+/// *"never below 5%"* and truncated would be publishing a floor it does not
+/// hold on the two commonest small ceilings there are. Rounding up costs at
+/// most one raw unit of brightness and buys a floor that is literally the
+/// number in the docs, on every `max_brightness` a panel can have.
+///
+/// Widened to `u64` before the multiply and divided last: `max / 100 * 5`
+/// throws away the remainder first and turns a `max_brightness` of 255 into a
+/// 3.9% step, and `max * 5` in `u32` would overflow at ceilings this type can
+/// hold even though no panel has one. The `.max(1)` is redundant for any
+/// non-zero `percent` — `div_ceil` already answers at least 1 whenever
+/// `max >= 1` — and is kept because it is the bound the module doc states, and
+/// a bound that depends on a caller never passing zero is not one.
+fn percent_of_max(max: u32, percent: u32) -> u32 {
+    (u64::from(max) * u64::from(percent)).div_ceil(100).max(1) as u32
+}
+
+/// **The whole of the step arithmetic**, with no filesystem in it.
+///
+/// `None` is [`Outcome::AtLimit`]; `Some(v)` is the value to write, and it is
+/// always in `[floor, max]`.
+///
+/// A free function taking both percentages **as arguments** rather than four
+/// lines inside [`Backlight::step`] reading the two constants, and that is the
+/// point rather than tidiness. [`STEP_PERCENT`] and [`FLOOR_PERCENT`] are
+/// equal, so with the shipped constants the final `max(floor)` below is
+/// *unreachable*: a step out of a below-floor value already lands at or above
+/// the floor. Tested only through `Backlight::step` it would therefore have no
+/// coverage at all while looking as though it had some —
+/// `the_final_clamp_lifts_a_step_smaller_than_the_floor` passes a step smaller
+/// than the floor and is the only thing that exercises it.
+fn step_target(
+    step: Step,
+    current: u32,
+    max: u32,
+    step_percent: u32,
+    floor_percent: u32,
+) -> Option<u32> {
+    // Both derived from `max` and both **at least 1**, so neither a panel whose
+    // `max_brightness` is 10 nor one whose ceiling is 96000 can produce a step
+    // of nothing or a floor of zero.
+    let delta = percent_of_max(max, step_percent);
+    let floor = percent_of_max(max, floor_percent).min(max);
+    let target = match step {
+        Step::Up => current.saturating_add(delta).min(max),
+        Step::Down => {
+            // At or below the floor, `Down` does NOTHING. Clamping upward here
+            // would make a "dim" press brighten a panel somebody else dimmed,
+            // and clamping downward would reach a value D-041 forbids this core
+            // from writing at all.
+            if current <= floor {
+                return None;
+            }
+            current.saturating_sub(delta).max(floor)
+        }
+    };
+    // Up at full, and any step whose arithmetic lands where it started.
+    // Skipping the write is not an optimisation: a write that changes nothing
+    // would still be a journal line claiming the panel moved.
+    if target == current {
+        return None;
+    }
+    // The floor is a property of every value this module writes, not of the
+    // `Down` arm alone, and this is where that is true. Reaching it from the
+    // `Up` arm needs `current + delta < floor`, which the shipped constants
+    // make impossible and a smaller step does not.
+    Some(target.max(floor).min(max))
 }
 
 /// Read at most `cap` bytes of `path` and trim it, or `None`.
@@ -1019,7 +1104,7 @@ mod tests {
     /// arithmetic gives a step of zero and a floor of zero.
     #[test]
     fn no_sequence_of_presses_reaches_zero() {
-        for max in [96000u32, 100, 10, 7, 1] {
+        for max in [96000u32, 1023, 255, 100, 99, 10, 7, 1] {
             let ceiling = format!("{max}\n");
             let start = format!("{max}\n");
             let root = tree(
@@ -1049,8 +1134,13 @@ mod tests {
             assert_eq!(light.step(Step::Down), Outcome::AtLimit);
             // The same arithmetic `step` does, restated once here on purpose:
             // a change to either side is then a red test rather than a silent
-            // drift in what "the floor" means.
-            let floor = ((u64::from(max) * u64::from(FLOOR_PERCENT)) / 100).max(1) as u32;
+            // drift in what "the floor" means. **Rounded up**, which is what
+            // makes the published 5% true on 255 (13, not 12) and on 99 (5,
+            // not 4) — the two ceilings in the list above that a truncating
+            // divide gets wrong.
+            let floor = (u64::from(max) * u64::from(FLOOR_PERCENT))
+                .div_ceil(100)
+                .max(1) as u32;
             assert_eq!(
                 value(&root, "intel_backlight"),
                 floor,
@@ -1074,11 +1164,22 @@ mod tests {
         assert_eq!(value(&root, "intel_backlight"), 2);
     }
 
-    /// ...and `Up` from there lands on the floor rather than on 2 + step,
-    /// because the floor is a property of every value written and not of one
-    /// arm.
+    /// ...and `Up` from there is allowed, and lands on `2 + step`.
+    ///
+    /// **Which is not the floor, and this test used to claim it was.** With
+    /// `max_brightness` 100 the step is 5 and the floor is 5, so `Up` from 2
+    /// lands on 7 — above the floor because it stepped, not because anything
+    /// clamped it. The name and the doc said *"lands on the floor rather than
+    /// on 2 + step"* while the assertions below said `7`, which is exactly
+    /// `2 + step`: the test asserted the opposite of what it claimed and the
+    /// final `target.max(floor)` in [`step_target`] had **no coverage at
+    /// all**, because [`STEP_PERCENT`] and [`FLOOR_PERCENT`] are equal and no
+    /// input to the shipped constants can reach it.
+    /// `the_final_clamp_lifts_a_step_smaller_than_the_floor` covers it, with a
+    /// step smaller than the floor; this one is what it always was — `Up` out
+    /// of a below-floor panel is a step and never a refusal.
     #[test]
-    fn an_up_press_below_the_floor_lands_on_the_floor() {
+    fn an_up_press_below_the_floor_steps_out_of_it() {
         let root = tree(
             "upfromfloor",
             &[(
@@ -1091,6 +1192,70 @@ mod tests {
             Outcome::Stepped { percent: 7 }
         );
         assert_eq!(value(&root, "intel_backlight"), 7);
+        // Said out loud, because it is the reason the test above cannot stand
+        // in for the clamp: 7 is `2 + step`, and the floor is 5.
+        assert_eq!(percent_of_max(100, STEP_PERCENT), 5);
+        assert_eq!(percent_of_max(100, FLOOR_PERCENT), 5);
+    }
+
+    /// **The final `max(floor)` clamp, exercised at last.**
+    ///
+    /// It is unreachable with the shipped constants — a step out of a
+    /// below-floor value lands at or above the floor whenever the step is at
+    /// least the floor, and [`STEP_PERCENT`] *is* [`FLOOR_PERCENT`]. So the
+    /// clamp is asked of [`step_target`] with a step **smaller** than the
+    /// floor, which is the only shape that reaches it, and the second half
+    /// shows the same input taking the other branch under the real constants
+    /// so this cannot be mistaken for a claim about shipped behaviour.
+    #[test]
+    fn the_final_clamp_lifts_a_step_smaller_than_the_floor() {
+        // 1% step, 20% floor, `max` 100: `Up` from 2 moves by 1 to 3, which is
+        // still below the floor of 20, so the clamp lifts it to exactly 20.
+        assert_eq!(step_target(Step::Up, 2, 100, 1, 20), Some(20));
+        // ...one notch further out and the clamp does nothing, which is what
+        // makes the assertion above about the clamp and not about the floor.
+        assert_eq!(step_target(Step::Up, 25, 100, 1, 20), Some(26));
+        // ...and with the constants this core ships, the first input is not
+        // clamped at all. Deleting the clamp would leave this whole file green
+        // except for the first assertion above.
+        assert_eq!(
+            step_target(Step::Up, 2, 100, STEP_PERCENT, FLOOR_PERCENT),
+            Some(7)
+        );
+    }
+
+    /// **The published floor is 5%, and this is where "published" is checked
+    /// against "computed".**
+    ///
+    /// `README.md`, `docs/book/src/limits.md`, `--help` and rung 16 of
+    /// `docs/drm-bringup.md` all say the core never writes below 5% of
+    /// `max_brightness`. Truncating the division made that false on most
+    /// ceilings — `(255 * 5) / 100` is 12, or 4.71%, and `(99 * 5) / 100` is
+    /// 4, or 4.04% — so the check is the published inequality itself rather
+    /// than a restatement of the expression.
+    #[test]
+    fn the_floor_is_never_below_the_published_five_percent() {
+        for max in [1u32, 7, 10, 15, 21, 99, 100, 255, 937, 1023, 96000] {
+            let floor = percent_of_max(max, FLOOR_PERCENT);
+            assert!(
+                u64::from(floor) * 100 >= u64::from(max) * u64::from(FLOOR_PERCENT),
+                "max_brightness {max}: a floor of {floor} is {}% of it, and every surface \
+                 this project publishes says never below {FLOOR_PERCENT}%",
+                f64::from(floor) * 100.0 / f64::from(max)
+            );
+            assert!(
+                floor >= 1,
+                "max_brightness {max}: the floor must never be 0"
+            );
+            assert!(
+                floor <= max,
+                "max_brightness {max}: the floor must be writable"
+            );
+        }
+        // The two ceilings the truncating version got wrong, pinned by value so
+        // a change back to `/ 100` is a named red rather than a general one.
+        assert_eq!(percent_of_max(255, FLOOR_PERCENT), 13);
+        assert_eq!(percent_of_max(99, FLOOR_PERCENT), 5);
     }
 
     #[test]
@@ -1193,6 +1358,53 @@ mod tests {
         assert_eq!(light.step(Step::Up), Outcome::Stepped { percent: 55 });
         assert_eq!(value(&root, "acpi_video0"), 48000);
         assert_eq!(value(&root, "intel_backlight"), 52800);
+    }
+
+    /// **A named device is found however many entries sort before it.**
+    ///
+    /// The cap bounds the *auto-pick*; a name is already a bound of one. When
+    /// the filter ran against the truncated list instead, a class holding
+    /// enough entries whose names sort ahead of the operator's — `acpi_video0`
+    /// and a row of `card0-*-backlight` DRM devices do exactly that on real
+    /// hardware — made `--backlight-device intel_backlight` resolve to nothing
+    /// and every press journal `no_device`, with the device sitting right
+    /// there. Sixteen decoys is one more than the cap can hold beside it.
+    #[test]
+    fn a_named_device_is_found_past_the_entry_cap() {
+        let decoys: Vec<String> = (0..MAX_ENTRIES + 8)
+            .map(|i| format!("bl{i:02}_backlight"))
+            .collect();
+        let small: Vec<(&str, &str)> = vec![("max_brightness", "100\n"), ("brightness", "50\n")];
+        let mut refs: Vec<(&str, &[(&str, &str)])> = decoys
+            .iter()
+            .map(|name| (name.as_str(), small.as_slice()))
+            .collect();
+        // `intel_backlight` sorts after every `bl..` name, so a cap applied
+        // before the filter removes it and nothing else.
+        refs.push(("intel_backlight", REAL_INTEL));
+        let root = tree("namedpastcap", &refs);
+
+        let light = at(root.clone(), Some("intel_backlight"));
+        assert_eq!(
+            light.candidate_names(),
+            vec![std::ffi::OsString::from("intel_backlight")],
+            "a named device is the whole candidate list, whatever sorts before it"
+        );
+        assert_eq!(light.step(Step::Up), Outcome::Stepped { percent: 55 });
+        assert_eq!(value(&root, "intel_backlight"), 52800);
+        for name in &decoys {
+            assert_eq!(
+                value(&root, name),
+                50,
+                "{name} must never have been written"
+            );
+        }
+        // ...and the auto-pick over the same tree still stops at the cap, so
+        // the fix above did not quietly widen the bound it was written beside.
+        let auto = at(root.clone(), None);
+        assert_eq!(auto.candidate_names().len(), MAX_ENTRIES);
+        assert_eq!(auto.step(Step::Up), Outcome::Stepped { percent: 55 });
+        assert_eq!(value(&root, "bl00_backlight"), 55);
     }
 
     #[test]
@@ -1371,14 +1583,18 @@ mod tests {
     /// `crate::backend`'s `the_blank_cover_has_exactly_one_chokepoint` is the
     /// precedent, including the truncation: otherwise the tests that exercise
     /// the write would count as production call sites.
-    fn rust_sources(dir: &Path, out: &mut Vec<(String, String)>) {
+    ///
+    /// Named by path **relative to `src/`** rather than by file name, because
+    /// this crate has seven files called `mod.rs` and an allowlist that cannot
+    /// tell them apart is an allowlist that admits six files nobody reviewed.
+    fn rust_sources(base: &Path, dir: &Path, out: &mut Vec<(String, String)>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
         };
         for entry in entries.filter_map(Result::ok) {
             let path = entry.path();
             if path.is_dir() {
-                rust_sources(&path, out);
+                rust_sources(base, &path, out);
             } else if path.extension().is_some_and(|ext| ext == "rs") {
                 let Ok(text) = std::fs::read_to_string(&path) else {
                     continue;
@@ -1388,8 +1604,8 @@ mod tests {
                     .map(|(before, _)| before.to_string())
                     .unwrap_or(text);
                 out.push((
-                    path.file_name()
-                        .unwrap_or_default()
+                    path.strip_prefix(base)
+                        .unwrap_or(&path)
                         .to_string_lossy()
                         .into(),
                     production,
@@ -1400,10 +1616,8 @@ mod tests {
 
     fn crate_sources() -> Vec<(String, String)> {
         let mut sources = Vec::new();
-        rust_sources(
-            Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src")),
-            &mut sources,
-        );
+        let base = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src"));
+        rust_sources(base, base, &mut sources);
         assert!(
             sources.iter().any(|(name, _)| name == "backlight.rs"),
             "the scan must cover this file, or it proves nothing"
@@ -1412,8 +1626,23 @@ mod tests {
             sources.iter().any(|(name, _)| name == "session.rs"),
             "the scan must cover the embedder, or a second call site there would be invisible"
         );
+        assert!(
+            sources.iter().any(|(name, _)| name == "input/mod.rs"),
+            "the scan must name nested files by their path, or the allowlist below cannot tell \
+             this crate's seven `mod.rs` files apart"
+        );
         sources
     }
+
+    /// The files **outside this module** that may name [`SYSFS_ROOT`] at all.
+    ///
+    /// Both name it in prose and neither writes anything: `main.rs` in
+    /// `--backlight`'s usage text, `input/mod.rs` in the comment on the two
+    /// scancodes. The list is short on purpose — every entry on it is a file
+    /// the assertion below then checks for a raw write API, and a file that
+    /// both knows the path and holds `OpenOptions` or `fs::write` is the exact
+    /// second writer the token count cannot see.
+    const MAY_NAME_THE_ROOT: &[&str] = &["main.rs", "input/mod.rs"];
 
     /// **The write has exactly one call site.**
     ///
@@ -1424,18 +1653,31 @@ mod tests {
     /// place in the core that opens a backlight attribute for writing, and this
     /// module growing a second caller of its own writer so the floor is applied
     /// in one of them and not the other.
+    ///
+    /// **The token counts alone do not hold the claim in the failure message,
+    /// and used to be asserted as though they did.** Counting `write_value(`
+    /// and `open_for_write(` sees only writers spelled with *this module's*
+    /// function names: a second writer that reached for `std::fs::write` or
+    /// built its own `OpenOptions` would pass both counts untouched, while the
+    /// message underneath said *"nothing outside this module may open a
+    /// backlight attribute for writing"*. So the reach is pinned as well as
+    /// the spelling — a file outside this module may name [`SYSFS_ROOT`] only
+    /// if it is on [`MAY_NAME_THE_ROOT`], and a file on that list may not hold
+    /// a raw write API at all. It is a bound on which files can reach the
+    /// backlight tree, which is the property the message actually asserts.
     #[test]
     fn the_backlight_write_has_exactly_one_call_site() {
+        let sources = crate_sources();
         let mut writers: Vec<(String, usize)> = Vec::new();
         let mut openers: Vec<(String, usize)> = Vec::new();
-        for (name, text) in crate_sources() {
+        for (name, text) in &sources {
             let w = text.match_indices("write_value(").count();
             let o = text.match_indices("open_for_write(").count();
             if w > 0 {
                 writers.push((name.clone(), w));
             }
             if o > 0 {
-                openers.push((name, o));
+                openers.push((name.clone(), o));
             }
         }
         // One definition and one call, both in this file: `fn write_value(` and
@@ -1453,6 +1695,46 @@ mod tests {
             vec![("backlight.rs".to_string(), 3)],
             "nothing outside this module may open a backlight attribute for writing"
         );
+
+        // ...and the half the counts above are blind to. Which files can reach
+        // the backlight tree at all, by name:
+        let reaches: Vec<&String> = sources
+            .iter()
+            .filter(|(name, text)| name != "backlight.rs" && text.contains(SYSFS_ROOT))
+            .map(|(name, _)| name)
+            .collect();
+        for name in &reaches {
+            assert!(
+                MAY_NAME_THE_ROOT.contains(&name.as_str()),
+                "{name} names `{SYSFS_ROOT}` and is not on this module's allowlist. Adding it \
+                 there is a claim somebody has to defend: the bound D-041 rests on is that one \
+                 module knows this path"
+            );
+        }
+        assert_eq!(
+            reaches.len(),
+            MAY_NAME_THE_ROOT.len(),
+            "every entry on the allowlist must still name the root, or the assertion below is \
+             checking files that cannot fail it: {reaches:?}"
+        );
+        // ...and none of them may hold a raw write API. This is the assertion
+        // the token counts cannot make: `std::fs::write(dir.join(\"brightness\"),
+        // b\"0\")` is a second writer that spells neither of this module's
+        // function names, and it would reach a panel through a floor that never
+        // ran.
+        for name in &reaches {
+            let text = sources
+                .iter()
+                .find(|(candidate, _)| candidate == *name)
+                .map(|(_, text)| text.as_str())
+                .expect("the name came out of this list");
+            assert!(
+                !text.contains("OpenOptions") && !text.contains("fs::write"),
+                "{name} both names `{SYSFS_ROOT}` and holds a raw write API. Every write to \
+                 that tree must go through `write_value`, which is the only place the floor \
+                 and the `[floor, max]` band are applied"
+            );
+        }
     }
 
     /// **The root is not reachable from any client-settable field.**

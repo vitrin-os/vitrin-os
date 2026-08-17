@@ -1595,6 +1595,12 @@ correction is followed here and not the issue.
   *and* a shim→core wire verb, i.e. paired IDL + prose work on `track:protocol`.
   **Reopened by:** that paired edit. Until then, publish plainly — **full-screen
   video will blank the screen.**
+
+  > **TRACKED 2026-08-17.** The paired edit is still owed and this deferral is
+  > therefore still standing — what changed is only that it is no longer
+  > untracked. It is [#306](https://github.com/vitrin-os/vitrin-os/issues/306).
+  > The bullet above is left as written because it is the honest status: nothing
+  > has been built, and full-screen video still blanks the screen.
 - **A software frame cadence for blanked or paused realms.** Inherits D-030's
   existing unscheduled deferral. **Reopened by:** the first agent-visible stall an
   operator reports, or an owner decision that a blank halting agents is
@@ -1605,6 +1611,14 @@ correction is followed here and not the issue.
   brightness and nothing happens. **Reopened by:** a shell client holding a named
   verb (Stage 2's design), or an explicit owner decision to let the core write
   `/sys/class/backlight`.
+
+  > **REOPENED 2026-08-17 BY THE SECOND OF ITS TWO NAMED TRIGGERS.** The owner
+  > decided that the core writes `/sys/class/backlight` — not the shell-client
+  > route this bullet named first. The decision is
+  > [D-041](20-decision-log.md#d-041--the-core-writes-sysclassbacklight-so-the-brightness-keys-actuate-d-033-refused-that-interface-as-a-blanking-mechanism-and-half-of-its-reasoning-still-bites-here)
+  > and the work is [#303](https://github.com/vitrin-os/vitrin-os/issues/303).
+  > **Nothing is built yet**, so the sentence above — the human presses
+  > brightness and nothing happens — is still true of every checkout today.
 - **Preparing for suspend** (logind `PrepareForSleep`). Stands on the no-D-Bus-in-
   the-TCB decision. **Reopened by:** evidence that post-hoc resume detection is
   insufficient — specifically, a reproducible corrupted or lost frame across a

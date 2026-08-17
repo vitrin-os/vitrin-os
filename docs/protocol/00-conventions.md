@@ -842,8 +842,8 @@ to is recorded here or nowhere.
 > `vitrin_shim_session.idle_inhibit` and its `idle_inhibit_state` enum, and both
 > rows above were extended in that same edit — the first addition since the rule
 > below was written down that had the warning above already in front of it. The
-> enum count in the paragraph below is stated as a number *and* as a list on
-> purpose: the number is what a reader checks against the list, and a
+> enum count in the paragraph *above* is stated as a number ("seven") *and* as a
+> list on purpose: the number is what a reader checks the list against, and a
 > disagreement between the two is the cheapest possible way to notice a drop.
 
 A version-1

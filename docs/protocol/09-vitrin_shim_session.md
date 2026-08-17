@@ -1,6 +1,6 @@
 # vitrin_shim_session — shim connection bootstrap
 
-**Interface version:** 2 · **Connection class:** shim · **Messages:** 4 requests + 4 events
+**Interface version:** 2 · **Connection class:** shim · **Messages:** 5 requests + 4 events
 
 > Framing, object-id allocation, the fatal/recoverable error taxonomy, delivery
 > classification, and versioning are defined once on the [conventions
@@ -44,18 +44,32 @@ asks; the pointer constraint is here because the **app** asks, and
 [`vitrin_shim_seat`](./11-vitrin_shim_seat.md) can carry neither half — that
 interface defines no requests at all (structural rule B2, schema-enforced), and
 every event on it ends with an `origin` tag naming a human's device or a
-principal's actuator, which a confined app is neither. So this one object
-carries the only two exchanges in the protocol whose asking party is not the one
-the interface it would otherwise belong to was built around. The IDL's own
+principal's actuator, which a confined app is neither.
+
+Version 2 carries a third such exchange, the **idle inhibit**
+([D-042](../plan/20-decision-log.md), issue #306): the `idle_inhibit` request,
+with no event of its own. It is app-asked like the pointer constraint, and it
+is here for that reason and one further — what it asks about is not input at
+all but the human's own panel, which no other interface addresses from the
+app's side. So this one object carries **every** exchange in the protocol whose
+asking party is not the one the interface it would otherwise belong to was
+built around. This paragraph said "the only two" until issue #306, and the
+correction is recorded rather than quietly applied: a closed count in a
+normative description is the tripwire
+[§7.4](./00-conventions.md#74-growth-rules-wayland-style) exists to warn about,
+so it is now written as a rule rather than as a number. The IDL's own
 descriptions carry the full argument and are authoritative.
 
-Two naming rules apply to everything below, and both are load-bearing. **Call it
-a *pointer constraint* or a *pointer lock*, never a bare "constraint"** — in
+Three naming rules apply to everything below, and each is load-bearing. **Call
+it a *pointer constraint* or a *pointer lock*, never a bare "constraint"** — in
 this protocol that word already means a **petition** constraint
 ([`vitrin_realm.request_grant`](./03-vitrin_realm.md)'s `flags`, and the
 `set_constraint` builder in [Appendix A](./00-conventions.md)), so every
-identifier this pair mints carries the qualifier. And **the core decides**: the
-shim's message is an *ask*, not a setting.
+identifier this pair mints carries the qualifier. **Call it an *idle inhibit*,
+never a bare "inhibit"** — Wayland has a second inhibitor (keyboard shortcuts)
+this protocol does not serve, and an unqualified identifier would be a
+collision waiting for the day it does. And **the core decides**: in both pairs
+the shim's message is an *ask*, not a setting.
 
 From this object the shim mints the two children that carry all subsequent
 shim-connection traffic: a [`vitrin_shim_surface`](./10-vitrin_shim_surface.md)
@@ -273,6 +287,88 @@ fire-and-forget ([§6.2](./00-conventions.md)) is **overridden in the strict
 direction**: the core sends at most one `pointer_constraint_state` per
 transition and never coalesces two different states.
 
+### idle_inhibit (since 2)
+
+```
+idle_inhibit(surface: object<vitrin_shim_surface>?, state: idle_inhibit_state)
+```
+
+| name | type | description |
+|---|---|---|
+| `surface` | `object<`[`vitrin_shim_surface`](./10-vitrin_shim_surface.md)`>` (nullable) | the surface whose content asks to stay visible; MUST be null when `state` is `released` |
+| `state` | `uint`<`idle_inhibit_state`> | whether this realm is holding an idle inhibit |
+
+The confined app's **ask**, relayed by its shim: *"do not blank the screen while
+this plays"*. It runs in `pointer_constraint`'s direction — the app asks and the
+core decides — and the opposite of `request_selection`'s.
+
+**The shim aggregates; the wire carries one bit per realm.** An app may hold any
+number of `zwp_idle_inhibitor_v1` objects at once, and the core has no use for
+the count: it is deciding one question about one panel. The shim therefore sends
+`held` when its live-inhibitor count rises from zero and `released` when it
+falls back to zero, and nothing in between. That leaves the per-object
+bookkeeping with the side that can see object lifetimes.
+
+**One message is the whole state, and `released` is the withdrawal** —
+`pointer_constraint`'s `kind = none` discipline, for its reason. Repetition is
+legal and idempotent: a second `held` while held changes nothing, so a shim that
+re-states its position is correct rather than merely tolerated.
+
+**No serial and no verdict event, and both absences are argued.** A serial names
+the answer an ask expects, and this ask has none. There is no verdict because
+there is nowhere to deliver one: `zwp_idle_inhibitor_v1` defines no events at
+all, so an app's only observable is whether its screen blanked — which makes a
+refusal both unobservable and harmless, since a deployment that blanks nothing
+has satisfied the ask vacuously. This is the one place the pair differs from
+`pointer_constraint`, whose app *is* waiting for an activation and would latch
+forever without one.
+
+**What the core honours.** An inhibit holds off the blank only while the human's
+output is bound to the realm that holds it. An inhibit from a realm the human is
+not looking at holds nothing, and stops holding the moment they look elsewhere —
+no new ask, and no message saying so. A background realm able to pin the human's
+panel awake would be an ambient power-and-attention channel; Wayland's own
+advice ("inhibitors should only be in effect while this surface is visible")
+says the same thing in the compositor's voice.
+
+**It suppresses the blank and never the lock.** The idle blank and the idle lock
+are separate mechanisms that share one activity clock
+([D-033](../plan/20-decision-log.md)(2)), and this message writes no clock: it
+adds a term to the blank's own decision and nothing else. So an idle lock still
+raises on time with an inhibit held, and the consequence for the human is named
+rather than hidden — a film longer than the idle-lock timeout gets a lock screen
+over it, exactly as it would with no inhibit at all.
+[D-042](../plan/20-decision-log.md) records why an inhibit needs no grant, and
+this is half of its argument.
+
+**The record is the core's, and the core drops it** on every path it already
+tears down a realm's other state on: the realm dying, the seat being handed to
+another session, the human's dead-man chord. The shim's own release is driven by
+**object destruction** rather than by app cooperation, so an app that exits
+without destroying its inhibitor still releases it. Both halves exist because a
+leaked inhibit that pins a human's panel awake forever is the worst failure this
+message can cause, and one layer of defence against that is a layer that can be
+forgotten.
+
+`surface` is recorded but gating is per **realm** today, not per surface — a
+named cost, carried for the reason `pointer_constraint` carries `lifetime`: a
+signature is immutable forever, nothing in this protocol hard-codes one surface
+per shim, and per-surface gating could not be added later without a whole new
+message.
+
+**Errors.** What is fatal is unchanged decode-level ground: a `surface` id this
+connection never minted, or one at or below its watermark, is `invalid_object`
+(the razor's first clause — the shim violating its **own** object graph); an
+out-of-range `state` is `invalid_argument`. On a shim connection both mean
+log-and-close. Stated positively so nobody goes looking: this request adds **no**
+new shim log-only condition, and — carrying no `string` argument — **no** row to
+[§2.3](./00-conventions.md)'s per-argument byte-bound table. An inhibit naming a
+surface that has never committed is a legitimate ask that simply holds nothing,
+not a `bad_order`.
+
+**Delivery class:** **fire-and-forget** ([§6.2](./00-conventions.md)), and here
+with no override: there is no answer, so there is nothing to coalesce.
+
 ## Events
 
 ### configure
@@ -489,6 +585,25 @@ them: nothing follows on that serial ever again.
 
 Entries are appended, never renumbered, like every enum in this protocol.
 
+### idle_inhibit_state (since 2)
+
+| entry | value | meaning |
+|---|---|---|
+| `released` | 0 | this realm holds no inhibit; `surface` MUST be null |
+| `held` | 1 | this realm asks that the screen not blank while its output is on the panel |
+
+Two entries, because the shim aggregates however many `zwp_idle_inhibitor_v1`
+objects its app holds into one bit. There is no count on the wire and there is
+deliberately no room for one: a count would make the core the bookkeeper of
+object lifetimes it cannot see.
+
+**The zero value is "not inhibited"**, on `pointer_constraint_status`' rule and
+for its reason: zero is where a mis-decode and a zeroed struct both land, and
+the safe reading of a byte nobody can trust is that the human's screen may
+blank. "Hold this panel awake" must never be what a zero means.
+
+Entries are appended, never renumbered, like every enum in this protocol.
+
 ## Flows
 
 The scenarios below are drawn from the canonical message-flow set; only the
@@ -554,6 +669,27 @@ exit must never be left with no visible pointer. Step 8 is why `persistent`
 exists — a design that only *un*-hid on the way out would owe a second, easily
 forgotten re-hide on the way back.
 
+### Flow M — an app asks the screen not to blank, and then leaks the ask
+
+Realm A's app is playing a film. The session runs `--blank-idle 300`. Nothing
+below is triggered by a principal and nothing below is refusable by one: an idle
+inhibit is derived from **no grant** ([D-042](../plan/20-decision-log.md)), so
+revoking every grant in the session leaves it exactly as it was.
+
+1. `[A's app creates a zwp_idle_inhibitor_v1 for its own surface on its Wayland connection to the shim]`
+2. **S(A)→C** `vitrin_shim_session.idle_inhibit(surface=<A's surface>, state=held)` — the shim's live-inhibitor count rose from zero
+3. `[300 s pass with no physical input. The blank does not fire: the output is bound to A, and A holds an inhibit. There is no event; the app's only observable is the screen it can see]`
+4. `[the human moves the output to realm B]`
+5. `[the blank's countdown is live again — A's inhibit holds nothing while the human is looking at B, with no message either way. If the session also runs --lock-idle, the lock was never held off at any point above]`
+6. `[the human returns to A. A's inhibit holds again, still with no new ask]`
+7. `[A's app is killed and never destroys its inhibitor. wlroots destroys the resource with the client, the shim's count falls to zero]` **S(A)→C** `idle_inhibit(surface=null, state=released)`
+8. `[if the SHIM died too, step 7 never happens — and the record still goes, because the core drops a realm's inhibit on the same path it drops the realm's seat state and its pointer constraint]`
+
+Steps 7 and 8 are the whole safety property, and they are deliberately two
+layers: a leaked inhibit that pins a human's panel awake forever is the worst
+failure this message can cause, and a single layer against it is a layer that
+can be forgotten.
+
 The `already_initialized` path (a second `get_seat`) does not appear in the
 canonical scenarios; it is a hostile/buggy-shim condition that terminates the
 connection by log-and-close.
@@ -604,6 +740,24 @@ never change meaning.
   deltas, say) is additive and is not foreclosed: it would be a facet on
   [`vitrin_grant`](./04-vitrin_grant.md) under a verb of its own, reaching the
   same core-side record through the enforcement chokepoint.
+
+- **Per-surface idle inhibition, and an inhibit verdict.** `idle_inhibit`
+  carries one bit per realm and no answer. Gating an inhibit on *which* surface
+  is visible, once a shim composites more than one, is an appended sibling — the
+  `surface` argument is already there to be read. An answer is the harder
+  addition and is deliberately not reserved for: `zwp_idle_inhibitor_v1` has no
+  events, so a verdict would have no destination beyond the shim's log, and
+  inventing one would mean inventing an app-visible message Wayland does not
+  have. If a later Wayland protocol gains one, the verdict is an appended
+  `since`-gated event, never a change to this request.
+
+- **An agent-facing inhibit verb.** As with the pointer constraint, nothing here
+  is grant-governed, because the asking party is the **confined app**
+  ([D-042](../plan/20-decision-log.md)). A principal asking to hold the human's
+  panel awake is a *different* request with a different answer — the blank
+  module refuses an agent even the power to *wake* a panel — and if it is ever
+  served it arrives as a facet under a verb of its own, not as a widening of
+  this one.
 
 - **Restart policy.** Version 1 defines none: shim death is terminal for the
   realm's surface. A restart/relaunch policy is a later addition; because it is

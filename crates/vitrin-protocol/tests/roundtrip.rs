@@ -84,6 +84,7 @@ type RequestSelection = gen::vitrin_shim_session::events::RequestSelection;
 type OfferSelection = gen::vitrin_shim_session::events::OfferSelection;
 type SessionPointerConstraint = gen::vitrin_shim_session::requests::PointerConstraint;
 type SessionPointerConstraintState = gen::vitrin_shim_session::events::PointerConstraintState;
+type SessionIdleInhibit = gen::vitrin_shim_session::requests::IdleInhibit;
 
 type Attach = gen::vitrin_shim_surface::requests::Attach;
 type Damage = gen::vitrin_shim_surface::requests::Damage;
@@ -229,6 +230,7 @@ impl_message!(
     OfferSelection,
     SessionPointerConstraint,
     SessionPointerConstraintState,
+    SessionIdleInhibit,
     Attach,
     Damage,
     Commit,
@@ -579,6 +581,21 @@ fn session_pointer_constraint() -> impl Strategy<Value = SessionPointerConstrain
         })
 }
 
+/// The idle inhibit (WS-E.4.4, issue #306).
+///
+/// `surface` is exercised both null and non-null in both `state` arms, for
+/// `session_pointer_constraint`'s reason: the IDL requires a null `surface`
+/// when `state` is `released`, but that is a *semantic* rule the core enforces
+/// and not a codec one, so the round trip generates every combination the wire
+/// admits rather than only the well-formed ones.
+fn session_idle_inhibit() -> impl Strategy<Value = SessionIdleInhibit> {
+    (
+        nullable_object(),
+        plain_enum(gen::vitrin_shim_session::IdleInhibitState::ALL),
+    )
+        .prop_map(|(surface, state)| SessionIdleInhibit { surface, state })
+}
+
 fn session_pointer_constraint_state() -> impl Strategy<Value = SessionPointerConstraintState> {
     (
         any_u32(),
@@ -851,6 +868,10 @@ roundtrip_test!(
 roundtrip_test!(
     roundtrip_vitrin_shim_session_pointer_constraint_state,
     session_pointer_constraint_state()
+);
+roundtrip_test!(
+    roundtrip_vitrin_shim_session_idle_inhibit,
+    session_idle_inhibit()
 );
 
 // vitrin_shim_surface.attach: fd-bearing, see dedicated block below.

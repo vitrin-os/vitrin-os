@@ -91,6 +91,7 @@ static int sink = 0;
     X(vitrin_shim_session_evt_offer_selection)                               \
     X(vitrin_shim_session_req_pointer_constraint)                            \
     X(vitrin_shim_session_evt_pointer_constraint_state)                      \
+    X(vitrin_shim_session_req_idle_inhibit)                                  \
     X(vitrin_shim_surface_req_attach)                                        \
     X(vitrin_shim_surface_req_damage)                                        \
     X(vitrin_shim_surface_req_commit)                                        \

@@ -315,7 +315,7 @@ static inline vitrin_decode_status_t vitrin_frame_header_decode(
 /* test_header_compiles.c) checks its own list length against this with */
 /* _Static_assert, so a message added to the IDL cannot ship without a */
 /* compile-time proof that its marshal functions type-check. */
-#define VITRIN_MESSAGE_COUNT 47
+#define VITRIN_MESSAGE_COUNT 48
 
 /* ==================================================================== */
 /* Section 1: per-interface metadata and enums.                          */
@@ -820,6 +820,30 @@ static inline bool vitrin_shim_session_pointer_constraint_status_is_valid(uint32
         case VITRIN_SHIM_SESSION_POINTER_CONSTRAINT_STATUS_WITHDRAWN:
         case VITRIN_SHIM_SESSION_POINTER_CONSTRAINT_STATUS_REFUSED:
         case VITRIN_SHIM_SESSION_POINTER_CONSTRAINT_STATUS_SUPERSEDED:
+            return true;
+        default:
+            return false;
+    }
+}
+
+/* Enum `idle_inhibit_state` on `vitrin_shim_session`.
+ *
+ * whether a realm is holding an idle inhibit
+ *
+ * Plain enum: a wire value MUST exactly equal one defined entry. */
+typedef enum {
+    /* this realm holds no inhibit; surface MUST be null */
+    VITRIN_SHIM_SESSION_IDLE_INHIBIT_STATE_RELEASED = 0,
+    /* this realm asks that the screen not blank while its output is on the panel */
+    VITRIN_SHIM_SESSION_IDLE_INHIBIT_STATE_HELD = 1,
+} vitrin_shim_session_idle_inhibit_state_t;
+
+/* Whole-value membership check for `vitrin_shim_session_idle_inhibit_state_t` (decode a wire value by
+   whether it equals one of the defined entries above). */
+static inline bool vitrin_shim_session_idle_inhibit_state_is_valid(uint32_t v) {
+    switch (v) {
+        case VITRIN_SHIM_SESSION_IDLE_INHIBIT_STATE_RELEASED:
+        case VITRIN_SHIM_SESSION_IDLE_INHIBIT_STATE_HELD:
             return true;
         default:
             return false;
@@ -3572,6 +3596,107 @@ static inline vitrin_decode_status_t vitrin_shim_session_req_pointer_constraint_
     if (st_width != VITRIN_DECODE_OK) { return st_width; }
     vitrin_decode_status_t st_height = vitrin_raw_read_u32(in, in_len, &pos, &out->height);
     if (st_height != VITRIN_DECODE_OK) { return st_height; }
+    if (pos != in_len) {
+        return VITRIN_DECODE_ERR_TRAILING_BYTES;
+    }
+    *out_object_id = hdr.object_id;
+    return VITRIN_DECODE_OK;
+}
+
+/* Request `idle_inhibit` (opcode 4) on `vitrin_shim_session`.
+ *
+ * ask the core not to blank this realm's screen while it is being watched
+ */
+typedef struct {
+    /* the surface whose content asks to stay visible; MUST be null when state is released (object: vitrin_shim_surface; 0 = null) */
+    uint32_t surface;
+    /* whether this realm is holding an idle inhibit */
+    vitrin_shim_session_idle_inhibit_state_t state;
+} vitrin_shim_session_req_idle_inhibit_t;
+
+#define VITRIN_SHIM_SESSION_REQ_IDLE_INHIBIT_OPCODE ((uint8_t)4)
+#define VITRIN_SHIM_SESSION_REQ_IDLE_INHIBIT_HAS_FD 0
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_SHIM_SESSION_REQ_IDLE_INHIBIT_SINCE 2u
+
+/* Encodes into a complete frame (header + argument payload). Returns the
+   number of bytes written (fits in an int32_t: the wire format's own u16
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
+static inline int32_t vitrin_shim_session_req_idle_inhibit_encode(const vitrin_shim_session_req_idle_inhibit_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN + 4 + 4;
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
+        return VITRIN_ENCODE_ERR_OVERFLOW;
+    }
+    vitrin_frame_header_t hdr;
+    hdr.object_id = object_id;
+    hdr.size = (uint16_t)size;
+    hdr.opcode = VITRIN_SHIM_SESSION_REQ_IDLE_INHIBIT_OPCODE;
+    hdr.fd_count = (uint8_t)VITRIN_SHIM_SESSION_REQ_IDLE_INHIBIT_HAS_FD;
+    vitrin_frame_header_encode(&hdr, out);
+    size_t pos = VITRIN_HEADER_LEN;
+    vitrin_raw_write_u32(out + pos, msg->surface);
+    pos += 4u;
+    vitrin_raw_write_u32(out + pos, (uint32_t)msg->state);
+    pos += 4u;
+    return (int32_t)size;
+}
+
+/* Decodes one complete frame's bytes (in/in_len -- exactly one frame, e.g.
+   already delimited by a transport layer using the header's own size field,
+   out of scope here) plus, iff HAS_FD below, the fd received alongside it
+   out-of-band (fd = -1 if none). On success writes the frame's object_id to
+   *out_object_id and the decoded message to *out and returns
+   VITRIN_DECODE_OK; otherwise returns a negative vitrin_decode_status_t and
+   leaves *out_object_id and *out unspecified.
+
+   docs/protocol/00-conventions.md 2.4/5.2 define fd_violation as two
+   independent disjuncts, both checked here: the header's own fd_count byte
+   disagreeing with this message's signature, and the out-of-band fd
+   parameter disagreeing with it. A hostile or buggy peer can make either
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
+static inline vitrin_decode_status_t vitrin_shim_session_req_idle_inhibit_decode(
+    const uint8_t *in, size_t in_len, int fd,
+    uint32_t *out_object_id, vitrin_shim_session_req_idle_inhibit_t *out) {
+    int fd_present = (fd >= 0) ? 1 : 0;
+    if (fd_present != VITRIN_SHIM_SESSION_REQ_IDLE_INHIBIT_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    vitrin_frame_header_t hdr;
+    vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
+    if (hdr_st != VITRIN_DECODE_OK) {
+        return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_SHIM_SESSION_REQ_IDLE_INHIBIT_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
+    }
+    if (hdr.fd_count != (uint8_t)VITRIN_SHIM_SESSION_REQ_IDLE_INHIBIT_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    size_t pos = VITRIN_HEADER_LEN;
+    vitrin_decode_status_t st_surface = vitrin_raw_read_u32(in, in_len, &pos, &out->surface);
+    if (st_surface != VITRIN_DECODE_OK) { return st_surface; }
+    uint32_t state_raw;
+    vitrin_decode_status_t st_state = vitrin_raw_read_u32(in, in_len, &pos, &state_raw);
+    if (st_state != VITRIN_DECODE_OK) { return st_state; }
+    if (!vitrin_shim_session_idle_inhibit_state_is_valid(state_raw)) { return VITRIN_DECODE_ERR_INVALID_ENUM; }
+    out->state = (vitrin_shim_session_idle_inhibit_state_t)state_raw;
     if (pos != in_len) {
         return VITRIN_DECODE_ERR_TRAILING_BYTES;
     }

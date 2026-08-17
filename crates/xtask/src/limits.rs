@@ -787,10 +787,14 @@ pub const CLAIMS: &[Claim] = &[
         }],
     },
     Claim {
-        id: "no-idle-inhibit",
-        says: "Idle inhibition is not served, so full-screen video will blank the screen.",
-        issue: "#223 (WS-E.4.3, open) owns it; it reopens on a paired IDL + prose edit on \
-                track:protocol.",
+        id: "idle-inhibit-bounded",
+        says: "Idle inhibition IS served, and is published as a bound: only the realm the \
+               human's output is bound to can hold one, it suppresses the blank and never the \
+               idle lock, and no run on real hardware has confirmed a video keeping a panel \
+               lit.",
+        issue: "#306 (WS-E.4.4) built it and D-042 decided that holding one needs no grant; \
+                #223 (WS-E.4.3, open) still owns the blank itself, whose hardware rungs this \
+                one inherits.",
         surfaces: &[
             Anchor {
                 path: LIMITS,
@@ -805,12 +809,40 @@ pub const CLAIMS: &[Claim] = &[
                 needle: "zwp_idle_inhibit_manager_v1",
             },
         ],
-        evidence: &[Evidence::AbsentFrom {
-            roots: &["shim/src", "protocol/vitrin-v0.xml"],
-            needle: "idle_inhibit",
-            means: "neither the shim global nor the shim->core wire verb exists. Both are \
-                    needed, so either one appearing means this claim needs re-reading.",
-        }],
+        evidence: &[
+            // The two halves the old claim's absence-of-both anchored, now
+            // required to be PRESENT: a global with no wire verb, or a wire verb
+            // with no global, would each make the published sentence false in a
+            // different direction.
+            Evidence::Contains {
+                path: "shim/src/globals.c",
+                needle: "vitrin_idle_create(s);",
+                means: "the shim advertises `zwp_idle_inhibit_manager_v1`. If this goes, apps \
+                        cannot ask at all and the published claim becomes false in the \
+                        optimistic direction.",
+            },
+            Evidence::Contains {
+                path: "protocol/vitrin-v0.xml",
+                needle: "<request name=\"idle_inhibit\"",
+                means: "the shim->core wire verb exists. Without it the global would be a \
+                        promise the shim cannot keep, which is the state D-042 says version 2 \
+                        left behind.",
+            },
+            // The bound itself, and it is the half a reader is most likely to
+            // lose in a refactor: the suppression is a `tick` guard, so it
+            // cannot postpone the lock. A parameter named here rather than a
+            // whole call, because a formatter may wrap the call and will not
+            // rename the parameter.
+            Evidence::Contains {
+                path: "crates/vitrin-core/src/backend/blank.rs",
+                needle: "inhibited: bool",
+                means: "the inhibit is a parameter of the blank's own decision rather than a \
+                        write to the shared activity clock. If it becomes a clock write, \
+                        `--lock-idle` is silently postponed too and the published \
+                        \"suppresses the blank and never the lock\" is false -- D-033(1)'s \
+                        exact prohibition.",
+            },
+        ],
     },
     Claim {
         id: "clipboard-bound",
@@ -2915,7 +2947,7 @@ pub const COVERED_CLAIMS: &[&str] = &[
     "accessibility-absent",
     "no-x-server",
     "no-layer-shell",
-    "no-idle-inhibit",
+    "idle-inhibit-bounded",
     "clipboard-bound",
     "realm-cardinality",
     "one-output",

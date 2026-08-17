@@ -178,6 +178,12 @@ struct core {
 	bool seat_created;
 	uint32_t seat_id;
 	uint32_t watermark;
+	/* Idle inhibition (WS-E.4.4, issue #306): what the shim has told this
+	 * peer, and how many edges it has sent. The real core keeps exactly this
+	 * one bit per realm and no count; the edge counter is this peer's own, so
+	 * a shim relaying levels instead of edges is observable. */
+	bool idle_held;
+	unsigned long long idle_edges;
 
 	/* surface pending state (Wayland's double-buffered model) */
 	bool ever_attached;
@@ -702,6 +708,61 @@ static void handle_get_seat(struct core *c, const uint8_t *f, size_t len) {
 	trace("EV get_seat id=%u", req.seat);
 }
 
+/* `vitrin_shim_session.idle_inhibit` (WS-E.4.4, issue #306).
+ *
+ * VALIDATED THE WAY THE REAL CORE VALIDATES IT, which is this file's standing
+ * discipline: `crates/vitrin-core/src/shim.rs` answers a surface id this
+ * connection never minted with fatal `invalid_object`, and the generated decoder
+ * answers an out-of-range `state` with fatal `invalid_argument`. Both present as
+ * a named FAIL line here and as log-and-close there.
+ *
+ * The ONE-BIT-PER-REALM aggregation is asserted rather than assumed: a `held`
+ * while already holding, or a `released` with nothing held, would mean the shim
+ * is relaying levels instead of edges, and the wire's own idempotence rule makes
+ * that invisible to the real core. Only a peer that counts can see it, which is
+ * exactly why this check lives here. */
+static void handle_idle_inhibit(struct core *c, const uint8_t *f, size_t len) {
+	uint32_t oid = 0;
+	vitrin_shim_session_req_idle_inhibit_t req;
+	vitrin_decode_status_t st =
+		vitrin_shim_session_req_idle_inhibit_decode(f, len, -1, &oid, &req);
+	if (st != VITRIN_DECODE_OK) {
+		fail(c, "idle_inhibit decode: %s", vitrin_decode_status_string(st));
+		return;
+	}
+	if (req.state == VITRIN_SHIM_SESSION_IDLE_INHIBIT_STATE_HELD) {
+		if (req.surface == 0u) {
+			fail(c, "idle_inhibit: held with a null surface");
+			return;
+		}
+		if (!c->surface_created || req.surface != c->surface_id) {
+			fail(c, "invalid_object: idle_inhibit names surface %u, which this "
+				"connection never minted", req.surface);
+			return;
+		}
+		if (c->idle_held) {
+			fail(c, "idle_inhibit: a second `held` with no `released` between -- the "
+				"shim must relay EDGES of its inhibitor count, not levels");
+			return;
+		}
+		c->idle_held = true;
+	} else {
+		if (req.surface != 0u) {
+			fail(c, "idle_inhibit: released must carry a null surface, got %u",
+				req.surface);
+			return;
+		}
+		if (!c->idle_held) {
+			fail(c, "idle_inhibit: a `released` with nothing held");
+			return;
+		}
+		c->idle_held = false;
+	}
+	c->idle_edges++;
+	trace("EV idle_inhibit state=%s surface=%u",
+		c->idle_held ? "held" : "released", req.surface);
+}
+
 static void handle_attach(struct core *c, const uint8_t *f, size_t len, int fd) {
 	uint32_t oid = 0;
 	vitrin_shim_surface_req_attach_t req;
@@ -1002,6 +1063,8 @@ static void dispatch(struct core *c, const uint8_t *f, size_t len, int fd) {
 			handle_create_surface(c, f, len);
 		} else if (hdr.opcode == VITRIN_SHIM_SESSION_REQ_GET_SEAT_OPCODE) {
 			handle_get_seat(c, f, len);
+		} else if (hdr.opcode == VITRIN_SHIM_SESSION_REQ_IDLE_INHIBIT_OPCODE) {
+			handle_idle_inhibit(c, f, len);
 		} else {
 			fail(c, "unknown session opcode %u", hdr.opcode);
 		}
@@ -1297,11 +1360,13 @@ int main(int argc, char **argv) {
 	}
 
 	trace("SUMMARY commits=%llu frame_dones=%llu buffer_dones=%llu max_inflight=%d "
-		"last_damage_area=%llu last_damage_rects=%d seat_sends=%llu failures=%d",
+		"last_damage_area=%llu last_damage_rects=%d seat_sends=%llu "
+		"idle_edges=%llu idle_held=%d failures=%d",
 		(unsigned long long)c->commits, (unsigned long long)c->frame_dones,
 		(unsigned long long)c->buffer_dones, c->max_inflight,
 		(unsigned long long)c->last_damage_area, c->last_damage_rects,
-		(unsigned long long)c->seat_sends, c->failures);
+		(unsigned long long)c->seat_sends, c->idle_edges, c->idle_held ? 1 : 0,
+		c->failures);
 
 	/* Hang up: socketpair EOF is how the core tells a shim to go away, and
 	 * the first rung of the P1.5.3 shutdown ladder. */

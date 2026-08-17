@@ -1601,6 +1601,29 @@ correction is followed here and not the issue.
   > untracked. It is [#306](https://github.com/vitrin-os/vitrin-os/issues/306).
   > The bullet above is left as written because it is the honest status: nothing
   > has been built, and full-screen video still blanks the screen.
+
+  > **DISCHARGED 2026-08-17, and both blocks above are left as written.** The
+  > paired edit landed: `protocol/vitrin-v0.xml` grew
+  > `vitrin_shim_session.idle_inhibit` at `since="2"` with its
+  > `idle_inhibit_state` enum, `docs/protocol/09-vitrin_shim_session.md` grew the
+  > matching prose page and Flow M, the shim grew the
+  > `zwp_idle_inhibit_manager_v1` global (`shim/src/idle.c`, citing the
+  > `globals-demand` line at
+  > `shim/docs/globals-touched-firefox-140.12.0esr.log:158`), and the core holds
+  > one bit per realm consulted at the single blank decision point. The grant
+  > question #306 raised is answered by [D-042](20-decision-log.md): **holding an
+  > inhibit is a property of the realm the human is looking at, not an authority
+  > a grant confers.**
+  >
+  > **What has NOT changed, and is why the deferral's published limit became a
+  > *bound* rather than being deleted:** the sentence *"full-screen video will
+  > blank the screen"* has not been falsified on any machine. It is now *"the ask
+  > reaches the core, and no human has watched a video to find out"* — blanking
+  > needs a display controller, CI has none, and the shim-side proof
+  > (`shim/tests/acceptance/idle_inhibit.sh`) is a **component** test against
+  > `mock_core.c`. Two further bounds are new rather than removed: an inhibit
+  > held by a realm the human is *not* looking at holds nothing, and an inhibit
+  > never suppresses the idle **lock**. See the limit register below.
 - **A software frame cadence for blanked or paused realms.** Inherits D-030's
   existing unscheduled deferral. **Reopened by:** the first agent-visible stall an
   operator reports, or an owner decision that a blank halting agents is
@@ -1677,8 +1700,8 @@ summarised, for the same reason.
 
 | Surface | The claim, as it must read |
 |---|---|
-| `README.md` | **Idle blanks the screen; it does not lock it.** With `--blank-idle` the panel goes dark after a period of no physical input and the session stays **unlocked** — anyone who touches a key gets the session, not a passphrase prompt. Locking is a separate, manual chord. **And a dark screen is not evidence that nothing is watching:** an agent holding an `observe` grant keeps capturing while the panel is off, exactly as it does across a lock. Idle inhibition is **not yet served**, so full-screen video will blank the screen; it reopens on a paired IDL and shim change. None of the session-lifecycle behaviour has been confirmed on hardware. |
-| `site/index.html` | **Idle blanks, it does not lock.** A dark screen is not a locked session and is not evidence that nothing is being observed — an agent with an observe grant keeps capturing. Full-screen video will blank the screen; idle inhibition is not yet served. Unconfirmed on hardware. |
+| `README.md` | **Idle blanks the screen; it does not lock it.** With `--blank-idle` the panel goes dark after a period of no physical input and the session stays **unlocked** — anyone who touches a key gets the session, not a passphrase prompt. Locking is a separate, manual chord. **And a dark screen is not evidence that nothing is watching:** an agent holding an `observe` grant keeps capturing while the panel is off, exactly as it does across a lock. Idle inhibition is **served and bounded** since #306: only the realm your output is on can hold one, it suppresses the blank and never the lock, and no human has watched a video on hardware to confirm the panel stayed lit. None of the session-lifecycle behaviour has been confirmed on hardware. |
+| `site/index.html` | **Idle blanks, it does not lock.** A dark screen is not a locked session and is not evidence that nothing is being observed — an agent with an observe grant keeps capturing. Idle inhibition is served and bounded three ways (the bound realm only, the blank and never the lock, and unconfirmed on a panel). Unconfirmed on hardware. |
 | `docs/book/src/limits.md` | Landed by this issue, in the blank/idle entries. Reproduced in this table only so #224 can check that three surfaces say the same thing. |
 
 Four constraints on that text, which are why it is dictated rather than left to
@@ -1688,6 +1711,15 @@ be re-worded:
    body calls refused. The owner corrected that register on #222: these are
    **deferrals**, and each names the evidence that reopens it. A surface that
    says *"refused"* has published a permanence nobody decided.
+
+   > **AMENDED 2026-08-17 by WS-E.4.4 (#306).** The two rows above are updated
+   > rather than left standing, because the table's own purpose is that three
+   > surfaces say the same thing and #306 changed what the true thing is: idle
+   > inhibition is **served**, and what is published is now a set of bounds. The
+   > constraint in this numbered item is unaffected and gets sharper — a surface
+   > must not say *"refused"*, and it must now also not say *"not yet served"*,
+   > which has become false in the other direction. The fourth constraint below
+   > still binds every word of it: no hardware claim may be made, and none is.
 2. **It must not soften "unlocked".** The point of Decision 1 is that the cost is
    real; a surface that says *"the screen turns off after a while"* and omits
    *"and the session stays unlocked"* has published the half a reader does not
@@ -2175,14 +2207,21 @@ The limit set follows.
   deferral, inherited rather than re-filed. Published in
   `docs/book/src/limits.md`.
 
-- <!-- limit: no-idle-inhibit -->
-  **Idle inhibition is not yet served, so full-screen video blanks the screen**
-  (created by WS-E.4.3, deferred with named reopening evidence).
-  `zwp_idle_inhibit_manager_v1` needs a new shim global *and* a shim→core wire
-  verb — paired IDL and prose work on `track:protocol` — for a comfort feature.
-  **What reopens it:** that paired edit. Stated as a *not yet* and never as a
-  refusal, on the register the owner corrected on #222. Published in
-  `docs/book/src/limits.md`.
+- <!-- limit: idle-inhibit-bounded -->
+  **Idle inhibition is served, bounded three ways, and unproven on hardware**
+  (created by WS-E.4.3 as a *not yet*; discharged by WS-E.4.4 / #306 and
+  [D-042](20-decision-log.md), and re-published as a **bound** rather than
+  deleted). `zwp_idle_inhibit_manager_v1` is advertised by the shim and relayed
+  over `vitrin_shim_session.idle_inhibit`. The three bounds: only the realm the
+  human's output is bound to can hold one; it suppresses the idle **blank** and
+  never the idle **lock** (D-033(1)), so a film longer than `--lock-idle` still
+  gets a lock screen over it; and **no run on real hardware has confirmed a
+  video keeping a panel lit** — blanking needs a display controller, CI has
+  none, and `shim/tests/acceptance/idle_inhibit.sh` is a component test against
+  `mock_core.c`. **What would close the third bound:** a human watching a video
+  under `--drm --blank-idle` and pasting the result, which is #223's own
+  hardware-rung debt inherited rather than re-filed. Published in
+  `docs/book/src/limits.md`, `README.md` and `site/index.html`.
 
 - <!-- limit: media-keys-reach-an-app-that-cannot-act -->
   **The media keys reach an app that cannot act on them** (created by WS-E.4.3,

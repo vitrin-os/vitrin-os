@@ -125,19 +125,20 @@ CORE_MARGIN_S="${CORE_MARGIN_S:-30}"
 #
 # EXPECT_ARMED = EXPECT_CATALOGUE - (catalogue entries that are in the v0 set),
 # because vitrin_ledger_create_probes refuses to shadow a real global with an
-# inert one. Today FOUR entries qualify: wl_subcompositor, which P1.6.4
-# promoted into the contract, and the three pointer interfaces WS-E.4.2 (issue
+# inert one. Today FIVE entries qualify: wl_subcompositor, which P1.6.4
+# promoted into the contract, the three pointer interfaces WS-E.4.2 (issue
 # #222) did -- zwp_relative_pointer_manager_v1, zwp_pointer_gestures_v1 and
-# zwp_pointer_constraints_v1. Changing the catalogue means changing both.
+# zwp_pointer_constraints_v1 -- and zwp_idle_inhibit_manager_v1, which WS-E.4.4
+# (issue #306) did. Changing the catalogue means changing both.
 #
-# The three rows STAY in the catalogue rather than being deleted from
+# The promoted rows STAY in the catalogue rather than being deleted from
 # shim/meson.build, deliberately: the catalogue is a compiled-in list of
 # things a build COULD probe, and `in_v0_contract` is the runtime rule that
 # declines to arm one that is already served. Deleting the rows would shrink
-# EXPECT_CATALOGUE and lose the record that these three were once probes --
+# EXPECT_CATALOGUE and lose the record that these were once probes --
 # which is the evidence that admitted them.
 EXPECT_CATALOGUE="${EXPECT_CATALOGUE:-21}"
-EXPECT_ARMED="${EXPECT_ARMED:-17}"
+EXPECT_ARMED="${EXPECT_ARMED:-16}"
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 ok() { echo "OK: $*"; }

@@ -452,6 +452,23 @@ pub(crate) struct Kernel {
     /// cannot reach, which is why [`crate::deadman::apply`] clears it
     /// explicitly.
     pub clipboard_slot: crate::clipboard::ClipboardSlot,
+    /// **Which realms are asking that the screen not blank** (WS-E.4.4, issue
+    /// #306, D-042): the core-side record behind
+    /// `vitrin_shim_session.idle_inhibit`.
+    ///
+    /// Kernel state rather than router state for [`Self::clipboard_slot`]'s
+    /// reason — it is a session-wide fact about the human's output, and the
+    /// router must learn about neither authority nor realms' intentions — and
+    /// rather than a field on [`crate::backend::blank::SessionActivity`] for a
+    /// second: the activity clock is shared by `Rc` with the lock's gate
+    /// (D-033(2)), and a record hanging off it would be reachable from the lock,
+    /// which is precisely the coupling this feature must not have.
+    ///
+    /// The dead-man switch deliberately does **not** clear it. The off-switch
+    /// destroys authority; an app declining a blank while the human is looking
+    /// at it is not authority (D-042), and the chord is physical input, which
+    /// forces the screen lit through the clock regardless.
+    pub idle_inhibits: crate::backend::blank::IdleInhibitTable,
     /// **The human's screenshot chord** (WS-E.2.4, issue #216): the queue the
     /// hook writes a gesture into and [`drain_screenshot_gestures`] drains.
     ///
@@ -1063,6 +1080,7 @@ impl<H: PreemptionHook> Runtime<H> {
                 attention,
                 clipboard,
                 clipboard_slot: crate::clipboard::ClipboardSlot::new(),
+                idle_inhibits: crate::backend::blank::IdleInhibitTable::new(),
                 screenshot,
                 screenshot_writer,
                 backlight,
@@ -1769,6 +1787,7 @@ fn with_realm_teardown<H: RuntimeHost, T>(
                 router,
                 retained,
                 clipboard: &mut kernel.clipboard_slot,
+                idle_inhibits: &mut kernel.idle_inhibits,
                 realms: &mut kernel.realms,
                 recorder: &mut kernel.recorder,
             };
@@ -2317,6 +2336,14 @@ pub(crate) fn service_lock_round<H: PreemptionHook>(
 /// [`note_seat_presence`] already takes — rather than a `bool` a future caller
 /// could pass wrongly and nothing would catch.
 ///
+/// **And an idle inhibit does not reach the lock either** (WS-E.4.4, issue
+/// #306). This round reads [`Kernel::idle_inhibits`] and hands the answer to
+/// [`crate::backend::blank::SessionActivity::tick`], which is the *blank's* own
+/// decision and nothing else. It writes no clock, so `--lock-idle 600` still
+/// raises at 600 s with an app holding an inhibit — a confined app must not be
+/// able to switch off a security control, and
+/// `an_idle_inhibit_holds_the_blank_and_not_the_lock` pins it.
+///
 /// # The observability half lives here, not in the backend (issues #258, #259)
 ///
 /// The blank's *power-down* line stays in [`crate::backend::drm`], because only
@@ -2345,9 +2372,24 @@ pub(crate) fn service_blank_round<H: PreemptionHook>(
     surface: &mut crate::backend::blank::BlankSurface,
     now: Instant,
 ) -> bool {
+    // **Recomputed every round from live records, never stored** (WS-E.4.4,
+    // issue #306): does the realm the human's input is bound to hold an idle
+    // inhibit? Level-triggered for `reconcile_pointer_constraints`' reason -- an
+    // inhibit that stops counting because the human looked elsewhere is a change
+    // nothing else in the round would announce, and there is no wire event on
+    // which to announce it either.
+    //
+    // The BOUND realm, not the focused one, and the choice is not incidental:
+    // the blank fires because *physical input* stopped, and `bound` is the realm
+    // physical input goes to. `None` -- nothing bound yet, or the bound realm
+    // just died -- answers "not inhibited", which is the fail-safe direction.
+    let inhibited = runtime
+        .kernel
+        .idle_inhibits
+        .holds(runtime.router.bound_realm());
     // The countdown first, so a session that went idle this round covers on
     // this round's frame rather than the next one.
-    activity.tick(now);
+    activity.tick(now, inhibited);
     // A wake that outran its deadline with no flip behind it is abandoned, so
     // the session is not left in a state where every subsequent press is
     // swallowed as "still waking". Fail open on input; the property that stops
@@ -4373,6 +4415,49 @@ fn apply_pointer_constraint_ask<H: RuntimeHost>(host: &mut H, realm_id: &RealmId
     send_constraint_verdicts(realms, owed);
 }
 
+/// Fold a shim's parked `idle_inhibit` ask into the table (WS-E.4.4, issue
+/// #306).
+///
+/// The third sibling of [`apply_selection_answer`] and
+/// [`apply_pointer_constraint_ask`], drained on the same turn from the same
+/// place in [`dispatch_shim`], for the same reason: an ask parked by a shim the
+/// core is about to bury must not reach the session's state.
+///
+/// **Nothing is sent, and nothing can be.** `idle_inhibit` carries no verdict
+/// event — `zwp_idle_inhibitor_v1` defines no events, so there is no destination
+/// for one — which is why this function has no `send_*` half where its two
+/// siblings do. What it does instead is say so in the log, on the *edge*: an
+/// operator asking "why did my screen not blank" has exactly one line to look
+/// for, and an operator asking "why did it blank during my film" has the
+/// matching release.
+///
+/// **It does not ask for a frame and does not mark the round dirty.** Holding a
+/// blank off changes nothing that is composited; the blank's own round is
+/// level-triggered against this table and will simply not fire.
+fn apply_idle_inhibit_ask<H: RuntimeHost>(host: &mut H, realm_id: &RealmId) {
+    let Runtime { realms, kernel, .. } = host.runtime();
+    let Some(ask) = realms
+        .get_mut(realm_id)
+        .and_then(|realm| realm.server.as_mut())
+        .and_then(|server| server.take_idle_inhibit_ask())
+    else {
+        return;
+    };
+    if !kernel.idle_inhibits.apply(realm_id, ask) {
+        // A level-triggered message restating a level it already holds. Legal
+        // and idempotent by the IDL, so it is not even a debug line.
+        return;
+    }
+    tracing::info!(
+        realm = %realm_id,
+        state = ?ask.state,
+        surface = ?ask.surface,
+        holding = kernel.idle_inhibits.len(),
+        "a realm changed its idle inhibit: the screen will not blank while the human's output \
+         is bound to a realm holding one. The idle LOCK is unaffected"
+    );
+}
+
 /// **Recompute every pointer constraint from live state and tell the shims what
 /// changed** (WS-E.4.2, issue #222).
 ///
@@ -4688,6 +4773,10 @@ fn dispatch_shim<H: RuntimeHost>(
             // (WS-E.4.2): a `pointer_constraint` ask from a shim that has just
             // violated the protocol must not reach the constraint table.
             apply_pointer_constraint_ask(host, realm_id);
+            // ...and the third, on the same terms (WS-E.4.4): an `idle_inhibit`
+            // from a shim the core is about to bury must not hold the human's
+            // panel awake for a realm that is already dying.
+            apply_idle_inhibit_ask(host, realm_id);
         }
         ConnectionEvent::Disconnected => {
             tracing::info!(realm = %realm_id, "shim connection closed");
@@ -8257,7 +8346,9 @@ mod tests {
         // The deadline passes. The rig's clock is the real one, so the round is
         // driven with a stamp far enough back to be idle -- the same seam
         // `LockScreen`'s own tests use.
-        activity.borrow_mut().tick(t0 + Duration::from_secs(300));
+        activity
+            .borrow_mut()
+            .tick(t0 + Duration::from_secs(300), false);
         rig.pump(Duration::from_millis(50));
         assert_eq!(
             activity.borrow().phase(),
@@ -8423,7 +8514,7 @@ mod tests {
         assert!(
             activity
                 .borrow_mut()
-                .tick(Instant::now() + idle + Duration::from_secs(1)),
+                .tick(Instant::now() + idle + Duration::from_secs(1), false),
             "the fix must restart the countdown, not switch it off"
         );
     }
@@ -8461,7 +8552,9 @@ mod tests {
 
         // --- the blank, and the entry it owes ------------------------------
         let log = LogCapture::install();
-        activity.borrow_mut().tick(t0 + Duration::from_secs(300));
+        activity
+            .borrow_mut()
+            .tick(t0 + Duration::from_secs(300), false);
         rig.pump(Duration::from_millis(50));
 
         // The panel powers down (the bare-metal half), the human presses a key,
@@ -8604,6 +8697,152 @@ mod tests {
         );
     }
 
+    /// **An app's idle inhibit reaches the blank's own round, and dies with its
+    /// realm** (WS-E.4.4, issue #306).
+    ///
+    /// The unit tests in `backend::blank` hold the table and the guard; this one
+    /// holds the **wiring**, which is what would silently break: a
+    /// `service_blank_round` that stopped consulting
+    /// [`Kernel::idle_inhibits`], or a realm-teardown funnel that stopped
+    /// dropping a dead realm's record, leaves every one of those unit tests
+    /// green. It drives the production function with a synthetic idle stamp —
+    /// the seam `a_failed_wake_is_journalled_as_a_failed_wake` already uses,
+    /// because the rig's clock is the real one and no test can wait out a
+    /// five-minute timeout.
+    ///
+    /// Three facts, in the order a human would meet them:
+    ///
+    /// 1. an inhibit held by the realm the human's input is bound to stops the
+    ///    blank;
+    /// 2. the same inhibit in a realm the human is *not* looking at stops
+    ///    nothing;
+    /// 3. the realm dying drops the record — the app-killed-mid-film case, which
+    ///    is the one failure mode that would otherwise pin a panel awake for
+    ///    good.
+    #[test]
+    fn an_idle_inhibit_reaches_the_blank_round_and_dies_with_its_realm() {
+        use crate::backend::blank::{BlankSurface, IdleInhibitAsk, Phase, SessionActivity};
+        use vitrin_protocol::generated::vitrin_shim_session::IdleInhibitState;
+
+        let _fd = crate::capture::tests::fd_lock();
+        let (mut rig, watched, background) = two_realm_rig("idle-inhibit-round");
+        let idle = Duration::from_secs(300);
+        // The session's own gate and clock, installed together exactly as on
+        // bare metal. The round below is driven with a synthetic stamp against
+        // its own `SessionActivity`, on `a_failed_wake_is_journalled_as_a_failed_wake`'s
+        // precedent; this pair is what makes `rig.lock()` the session's real one
+        // rather than a second gate that could journal a lock state its own gate
+        // contradicts.
+        let _shared = rig.attach_blank(idle);
+        let lock = rig.lock();
+        let t0 = Instant::now();
+        let held = |surface| IdleInhibitAsk {
+            surface: Some(surface),
+            state: IdleInhibitState::Held,
+        };
+
+        // The human's input is on `watched`, which is what `bound` means. The
+        // drain is discarded: nothing was bound before, so nothing is owed.
+        assert!(rig.host.runtime.router.bind_to(&watched).is_none());
+
+        // (1) The realm the human is looking at holds an inhibit, so the round
+        // does not cover -- and the control is the same round with the table
+        // empty, which does.
+        let mut control = SessionActivity::new(Some(idle), t0);
+        let mut control_surface = BlankSurface::for_test();
+        service_blank_round(
+            &mut rig.host.runtime,
+            &lock,
+            &mut control,
+            &mut control_surface,
+            t0 + idle,
+        );
+        assert_eq!(
+            control.phase(),
+            Phase::Covering,
+            "control: with nothing inhibiting, the round covers at the deadline"
+        );
+
+        rig.host
+            .runtime
+            .kernel
+            .idle_inhibits
+            .apply(&watched, held(2));
+        let mut activity = SessionActivity::new(Some(idle), t0);
+        let mut surface = BlankSurface::for_test();
+        service_blank_round(
+            &mut rig.host.runtime,
+            &lock,
+            &mut activity,
+            &mut surface,
+            t0 + idle,
+        );
+        assert_eq!(
+            activity.phase(),
+            Phase::Lit,
+            "an inhibit held by the bound realm must reach the round: the screen stays lit"
+        );
+        assert!(!surface.is_covering());
+
+        // ...and the LOCK is untouched by all of it. Read rather than assumed:
+        // this is the assertion that stops a confined app switching off a
+        // security control (D-042).
+        assert!(
+            !lock.borrow().is_locked(),
+            "the session was never locked, so the next assertion is about the inhibit and \
+             nothing else"
+        );
+        assert_eq!(
+            activity.last_activity(),
+            t0,
+            "the round must not have written the activity clock to hold the blank off: that \
+             clock is what `--lock-idle` reads, so a write here would postpone the idle LOCK too"
+        );
+
+        // (2) The human looks elsewhere. Nothing was re-asked and nothing was
+        // told, and the countdown is live again.
+        let _ = rig.host.runtime.router.bind_to(&background);
+        let mut activity = SessionActivity::new(Some(idle), t0);
+        let mut surface = BlankSurface::for_test();
+        service_blank_round(
+            &mut rig.host.runtime,
+            &lock,
+            &mut activity,
+            &mut surface,
+            t0 + idle,
+        );
+        assert_eq!(
+            activity.phase(),
+            Phase::Covering,
+            "a background realm's inhibit must hold nothing, or any app could pin the human's \
+             panel awake from behind another realm's window"
+        );
+
+        // (3) The realm dies without ever releasing. The record goes with it,
+        // through the funnel every death path reaches.
+        let _ = rig.host.runtime.router.bind_to(&watched);
+        assert!(rig.host.runtime.kernel.idle_inhibits.holds(Some(&watched)));
+        close_realm(&mut rig.host, &watched, DeathCause::ConnectionClosed);
+        assert!(
+            !rig.host.runtime.kernel.idle_inhibits.holds(Some(&watched)),
+            "an app killed without destroying its inhibitor must not hold the panel awake for a \
+             realm that no longer exists"
+        );
+        assert_eq!(rig.host.runtime.kernel.idle_inhibits.len(), 0);
+
+        // And the round agrees: same table, same router, the blank is back.
+        let mut activity = SessionActivity::new(Some(idle), t0);
+        let mut surface = BlankSurface::for_test();
+        service_blank_round(
+            &mut rig.host.runtime,
+            &lock,
+            &mut activity,
+            &mut surface,
+            t0 + idle,
+        );
+        assert_eq!(activity.phase(), Phase::Covering);
+    }
+
     /// **A session that is already locked when the panel goes dark is journalled
     /// as locked** — on both ends of the pair (issue #259, review of #257–#259).
     ///
@@ -8645,7 +8884,9 @@ mod tests {
         assert!(lock.borrow_mut().raise(LockCause::Chord));
         assert!(lock.borrow().is_locked());
 
-        activity.borrow_mut().tick(t0 + Duration::from_secs(300));
+        activity
+            .borrow_mut()
+            .tick(t0 + Duration::from_secs(300), false);
         rig.pump(Duration::from_millis(50));
         assert_eq!(
             activity.borrow().phase(),
@@ -8695,7 +8936,9 @@ mod tests {
         let fresh = rig.attach_blank(Duration::from_secs(300));
         assert!(!rig.lock().borrow().is_locked());
         let t1 = fresh.borrow().last_activity();
-        fresh.borrow_mut().tick(t1 + Duration::from_secs(300));
+        fresh
+            .borrow_mut()
+            .tick(t1 + Duration::from_secs(300), false);
         rig.pump(Duration::from_millis(50));
 
         let entries = rig.entries();
@@ -8744,7 +8987,9 @@ mod tests {
         let t0 = activity.borrow().last_activity();
 
         // The cover goes up first, on an unlocked session.
-        activity.borrow_mut().tick(t0 + Duration::from_secs(300));
+        activity
+            .borrow_mut()
+            .tick(t0 + Duration::from_secs(300), false);
         rig.pump(Duration::from_millis(50));
         assert_eq!(activity.borrow().phase(), Phase::Covering);
         let blanked = {
@@ -8834,7 +9079,7 @@ mod tests {
         // The screen is already dark when the petition arrives.
         {
             let mut a = activity.borrow_mut();
-            assert!(a.tick(t0 + Duration::from_secs(300)));
+            assert!(a.tick(t0 + Duration::from_secs(300), false));
             a.note_frame_queued();
             a.went_dark();
             assert_eq!(a.phase(), Phase::Dark);
@@ -10414,9 +10659,25 @@ mod tests {
         // cannot re-express a principal's actuation either. A constraint is
         // also derived from no grant, so it adds no verb whose requests the
         // server could fail to enforce. That is D-032, not this invariant.
+        // Re-pinned 47 -> 48 by WS-E.4.4 (issue #306), decision taken rather
+        // than skipped. The one added message is
+        // `vitrin_shim_session.idle_inhibit`, a REQUEST on the shim bootstrap
+        // object, on the shim connection class no principal can address. It is
+        // not a request on either layout interface, it adds no arrangement this
+        // scene cannot honour, and it allocates no verb bit
+        // (`Verb::VALID_MASK` is still 575) -- so invariant 2's first half is
+        // untouched.
+        // Its second half, in the form #222 put it: an idle inhibit changes
+        // what the CORE does with its own panel, and nothing at all about what
+        // the app is told or what the core believes about geometry, focus or
+        // input. It reaches exactly one predicate, the blank's own countdown,
+        // and it is gated on the realm the human's physical input is bound to,
+        // so an app cannot suppress a blank in a realm nobody is looking at.
+        // Being derived from no grant, it adds no verb whose requests the
+        // server could fail to enforce. That is D-042, not this invariant.
         assert_eq!(
             vitrin_protocol::generated::MESSAGE_COUNT,
-            47,
+            48,
             "a message was added to the IDL. If it is a request on \
              vitrin_layout_arrange or vitrin_layout_focus, D-018(2) invariant 2 is at \
              stake: this scene shows one realm, unstacked and unoverlapped, so it cannot \

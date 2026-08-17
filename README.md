@@ -366,11 +366,16 @@ is a different promise from one that is scheduled.
   deferrals with named reopening evidence (a device in the measured set plus an
   application that needs it), not refusals
   ([#222](https://github.com/vitrin-os/vitrin-os/issues/222)).
-- **Idle inhibition is not served**, so full-screen video will blank the screen.
-  `zwp_idle_inhibit_manager_v1` needs a new shim global *and* a new wire verb;
-  that paired IDL-and-prose edit is what reopens it
-  ([#223](https://github.com/vitrin-os/vitrin-os/issues/223)). A *not yet* with a
-  named condition, not a refusal.
+- **Idle inhibition is served, and bounded three ways.**
+  `zwp_idle_inhibit_manager_v1` is advertised and relayed to the core over
+  `vitrin_shim_session.idle_inhibit`
+  ([#306](https://github.com/vitrin-os/vitrin-os/issues/306), D-042). Only the
+  realm your output is bound to can hold one; it suppresses the idle **blank**
+  and never the idle **lock**, so a film longer than `--lock-idle` still gets a
+  lock screen over it; and **nobody has watched a video on real hardware and
+  confirmed the panel stayed lit** — a blank needs a display controller and CI
+  has none ([#223](https://github.com/vitrin-os/vitrin-os/issues/223) owns the
+  blank's hardware rungs).
 - **The volume keys reach an app that cannot act on them; the brightness keys
   now work, narrowly.** Neither is dropped at intake any more. For volume that
   changed *where they stop* and not what they do — a confined app cannot open a

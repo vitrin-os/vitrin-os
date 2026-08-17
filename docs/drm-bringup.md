@@ -317,6 +317,7 @@ un-wedge a display, and it needs a shell you can still reach.
 | 14 | Frame cadence | A number, measured, written down | — |
 | 15 | Shut down cleanly | Hyprland intact on tty1 | Panel left in a bad mode |
 | 16 | Brightness keys, on a second `vitrind --backlight` | The panel dims and brightens, never to black, and the app never sees the key | The key does nothing (a machine permission), or drives the wrong device |
+| 17 | Idle inhibition, on a `vitrind --drm --blank-idle 60` with a video playing | The panel stays lit past 60 s while the video plays, and blanks at 60 s once it stops | The panel blanks under the video (nothing relayed), or never blanks again afterwards (a leaked inhibit) |
 
 ---
 
@@ -893,6 +894,71 @@ issue's acceptance criterion and nothing else can stand in for it.
 16-vi    date: ____  entries per press: ____
 16-vii   date: ____  app saw the key without the flag: yes/no
 16-viii  date: ____  external display: ____
+```
+
+---
+
+## 17. Idle inhibition holds the blank, and lets go of it (D-042, issue #306) — NOT YET RUN
+
+**Written before it can be executed, on D-033's own lesson and rung 16's
+precedent**, and the record block below is empty on purpose. Nothing on this
+rung has been observed. CI cannot observe any of it: blanking needs a display
+controller, no runner has one, and
+`shim/tests/acceptance/idle_inhibit.sh` is a **component** test against
+`shim/tests/mock_core.c` that settles what the *shim sends* and says nothing
+about a panel. Until somebody fills this in, the honest status of the feature is
+*landed in the tree, unproven on hardware* — and the sentence
+`docs/book/src/limits.md` publishes says exactly that.
+
+**This is the one rung on this page whose subject is a thing a human notices
+rather than a thing a test finds.** #306 exists because full-screen video blanked
+somebody's screen. So the observation is: *watch a video, and see whether the
+screen stays on.*
+
+Use a **short** timeout, or the rung takes half an hour:
+
+```bash
+# On the VT, with step 6's command line plus a deliberately short blank:
+vitrind --drm --blank-idle 60 ... 2>&1 | tee /tmp/vitrind-drm.log
+```
+
+Then, inside the realm, play something full-screen in an app that actually asks.
+`mpv --fullscreen` does; so does Firefox on a YouTube page. **Check that the app
+asked before concluding anything about the core** — the shim logs it:
+
+```bash
+grep 'idle: told the core' /tmp/vitrind-drm.log      # the shim's own relay
+grep 'idle inhibit'        /tmp/vitrind-drm.log      # the core's edge, per realm
+```
+
+An app that never asks makes every row below vacuous, which is the failure mode
+this rung is easiest to fool itself with.
+
+| Rung | Expected [inferred] | Failure | What it means |
+|---|---|---|---|
+| 17-i | The shim logs `idle: told the core state=1` and the core logs `a realm changed its idle inhibit` with `state=Held` within a second of the video starting | Neither line | The app is not asking (try `mpv --fullscreen`, and check `wayland-info` lists `zwp_idle_inhibit_manager_v1`), or the global was not created — the shim logs that too, at `WLR_ERROR` |
+| 17-ii | **Watch the screen: it stays lit for well past 60 s with the video playing, and your hands off the keyboard.** This is the whole rung | The panel goes dark under the video | The relay arrived and the guard did not fire, or the realm the output is bound to is not the realm that asked. `grep 'idle inhibit' ` again and compare the realm id with the one on screen |
+| 17-iii | **Stop the video (or close the app). Within about 60 s of the last keypress the panel blanks.** The countdown was postponed, not switched off | It never blanks again | A leaked inhibit — the one failure this feature can cause that a human cannot work around except by killing something. Look for `state=0` in the shim log and `idle inhibit dropped` in the core's. **Stop and file it** |
+| 17-iv | **`kill -9` the app while the video is playing.** The core logs `idle inhibit dropped` (realm death) or the shim relays `state=0` (client disconnect), and the panel blanks on schedule afterwards | The panel never blanks | Both layers of the leak defence failed at once. This is the case `idle_inhibit.sh`'s scenario (B) covers against the mock, so a green component test with a red rung here means the CORE half is the broken one |
+| 17-v | **With `--lock-idle 120` as well: the lock screen comes up at 120 s while the video is still playing and the panel is still lit.** That is correct and published | The session does not lock | A confined app just switched off a security control. That is D-033(1)'s exact prohibition and D-042's central bound. **Stop and file it** |
+| 17-vi | **Switch the output to another realm while the video plays.** The panel blanks on schedule — the inhibit stops counting the moment the human looks away, with no message either way | It stays lit | The gate is not on the bound realm, so any background app can pin the panel |
+| 17-vii | Without `--blank-idle` at all: an app holding an inhibitor changes nothing, and nothing is logged as an error | An error, or a refusal | The feature has no CLI surface of its own on purpose: with no blank armed, an inhibit is satisfied vacuously |
+
+**Paste what you saw onto
+[#306](https://github.com/vitrin-os/vitrin-os/issues/306)** — at minimum 17-ii,
+17-iii and 17-v, in words, with the app you used. Nothing else can stand in for
+it, and in particular a green `meson test` cannot: it never touches a panel.
+
+**Record block — empty on purpose. Do not fill it in from reasoning.**
+
+```text
+17-i    date: ____  app: ____  shim relayed: yes/no  core logged: yes/no
+17-ii   date: ____  seconds lit past the timeout: ____  blanked under the video: yes/no
+17-iii  date: ____  blanked after stopping: yes/no  seconds: ____
+17-iv   date: ____  killed the app: ____  blanked afterwards: yes/no
+17-v    date: ____  --lock-idle used: ____  locked on time: yes/no
+17-vi   date: ____  switched realms: ____  blanked on schedule: yes/no
+17-vii  date: ____  no --blank-idle: nothing happened: yes/no
 ```
 
 ---

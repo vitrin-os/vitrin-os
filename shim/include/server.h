@@ -24,6 +24,7 @@
 #include "ledger.h"
 #include "clipboard.h"
 #include "constraint.h"
+#include "idle.h"
 #include "seat.h"
 #include "upstream.h"
 
@@ -132,6 +133,13 @@ struct vitrin_shim {
 	 * ever speaks upstream unasked -- an ask is sent because the APP created
 	 * a lock, and the verdict comes back on the core's own schedule. */
 	struct vitrin_constraint constraint;
+	/* Idle inhibition (WS-E.4.4, idle.h): the
+	 * `zwp_idle_inhibit_manager_v1` global, how many inhibitor objects the
+	 * app is holding, and whether the core has been told. Like the
+	 * constraint above, nothing here ever speaks upstream unasked -- an ask
+	 * is sent because the APP created an inhibitor, and there is no verdict
+	 * to wait for because `zwp_idle_inhibitor_v1` defines no events. */
+	struct vitrin_idle idle;
 	struct wlr_xdg_decoration_manager_v1 *xdg_decoration;
 	struct wl_listener new_deco; /* xdg_decoration.new_toplevel_decoration */
 

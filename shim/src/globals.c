@@ -7,7 +7,7 @@
  *
  *   wl_compositor, wl_subcompositor, xdg_wm_base, wl_seat,
  *   zwp_relative_pointer_manager_v1, zwp_pointer_gestures_v1,
- *   zwp_pointer_constraints_v1,
+ *   zwp_pointer_constraints_v1, zwp_idle_inhibit_manager_v1,
  *   wl_data_device_manager, zxdg_decoration_manager_v1
  *   (+ zwp_linux_dmabuf_v1 iff --dmabuf)
  *
@@ -55,6 +55,7 @@
 #include "ledger.h"
 #include "clipboard.h"
 #include "constraint.h"
+#include "idle.h"
 #include "server.h"
 
 /* Decline server-side decorations: whenever a client asks for a decoration
@@ -346,6 +347,67 @@ bool vitrin_create_globals(struct vitrin_shim *s) {
 	 * Best-effort, like the two above: an app that never binds it is
 	 * unaffected, and one that does keeps an unconstrained pointer. */
 	vitrin_constraint_create(s);
+
+	/* zwp_idle_inhibit_manager_v1.
+	 *
+	 * ADDED IN WS-E.4.4 (issue #306), on this file's own rule, and the
+	 * citation is a `globals-demand` line from a real pre-addition run
+	 * already in the tree:
+	 *
+	 *   globals-demand: seq=83 interface=zwp_idle_inhibit_manager_v1
+	 *     version_requested=1 (the app bound a PROBE global ...)
+	 *
+	 * -- shim/docs/globals-touched-firefox-140.12.0esr.log:158, with the bind
+	 * it follows at :157, summarised at :289 as `class=probe advertised=1
+	 * binds=1 version_min=1 version_max=1 first_seq=83 last_seq=83
+	 * status=bound`. All three lines were read before this comment was
+	 * written -- this file is where the cite-your-evidence rule is ENFORCED,
+	 * and the miscitation noted at the relative-pointer constructor above is
+	 * the reason that is said rather than assumed. That run is a
+	 * shipping-state ledger and can carry the demand line precisely because
+	 * this interface was NOT in the v0 contract at the time (ledger.c's
+	 * in_v0_contract never arms a probe for an interface already in it). It IS
+	 * in the contract now, listed in `vitrin_v0_contract[]` -- without that,
+	 * the probe catalogue would advertise a second, inert copy and the app
+	 * could bind the one that does nothing.
+	 *
+	 * WHAT CHANGED SINCE shim/docs/firefox.md CALLED THIS ONE REFUSED. That
+	 * note reads: "A realm has no screen and no idle timer; the host's screen
+	 * is the core's, and inhibiting it from inside a confined app is a
+	 * decision for the core." Every clause of that is still true, and none of
+	 * it was ever the objection. The objection -- exactly as with
+	 * `zwp_pointer_constraints_v1` above -- was that an inhibit global with no
+	 * wire verb behind it would be a promise this shim cannot keep: the app
+	 * would be told "yes" by the mere existence of the global and the core
+	 * would never hear about it. Version 2 of the wire now carries
+	 * `vitrin_shim_session.idle_inhibit`, so the ask reaches the party that
+	 * owns the screen and the decision stays exactly where firefox.md said it
+	 * belongs. idle.h is the whole design.
+	 *
+	 * WHAT IT IS FOR: a video player, a slide presenter, a long download's
+	 * progress view. There is no fallback whatsoever -- nothing in core
+	 * Wayland can express "do not blank" -- which is why an app that wants
+	 * this and cannot have it simply watches the screen go black mid-film.
+	 *
+	 * IT GRANTS NOTHING ACROSS THE REALM BOUNDARY, and this is the second
+	 * global here that asks the core to DO something rather than to send
+	 * something, so it is worth spelling out. The ask is one bit per realm and
+	 * the core decides: it honours an inhibit only while the human's own
+	 * output is bound to this realm, so a confined app cannot hold the panel
+	 * awake from behind another realm's window; it drops the record when the
+	 * realm dies; and it never lets the ask reach the idle LOCK, so an app
+	 * cannot suppress `--lock-idle` -- a comfort request must not switch off a
+	 * security control. Nor can this WAKE anything: there is no verb anywhere
+	 * in the IDL, for an app or for an agent, that powers a dark panel back
+	 * on.
+	 *
+	 * IT DOES NOT WIDEN `wl_seat`'s CAPABILITIES. This is a global, not a
+	 * capability, and nothing new is served through one.
+	 *
+	 * Best-effort, like everything above: an app that never binds it is
+	 * unaffected, and one that does has its screen blank exactly as it did
+	 * before this global existed. */
+	vitrin_idle_create(s);
 
 	/* The virtual keyboard and its dynamic keymap, before the socket is
 	 * bound: the app's first `wl_keyboard` bind must already find a keymap

@@ -522,7 +522,7 @@ pub(crate) struct RealmTeardown<'a, 'v, H: PreemptionHook> {
     /// exiting -- while D-024(5), `limits.md` and `clipboard.rs` all published
     /// it as a mitigation.
     pub clipboard: &'a mut crate::clipboard::ClipboardSlot,
-    /// **Which realms are holding an idle inhibit** (WS-E.4.4, issue #306), so a
+    /// **Which realms are holding an idle inhibit** (D-042, issue #306), so a
     /// dying realm stops holding the human's panel awake.
     ///
     /// Here for exactly [`Self::clipboard`]'s reason — this is the funnel every
@@ -1117,7 +1117,7 @@ impl RealmLifecycle {
             );
         }
 
-        // 1d. ...and this realm's idle inhibit, if it held one (WS-E.4.4, issue
+        // 1d. ...and this realm's idle inhibit, if it held one (D-042, issue
         //     #306). Same shape as the clipboard above and the same reason it is
         //     here rather than at the connection-close site: a realm reaped
         //     through `SIGCHLD` never reaches `close_realm`, and an app killed

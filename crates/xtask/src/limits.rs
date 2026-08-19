@@ -792,7 +792,7 @@ pub const CLAIMS: &[Claim] = &[
                human's output is bound to can hold one, it suppresses the blank and never the \
                idle lock, and no run on real hardware has confirmed a video keeping a panel \
                lit.",
-        issue: "#306 (WS-E.4.4) built it and D-042 decided that holding one needs no grant; \
+        issue: "#306 (D-042) built it and D-042 decided that holding one needs no grant; \
                 #223 (WS-E.4.3, open) still owns the blank itself, whose hardware rungs this \
                 one inherits.",
         surfaces: &[

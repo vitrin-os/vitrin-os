@@ -407,7 +407,7 @@ pub(crate) struct ShimServer {
     /// disagree about which one won.
     pointer_constraint_ask: Option<crate::input::PointerConstraintAsk>,
     /// The `idle_inhibit` request this shim sent and the runtime has not yet
-    /// drained (WS-E.4.4, issue #306).
+    /// drained (D-042, issue #306).
     ///
     /// Parked for the reason its two siblings above are: this type knows about
     /// one connection's object graph and nothing about the realm registry, the
@@ -461,7 +461,7 @@ impl ShimServer {
         self.pointer_constraint_ask.take()
     }
 
-    /// Take this shim's pending `idle_inhibit` ask, if it sent one (WS-E.4.4,
+    /// Take this shim's pending `idle_inhibit` ask, if it sent one (D-042,
     /// issue #306). The third sibling of [`Self::take_selection_answer`],
     /// drained on the same turn by the same dispatch path.
     pub fn take_idle_inhibit_ask(&mut self) -> Option<crate::backend::blank::IdleInhibitAsk> {
@@ -3240,7 +3240,7 @@ pub(crate) mod tests {
             .expect("send idle_inhibit");
     }
 
-    /// **An `idle_inhibit` is parked, never acted on** (WS-E.4.4, issue #306) —
+    /// **An `idle_inhibit` is parked, never acted on** (D-042, issue #306) —
     /// the same discipline as its two siblings, and the reason is if anything
     /// clearer here: whether the human's screen may blank depends on the output,
     /// the bound realm and a clock, and this type knows about none of the three.

@@ -2307,7 +2307,7 @@ mod tests {
         );
     }
 
-    /// **An idle inhibit holds the blank and not the lock** (WS-E.4.4, issue
+    /// **An idle inhibit holds the blank and not the lock** (D-042, issue
     /// #306, D-042).
     ///
     /// The sibling of the test above, from the other direction and with a

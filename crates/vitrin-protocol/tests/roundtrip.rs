@@ -581,7 +581,7 @@ fn session_pointer_constraint() -> impl Strategy<Value = SessionPointerConstrain
         })
 }
 
-/// The idle inhibit (WS-E.4.4, issue #306).
+/// The idle inhibit (D-042, issue #306).
 ///
 /// `surface` is exercised both null and non-null in both `state` arms, for
 /// `session_pointer_constraint`'s reason: the IDL requires a null `surface`

@@ -17,7 +17,7 @@ import vitrin_os
 
 conn = vitrin_os.connect(
     "/run/user/1000/vitrin-0/core.sock",
-    identity="agent://demo",
+    identity="vitrin://local/agent/demo",
 )
 
 grant = conn.request_grant(
@@ -57,7 +57,7 @@ there is no half-open state to clean up.
 from vitrin_os import AuthFailed, VersionUnsupported
 
 try:
-    conn = vitrin_os.connect(sock, identity="agent://demo", timeout=30)
+    conn = vitrin_os.connect(sock, identity="vitrin://local/agent/demo", timeout=30)
 except AuthFailed:
     ...   # the core does not know this identity
 except VersionUnsupported:

@@ -56,6 +56,8 @@ commit the regenerated files together with the change that motivated them.
 | `tests/golden/headless_test_pattern_96x60.xrgb` | `capture::tests::headless_test_pattern_image_golden` | **Exact**, raw xrgb8888 bytes — the flagship harness consumer |
 | `crates/vitrin-core/tests/golden/consent_prompt.txt` | `consent::tests::consent_prompt_golden` | Deterministic ink map + blake3 (bundled font, SIMD disabled) |
 | `sdk/python/tests/golden/test_pattern_64x40.xrgb` | `capture::tests::sdk_capture_golden_file_pins_the_wire_bytes` | Exact, raw xrgb8888 — cross-language pin (Rust writes, Python consumes) |
+| `crates/vitrin-core/tests/golden/lock_screen.txt` | `lock::tests::lock_screen_golden` | Deterministic ink map (one character per 8×8 block) + blake3, same bundled font and disabled SIMD |
+| `crates/vitrin-core/tests/golden/status_strip.txt` | `status::tests::status_strip_golden` | Deterministic ink map (one character per 4×4 block) + blake3 |
 
 The consent-UI golden is deterministic across CI runs because the font is
 vendored and embedded and fontdue's architecture-dependent SIMD is disabled

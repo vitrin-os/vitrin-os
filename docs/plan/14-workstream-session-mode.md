@@ -185,7 +185,7 @@ be dogfooded incrementally. Only Stage 3 takes DRM master.
 | **1 — multi-app, nested** | ~~Runtime app launch~~ (**landed**, WS-E.1.1/#207: `autostart = false` templates, a served `realm_launch` verb, core-minted `<template>.<n>` instance ids, `capacity` at `MAX_REALMS`, and `realm_spawned` naming who asked) · ~~`MAX_REALMS` > 1~~ (**landed**, WS-E.1.2/#208: cap 16, `realm-0` mandatory) · ~~Scene binds the output to a focused realm~~ (**landed**, WS-E.1.3/#209: one scene per realm, one bound, captures resolved per grant) · ~~`layout_focus`/`layout_arrange` served~~ (**landed**, WS-E.1.4/#210: two facets, `focus` + `set_fullscreen`, `layout_held` for the second arranger, D-018(2)'s invariants tested as invariants) · ~~input routed to the focused realm~~ (**landed**, WS-E.1.6/#212: physical input follows the bound realm, an agent's follows its grant, per-realm `PhysicalPresence`, and the cross-realm refusal deleted) · ~~a core-owned attention key~~ (**landed**, WS-E.1.7/#232: a tapped, consumed Super lifts `preempted` for one layout use and delivers `vitrin_principal.attention`, so an in-realm shell can switch realms at all) · a shell client (switcher + launcher) | 7–9 w |
 | **2 — livable** | ~~Cross-realm clipboard~~ (**landed**, WS-E.2.1/#213: a core-held single slot the core *pulls* into on Ctrl-Shift-Insert and offers on Shift-Insert, `text/plain;charset=utf-8` at 60 KiB, plus the modifier-aware chord matcher 2.2 and 2.4 consume — §4.1, [D-024](20-decision-log.md#d-024--the-cross-realm-clipboard-is-a-core-held-single-slot-pulled-by-the-core-on-two-human-gestures-that-delegate-nothing)) · ~~core-drawn lock screen on the consent stack~~ (**landed**, WS-E.2.2/#214) · ~~status in the trusted band~~ (**landed**, WS-E.2.3/#215) · ~~human screenshot~~ (**landed**, WS-E.2.4/#216: `ctrl+print` writes one PNG of the REALM VIEW into one audited `--screenshot-dir`, touching no grant — §6) | 4–6 w |
 | **3 — bare metal** | ~~The keymap decision~~ (**landed**, WS-E.3.1/#217: xkbcommon in the core behind the off-by-default `session-keymap` feature, fed a pre-compiled keymap **file** and never a layout name, keysyms normalised to one Unicode convention, and key pairing moved to the scancode — §4, [D-028](20-decision-log.md#d-028--a-bare-metal-session-interprets-the-keyboard-inside-the-core-from-a-pre-compiled-keymap-file-and-key-pairing-moves-to-the-scancode)) · DRM/KMS + GBM + GLES + libseat + libinput · VT switch and what the trusted band asserts across it · hardware bring-up and its evidence problem | 6–9 w |
-| **4 — long tail** | X11 (defers to E3.2 — **scoped, not built**, WS-E.4.1/#221: six requirements handed to E3.2, the X11-only software measured on this machine, and the interim, all in §4.2) · ~~seat vocabulary~~ (**landed in the tree, unproven on hardware**, WS-E.4.2/#222: `relative_motion` and four gesture events on `vitrin_shim_seat`, a `pointer_constraint` ask-and-verdict pair on `vitrin_shim_session`, three new shim globals, touch and tablet deferred against named reopening evidence, the lid handed to WS-E.4.3 — §4.3, [D-032](20-decision-log.md#d-032--relative-motion-and-pointer-gestures-grow-the-seat-vocabulary-pointer-constraints-grow-the-shim-session-instead-and-touch-and-tablet-are-deferred-against-named-evidence)) · ~~session lifecycle~~ (**landed in the tree, unproven on hardware**, WS-E.4.3/#223: idle **blanks and does not lock**, one shared activity clock, suspend detected after the fact from the monotonic/wall clock pair rather than from D-Bus, lid and power delegated to logind, the XF86 media/brightness rows, and a recovery runbook whose SysRq path is `sudo`-only with the kernel mask untouched — §4.4, [D-033](20-decision-log.md#d-033--idle-blanks-the-screen-and-does-not-lock-it-suspend-is-detected-after-the-fact-or-not-at-all-and-the-recovery-path-is-sudo-only)) · the honesty sweep | open |
+| **4 — long tail** | X11 (defers to E3.2 — **scoped, not built**, WS-E.4.1/#221: six requirements handed to E3.2, the X11-only software measured on this machine, and the interim, all in §4.2) · ~~seat vocabulary~~ (**landed, and exercised on the target laptop 2026-08-13 — five of [`docs/drm-bringup.md`](../drm-bringup.md) step 13a's six rungs PASS, including rung 13a-vi's cursor-sprite half that no headless backend can reach; the one failure is rung 13a-v, where a swipe interrupted by a VT switch is delivered `completed` where it must say `cancelled`, open as [#275](https://github.com/vitrin-os/vitrin-os/issues/275)**, WS-E.4.2/#222: `relative_motion` and four gesture events on `vitrin_shim_seat`, a `pointer_constraint` ask-and-verdict pair on `vitrin_shim_session`, three new shim globals, touch and tablet deferred against named reopening evidence, the lid handed to WS-E.4.3 — §4.3, [D-032](20-decision-log.md#d-032--relative-motion-and-pointer-gestures-grow-the-seat-vocabulary-pointer-constraints-grow-the-shim-session-instead-and-touch-and-tablet-are-deferred-against-named-evidence)) · ~~session lifecycle~~ (**landed, and executed on hardware on 2026-08-11 and 2026-08-13, and again on 2026-08-12 for the blank rung alone** — rungs `L1`–`L7` of [the recovery runbook](../book/src/recovery.md#the-numbers-this-checklist-owes) have all been run and all have their numbers, that second `L4` execution reading the log and the flight recorder rather than only the panel and so observing #258's and #259's fixes on the machine that produced them, at the cost of #257–#260 and #277 filed against those runs — and of #268, which came out of the same 2026-08-11 session from driving alacritty and nautilus rather than from any rung, so a reader counting defects against that date should count five — with routes 3 and 4 still unexecuted predictions and the VKMS rung attempted on every PR while covering nothing, WS-E.4.3/#223: idle **blanks and does not lock**, one shared activity clock, suspend detected after the fact from the monotonic/wall clock pair rather than from D-Bus, lid and power delegated to logind, the XF86 media/brightness rows, and a recovery runbook whose SysRq path is `sudo`-only with the kernel mask untouched — §4.4, [D-033](20-decision-log.md#d-033--idle-blanks-the-screen-and-does-not-lock-it-suspend-is-detected-after-the-fact-or-not-at-all-and-the-recovery-path-is-sudo-only)) · ~~the honesty sweep~~ (**landed**, WS-E.4.4/#224: §6's register of the published surfaces a WS-E limit is written on, each with the register it is written in and what holds it, plus the marker-comment limit-set gate that compares this document's limit set against `limits.md`'s **by id and never by wording**, so either register can be reworded honestly — the §4.2 and §4.4 handoff tables stay as the dictated text for their own claims) | open |
 
 **Stage 1 is the one that is genuinely dual-use.** Layout verbs are allocated
 and unserved, and multi-realm is Phase-3 fleet work; both get built here
@@ -1263,6 +1263,36 @@ capabilities share a noun in a document that cannot rename either.
   documented runbook and its result is dated, the status of everything in this
   section is **landed in the tree, unproven on hardware** — the same status
   Stage 3's DRM work had to carry, for the same reason.
+
+  > **EXECUTED 2026-08-13, by a different instrument than this bullet named, and
+  > the bullet above is left as written.** What ran is not a
+  > `tests/integration/test_real_*.py` rung on the target machine: it is
+  > [`docs/drm-bringup.md`](../drm-bringup.md) step 13a, a manual runbook rung,
+  > and the substitution is recorded here rather than made silently.
+  > `tests/integration/test_real_gestures.py` does exist and covers everything
+  > from `input::intake_physical` onward by injection — which is why it cannot
+  > be the witness for this bullet, since libinput's own classification of three
+  > fingers, and the cursor sprite, sit *before* and *outside* that entry point
+  > and are unreachable from every backend CI can execute. The maintainer ran
+  > 13a on 2026-08-13 on the target laptop, on tty3, across three sessions,
+  > against `shim/tests/gesture_probe.c` — this repo's own witness client, a
+  > real Wayland client under the real shim, not a third-party app and not a
+  > mock. `13a-i` relative motion, `13a-ii` three-finger swipe, `13a-iii`
+  > two-finger pinch, `13a-iv` two-finger scroll and `13a-vi` the pointer lock,
+  > including the cursor-sprite half, all PASS. `13a-v` is the one that did not:
+  > a gesture interrupted by a VT switch arrives `completed` where the core owes
+  > `cancelled`, because libinput flushes the in-flight swipe before
+  > `session::suspend_physical_seat` runs. That is
+  > [#275](https://github.com/vitrin-os/vitrin-os/issues/275), still open, and
+  > it joins the Owed list below rather than replacing anything on it. So the
+  > status of this section is no longer *"landed in the tree, unproven on
+  > hardware"*; it is *"landed, exercised once on one laptop by one purpose-built
+  > client, with one recorded defect still open"*. Of the "Owed" bullet below,
+  > the hardware rung is discharged in substance by that run; cancelling an
+  > in-flight gesture when a consent card or the lock screen raises is not —
+  > `ConsentGrab` and `LockGate` still answer `Gate::Deliver` for `GestureEnd`
+  > (`consent/grab.rs`, `lock/gate.rs`), exactly as written above.
+
 - **Owed, and named rather than smoothed over:** cancelling an in-flight
   gesture when a consent card or the lock screen raises (above); and the
   hardware rung itself.
@@ -1712,7 +1742,7 @@ be re-worded:
    **deferrals**, and each names the evidence that reopens it. A surface that
    says *"refused"* has published a permanence nobody decided.
 
-   > **AMENDED 2026-08-17 by WS-E.4.4 (#306).** The two rows above are updated
+   > **AMENDED 2026-08-17 by D-042 (#306).** The two rows above are updated
    > rather than left standing, because the table's own purpose is that three
    > surfaces say the same thing and #306 changed what the true thing is: idle
    > inhibition is **served**, and what is published is now a set of bounds. The
@@ -1956,7 +1986,7 @@ the plan document" is a rule this task could not follow from memory either:
    inhibition"*. WS-E.2.2/#214 shipped the lock screen. Only the
    idle-inhibition half was true, and only that half is published.
 
-   > **AMENDED 2026-08-17 by WS-E.4.4 (#306).** The sentence above is left as
+   > **AMENDED 2026-08-17 by D-042 (#306).** The sentence above is left as
    > written, because it is the honest record of what this sweep found and a
    > correction list that edits its own findings teaches the next sweep nothing.
    > What has changed since: **neither half of #224's item (8) is true any
@@ -2225,7 +2255,7 @@ The limit set follows.
 
 - <!-- limit: idle-inhibit-bounded -->
   **Idle inhibition is served, bounded three ways, and unproven on hardware**
-  (created by WS-E.4.3 as a *not yet*; discharged by WS-E.4.4 / #306 and
+  (created by WS-E.4.3 as a *not yet*; discharged by #306 and
   [D-042](20-decision-log.md), and re-published as a **bound** rather than
   deleted). `zwp_idle_inhibit_manager_v1` is advertised by the shim and relayed
   over `vitrin_shim_session.idle_inhibit`. The three bounds: only the realm the

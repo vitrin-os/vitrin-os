@@ -26,7 +26,7 @@ lockfile or compile times.
 
 | Target | Crate under test | What it drives |
 |---|---|---|
-| `protocol_decode` | `vitrin-protocol` | Every one of the 29 generated `<message>.decode(bytes, fd)` functions, directly, with arbitrary bytes and an arbitrary fd presence. Pure in-memory: no socket at all. |
+| `protocol_decode` | `vitrin-protocol` | Every one of the generated `<message>.decode(bytes, fd)` functions, directly, with arbitrary bytes and an arbitrary fd presence — no literal count here on purpose, because `DECODERS.len()` is asserted against the generated `MESSAGE_COUNT`, so a message added to the IDL fails that assertion rather than silently escaping the table. Pure in-memory: no socket at all. |
 | `ipc_framing` | `vitrin-ipc` | `Connection::recv_message`'s frame reassembly and `SCM_RIGHTS` fd matching, over a real `socketpair(2)` fed with arbitrary byte streams split across two raw `sendmsg(2)` calls with arbitrary attached-fd counts. |
 
 Each target's own doc comment (top of its `fuzz_targets/*.rs` file) is the
@@ -193,11 +193,15 @@ cargo test --manifest-path fuzz/Cargo.toml
 Adding a seed means adding its claim to both tables
 (`PROTOCOL_DECODE_CLAIMS` / `IPC_FRAMING_CLAIMS`, one copy in each file);
 a seed that claims nothing fails the checks, and so does a claim with no
-seed. Neither check is wired into `ci.yml` yet — the `fuzz-smoke` job
-replays the corpus but cannot tell which path a replay reached — so today
-they are a documented local gate. Wiring `python3 fuzz/seed_corpus.py
---check` plus `cargo test --manifest-path fuzz/Cargo.toml` into that job
-is the natural follow-up.
+seed. Both checks run in `ci.yml`'s `fuzz-smoke` job (WS-E.2.1, #213), in a
+`Seed-corpus reachability` step placed before the replay step — `--check`
+first, so a stale generator reads as a clear message rather than a confusing
+test failure, then the real-decoder proof. The replay step alone cannot tell
+which path a replay reached, which is why it is not a substitute. The step has
+earned its place twice: the `DECODERS` table had drifted out of IDL
+declaration order on `main`, handing `attach_with_fd`'s descriptor to
+`get_seat`; and adding `vitrin_shim_session.idle_inhibit` (#306) shifted every
+later selector while every other local gate stayed green.
 
 ## CI
 

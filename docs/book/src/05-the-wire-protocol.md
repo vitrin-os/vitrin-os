@@ -66,7 +66,7 @@ unknown message never desynchronises the fd stream. If the header's
 
 | Class | Reaches the core by | Interfaces |
 |---|---|---|
-| **Agent principal** | Connecting to the core's listening socket and authenticating | `vitrin_handshake`, `vitrin_principal`, `vitrin_realm`, `vitrin_grant`, `vitrin_consent`, `vitrin_view`, `vitrin_actuator_*` |
+| **Agent principal** | Connecting to the core's listening socket and authenticating | `vitrin_handshake`, `vitrin_principal`, `vitrin_realm`, `vitrin_grant`, `vitrin_consent`, `vitrin_view`, `vitrin_actuator_*`, `vitrin_launcher`, `vitrin_layout_*` |
 | **Shim** | Inheriting a socketpair from the core across `fork`/`exec` | `vitrin_shim_session`, `vitrin_shim_surface`, `vitrin_shim_seat` |
 
 The classes are mutually unreachable. A message using the other class's
@@ -91,6 +91,9 @@ authentication, because the core created both ends itself.
 | `vitrin_shim_session` | Shim connection bootstrap |
 | `vitrin_shim_surface` | Shim-to-core buffer path |
 | `vitrin_shim_seat` | Input delivery to the shim (events only, origin-tagged) |
+| `vitrin_launcher` | Realm-launch facet (since wire version 2) — fork a new realm instance from an operator-written template, under a core-minted id; `launch` carries no arguments, so the command never crosses the wire |
+| `vitrin_layout_focus` | Focus facet (since wire version 2) — bind the output to the granted realm and send the human's own input there, one act |
+| `vitrin_layout_arrange` | Arrangement facet (since wire version 2) — fill the output, or compose at the app's own size; `place`, `resize`, `raise` and stacking are absent rather than refused |
 
 Each has a prose page under
 [`docs/protocol/`](https://github.com/vitrin-os/vitrin-os/tree/main/docs/protocol).
@@ -139,13 +142,19 @@ retry helps, because the bug is in your client.
 
 `invalid_object` · `invalid_opcode` · `invalid_argument` · `oversized` ·
 `fd_violation` · `pre_handshake` · `version_unsupported` · `auth_failed` ·
-`internal_error` · `resource_exhausted`
+`internal` · `resource_exhausted`
 
 **Recoverable** — your request failed. The connection is healthy and you may
 try something else.
 
-`not_granted` · `grant_expired` · `revoked` · `rate_limited` · `preempted` ·
-`consent_held` · `no_surface` · `operation_failed` · `at_capacity`
+`not_granted` · `expired` · `revoked` · `rate_limited` · `preempted` ·
+`consent_held` · `no_surface` · `internal` · `capacity`
+
+Those are the IDL's own spellings, which is what a client in another language
+has to match. The Python SDK's exception names are deliberately not all
+identical to them — `expired` is `GrantExpired`, `internal` (7, recoverable) is
+`OperationFailed`, `capacity` is `AtCapacity`, and the fatal `internal` (8) is
+`InternalError` — so transcribe from the IDL, never from an SDK.
 
 The line is: *did the client send something incoherent, or did a coherent
 request get refused?* Setting an out-of-range verb bit is incoherent —
@@ -168,19 +177,27 @@ values; existing opcodes never change meaning. The negotiated version comes
 out of the handshake, and each side serves only what that version defines.
 
 Version 0 is frozen for Phase 1 — **not forever**. The wire integer is now
-**2**, and it appends, in full:
+**2**, and it appends:
 
-- the `realm_launch` verb;
+- the `realm_launch` verb, and `vitrin_principal`'s `attention` event;
 - three structural mints on `vitrin_grant` — `get_launcher`,
   `get_layout_focus`, `get_layout_arrange`;
 - the three interfaces they mint — `vitrin_launcher` (`launch`/`launched`),
   `vitrin_layout_focus` (`focus`), `vitrin_layout_arrange`
   (`set_fullscreen`) — and the `vitrin_layout_arrange.mode` enum;
-- the `capacity` refusal code and the `layout_held` outcome.
+- the `capacity` refusal code and the `layout_held` outcome;
+- on `vitrin_shim_session`, the cross-realm clipboard, the pointer
+  constraints and the idle inhibit (`request_selection`, `offer_selection`,
+  `pointer_constraint_state`, `selection`, `pointer_constraint`,
+  `idle_inhibit`), and on `vitrin_shim_seat`, `relative_motion` and the four
+  gesture events — plus the enums their arguments carry.
 
 It changes nothing else: every version-1 signature is byte-identical at
-version 2. Phase 2 brings semantic trees and epoch/CAS action semantics.
-Expect to move.
+version 2. The complete, normative enumeration — every message, and every
+enum with a count to check the list against — is
+[`00-conventions.md` §7.3](https://github.com/vitrin-os/vitrin-os/blob/main/docs/protocol/00-conventions.md#73-version-semantics),
+and this list restates it. Phase 2 brings semantic trees and epoch/CAS action
+semantics. Expect to move.
 
 ## Validating your understanding
 

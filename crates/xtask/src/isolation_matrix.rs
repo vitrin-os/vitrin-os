@@ -1371,14 +1371,21 @@ fn render_not_here(p: &mut String, c: &Constants) {
          archives nothing, and it is corroborated but **not** replaced by the kernel page:\n  \
          booting the runner's own `6.17.0-1020-azure` in a bare initramfs answers ABI {ci}\n  \
          too, which is a fact about that kernel and not about that runner.\n\
-         - **Any statement that P2.6.3 is finished.** What landed with this page is a\n  \
+         - **Any statement that P2.6.3's criteria were all met as written.** The task\n  \
+         (issue #187) closed on 2026-08-19, on its *corrected* criteria and on decision\n  \
+         D-043 — not on the row the plan first wrote. What landed with this page is a\n  \
          generated ladder of what this build requires, held by CI. A per-kernel row set\n  \
          landed separately on 2026-08-16 — five kernels, on [the kernel\n  \
          page](isolation-kernels.md) — and it is a row per *kernel*, not the \"one row per\n  \
-         ABI actually reported\" the criteria ask for: five kernels answered five ABIs, and\n  \
-         four of the nine rungs are reported by none of them. The behavioural per-rung\n  \
-         tests this page's numbers rest on still live in `vitrin-realm-init`'s own suite,\n  \
-         on one box.\n\
+         ABI actually reported\" the criteria ask for, a clause no byte-stable checked-in\n  \
+         page can satisfy (the plan carries that as Correction 5). Four things did not\n  \
+         become true when the task closed: five kernels answered five ABIs, and four of\n  \
+         the nine rungs are reported by none of them; every row on that page is a\n  \
+         **kernel** reading taken in a bare initramfs rather than a distribution; the\n  \
+         behavioural per-rung tests this page's numbers rest on still live in\n  \
+         `vitrin-realm-init`'s own suite, on one box; and the sub-floor half of those\n  \
+         tests is evidence about the `--landlock=abi:N` dial rather than about any state a\n  \
+         stock session reaches.\n\
          - **The realm's grant table.** Which hierarchies get which rights is\n  \
          [the limits page](limits.md)'s two-tier grant list, not a per-rung fact. The\n  \
          only grant-table row here is the one denial the mount table does not carry.\n\n",
@@ -1504,6 +1511,27 @@ pub static CLAIMS: &[Claim] = &[
                 needle: "build.landlock_min_abi",
             },
         ],
+    },
+    // The lower half of this ladder is unreachable in production, and until
+    // D-043 (2026-08-19) nothing published said what its behavioural tests
+    // were therefore evidence *about*. A reader met three tests exercising
+    // rungs no shipped session can run at and had to guess. This claim is the
+    // machine-held half of that decision: it is named by every sub-floor row,
+    // so a rung below the floor can never again render without the
+    // explanation, and the sentence it cites cannot be deleted from the limits
+    // page while the rows still cite it.
+    Claim {
+        id: "sub-floor-rungs-hold-the-dial-not-the-floor",
+        says: "Rungs below this build's floor are unreachable in production -- a kernel \
+               reporting one is REFUSED at startup rather than confined weakly -- so the \
+               behavioural tests that exercise them hold the `--landlock=abi:N` DIAL honest \
+               and not the floor. They describe no state a stock session can reach, and they \
+               are the only evidence that the lower half of this table is not fiction \
+               (decision D-043, 2026-08-19).",
+        anchors: &[Anchor {
+            surface: LIMITS,
+            needle: "hold the dial honest, not the floor",
+        }],
     },
     Claim {
         id: "refer-makes-the-cap-a-dial",
@@ -1677,6 +1705,7 @@ pub static RUNGS: &[Rung] = &[
         claims: &[
             "refer-makes-the-cap-a-dial",
             "abi-floor-refuses-below-the-number",
+            "sub-floor-rungs-hold-the-dial-not-the-floor",
         ],
     },
     Rung {
@@ -1687,7 +1716,10 @@ pub static RUNGS: &[Rung] = &[
         not_bought: "a tightening of any kind. Handling `REFER` is what **permits** \
                      cross-directory rename, which is how GTK and Firefox write files; a ladder \
                      read as \"higher is tighter\" has this rung backwards.",
-        claims: &["refer-makes-the-cap-a-dial"],
+        claims: &[
+            "refer-makes-the-cap-a-dial",
+            "sub-floor-rungs-hold-the-dial-not-the-floor",
+        ],
     },
     Rung {
         abi: 3,
@@ -1698,7 +1730,10 @@ pub static RUNGS: &[Rung] = &[
                      never truncatable at any rung. What it adds is that a path the domain \
                      grants only `READ_FILE` on can no longer be emptied by `truncate(2)`, \
                      `creat(2)` or `O_TRUNC`.",
-        claims: &["truncate-arrives-at-abi-3"],
+        claims: &[
+            "truncate-arrives-at-abi-3",
+            "sub-floor-rungs-hold-the-dial-not-the-floor",
+        ],
     },
     Rung {
         abi: 4,
@@ -1715,6 +1750,7 @@ pub static RUNGS: &[Rung] = &[
         claims: &[
             "net-scoping-is-carried-by-the-namespace",
             "nine-rungs-are-six-domains",
+            "sub-floor-rungs-hold-the-dial-not-the-floor",
         ],
     },
     Rung {
@@ -1726,7 +1762,10 @@ pub static RUNGS: &[Rung] = &[
                      hierarchy and the app needs the node's ioctls, so the ruleset **grants** \
                      `IOCTL_DEV` on every bound render node and on `/dev/pts`. What the rung \
                      buys is denying `ioctl` on every *other* device node in the realm.",
-        claims: &["ioctl-dev-does-not-close-the-render-node"],
+        claims: &[
+            "ioctl-dev-does-not-close-the-render-node",
+            "sub-floor-rungs-hold-the-dial-not-the-floor",
+        ],
     },
     Rung {
         abi: 6,

@@ -1672,6 +1672,48 @@ fn drop_all_capabilities() -> Result<(), Fail> {
 /// [`landlock::add_path_rule`] and [`landlock::restrict_self`] are
 /// allocation-free and take a `&CStr` the parent built: the split is for this
 /// caller, not for tidiness.
+///
+/// # The sub-floor rungs: what these measurements ARE evidence about, and
+/// what they are NOT
+///
+/// Three of them enforce a domain at rung 1, 2 or 3 —
+/// `rung_one_forbids_reparenting_that_the_rung_above_permits`,
+/// `the_truncate_rung_is_measured_and_its_absence_is_measured_with_it` and
+/// `a_realm_can_write_where_it_was_granted_and_nowhere_else`. **Every one of
+/// those rungs is below this build's floor**
+/// ([`LANDLOCK_MIN_ABI`](vitrin_realm_init::LANDLOCK_MIN_ABI) = 6): a kernel
+/// reporting one is **refused at startup**, not confined at a weaker rung, so
+/// no shipped session has ever run at rung 1, 2 or 3 and none ever will while
+/// the floor stands.
+///
+/// They are kept on purpose — **D-043** (`docs/plan/20-decision-log.md`,
+/// 2026-08-19, the owner's decision closing issue #187) — and the reason is
+/// written here rather than left to be inferred from the fact that the tests
+/// exist:
+///
+/// - **They hold the `--landlock=abi:N` DIAL honest, not the floor.** The cap
+///   keeps its full range *including below the floor*, deliberately, because
+///   it is the instrument every per-rung measurement in this repository is
+///   taken with. Rungs 1–5 are unreachable as a kernel's answer and entirely
+///   reachable as an operator's.
+/// - **They are the only evidence the generated ladder's lower half is not
+///   fiction.** `docs/book/src/isolation-matrix.md` is *derived*: the rungs
+///   are parsed out of [`landlock`], cross-checked against
+///   `the_rung_masks_pin_a_measured_table`, and rendered. Nothing in that
+///   chain observes a kernel *answering* — these three do.
+/// - **The `REFER` result is not derivable from the table.** Rung 1 is
+///   *stricter* than rung 2 about reparenting, so the dial is not a one-way
+///   weakening; two tests asserting the opposite invariant were replaced
+///   because of it. The rung that corrects a reader here is a sub-floor rung.
+///
+/// **What they are not evidence about**, stated in the words that make the
+/// gap findable: not the floor, not any confinement claim this build
+/// publishes, and **not any state an operator running a stock build can
+/// reach** — a session pinned below the floor warns in as many words that no
+/// published confinement claim applies to its realms. They are also not
+/// evidence about any kernel's *answer*: which kernels report which ABI is
+/// `docs/book/src/isolation-kernels.md` and its checked-in boot rows (#281),
+/// measured elsewhere and by other means.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1856,6 +1898,14 @@ mod tests {
     /// move a file between two directories **inside its own writable
     /// storage**, and a realm at rung 2 or above can. Climbing the ladder
     /// loosens the domain here; the cap is a dial, not a one-way weakening.
+    ///
+    /// **Sub-floor, and kept for a stated reason (D-043).** Rungs 1 and 2 are
+    /// below `LANDLOCK_MIN_ABI`, so this measures **the dial**, not the floor,
+    /// and describes no state a stock session can reach. It is also the one
+    /// measurement whose result cannot be read off the mask table: it is what
+    /// makes "the cap can only ever weaken" false. See the module docs above
+    /// for the full statement of what these sub-floor runs are and are not
+    /// evidence about.
     #[test]
     fn rung_one_forbids_reparenting_that_the_rung_above_permits() {
         vitrin_skip::skip_unless!(
@@ -2298,6 +2348,14 @@ mod tests {
         // and outside the designated set fails EACCES". Rung 1 is enough --
         // this is the primitive the whole ladder stands on -- so it runs on
         // every kernel that has Landlock at all.
+        //
+        // **Sub-floor, and kept for a stated reason (D-043).** Rung 1 is below
+        // `LANDLOCK_MIN_ABI`; this is evidence about the DIAL and about the
+        // primitive, never about the floor and never about a rung a shipped
+        // session runs at. The mock-free evidence for the SHIPPED default's
+        // write denial is `tests/integration/test_real_confinement.py`, which
+        // opens an ungranted path inside a real realm and gets `EACCES` at the
+        // default and success at `--landlock=off`. Module docs above.
         vitrin_skip::skip_unless!(
             vitrin_skip::LANDLOCK_ABI,
             landlock_abi_at_least(1, "the write-set floor")
@@ -2355,6 +2413,12 @@ mod tests {
         }
     }
 
+    /// **Sub-floor, and kept for a stated reason (D-043).** Rungs 2 and 3 are
+    /// below `LANDLOCK_MIN_ABI`, so a kernel that reported either would be
+    /// refused at startup rather than confined here. What this measures is the
+    /// `--landlock=abi:N` **dial** and the ladder table's lower half — never
+    /// the floor, and never a state a stock session can reach. The module docs
+    /// above state that in full.
     #[test]
     fn the_truncate_rung_is_measured_and_its_absence_is_measured_with_it() {
         // The rung the plan row names, and the one whose absence is directly

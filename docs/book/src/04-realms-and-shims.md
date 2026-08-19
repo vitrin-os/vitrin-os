@@ -127,8 +127,10 @@ without spawning anything.
 > `/dev/pts` and each render node — eight with one render node bound, one more
 > for each additional one). What that ruleset requires of a kernel is published
 > as a generated, CI-held table — [the Landlock ABI matrix](isolation-matrix.md)
-> — but P2.6.3 is **still not finished**: that table measures no kernel, the
-> per-kernel one its criteria ask for exists now, on a page of its own —
+> — and P2.6.3 closed on 2026-08-19 on **corrected** criteria rather than the
+> ones it was written with, so read the closure narrowly: that table measures no
+> kernel, the
+> per-kernel one its criteria ask for exists on a page of its own —
 > [which kernels this build starts on](isolation-kernels.md), five distribution
 > kernels booted under QEMU with the shipped `vitrind`, two admitted and three
 > refused `below-floor` — but every row there is a **kernel** reading taken in a

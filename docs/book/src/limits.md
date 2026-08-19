@@ -247,10 +247,11 @@ inferred from the word "Landlock":
   numbers are now deliberately different: the *build* floor is 6 and the *CI
   require-variable* is 7, because the second is a statement about the runner's
   kernel and not about what this build needs.
-  **This narrows P2.6.3 rather than completing it**: PRD §20's
-  "coverage is kernel-dependent" caveat is *deferred*, not answered. Five
-  kernels reported five ABIs and four of this build's nine rungs are reported by
-  none of them, so the per-rung table the task asks for is still generated from
+  **The floor narrowed P2.6.3 rather than completing it**, and what completed
+  it was other work plus a decision — not this. PRD §20's "coverage is
+  kernel-dependent" caveat is answered **for those five kernels and for no
+  others**: five kernels reported five ABIs and four of this build's nine rungs
+  are reported by none of them, so the per-rung table is still generated from
   source rather than measured on machines. The plan document carries that
   correction in as many words.
 - **The rung matters, and the rung *obtained* is what is published.** A
@@ -292,6 +293,30 @@ inferred from the word "Landlock":
   a same-directory rename succeeds at every rung. Practically, `--landlock=abi:1`
   breaks every app that writes by rename-into-place (GTK, Firefox). Do not read
   the ladder as "higher is always tighter"; read it as "rung N is ABI N".
+- **The rungs below the floor are still exercised, on purpose: those tests
+  hold the dial honest, not the floor.** Three behavioural measurements in
+  `crates/vitrin-realm-init/src/main.rs` enforce a domain at rung 1, 2 or 3 —
+  `rung_one_forbids_reparenting_that_the_rung_above_permits`,
+  `the_truncate_rung_is_measured_and_its_absence_is_measured_with_it` and
+  `a_realm_can_write_where_it_was_granted_and_nowhere_else`. Every one of those
+  rungs is **below `build.landlock_min_abi`**, so a kernel reporting one is
+  refused at startup rather than confined weakly, and no shipped session has
+  ever run at any of them. They are kept deliberately — decision **D-043**
+  (`docs/plan/20-decision-log.md`, 2026-08-19), taken as a dated decision
+  precisely because this task's *previous* narrowing was settled by attrition
+  and reached these pages as a deferral nobody could date. The reasons are two,
+  and neither is "deleting tests feels wrong": they are the only evidence that
+  the lower half of the [ABI matrix](isolation-matrix.md) is not fiction, that
+  page being *derived* from this build's own source and observing no kernel
+  answering anything; and the `REFER` result in the bullet above — rung 1 being
+  **stricter** than rung 2 — cannot be read off the mask column at all, which
+  is why two tests asserting the opposite invariant were replaced when it was
+  measured. What they are **not** evidence about is said in the same breath:
+  not the floor, not any confinement claim this build publishes, and not any
+  state an operator running a stock build can reach. Nor are they evidence
+  about a kernel: which kernels report which ABI is [the kernel
+  page](isolation-kernels.md) and its checked-in boot rows, measured elsewhere
+  and by other means.
 - **This build's ladder stops at rung 9, and a newer kernel is clamped to it.**
   ABI 10 exists in mainline and this build does not request it. A kernel
   reporting more than 9 gets a rung-9 ruleset, and that is journaled per realm
@@ -391,8 +416,9 @@ inferred from the word "Landlock":
   a real realm — those are measured in `vitrin-realm-init`'s own suite, where a
   forked child can enforce a capped domain and try the syscall.
 - **There is a ladder table now, and it is a table about this build — not
-  about kernels. P2.6.3 is still not finished and this page will not say
-  otherwise.** The task's own acceptance criteria
+  about kernels. P2.6.3 closed on 2026-08-19, on its *corrected* criteria and
+  not on the ones its plan row first wrote, and this page will not round that
+  up.** The task's own acceptance criteria
   (`docs/plan/02-phase-2-semantic-epochs.md`, P2.6.3) ask for two deliverables:
   the ruleset, which landed, **and** a per-ABI ladder table *generated* on each
   kernel in the CI matrix with CI going red when the checked-in copy is stale.
@@ -436,11 +462,21 @@ inferred from the word "Landlock":
   others. The per-rung *behavioural* statements quoted above
   (the `TRUNCATE` pair, the `REFER` pair) are held by `vitrin-realm-init`'s own
   tests on one box; everything else about a rung is now generated and gated,
-  which is a narrower promise than "measured". Do not read "P2.6.3" anywhere in
-  this repository as a finished task. The plan document carries the
-  corrections, and two of the criteria written there were **wrong on the
-  kernel's own terms**; they are restated with the correction visible rather
-  than deleted.
+  which is a narrower promise than "measured". **What "P2.6.3 closed" does and
+  does not mean.** It closed on the corrected criteria plus decision D-043 (the
+  sub-floor rung tests, above), and two of the criteria written in the plan were
+  **wrong on the kernel's own terms** while a third — "one row per ABI actually
+  reported, on each kernel in the CI matrix" — cannot be satisfied by any
+  byte-stable checked-in page and was replaced rather than met; the plan
+  document restates all three with the correction visible rather than deleting
+  them. Four things did not become true when it closed, and each is stated
+  above in its own words: five kernels answered five ABIs and four of the nine
+  rungs are reported by none of them; every one of those rows is a **kernel**
+  reading in a bare initramfs, so the number of *distributions* measured is
+  still one; the suite itself has still only ever run on two machines and
+  nobody but the collector's author has re-run its levers; and the per-rung
+  behavioural statements are one box, on one date. Read a closed issue as a
+  closed issue and this page for what is actually measured.
 
 ### The six enforced domains, stated once so a generated table can be compared
 

@@ -179,8 +179,9 @@ does not spend a weekend on something the project already says out loud:
   beneath them, and **no path carrying data**. The rung is journaled per realm and is
   **child-asserted**: no `/proc` file names a process's Landlock domain, so the
   core cannot corroborate it the way it corroborates the namespace inodes. Note
-  also that P2.6.3 is **not finished**: the ruleset landed, and so did a
-  generated ladder table with a CI staleness gate — the
+  also what P2.6.3 closing on 2026-08-19 does **not** mean, since it closed on
+  its corrected criteria rather than the ones first written: the ruleset landed,
+  and so did a generated ladder table with a CI staleness gate — the
   [Landlock ABI matrix](docs/book/src/isolation-matrix.md), which states what
   this build requires of a kernel — but it measures **no** kernel. The
   per-kernel table the task's criteria ask for is a separate artefact,

@@ -191,19 +191,25 @@ pub const LANDLOCK_BUILD_MAX_RUNG: u32 = 9;
 /// A session either gets a domain at this number or above, or it does not
 /// start.
 ///
-/// **This narrows #187 rather than completing it.** PRD §20's "coverage is
-/// kernel-dependent" caveat is *deferred*, not answered: this build now targets
-/// recent kernels and says so, instead of claiming a spectrum it never measured.
+/// **The floor narrowed #187 rather than completing it**, and what completed it
+/// was other work plus a dated decision — #187 closed on 2026-08-19; see
+/// `docs/plan/02-phase-2-semantic-epochs.md` (P2.6.3, Correction 7) and D-043.
+/// PRD §20's "coverage is kernel-dependent" caveat is answered **for the five
+/// kernels #281 booted and for no others**: this build targets recent kernels
+/// and says so, instead of claiming a spectrum it never measured.
 ///
 /// A generated multi-rung table with a CI staleness gate now exists at the
 /// narrowed scope -- `docs/book/src/isolation-matrix.md`, emitted by `cargo
 /// xtask isolation-matrix`, which **reads this constant out of this file** and
 /// goes red when the checked-in page no longer prints the number declared here.
 /// Re-tuning it is therefore a regeneration, not an edit. What that table is
-/// not is a per-kernel measurement: it probes nothing, and the per-ABI row set
-/// the original criteria ask for is still undone. See
-/// `docs/plan/02-phase-2-semantic-epochs.md` (P2.6.3, Corrections 4 and 5) and
-/// `docs/book/src/limits.md`.
+/// not is a per-kernel measurement: it probes nothing. The per-kernel row set
+/// landed separately as `docs/book/src/isolation-kernels.md` (#281, five
+/// kernels booted under QEMU), and the original criteria's "one row per ABI
+/// actually reported, on each kernel in the CI matrix" was found unsatisfiable
+/// by any byte-stable checked-in page and replaced rather than met. See
+/// `docs/plan/02-phase-2-semantic-epochs.md` (P2.6.3, Corrections 4, 5, 6 and
+/// 7) and `docs/book/src/limits.md`.
 ///
 /// # Why 6 and not 7, and why lowering it took no enforcement away
 ///

@@ -426,6 +426,51 @@ distribution row still has to come from the distribution, the runner's own
 reading remains a transcription from an expiring job log, and PRD §20's caveat
 is still not closed.
 
+**Correction 7 — P2.6.3 closes, on the corrected criteria and on a dated
+decision about the ladder's lower half** (2026-08-19, [D-043](20-decision-log.md#d-043--the-sub-floor-landlock-rung-tests-are-kept-and-what-they-are-evidence-about-is-published-beside-them-the---landlockabin-dial-never-the-floor)).
+
+The two sentences above that forbid reading Corrections 4 and 5 as this task
+closing **stand exactly as written and are not being walked back**: the floor
+decision did not close it and neither did the build-side ladder table. What
+closes it is the whole set — the ruleset, the generated ladder with its
+`--check` gate and its claim anchoring, the measured kernel page Correction 6
+records, both behavioural per-rung tests in their corrected form, and the one
+judgement that was left open after all of those had landed.
+
+**That judgement, and the answer.** With the floor at 6, rungs 1–5 are
+unreachable in production: a kernel reporting one is refused outright, not
+confined weakly. Three behavioural tests in
+`crates/vitrin-realm-init/src/main.rs` nevertheless enforce a domain at rung 1,
+2 or 3, so they measure no state an operator can reach — the shape this
+repository calls a check that stopped checking. The owner's answer is to
+**keep them and publish why**: they hold the `--landlock=abi:N` *dial* honest
+rather than the floor; they are the only evidence the ladder table's lower half
+is not fiction, that page being derived from source and observing no kernel
+answering; and the `REFER` result — rung 1 being *stricter* than rung 2 —
+cannot be read off the mask column at all, which is why two tests asserting the
+opposite invariant were replaced when it was measured. The reasoning is
+published beside the tests, on `docs/book/src/limits.md`, and as the
+generator-held claim `sub-floor-rungs-hold-the-dial-not-the-floor`, which every
+sub-floor row of the matrix now names — so the ladder's lower half cannot go
+back to having an unexplained status while CI is green. The option of *adding*
+tests for the four rungs no measured kernel reports was offered and **not**
+taken; two of those four are not testable by this mechanism at all, since rungs
+7 and 8 buy `landlock_restrict_self` flags rather than mask bits.
+
+**Why this is a correction and not a silent close.** This task's *previous*
+narrowing — "target recent kernels for now" — was settled by attrition and
+reached four published pages as a deferral nobody could date. The decision
+above is smaller and would have been easier still to leave implicit.
+
+**What closing it does not make true**, and every one of these is published in
+the same words on `docs/book/src/limits.md`: five kernels answered five ABIs and
+four of the nine rungs are reported by none of them; those are **kernel** rows
+in a bare initramfs, so the number of distributions measured as such is still
+one; nobody but the collector's author has re-run its failure levers; the suite
+itself has still only ever run on two machines; and the per-rung behavioural
+statements are one box on one date. **PRD §20's caveat is answered for those
+five kernels and for no others** — the sentence above stands.
+
 ### E2.7 — Network authority v0
 
 - **Goal:** per-realm loopback-only network namespace plus own PID/IPC/UID (completing the container-per-realm baseline, PRD Doc 2 §4.5); egress as a designated host:port-scoped, journaled grant via a mediating proxy (PRD P13).

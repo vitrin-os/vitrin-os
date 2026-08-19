@@ -99,7 +99,7 @@ _Static_assert(VITRIN_SHIM_SEAT_EVT_GESTURE_END_OPCODE < VITRIN_SEAT_EVENT_SLOTS
  * constant for the same reason, so a message added to the IDL turns two
  * unrelated files red on purpose.
  *
- * Re-pinned 47 -> 48 by WS-E.4.4 (issue #306), with the check the paragraph
+ * Re-pinned 47 -> 48 by D-042 (issue #306), with the check the paragraph
  * above asks for actually made: the added message is
  * `vitrin_shim_session.idle_inhibit`, a REQUEST on the session bootstrap object.
  * It is not a `vitrin_shim_seat` event, so `VITRIN_SEAT_EVENT_SLOTS` is

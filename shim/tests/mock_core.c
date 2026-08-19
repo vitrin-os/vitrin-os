@@ -178,7 +178,7 @@ struct core {
 	bool seat_created;
 	uint32_t seat_id;
 	uint32_t watermark;
-	/* Idle inhibition (WS-E.4.4, issue #306): what the shim has told this
+	/* Idle inhibition (D-042, issue #306): what the shim has told this
 	 * peer, and how many edges it has sent. The real core keeps exactly this
 	 * one bit per realm and no count; the edge counter is this peer's own, so
 	 * a shim relaying levels instead of edges is observable. */
@@ -708,7 +708,7 @@ static void handle_get_seat(struct core *c, const uint8_t *f, size_t len) {
 	trace("EV get_seat id=%u", req.seat);
 }
 
-/* `vitrin_shim_session.idle_inhibit` (WS-E.4.4, issue #306).
+/* `vitrin_shim_session.idle_inhibit` (D-042, issue #306).
  *
  * TWO OF THE CHECKS BELOW MATCH THE REAL CORE AND FOUR ARE DELIBERATELY
  * STRICTER THAN IT. Which is which is written down rather than left to a reader,

@@ -350,7 +350,7 @@ bool vitrin_create_globals(struct vitrin_shim *s) {
 
 	/* zwp_idle_inhibit_manager_v1.
 	 *
-	 * ADDED IN WS-E.4.4 (issue #306), on this file's own rule, and the
+	 * ADDED IN D-042 (issue #306), on this file's own rule, and the
 	 * citation is a `globals-demand` line from a real pre-addition run
 	 * already in the tree:
 	 *

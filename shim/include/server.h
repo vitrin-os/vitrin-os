@@ -133,7 +133,7 @@ struct vitrin_shim {
 	 * ever speaks upstream unasked -- an ask is sent because the APP created
 	 * a lock, and the verdict comes back on the core's own schedule. */
 	struct vitrin_constraint constraint;
-	/* Idle inhibition (WS-E.4.4, idle.h): the
+	/* Idle inhibition (D-042, idle.h): the
 	 * `zwp_idle_inhibit_manager_v1` global, how many inhibitor objects the
 	 * app is holding, and whether the core has been told. Like the
 	 * constraint above, nothing here ever speaks upstream unasked -- an ask

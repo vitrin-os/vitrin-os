@@ -296,27 +296,27 @@ Recorder wall times, one session unless noted:
   printing each frame's near-black fraction is what distinguishes the two
   failures named above.
 
-```text
-Last executed: (not yet — WS-E.2.2 landed the code; the first dated run belongs
-to whoever next brings up a nested session on the target laptop)
-Host compositor:
-Result:
-```
-
-> **This runbook is UNEXECUTED, and that means issue #214 has an unmet
-> acceptance criterion.** #214 asks for "a documented manual runbook in
-> `shim/docs/`, executed on the target laptop and dated" — the document exists
-> and the execution does not, so half the criterion is outstanding. It is
-> recorded here rather than quietly counted as done, because a runbook nobody
-> has run is a plan, not evidence.
+> **This runbook has been executed, and the dated record above is that run** —
+> 2026-08-09, nested under Hyprland 0.56.2, core `f9f2b8a`. #214 asks for "a
+> documented manual runbook in `shim/docs/`, executed on the target laptop and
+> dated"; the document exists and one dated execution of it now exists, so the
+> half of the criterion that was outstanding when this block was written is
+> outstanding no longer. The empty template that stood here is removed rather
+> than left standing beside a dated PASS, because a page that says both is a
+> page nobody can act on.
 >
-> Why it was not run as part of this change: it needs a real nested session on
+> What one nested run does **not** settle is recorded above under "Gaps this run
+> did not close": step 7 is weaker than it reads, step 8's second half has never
+> been exercised, and a re-run with `damage-client` is still owed. Nor does it
+> reach bare metal — this run was nested, where, as this page says at the top,
+> the lock locks a window and not a session.
+>
+> Why no gate replaces this page, then or now: it needs a real nested session on
 > the maintainer's own laptop, driven by a human at a real keyboard holding a
 > real chord. That is exactly the class of evidence CI cannot produce and an
 > agent must not fake — the same split #212 and #232 wrote down for physical
 > input. Everything the automated suite *can* reach is covered: the gate, the
-> pairing contract, the off-switch surviving a locked gate, the passphrase
-> path, the startup refusals, and the golden card.
->
-> What the run would add that none of those do: that a human looking at a real
-> screen sees the card, can type into it, and gets back in.
+> pairing contract, the off-switch surviving a locked gate, the passphrase path,
+> the startup refusals, and the golden card. What the run adds that none of
+> those do: that a human looking at a real screen sees the card, can type into
+> it, and gets back in.

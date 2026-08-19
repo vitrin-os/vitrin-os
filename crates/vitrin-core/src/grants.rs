@@ -304,18 +304,30 @@ impl ResourceRef {
 ///
 /// The host is kept as the **bytes the petition presented**, not as a
 /// resolved address: what the human approves is the selector, and the
-/// addresses it resolved to at approval time are a separate row column
-/// ([`GrantRow::pinned_addrs`]) so that a rebind cannot silently redirect
-/// authority the human already granted.
+/// addresses it resolved to at approval time belong in a separate row
+/// column ([`GrantRow::pinned_addrs`], **present-but-null until P2.7.4**)
+/// so that a rebind cannot silently redirect authority the human already
+/// granted. Nothing resolves anything today.
 ///
-/// **Comparison is byte-exact, including case**, and the consequence is
-/// stated rather than left to be met later: DNS is case-insensitive, so
-/// `net:Example.com:443` and `net:example.com:443` name the same endpoint
-/// and are nonetheless two different selectors here. Holding one
-/// therefore does not cover the other. That errs **narrow** -- the wrong
-/// answer is a refusal, never an unapproved connection -- which is the
-/// only direction this type is allowed to be wrong in. Normalising case
-/// instead would make the row hold a string the human was never shown.
+/// **Comparison is byte-exact, so one endpoint can have more than one
+/// selector string** -- the consequence is stated here rather than left
+/// to be met later, because the IDL's port rule is easy to misread as a
+/// canonicality guarantee for the whole selector, and it is not one:
+///
+/// * DNS is case-insensitive, so `net:Example.com:443` and
+///   `net:example.com:443` name the same endpoint and are two selectors.
+/// * One IPv6 address has many legal literals, and the literal is kept
+///   verbatim, so `net:[2001:db8::1]:443` and
+///   `net:[2001:0db8:0000:0000:0000:0000:0000:0001]:443` are two
+///   selectors.
+///
+/// Both spellings of each pair parse, both round-trip byte-identically,
+/// and neither covers the other -- pinned by
+/// `one_endpoint_can_have_several_selector_strings_and_none_covers_another`.
+/// That errs **narrow** -- the wrong answer is a refusal, never an
+/// unapproved connection -- which is the only direction this type is
+/// allowed to be wrong in. Normalising instead would make the row hold a
+/// string the human was never shown.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NetSelector {
     host: NetHost,
@@ -351,10 +363,13 @@ pub(crate) enum NetSelectorError {
     MalformedHostPort,
     /// The port is not a bare decimal integer in `1..=65535`. A range, a
     /// list, a leading `+`/`-`, whitespace, a leading zero, and `0` all
-    /// land here. The leading zero is refused rather than tolerated so
-    /// that one endpoint has exactly one spelling: `covers` is byte-exact,
-    /// and two spellings of the same port would be two selectors the
-    /// consent card renders identically.
+    /// land here. The leading zero is refused rather than tolerated for a
+    /// narrower reason than "one endpoint, one spelling" -- which is
+    /// **false** here, see [`NetSelector`]: the port is the one half of
+    /// the selector this type *normalises* (it becomes a `NonZeroU16`),
+    /// so `0443` would re-serialize to `443` and break the byte-identity
+    /// round-trip that makes the stored selector and the string the human
+    /// was shown the same string.
     BadPort,
     /// The host contains something the wildcard-free grammar forbids: `*`,
     /// `/` (a CIDR suffix), `,` (a list), a leading `.` (the
@@ -379,6 +394,20 @@ impl NetSelector {
     /// a blanket egress grant is *inexpressible* rather than refused by a
     /// policy someone can relax later. `covers` is exact match precisely
     /// because this function admits no pattern to be inexact about.
+    ///
+    /// **What this does NOT do, stated so nobody infers it**: it does not
+    /// validate that the host is a well-formed DNS name or IP literal. It
+    /// enforces a *denylist* -- `*`, `/`, `,`, `[`, `]`, `:`, whitespace,
+    /// control characters, a leading `.` and an empty label -- and keeps
+    /// whatever else it was handed, so `net:-:443`,
+    /// `net:user@evil.com:443`, `net:999.999.999.999:443` and a Unicode
+    /// homograph of a real name all parse. None of them widens authority
+    /// ([`ResourceRef::covers`] is exact match, so no accepted selector can
+    /// name more than one endpoint -- that is the whole of what
+    /// "wildcard-free" buys), but a homograph is a confusion attack on the
+    /// *human*, and P2.7.3 -- the first task that renders one of these
+    /// strings on a consent card -- owns deciding the host charset before
+    /// it does.
     pub fn parse(selector: &str) -> Result<Self, NetSelectorError> {
         let rest = selector
             .strip_prefix(Self::PREFIX)
@@ -1701,6 +1730,55 @@ mod tests {
         assert!(!held.covers(&ResourceRef::WholeRealm));
     }
 
+    #[test]
+    fn one_endpoint_can_have_several_selector_strings_and_none_covers_another() {
+        // The IDL's canonical-port rule reads, at a glance, like a
+        // guarantee that one endpoint has exactly one selector string. It
+        // is not one, and the IDL says so in as many words -- this test is
+        // what keeps the two in step. The host is stored verbatim, so every
+        // legal spelling of one host is its own selector.
+        //
+        // Levered by making `NetHost::V6` re-emit `Ipv6Addr::to_string()`:
+        // the round-trip assertion below goes red on the expanded literal,
+        // which is the property that would actually be lost.
+        let one_endpoint_many_spellings: &[&[&str]] = &[
+            // DNS is case-insensitive; these bytes are not.
+            &["net:Example.com:443", "net:example.com:443"],
+            // One IPv6 address, three legal literals.
+            &[
+                "net:[2001:db8::1]:443",
+                "net:[2001:0db8:0000:0000:0000:0000:0000:0001]:443",
+                "net:[2001:DB8::1]:443",
+            ],
+        ];
+
+        for spellings in one_endpoint_many_spellings {
+            for raw in *spellings {
+                // Each spelling is accepted and survives the round trip
+                // byte-identically: the row stores what the human was shown.
+                assert_eq!(
+                    net(raw).to_wire(),
+                    *raw,
+                    "`{raw}` must round-trip byte-identically; normalising it \
+                     would make the grant row hold a string nobody approved"
+                );
+            }
+            // ...and no spelling covers any other, which is what "errs
+            // narrow" means concretely: the wrong answer is a refusal.
+            for held in *spellings {
+                for want in *spellings {
+                    let covers = ResourceRef::Net(net(held)).covers(&ResourceRef::Net(net(want)));
+                    assert_eq!(
+                        covers,
+                        held == want,
+                        "`{held}`.covers(`{want}`) must be exact-match only: \
+                         two spellings of one endpoint are two selectors"
+                    );
+                }
+            }
+        }
+    }
+
     // The component alphabets the selector generator draws from. Shared by
     // the proptest and by `the_generator_really_emits_the_forbidden_forms`,
     // which is what makes "the refusals are checked by generation" a fact
@@ -1773,6 +1851,38 @@ mod tests {
         );
     }
 
+    /// Everything that must hold of a selector string the parser
+    /// **accepted**. Written once and called from both the proptest and
+    /// the exhaustive sweep below, so the sampled half and the complete
+    /// half cannot drift into asserting different things.
+    ///
+    /// Panics on violation rather than returning: proptest catches the
+    /// panic and shrinks on it exactly as it does for `prop_assert!`.
+    fn assert_accept_side_properties(raw: &str, parsed: &NetSelector) {
+        // Byte-identical re-serialization: the row stores the string the
+        // human was shown, not a normalisation of it.
+        assert_eq!(
+            parsed.to_wire(),
+            raw,
+            "accepted `{raw}` and re-emitted it differently"
+        );
+        // Exactly one endpoint, and parsing is idempotent.
+        assert_eq!(NetSelector::parse(&parsed.to_wire()).as_ref(), Ok(parsed));
+        // ...and it is genuinely one pair, not a pattern.
+        assert!(!parsed.host().is_empty());
+        for c in WIDENING_CHARS {
+            assert!(
+                !raw.contains(*c),
+                "accepted `{raw}`, which contains `{c}` -- the grammar must \
+                 admit no wildcard, no CIDR and no list"
+            );
+        }
+        // An accepted selector covers itself and nothing wider.
+        let held = ResourceRef::Net(parsed.clone());
+        assert!(held.covers(&held.clone()));
+        assert!(!held.covers(&ResourceRef::WholeRealm));
+    }
+
     proptest::proptest! {
         /// Acceptance, issue #196: over *generated* selector strings,
         /// every string the parser accepts round-trips to exactly one
@@ -1784,6 +1894,14 @@ mod tests {
         /// an empty host, port `0` and port `65536`, and the property is
         /// stated over whatever the generator produced rather than over a
         /// hand-listed table of bad strings.
+        ///
+        /// **Its accept side is nearly vacuous on its own** -- only a
+        /// small fraction of the cross product parses (35 of 2772 when
+        /// this was written), so a 256-case run exercises the round-trip
+        /// property a handful of times and occasionally not at all. The
+        /// cross-product sweep below is the non-vacuity guard: it walks
+        /// every combination the alphabets admit, counts the acceptances
+        /// and fails if there are none.
         #[test]
         fn every_accepted_net_selector_round_trips_and_names_one_endpoint(
             prefix in proptest::sample::select(PREFIX_FORMS),
@@ -1792,29 +1910,42 @@ mod tests {
         ) {
             let raw = format!("{prefix}{host}:{port}");
             if let Ok(parsed) = NetSelector::parse(&raw) {
-                // Byte-identical re-serialization: the row stores the
-                // string the human was shown, not a normalisation of it.
-                proptest::prop_assert_eq!(parsed.to_wire(), raw.clone());
-                // Exactly one endpoint, and parsing is idempotent.
-                let reparsed = NetSelector::parse(&parsed.to_wire());
-                proptest::prop_assert_eq!(reparsed.as_ref(), Ok(&parsed));
-                // ...and it is genuinely one pair, not a pattern.
-                proptest::prop_assert!(!parsed.host().is_empty());
-                for c in WIDENING_CHARS {
-                    proptest::prop_assert!(
-                        !raw.contains(*c),
-                        "accepted `{}`, which contains `{}` -- the grammar \
-                         must admit no wildcard, no CIDR and no list",
-                        raw,
-                        c
-                    );
-                }
-                // An accepted selector covers itself and nothing wider.
-                let held = ResourceRef::Net(parsed.clone());
-                proptest::prop_assert!(held.covers(&held.clone()));
-                proptest::prop_assert!(!held.covers(&ResourceRef::WholeRealm));
+                assert_accept_side_properties(&raw, &parsed);
             }
         }
+    }
+
+    #[test]
+    fn the_alphabet_cross_product_accepts_a_selector_and_every_one_holds() {
+        // Non-vacuity for the proptest's ACCEPT side, the mirror of what
+        // `the_generator_really_emits_the_forbidden_forms` does for its
+        // refuse side. The proptest draws 256 samples from a space in
+        // which only a small fraction parses (35 of 2772 when this was
+        // written), so a run can legitimately accept nothing at all and
+        // still pass -- a green property asserting nothing, the failure
+        // mode this repo keeps finding.
+        //
+        // Sweeping the whole cross product is both the guard and strictly
+        // more coverage: every accepted combination is checked on every
+        // run, not a sampled few.
+        let mut accepted = 0usize;
+        for prefix in PREFIX_FORMS {
+            for host in HOST_FORMS {
+                for port in PORT_FORMS {
+                    let raw = format!("{prefix}{host}:{port}");
+                    if let Ok(parsed) = NetSelector::parse(&raw) {
+                        accepted += 1;
+                        assert_accept_side_properties(&raw, &parsed);
+                    }
+                }
+            }
+        }
+        assert!(
+            accepted > 0,
+            "the alphabets no longer cross to a single selector the parser \
+             accepts, so the proptest's round-trip, idempotence and \
+             covers-itself properties assert nothing at all"
+        );
     }
 
     #[test]

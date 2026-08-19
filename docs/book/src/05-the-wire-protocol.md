@@ -180,6 +180,10 @@ Version 0 is frozen for Phase 1 — **not forever**. The wire integer is now
 **2**, and it appends:
 
 - the `realm_launch` verb, and `vitrin_principal`'s `attention` event;
+- the `egress` verb (128, at P2.7.2) and the `net:HOST:PORT` value its
+  authority is named with — **a verb bit and a `resource` grammar, and no
+  message at all**: the facet a connection would be asked for through has
+  not landed, so every deployment refuses the verb `unsupported`;
 - three structural mints on `vitrin_grant` — `get_launcher`,
   `get_layout_focus`, `get_layout_arrange`;
 - the three interfaces they mint — `vitrin_launcher` (`launch`/`launched`),

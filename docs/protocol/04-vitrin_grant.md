@@ -270,11 +270,17 @@ served is a property of a *deployment*, so a client reads `unsupported` as
 `VALID_MASK` is therefore `0x2bf` (703), not `0x7f`.
 
 This enum is the type of `request_grant`'s `verbs` argument, of
-`resolved.verbs`, and of `refused.verb`. Six verbs map one-to-one to a facet
-interface and to that interface's `@verb` annotation, which drives the
+`resolved.verbs`, and of `refused.verb`. **Six** verbs map one-to-one to a
+facet interface and to that interface's `@verb` annotation, which drives the
 scanner-generated chokepoint table; `observe_cursor` is the one that does not,
 by construction, and `egress` is the one whose facet has not landed yet — see
-[below](#the-net-resource-prefix). Later phases append entries (for example
+[below](#the-net-resource-prefix). That six is checked rather than remembered:
+`crates/vitrin-protocol/tests/decode_errors.rs`'s
+`every_verb_is_classified_as_facet_bearing_or_not` counts the generated `VERB`
+constants against `Verb::VALID_MASK`, so a verb appended without being put on
+one side of that line is a red test rather than a stale sentence — this
+sentence and [its restatement further down](#defined-but-unserved). Later
+phases append entries (for example
 key actuation, credential presentation, subtree reads) without touching
 existing bits; values are immutable.
 
@@ -320,10 +326,30 @@ than a restriction someone will later relax:
 | host | exactly one — a DNS name, an IPv4 literal, or a **bracketed** IPv6 literal (`[2001:db8::1]`) | `*`, `*.example.com`, a leading `.`, an empty label, a CIDR suffix (`10.0.0.0/8`), a comma-separated list, whitespace, an unbracketed IPv6 literal |
 | port | exactly one decimal integer in `1`–`65535`, in its canonical spelling | `0`, `65536`, a range (`443-8443`), a list (`443,80`), a signed form (`+443`), a leading zero (`0443`) |
 
-The canonical-spelling rule on the port is not fussiness: one endpoint must
-have exactly one selector string, because `covers` is byte-exact and two
-spellings of one port would be two selectors a consent card renders
-identically.
+The canonical-spelling rule on the port is not fussiness, and the reason is
+narrower than it looks: **the port is the one half of the selector a parser
+normalises** — it becomes an integer — so a non-canonical spelling would
+re-serialize to a *different* string from the one the human approved. `0443`
+is refused so that `parse` followed by re-serialization is byte-identity, not
+so that the selector as a whole is canonical.
+
+**The selector as a whole is deliberately not canonical, and a reader must not
+infer that it is.** The host is stored exactly as it was presented, so **one
+endpoint can have more than one selector string**, and none of them covers
+another:
+
+| one endpoint | two selectors, because |
+|---|---|
+| `net:Example.com:443` and `net:example.com:443` | DNS is case-insensitive; these bytes are not |
+| `net:[2001:db8::1]:443` and `net:[2001:0db8:0000:0000:0000:0000:0000:0001]:443` | one IPv6 address has many legal literals, and the literal is kept verbatim |
+
+Both spellings parse, both round-trip byte-identically, and `covers` is false
+between them. That errs **narrow** — the wrong answer is a refusal, never an
+unapproved connection — which is the only direction this comparison is
+permitted to be wrong in, and normalising instead would make the grant row hold
+a string the human was never shown. The reference core pins this by test
+(`crates/vitrin-core/src/grants.rs`,
+`one_endpoint_can_have_several_selector_strings_and_none_covers_another`).
 
 Consequences worth stating rather than deriving:
 
@@ -336,20 +362,26 @@ Consequences worth stating rather than deriving:
   does not cover `net:example.com:80` and does not cover
   `net:sub.example.com:443`. With no wildcard there is no subsumption to
   express, and a server that invented one would widen authority the human never
-  approved. Comparison is byte-exact, so a differently-cased spelling of the
-  same DNS name is a *different* selector — which errs narrow, the only
-  direction this comparison is allowed to be wrong in.
+  approved. Comparison is byte-exact, with the consequence stated in full
+  above: two spellings of one endpoint are two selectors, and neither covers
+  the other.
 - **Whole-realm authority is not egress authority.** A null-or-empty `resource`
   means the whole realm, and it does **not** cover a `net:` endpoint. Reading it
   as covering one would make every `observe` grant an egress grant.
-- **A name is not the authority; the addresses behind it at grant time are.**
-  DNS resolves only in the out-of-core proxy — there is no resolver inside a
-  realm to route around — and the addresses the name resolved to when the human
-  approved are pinned into the grant row. A connection to an address the pin
-  does not contain is outside what was approved and is refused `not_granted`,
+- **A name is not the authority; the addresses behind it at grant time are —
+  and this rule is specified, not implemented.** DNS is to resolve only in the
+  out-of-core proxy — there is no resolver inside a realm to route around — and
+  the addresses the name resolved to when the human approved are to be pinned
+  into the grant row, so that a connection to an address the pin does not
+  contain is outside what was approved and is refused `not_granted`,
   **including a literal-IP connection under a name-scoped grant**. Keeping the
   pin in the row rather than in the proxy is what stops a DNS rebind winning by
-  outlasting a process.
+  outlasting a process. **Nothing enforces any of this today**: the resolver
+  and the proxy are P2.7.3's, the pin is P2.7.4's, and the reference core's
+  `pinned_addrs` column is present-but-null by construction (an empty enum, so
+  no row can carry a value). The rule is written in the future tense it is in
+  because the column and the proxy are *built to* it — not because a deployment
+  can be found that obeys it.
 
 **The fatal-vs-recoverable razor, for this vocabulary specifically**
 ([conventions §5](00-conventions.md#5-error-taxonomy)):
@@ -378,6 +410,25 @@ The reference core's parser for this grammar exists
 (`crates/vitrin-core/src/grants.rs`, `NetSelector`) and **nothing in the
 admission path calls it yet** — a `net:` petition is refused like any other
 non-empty selector.
+
+Two more gaps, named here so this paragraph is a *complete* list rather than a
+list that reads complete:
+
+- **The address pin is specified and unimplemented.** `pinned_addrs` is a
+  present-but-null column (an empty enum); there is no resolver, no proxy and
+  no chokepoint arm that consults a pin. P2.7.3 builds the proxy and P2.7.4
+  fills the column. Until then the bullet above describes a design, not a
+  behaviour.
+- **The host is not validated as a DNS name or an IP literal.** The parser
+  enforces a *denylist* — `*`, `/`, `,`, `[`, `]`, `:`, whitespace, control
+  characters, a leading `.` and an empty label — and keeps whatever else it was
+  given. So `net:-:443`, `net:user@evil.com:443`, `net:999.999.999.999:443` and
+  a Unicode homograph of a real name all parse today. None of them *widens*
+  authority — `covers` is exact match, so no accepted selector can ever name
+  more than one endpoint, which is the sense in which the grammar is
+  wildcard-free by construction — but a homograph is a confusion attack on the
+  human, and P2.7.3, which is the first task to render one of these strings on
+  a consent card, owns deciding the host charset before it does.
 
 #### Defined but unserved
 
@@ -447,8 +498,14 @@ Not every verb has a facet interface. `observe_cursor` has none by
 construction: it widens what
 [`vitrin_view.capture_frame`](06-vitrin_view.md) composites rather than adding
 a request. `egress` has none **yet**, which is a gap rather than a design — its
-facet is P2.6.5's and has not landed. The other five do, and the three added at
-version 2 all arrive as `since`-gated mints on *this* interface, because
+facet is a *separate* interface of its own and has not landed (see
+[Growth](#growth)). The other **six** do — the same six counted
+[above](#verb), and the count is held by a test rather than by memory
+(`crates/vitrin-protocol/tests/decode_errors.rs`,
+`every_verb_is_classified_as_facet_bearing_or_not`, which fails the moment a
+ninth verb bit appears without being put on one side of this line) — and the
+three added at version 2 all arrive as `since`-gated mints on *this* interface,
+because
 `request_grant`'s five `new_id` arguments are frozen forever (see
 [Growth](#growth)): [`get_launcher`](#get_launcher),
 [`get_layout_focus`](#get_layout_focus) and
@@ -854,18 +911,23 @@ rules](00-conventions.md) guarantee.
   P2.7.2 appended the [`egress`](#verb) bit (128) and the
   [`net:` selector grammar](#the-net-resource-prefix) and **no message at
   all**, so this is the first row where the vocabulary is on the wire and the
-  facet is not. The facet — `request_connect` and its connected-socket
-  delivery event — belongs to `vitrin_powerbox`, an interface P2.6.5 creates,
-  and this page's sibling page 13 does not exist yet. Two consequences worth
-  stating here rather than discovering later. First, until it lands, `egress`
-  is a verb **no request exercises**, which is why every deployment refuses it
-  `unsupported` — a granted verb with nothing to exercise it would be
-  authority nobody checks. Second, `interface/@verb` is **one value per
-  interface** — the rule that made the layout facet *two* interfaces — so a
-  single `vitrin_powerbox` carrying both `designate_file` and `egress`
-  requests cannot declare both, and whoever lands the facet owes either a
-  second interface or an explicit account of how those requests reach the
-  enforcement chokepoint.
+  facet is not. Until it lands, `egress` is a verb **no request exercises**,
+  which is why every deployment refuses it `unsupported` — a granted verb with
+  nothing to exercise it would be authority nobody checks.
+  **The facet is its own interface, not a request on `vitrin_powerbox`**, and
+  the dialect settles that rather than taste: `interface/@verb` is **one value
+  per interface**, so an interface declaring `verb="designate_file"` cannot
+  also declare `verb="egress"`, and the `egress` requests on it would reach the
+  enforcement chokepoint with no verb to check them against. This is the same
+  rule that made the layout facet *two* interfaces (see the
+  [paragraph above](#verb) and
+  [`get_layout_arrange`](#get_layout_arrange)), and the same correction: an
+  earlier plan row anticipated one powerbox carrying `request_file`,
+  `request_dir` **and** `request_connect`, and the dialect cannot express it.
+  So `vitrin_powerbox` (P2.6.5) carries the file half and `egress` gets a
+  separate facet interface of its own carrying `request_connect` and its
+  connected-socket delivery event. The correction is recorded here rather than
+  made silently, because this row was the record.
 
 ## Version history
 

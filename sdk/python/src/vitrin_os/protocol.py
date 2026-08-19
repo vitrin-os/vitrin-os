@@ -122,7 +122,9 @@ VERB_MASK = int(
 # `egress` (128, P2.7.2 / issue #196) is also out, and its IDL summary carries
 # the same marker phrase for a reason that goes further than the version: the
 # facet a connection would be asked for through is not in the IDL at all yet
-# (P2.6.5), and the mediating proxy that would carry it is P2.7.3's. So the
+# (a separate interface of its own, not a request on the filesystem powerbox:
+# `interface/@verb` is one value per interface), and the mediating proxy that
+# would carry it is P2.7.3's. So the
 # bit is refused by **every** deployment at version 2, not merely by a
 # version-1 connection — which is why this constant does not move when it is
 # eventually served on some deployments and not others.

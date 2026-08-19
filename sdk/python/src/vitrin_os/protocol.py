@@ -14,15 +14,20 @@ import enum
 
 # protocol/@version — the wire version integer offered in hello. The "v0"
 # in the document family's name is the spec generation; the wire integer
-# starts at 1 (the schema forbids 0) and is 2 today. Version 2 appends, in
-# full: the realm_launch verb; the three structural mints on vitrin_grant
-# (get_launcher, get_layout_focus, get_layout_arrange); the three interfaces
-# they mint (vitrin_launcher, vitrin_layout_focus, vitrin_layout_arrange)
-# with their requests launch/launched, focus and set_fullscreen; the
-# vitrin_layout_arrange.mode enum; the capacity refusal code; and the
-# layout_held outcome. Every version-1 signature is byte-identical at
-# version 2, so this SDK offering 2 changes nothing about the messages it
-# already sends — it only widens what it can send and must decode.
+# starts at 1 (the schema forbids 0) and is 2 today. Every version-1
+# signature is byte-identical at version 2, so this SDK offering 2 changes
+# nothing about the messages it already sends — it only widens what it can
+# send and must decode.
+#
+# THIS COMMENT USED TO ENUMERATE VERSION 2 "in full", and the list was
+# already false when P2.6.5 (issue #189) came to append to it: it named the
+# launcher and the two layout facets and stopped there, while the wire had
+# since gained the cross-realm clipboard, the pointer constraint, the idle
+# inhibit, the seat's relative-motion and gesture events, and now the
+# powerbox. A second closed list of the same facts is how one of them goes
+# stale — the normative enumeration is `docs/protocol/00-conventions.md`
+# §7.3, which is extended in the same edit as any `since=` addition, and it
+# is deliberately not restated here.
 PROTOCOL_VERSION = 2
 
 # --- object-id ranges (conventions section 3) ------------------------------
@@ -71,10 +76,12 @@ class Verb(enum.IntFlag):
     petitioned one. Read "unsupported" as "not here, not now", never as "not
     in this protocol".
 
-    The 64/128/256 gap is deliberate and must not be filled by guesswork:
+    The 128/256 gap is deliberate and must not be filled by guesswork:
     those bits are allocated repo-wide to verbs the IDL does not define yet,
     so they are still *out of range* and fatal. `realm_launch` took 512 for
-    exactly that reason.
+    exactly that reason. 64 was in that gap until P2.6.5 landed
+    `designate_file` on it, from the same registry rather than from the next
+    unused-looking power of two.
     """
 
     OBSERVE = 1
@@ -83,6 +90,7 @@ class Verb(enum.IntFlag):
     OBSERVE_CURSOR = 8  # refused "unsupported" by every deployment at version 2
     LAYOUT_ARRANGE = 16  # served by the reference core since WS-E.1.4
     LAYOUT_FOCUS = 32  # served by the reference core since WS-E.1.4
+    DESIGNATE_FILE = 64  # refused "unsupported" by every deployment (P2.6.6/P2.6.8 owed)
     REALM_LAUNCH = 512  # resolves "unsupported" until a deployment serves it
 
 
@@ -95,6 +103,7 @@ VERB_MASK = int(
     | Verb.OBSERVE_CURSOR
     | Verb.LAYOUT_ARRANGE
     | Verb.LAYOUT_FOCUS
+    | Verb.DESIGNATE_FILE
     | Verb.REALM_LAUNCH
 )
 
@@ -115,6 +124,13 @@ VERB_MASK = int(
 # at all (`get_launcher` is `since="2"`), so there is nothing for a version-1
 # grant carrying the bit to be exercised through. The IDL says exactly that,
 # and this constant is derived from the IDL's own summaries.
+#
+# `designate_file` (P2.6.5, issue #189) is out for BOTH reasons at once, which
+# is why the constant did not move when the bit landed: a version-1 connection
+# cannot mint `vitrin_powerbox` either, AND no deployment serves the verb at
+# any version until the core-drawn picker (P2.6.6) and its consent copy
+# (P2.6.8) exist. A petition naming it resolves "unsupported" everywhere
+# today.
 # Those are refused "unsupported", and a petition mixing served and unserved
 # verbs is refused whole — the core never silently narrows a verb set.
 VERBS_SERVED_IN_VERSION_1 = int(
@@ -135,6 +151,7 @@ VERB_BY_DOTTED_NAME: dict[str, Verb] = {
     "observe.cursor": Verb.OBSERVE_CURSOR,
     "layout.arrange": Verb.LAYOUT_ARRANGE,
     "layout.focus": Verb.LAYOUT_FOCUS,
+    "designate.file": Verb.DESIGNATE_FILE,
     "realm.launch": Verb.REALM_LAUNCH,
 }
 

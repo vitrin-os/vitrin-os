@@ -696,7 +696,9 @@ impl PetitionRegistry {
             return declined(Outcome::Unsupported);
         }
         // A verb bit the IDL defines but this core does not enforce --
-        // today exactly `observe_cursor` (D-017). `layout_arrange` and
+        // today `observe_cursor` (D-017) and `designate_file` (P2.6.5, which
+        // put the bit on the wire and deliberately left the picker and the
+        // consent copy to P2.6.6/P2.6.8). `layout_arrange` and
         // `layout_focus` left that set at WS-E.1.4 and `realm_launch` at
         // WS-E.1.1, each when the core gained the mechanism its refusal
         // stood for. Refused **whole**, never narrowed to the served
@@ -1346,24 +1348,32 @@ mod tests {
         // the ones it does not implement. The failure this guards is the
         // silent one: accepting the bit and enforcing nothing.
         //
-        // **One bit now**, and each removal was a decision rather than a
-        // subtraction: WS-E.1.4 (issue #210) served the layout pair, and
-        // WS-E.1.1 (issue #207) served `realm_launch` once the core gained
-        // the spawn path, the realm cap and the consent copy its absence
-        // used to stand for. `observe_cursor` is what is left, because
-        // per-principal cursor delivery is still M2's.
+        // **Two bits now**, and every movement in either direction was a
+        // decision rather than a subtraction: WS-E.1.4 (issue #210) served the
+        // layout pair, and WS-E.1.1 (issue #207) served `realm_launch` once
+        // the core gained the spawn path, the realm cap and the consent copy
+        // its absence used to stand for. `observe_cursor` stays, because
+        // per-principal cursor delivery is still M2's. `designate_file`
+        // JOINED at P2.6.5 (issue #189): the bit is on the wire so a petition
+        // for it is an answer rather than a connection death, and it is
+        // refused here until P2.6.6's picker and P2.6.8's consent copy exist.
+        //
+        // This is also the whole of P2.6.5's core-side behaviour, so it is
+        // asserted rather than assumed: a petition naming `designate_file`
+        // resolves `unsupported`, alone and mixed, on the same terms
+        // `observe_cursor` does.
         let t0 = t0();
         let mut reg = registry(ConsentPolicy::AutoApprove);
         let conn = reg.register_connection();
 
         let mut wire_id = 10;
-        // A one-element list, deliberately: this is a SET that has shrunk
-        // three times (D-018's two verbs, then `realm_launch` at WS-E.1.1) and
-        // will shrink again when cursor delivery lands. Collapsing it to a
-        // straight-line assertion would hide that shape and make the next
-        // removal a rewrite rather than a deletion.
-        #[allow(clippy::single_element_loop)]
-        for verb in [Verb::OBSERVE_CURSOR] {
+        // A two-element list: this is a SET that has shrunk three times
+        // (D-018's two verbs, then `realm_launch` at WS-E.1.1), grown once
+        // (`designate_file` at P2.6.5) and will shrink again when the picker
+        // and cursor delivery land. Collapsing it to a straight-line assertion
+        // would hide that shape and make the next removal a rewrite rather
+        // than a deletion.
+        for verb in [Verb::OBSERVE_CURSOR, Verb::DESIGNATE_FILE] {
             // Alone.
             let mut req = request(DEMO, conn, wire_id);
             req.verbs = verb;

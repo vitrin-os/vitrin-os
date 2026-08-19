@@ -1,6 +1,6 @@
 # vitrin_shim_session — shim connection bootstrap
 
-**Interface version:** 2 · **Connection class:** shim · **Messages:** 5 requests + 4 events
+**Interface version:** 2 · **Connection class:** shim · **Messages:** 5 requests + 5 events
 
 > Framing, object-id allocation, the fatal/recoverable error taxonomy, delivery
 > classification, and versioning are defined once on the [conventions
@@ -57,8 +57,21 @@ built around. This paragraph said "the only two" until issue #306, and the
 correction is recorded rather than quietly applied: a closed count in a
 normative description is the tripwire
 [§7.4](./00-conventions.md#74-growth-rules-wayland-style) exists to warn about,
-so it is now written as a rule rather than as a number. The IDL's own
+so it was rewritten as a rule rather than as a number. The IDL's own
 descriptions carry the full argument and are authoritative.
+
+**And the rule was then falsified in its turn**, by P2.6.5's
+[`designation`](#designation-since-2) (issue #189) — a **fourth** version-2
+addition and the first that is not an *exchange* at all. It is a one-way
+core→shim delivery whose asking party is a third one this connection cannot
+name: an agent principal holding `designate_file`, on a connection the shim
+knows nothing about. It is here because the session bootstrap is the only
+object the core can address before the shim has done anything but read
+`configure`. The wider rule this object now satisfies is *every message whose
+counterparty is not the one the interface it would otherwise belong to was
+built around* — and the lesson recorded rather than smoothed over is that a
+rule which quietly widens to admit whatever arrives next is worth no more than
+the closed count it replaced.
 
 Three naming rules apply to everything below, and each is load-bearing. **Call
 it a *pointer constraint* or a *pointer lock*, never a bare "constraint"** — in
@@ -562,6 +575,64 @@ the pointer back, and each is a path on which this event reports the constraint
 **Delivery class:** a **server directive**, in the class `configure` occupies —
 correlated to an ask by `serial`, never terminal to it.
 
+### designation (since 2)
+
+```
+designation(fd: fd, designation_id: uint, kind: vitrin_powerbox.kind,
+            mode: vitrin_powerbox.mode, name: string)
+```
+
+| name | type | description |
+|---|---|---|
+| `fd` | `fd` | the designated file or directory descriptor; ownership transfers to the shim, which MUST close it |
+| `designation_id` | `uint` | the core's opaque id for this designation, matching the journal record and the asking agent's [`designated`](./13-vitrin_powerbox.md#designated) |
+| `kind` | `uint`<[`vitrin_powerbox.kind`](./13-vitrin_powerbox.md#kind)> | file, or directory subtree |
+| `mode` | `uint`<[`vitrin_powerbox.mode`](./13-vitrin_powerbox.md#mode)> | the **effective** access the human approved |
+| `name` | `string` (max 255 bytes) | basename of what the human chose, for display only — **never a path** |
+
+The core's half of a completed designation: an agent holding
+[`designate_file`](./04-vitrin_grant.md#verb) asked, the human chose in the
+core-drawn picker, and this event delivers the resulting descriptor into the
+realm. The shim relays it to its app over the realm's own designation socket
+(P2.6.7); it is the app, not the shim, that the descriptor is for.
+
+**Exactly one fd per event**, which is the framing invariant rather than a
+property of this signature ([conventions § 2.4](./00-conventions.md)). A
+subtree designation is therefore **one directory fd**, never a batch, and a
+multi-select picker emits N of these events. Ownership transfers to the shim,
+which MUST close the descriptor once relayed — or immediately, on any path that
+does not relay it. There is no message by which the shim declines one, and
+adding one would buy nothing: a shim that cannot relay a descriptor closes it,
+and the agent's own answer was already delivered on its own connection before
+this event was sent.
+
+**What the core cannot take back.** Once the fd crosses, it is kernel authority
+the core has no means to recall — no revocation, no expiry, and no dead-man
+chord closes a descriptor in another process. Revoking the grant stops *future*
+designations and kills the grant row; every descriptor already delivered keeps
+working until the realm dies. See
+[`vitrin_powerbox`](./13-vitrin_powerbox.md#revocation-cannot-recall-a-delivered-descriptor).
+
+**Who asked is deliberately not on the wire here.** A realm learns that it was
+handed a descriptor, never which principal asked for it. Naming the agent would
+make every designation a cross-principal identifier the app could fingerprint
+and correlate, in the one direction this protocol otherwise keeps closed: the
+app is the least-trusted process in the system and has no petition, no grant
+and no name for any principal.
+
+**This event is on this object for a different reason from the other four**,
+and the difference is worth stating rather than glossing. The clipboard, the
+pointer constraint and the idle inhibit are here because their *asking party*
+is inverted. This one is a one-way core→shim **delivery**, and the party that
+asked is neither the core nor the app but a third one this connection cannot
+name. It lands here because the session bootstrap is the only object the core
+can address before the shim has done anything but read `configure`, and because
+a designation must reach a realm whose app may hold no surface, no seat and no
+powerbox-aware code at all.
+
+**Delivery class:** a **server directive**, unsolicited from the shim's point of
+view — not a terminal event of anything the shim sent.
+
 ## Enums
 
 ### selection_status
@@ -812,3 +883,18 @@ never change meaning.
   orchestration above the wire, it need not alter this interface at all, and any
   wire support it does want (e.g. a relaunch directive) arrives as an appended
   `since`-gated message.
+
+- **A shim-side answer to a designation.** [`designation`](#designation-since-2)
+  has none, deliberately: a shim that cannot relay a descriptor closes it, and
+  the asking agent's own terminal was already delivered on its own connection
+  before this event was sent, so there is nowhere for a shim's refusal to be
+  useful. If a later realm layout ever needs the shim to route a designation to
+  one surface among several, that arrives as an appended `since`-gated sibling
+  carrying the surface, never as arguments added here.
+
+- **Naming the asking principal in a designation.** Not reserved for, and the
+  absence is a decision rather than a gap: telling a realm which principal
+  designated something would hand the least-trusted process in the system a
+  cross-principal identifier to fingerprint and correlate. If a use case for it
+  ever appears it needs its own argument on its own message *and* its own
+  answer to that objection.

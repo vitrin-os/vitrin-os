@@ -32,8 +32,11 @@
 //! answer to the confused-deputy question, and it is why **no verb bit is
 //! allocated**: a grantable "receive the human's attention key" verb would put
 //! the delegation framing on the wire for a signal that delegates nothing
-//! ([`Verb::VALID_MASK`](vitrin_protocol::generated::vitrin_grant::Verb::VALID_MASK)
-//! stays 575).
+//! (this module added nothing to
+//! [`Verb::VALID_MASK`](vitrin_protocol::generated::vitrin_grant::Verb::VALID_MASK),
+//! which read 575 when that decision was taken and reads 639 since P2.6.5
+//! allocated `designate_file` — a bit that has nothing to do with the
+//! attention key and is not exempted by it).
 //!
 //! Why a bare bit is acceptable at all: **step 5c is not a focus-theft
 //! defence.** It is a 500 ms courtesy
@@ -981,7 +984,27 @@ mod tests {
         // positively, because a grantable "receive the human's attention key"
         // verb would put the delegation framing on the wire for a signal that
         // delegates nothing.
-        assert_eq!(Verb::VALID_MASK, 575);
+        //
+        // **Re-pinned 575 -> 639 by P2.6.5 (issue #189)**, which allocated
+        // `designate_file` (64). What this pin says has NOT changed: the
+        // attention signal still allocates nothing, and `EXEMPT_VERBS` above
+        // is still exactly the two layout verbs. Pinning the whole mask is a
+        // proxy for "no bit was added *here*", so it moves whenever any epic
+        // adds one -- and moving it is the point, because it forces the next
+        // author to check that the new bit is not an attention verb before
+        // re-pinning. `designate_file` is not: nothing about the human's
+        // attention key is exempted for it, and it is not in `EXEMPT_VERBS`.
+        assert_eq!(Verb::VALID_MASK, 639);
+        assert_eq!(
+            Verb::VALID_MASK & Verb::DESIGNATE_FILE.bits(),
+            Verb::DESIGNATE_FILE.bits(),
+            "sanity: the bit that moved the pin is the one P2.6.5 allocated"
+        );
+        assert!(
+            !EXEMPT_VERBS.contains(&Verb::DESIGNATE_FILE),
+            "designate_file is not lifted by the attention key, and adding it here \
+             would be a decision about the human's own hand, not a bookkeeping edit"
+        );
     }
 
     // -- the marker ----------------------------------------------------------

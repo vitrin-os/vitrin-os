@@ -19,11 +19,16 @@
 //! declarative `roundtrip_test!` table below, not as a missing hand-rolled
 //! test function nobody wrote.
 //!
-//! The two fd-bearing messages (`vitrin_view.frame_ready`,
-//! `vitrin_shim_surface.attach` -- found by grep for an `fd`-typed arg) get
+//! The four fd-bearing messages (`vitrin_view.frame_ready`,
+//! `vitrin_shim_surface.attach`, and P2.6.5's designation pair
+//! `vitrin_powerbox.designated` / `vitrin_shim_session.designation` -- found
+//! by grep for an `fd`-typed arg) get
 //! their own hand-written `proptest!` blocks instead of the table, since they
 //! need a real disposable fd pair from `std::io::pipe()` rather than a pure
-//! value strategy.
+//! value strategy. That count is checked, not merely stated: the
+//! `impl_message!` table's length is asserted against the generated
+//! `MESSAGE_COUNT`, so an fd-bearing message left out of both the table and a
+//! block below turns `every_idl_message_is_in_the_roundtrip_table` red.
 
 use std::os::fd::OwnedFd;
 
@@ -85,6 +90,13 @@ type OfferSelection = gen::vitrin_shim_session::events::OfferSelection;
 type SessionPointerConstraint = gen::vitrin_shim_session::requests::PointerConstraint;
 type SessionPointerConstraintState = gen::vitrin_shim_session::events::PointerConstraintState;
 type SessionIdleInhibit = gen::vitrin_shim_session::requests::IdleInhibit;
+type SessionDesignation = gen::vitrin_shim_session::events::Designation;
+
+type GetPowerbox = gen::vitrin_grant::requests::GetPowerbox;
+type PowerboxRequestFile = gen::vitrin_powerbox::requests::RequestFile;
+type PowerboxRequestDir = gen::vitrin_powerbox::requests::RequestDir;
+type PowerboxDesignated = gen::vitrin_powerbox::events::Designated;
+type PowerboxRefused = gen::vitrin_powerbox::events::Refused;
 
 type Attach = gen::vitrin_shim_surface::requests::Attach;
 type Damage = gen::vitrin_shim_surface::requests::Damage;
@@ -231,6 +243,12 @@ impl_message!(
     SessionPointerConstraint,
     SessionPointerConstraintState,
     SessionIdleInhibit,
+    SessionDesignation,
+    GetPowerbox,
+    PowerboxRequestFile,
+    PowerboxRequestDir,
+    PowerboxDesignated,
+    PowerboxRefused,
     Attach,
     Damage,
     Commit,
@@ -802,6 +820,45 @@ fn set_fullscreen() -> impl Strategy<Value = SetFullscreen> {
     plain_enum(gen::vitrin_layout_arrange::Mode::ALL).prop_map(|mode| SetFullscreen { mode })
 }
 
+fn get_powerbox() -> impl Strategy<Value = GetPowerbox> {
+    any_u32().prop_map(|powerbox| GetPowerbox { powerbox })
+}
+
+fn powerbox_request_file() -> impl Strategy<Value = PowerboxRequestFile> {
+    plain_enum(gen::vitrin_powerbox::Mode::ALL).prop_map(|mode| PowerboxRequestFile { mode })
+}
+
+/// `request_dir` carries no arguments -- a subtree ask steers nothing, and
+/// its mode is the human's tick in the picker (IDL).
+fn powerbox_request_dir() -> impl Strategy<Value = PowerboxRequestDir> {
+    Just(PowerboxRequestDir {})
+}
+
+fn powerbox_refused() -> impl Strategy<Value = PowerboxRefused> {
+    plain_enum(gen::vitrin_powerbox::Refusal::ALL).prop_map(|code| PowerboxRefused { code })
+}
+
+/// Non-fd fields of the designation pair, in field order. `designated` and
+/// `vitrin_shim_session.designation` carry the *same* four non-fd arguments
+/// by design (one designation, two connections), so one strategy feeds both
+/// dedicated `proptest!` blocks below and the two cannot drift apart here
+/// while drifting apart in the IDL.
+fn designation_fields() -> impl Strategy<
+    Value = (
+        u32,
+        gen::vitrin_powerbox::Kind,
+        gen::vitrin_powerbox::Mode,
+        String,
+    ),
+> {
+    (
+        any_u32(),
+        plain_enum(gen::vitrin_powerbox::Kind::ALL),
+        plain_enum(gen::vitrin_powerbox::Mode::ALL),
+        bounded_string(255),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // One `#[test]` per message, generated from the table below. Each expands to
 // exactly: generate an object_id and a value, run `assert_roundtrip`. Adding
@@ -873,6 +930,19 @@ roundtrip_test!(
     roundtrip_vitrin_shim_session_idle_inhibit,
     session_idle_inhibit()
 );
+// vitrin_shim_session.designation: fd-bearing, see dedicated block below.
+
+roundtrip_test!(roundtrip_vitrin_grant_get_powerbox, get_powerbox());
+roundtrip_test!(
+    roundtrip_vitrin_powerbox_request_file,
+    powerbox_request_file()
+);
+roundtrip_test!(
+    roundtrip_vitrin_powerbox_request_dir,
+    powerbox_request_dir()
+);
+roundtrip_test!(roundtrip_vitrin_powerbox_refused, powerbox_refused());
+// vitrin_powerbox.designated: fd-bearing, see dedicated block below.
 
 // vitrin_shim_surface.attach: fd-bearing, see dedicated block below.
 roundtrip_test!(roundtrip_vitrin_shim_surface_damage, damage());
@@ -917,8 +987,10 @@ roundtrip_test!(
 );
 
 // ---------------------------------------------------------------------------
-// The two fd-bearing messages in v0.xml (grep for an `fd`-typed arg):
-// `vitrin_view.frame_ready` and `vitrin_shim_surface.attach`. Each gets a
+// The four fd-bearing messages in v0.xml (grep for an `fd`-typed arg):
+// `vitrin_view.frame_ready`, `vitrin_shim_surface.attach`, and the
+// designation pair `vitrin_powerbox.designated` /
+// `vitrin_shim_session.designation`. Each gets a
 // real, disposable fd pair from `std::io::pipe()` (stable since Rust 1.87;
 // this workspace pins its toolchain in `rust-toolchain.toml` and declares
 // `rust-version` in the workspace `Cargo.toml`) rather than skipping fd
@@ -964,6 +1036,42 @@ proptest! {
             width,
             height,
             stride,
+        };
+        assert_roundtrip(value, object_id, Some(OwnedFd::from(writer)));
+    }
+}
+
+proptest! {
+    #[test]
+    fn roundtrip_vitrin_powerbox_designated(
+        object_id in any::<u32>(),
+        (designation_id, kind, mode, name) in designation_fields(),
+    ) {
+        let (reader, writer) = std::io::pipe().expect("creating a disposable pipe for fd round-trip coverage");
+        let value = PowerboxDesignated {
+            fd: OwnedFd::from(reader),
+            designation_id,
+            kind,
+            mode,
+            name,
+        };
+        assert_roundtrip(value, object_id, Some(OwnedFd::from(writer)));
+    }
+}
+
+proptest! {
+    #[test]
+    fn roundtrip_vitrin_shim_session_designation(
+        object_id in any::<u32>(),
+        (designation_id, kind, mode, name) in designation_fields(),
+    ) {
+        let (reader, writer) = std::io::pipe().expect("creating a disposable pipe for fd round-trip coverage");
+        let value = SessionDesignation {
+            fd: OwnedFd::from(reader),
+            designation_id,
+            kind,
+            mode,
+            name,
         };
         assert_roundtrip(value, object_id, Some(OwnedFd::from(writer)));
     }

@@ -140,6 +140,58 @@ check_rejected clipboard-status-enum-on-string \
 check_rejected clipboard-status-without-description \
   '/<enum name="selection_status">/,/<\/enum>/{/<description summary="why a selection answer carries no data">/,/<\/description>/d}'
 
+# --- P2.6.5 (issue #189): the powerbox messages ------------------------------
+#
+# Each case is pinned on a message this issue ADDED, for the reason the
+# clipboard block above states: the corpus should exercise the schema against
+# the newest surface, not only against the oldest.
+
+# The @verb set is closed even though this issue WIDENED it. `designate_file`
+# joining the choice list is a dialect change, and the risk a dialect change
+# carries is that the list stops being closed at all -- so mutate the new value
+# to `egress`, the next verb the allocation registry names (128, E2.7) and one
+# with no facet interface today. It must be rejected: an unadmitted verb name
+# would otherwise reach a backend and emit a chokepoint entry nothing enforces.
+check_rejected powerbox-verb-not-in-the-closed-set \
+  's|verb="designate_file"|verb="egress"|'
+
+# `designated` carries the protocol's third `fd` argument, and `allow-null` is
+# legal only on string and object arguments. An `allow-null` fd would be a
+# descriptor argument with a null form, which the one-fd framing invariant has
+# no way to express -- fd_count is 0 or 1 and is read from the header, not from
+# the payload.
+check_rejected designated-fd-allow-null \
+  's|<arg name="fd" type="fd" summary="the designated file or directory descriptor; ownership transfers to the receiver, which MUST close it"/>|<arg name="fd" type="fd" allow-null="true" summary="the designated file or directory descriptor; ownership transfers to the receiver, which MUST close it"/>|'
+
+# The display name is a bounded string, and the bound lives in a
+# machine-readable summary token the generated decoder reads. Dropping it from
+# `designated` must be a schema failure rather than an unbounded string
+# argument arriving over the wire.
+check_rejected designated-name-without-bound \
+  's|summary="basename of what the human chose, for display only - never a path (max 255 bytes)"|summary="basename of what the human chose, for display only - never a path"|'
+
+# Enum references are legal only on int and uint arguments: the designation's
+# `kind` may not be carried by the string beside it.
+check_rejected designation-kind-enum-on-string \
+  's|<arg name="name" type="string" summary="basename of what the human chose, for display only - never a path (max 255 bytes)"/>|<arg name="name" type="string" enum="vitrin_powerbox.kind" summary="basename of what the human chose, for display only - never a path (max 255 bytes)"/>|'
+
+# The closed set of seven admits no `array`. A designation delivered as an
+# array of descriptors is exactly the shape the one-fd-per-message invariant
+# forbids, and the type system is where it is forbidden.
+check_rejected powerbox-mode-as-array \
+  's|<arg name="mode" type="uint" enum="mode" summary="the access this ask is for; the human may narrow it, and designated.mode carries what was actually approved"/>|<arg name="mode" type="array" summary="the access this ask is for; the human may narrow it, and designated.mode carries what was actually approved"/>|'
+
+# Enum entry values are required and immutable. An unvalued `refusal` entry
+# would leave the wire value to document order -- the renumbering hazard the
+# "values are immutable" rule exists to forbid.
+check_rejected powerbox-refusal-entry-without-value \
+  's|<entry name="cancelled" value="0" |<entry name="cancelled" |'
+
+# Every request carries a description. `request_dir` has no arguments at all,
+# so its description is the whole of what the message documents.
+check_rejected powerbox-request-dir-without-description \
+  '/<request name="request_dir" since="2">/,/<\/request>/{/<description summary="ask the human to designate one directory subtree">/,/<\/description>/d}'
+
 if [ "$fail" -ne 0 ]; then
   echo "test-mutations: FAILURES"
   exit 1

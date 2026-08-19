@@ -626,13 +626,13 @@ Two further obligations, both inherited from the P1.9.8 gate-integrity pass: a g
 
 Three clusters decomposing in parallel independently claimed the same verb bit, the same prose-page number and the same message name — each an **immutable** choice once landed ([00-conventions.md](../protocol/00-conventions.md) §7.4, and D-017's note that `deprecated-since` marks but never removes). The allocations below are therefore made **once, here, before any of the tasks open**, and belong in a `20-decision-log.md` entry rather than in whichever task lands first.
 
-**Verb bits** (`Verb::VALID_MASK` is **575** today — `1|2|4|8|16|32|512`, the six original bits plus `realm_launch`; it read 63 until WS-E.1.1 landed the 512 row below). Re-pin the mask **once per epic**, never once per task, in its three sites: `crates/vitrin-protocol/tests/decode_errors.rs`, `crates/vitrin-core/src/consent/render.rs`'s unserved-set catalogue test, and `sdk/python/tests/test_verb_parity.py`.
+**Verb bits** (`Verb::VALID_MASK` is **639** today — `1|2|4|8|16|32|64|512`, the six original bits plus `realm_launch` and `designate_file`; it read 63 until WS-E.1.1 landed the 512 row below, and 575 until P2.6.5 landed the 64 row). Re-pin the mask **once per epic**, never once per task, in its three sites: `crates/vitrin-protocol/tests/decode_errors.rs`, `crates/vitrin-core/src/consent/render.rs`'s unserved-set catalogue test, and `sdk/python/tests/test_verb_parity.py`.
 
 **Serving an already-allocated bit allocates nothing and still moves two of those three.** WS-E.1.4 served `layout_arrange` (16) and `layout_focus` (32) without adding a bit, so `VALID_MASK` did not move and `decode_errors.rs` did not fire — but the served/unserved *split* did move, which turned the catalogue test's unserved-set pin and `test_verb_parity.py`'s served-set constant red. That is the tripwire pair working with no new allocation: a verb cannot become served without a human classifying it and writing its consent-prompt copy.
 
 | Bit | Verb | Epic | Task |
 |---|---|---|---|
-| 64 | `designate_file` | E2.6 (earliest-starting) | P2.6.5 |
+| 64 | `designate_file` (**landed**) | E2.6 (earliest-starting) | P2.6.5 (#189) |
 | 128 | `egress` | E2.7 | P2.7.2 |
 | 256 | `publish_tree` | E2.4 | P2.4.1 |
 | 512 | `realm_launch` | **WS-E** ([14-workstream-session-mode.md](14-workstream-session-mode.md)) | WS-E.1.1 (#207) |
@@ -657,8 +657,9 @@ landings. Nothing may bump to version 3.
 **Prose pages.** When this table was written `docs/protocol/` ended at
 `11-vitrin_shim_seat.md` and three tasks had each claimed 12 — the collision it
 exists to stop. WS-E.1.1 then landed page **16**, skipping the four numbers
-allocated below rather than taking one, which is the rule working: 12–15 stay
-reserved for tasks that have not opened yet. WS-E.1.4 landed **17** and **18**
+allocated below rather than taking one, which is the rule working: 12, 14 and
+15 stay reserved for tasks that have not opened yet, and P2.6.5 took **13**
+from this table rather than the next free number. WS-E.1.4 landed **17** and **18**
 on the same rule, so `docs/protocol/` now ends at
 `18-vitrin_layout_arrange.md` with the same deliberate gap. **Two** pages
 rather than one, because `interface/@verb` is one value per interface and the
@@ -668,7 +669,7 @@ had anticipated a single "layout facet" would have understated it.
 | Page | Content | Task |
 |---|---|---|
 | `12-semantic-nodes.md` | Node schema + `vitrin_tree_publisher` folded in as a second interface | P2.1.1 / P2.4.1 |
-| `13-vitrin_powerbox.md` | Powerbox facet | P2.6.5 |
+| `13-vitrin_powerbox.md` | Powerbox facet (**landed**) | P2.6.5 (#189) |
 | `14-vitrin_shim_text_input.md` | IME | P2.8.1 |
 | `15-vitrin-semantic-v1.md` | Native app-facing extension | P2.5.1 |
 | `16-vitrin_launcher.md` | Realm-launch facet (**landed**) | WS-E.1.1 (#207) |

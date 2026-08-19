@@ -287,6 +287,18 @@ impl ResourceRef {
 /// out -- per-principal cursor *delivery* is M2's, and serving the verb
 /// would promise a capture widened with a cursor this core does not have.
 ///
+/// **`designate_file` (64) joined the wire at P2.6.5 (issue #189) and is
+/// deliberately absent from this constant**, which is the whole of that
+/// issue's core-side deliverable. The verb has a facet interface
+/// (`vitrin_powerbox`) and nothing else: no picker mints a descriptor
+/// (P2.6.6), no chokepoint arm carries a designation, and no consent copy
+/// names what approving it costs (P2.6.8, Q13's rule). Leaving it out means
+/// [`UNSERVED_VERB_BITS`] picks it up by derivation and
+/// [`crate::petitions::PetitionRegistry::admit`] resolves every petition
+/// naming it `unsupported` **whole** -- so the failure mode if someone
+/// forgets the rest of E2.6 is a refusal, never a grant this core cannot
+/// enforce.
+///
 /// **Moving `realm_launch` in is the single largest widening this
 /// constant has taken**, and it is worth naming here rather than only at
 /// the chokepoint: a bit in this set is a bit a grant row may carry, and
@@ -1323,8 +1335,8 @@ mod tests {
     }
 
     #[test]
-    fn the_cursor_verb_is_defined_on_the_wire_but_unserved() {
-        // The one bit still staged: in-range (so naming it is never fatal)
+    fn the_staged_verbs_are_defined_on_the_wire_but_unserved() {
+        // The bits still staged: in-range (so naming it is never fatal)
         // and unserved (so a petition for it resolves `unsupported`). Both
         // halves matter -- either alone would be a lie about what this core
         // does.
@@ -1342,13 +1354,21 @@ mod tests {
         // serving the verb would promise a capture widened with a cursor
         // this core does not have. It is not a placeholder for "not got to
         // yet".
-        // A one-element list, deliberately: this is a SET that has shrunk
-        // three times (D-018's two verbs, then `realm_launch` at WS-E.1.1) and
-        // will shrink again when cursor delivery lands. Collapsing it to a
-        // straight-line assertion would hide that shape and make the next
-        // removal a rewrite rather than a deletion.
-        #[allow(clippy::single_element_loop)]
-        for verb in [Verb::OBSERVE_CURSOR] {
+        // `designate_file` JOINED it at P2.6.5 (issue #189), and this is the
+        // first time this list has grown. It is here for a reason that is
+        // scheduled rather than open-ended: there is no picker to mint a
+        // descriptor (P2.6.6) and no consent copy naming what approving it
+        // costs (P2.6.8). Both must land before this bit may move into
+        // `SERVED_VERB_BITS`, and moving it before then would be exactly the
+        // "a deployment MUST NOT grant a verb it does not enforce" breach the
+        // list exists to make visible.
+        //
+        // A two-element list: this is a SET that has shrunk three times
+        // (D-018's two verbs, then `realm_launch` at WS-E.1.1), grown once,
+        // and will shrink again when the picker and cursor delivery land.
+        // Collapsing it to a straight-line assertion would hide that shape and
+        // make the next removal a rewrite rather than a deletion.
+        for verb in [Verb::OBSERVE_CURSOR, Verb::DESIGNATE_FILE] {
             assert!(
                 Verb::from_bits(verb.bits()).is_ok(),
                 "{verb:?} must decode: an out-of-range bit would be fatal, not `unsupported`"

@@ -26,14 +26,27 @@
  *     unexplained disconnect, so every send is checked before it reaches the
  *     kernel.
  *
- * THE ASYMMETRY THAT SIMPLIFIES THE RECEIVE PATH. Every fd on a shim
- * connection travels shim -> core (the `attach` buffer). No version-1
- * core -> shim event carries one: `configure`, `frame_done`, `buffer_done`
- * and all five `vitrin_shim_seat` events are fd-less. So this transport
- * needs SCM_RIGHTS on the send side only; on the receive side an arriving fd
- * is a violation, closed immediately and then fatal. That is why there is no
- * pending-fd queue and no positional-matching machinery here, unlike
- * vitrin-ipc's `Connection`, which must serve both directions.
+ * THE ASYMMETRY THAT SIMPLIFIED THE RECEIVE PATH, AND THE MESSAGE THAT ENDS
+ * IT. Every fd this transport has ever had to carry travels shim -> core (the
+ * `attach` buffer). No version-1 core -> shim event carries one: `configure`,
+ * `frame_done`, `buffer_done` and all five `vitrin_shim_seat` events are
+ * fd-less. So this transport needs SCM_RIGHTS on the send side only; on the
+ * receive side an arriving fd is a violation, closed immediately and then
+ * fatal. That is why there is no pending-fd queue and no positional-matching
+ * machinery here, unlike vitrin-ipc's `Connection`, which must serve both
+ * directions.
+ *
+ * P2.6.5 (issue #189) PUT THE FIRST FD-BEARING core -> shim EVENT ON THE
+ * WIRE: `vitrin_shim_session.designation`, which delivers one designated
+ * file or directory descriptor into the realm. THIS TRANSPORT DOES NOT
+ * IMPLEMENT RECEIVING IT. A `designation` arriving here today takes the path
+ * above -- the descriptor is closed and the connection dies -- which is safe
+ * (nothing leaks) but is not the behaviour the protocol asks for. It costs
+ * nothing today because no deployment serves the `designate_file` verb, so
+ * the core never sends the event; it is the receive-side machinery P2.6.7
+ * owes, alongside the per-realm designation socket it serves to the app. The
+ * paragraph above is left standing rather than rewritten, because what it
+ * describes is still exactly what this file does.
  *
  * BLOCKING MODE. The descriptor is non-blocking from the moment it is
  * adopted, and stays that way. The one synchronous read the protocol

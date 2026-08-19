@@ -16,7 +16,7 @@
  *     precisely-typed local (via the CHECK_MESSAGE macro below), which only
  *     compiles if the function's real signature matches exactly what this
  *     file expects;
- *   - every enum's validity predicate likewise (CHECK_IS_VALID);
+ *   - every enum's validity predicate likewise (CHECK_IS_VALID_ONE);
  *   - the frame-header and raw little-endian helpers are checked directly;
  *   - a handful of representative messages (a plain zero-argument request,
  *     a string-and-scalar-heavy request, a bitfield-and-enum-heavy event,
@@ -33,10 +33,15 @@
  * exactly what happened when version 2 added get_launcher, launch and
  * launched: the file kept compiling while type-checking 29 of 32 messages.
  * (It fired as designed when version 2 later added the two layout mints and
- * their two facet requests -- 32 to 36.)
+ * their two facet requests -- 32 to 36; and again at P2.6.5's powerbox --
+ * 48 to 54.)
  * It mirrors crates/vitrin-protocol/tests/roundtrip.rs's
  * `every_idl_message_is_in_the_roundtrip_table`, which gates the Rust
  * round-trip table on the same generated constant.
+ *
+ * "Every enum" is asserted the same way as of P2.6.5, against the newly
+ * generated VITRIN_ENUM_COUNT. Until then that list had no gate, and it was
+ * short four predicates -- see VITRIN_EVERY_ENUM below.
  *
  * Build/check exactly as CI does:
  *
@@ -74,6 +79,7 @@ static int sink = 0;
     X(vitrin_grant_req_get_launcher)                                         \
     X(vitrin_grant_req_get_layout_focus)                                     \
     X(vitrin_grant_req_get_layout_arrange)                                   \
+    X(vitrin_grant_req_get_powerbox)                                        \
     X(vitrin_grant_evt_resolved)                                             \
     X(vitrin_grant_evt_refused)                                              \
     X(vitrin_consent_evt_state)                                              \
@@ -92,6 +98,7 @@ static int sink = 0;
     X(vitrin_shim_session_req_pointer_constraint)                            \
     X(vitrin_shim_session_evt_pointer_constraint_state)                      \
     X(vitrin_shim_session_req_idle_inhibit)                                  \
+    X(vitrin_shim_session_evt_designation)                                   \
     X(vitrin_shim_surface_req_attach)                                        \
     X(vitrin_shim_surface_req_damage)                                        \
     X(vitrin_shim_surface_req_commit)                                        \
@@ -110,7 +117,11 @@ static int sink = 0;
     X(vitrin_launcher_req_launch)                                            \
     X(vitrin_launcher_evt_launched)                                          \
     X(vitrin_layout_focus_req_focus)                                         \
-    X(vitrin_layout_arrange_req_set_fullscreen)
+    X(vitrin_layout_arrange_req_set_fullscreen)                              \
+    X(vitrin_powerbox_req_request_file)                                      \
+    X(vitrin_powerbox_req_request_dir)                                       \
+    X(vitrin_powerbox_evt_designated)                                        \
+    X(vitrin_powerbox_evt_refused)
 
 /* The exhaustiveness gate. VITRIN_MESSAGE_COUNT is generated from the IDL,
  * so an appended message makes this a compile error here rather than a
@@ -121,6 +132,53 @@ _Static_assert((int)vitrin_messages_listed == (int)VITRIN_MESSAGE_COUNT,
                "protocol/vitrin-v0.xml defines a message missing from (or "
                "extra in) VITRIN_EVERY_MESSAGE, so this file no longer "
                "type-checks every generated marshal function");
+
+/* Every enum (plain and bitfield) the IDL defines, in the same document order
+ * the header emits them, naming its validity predicate's *base* -- the
+ * generator spells the predicate <base>_is_valid.
+ *
+ * THIS LIST USED TO BE AN UNGATED SEQUENCE OF CHECK_IS_VALID CALLS, and it
+ * had gone stale three times: `vitrin_layout_arrange_mode` (WS-E.1.4) and
+ * `vitrin_shim_session_selection_status` (WS-E.2.1) were each found missing
+ * by the next change that came along, and when P2.6.5 arrived it was short
+ * four more -- vitrin_shim_session's three pointer-constraint enums and its
+ * idle_inhibit_state, all landed by WS-E.4.2 and D-042 without arriving here.
+ * Its own comment had predicted exactly that and asked whoever next touched
+ * the generator to emit a count. P2.6.5 did: VITRIN_ENUM_COUNT below is
+ * generated from the IDL, so this list now fails to COMPILE when it falls
+ * behind instead of silently type-checking less than the banner claims. */
+#define VITRIN_EVERY_ENUM(X)                                                 \
+    X(vitrin_handshake_error)                                                \
+    X(vitrin_grant_verb)                                                     \
+    X(vitrin_grant_persistence)                                              \
+    X(vitrin_grant_outcome)                                                  \
+    X(vitrin_grant_refusal)                                                  \
+    X(vitrin_consent_consent_state)                                          \
+    X(vitrin_view_format)                                                    \
+    X(vitrin_view_frame_flags)                                               \
+    X(vitrin_actuator_pointer_button_state)                                  \
+    X(vitrin_actuator_pointer_axis)                                          \
+    X(vitrin_shim_session_selection_status)                                  \
+    X(vitrin_shim_session_pointer_constraint_kind)                           \
+    X(vitrin_shim_session_pointer_constraint_lifetime)                       \
+    X(vitrin_shim_session_pointer_constraint_status)                         \
+    X(vitrin_shim_session_idle_inhibit_state)                                \
+    X(vitrin_shim_surface_kind)                                              \
+    X(vitrin_shim_surface_buffer_status)                                     \
+    X(vitrin_shim_seat_key_state)                                            \
+    X(vitrin_shim_seat_origin)                                               \
+    X(vitrin_shim_seat_gesture_kind)                                         \
+    X(vitrin_shim_seat_gesture_state)                                        \
+    X(vitrin_layout_arrange_mode)                                            \
+    X(vitrin_powerbox_mode)                                                  \
+    X(vitrin_powerbox_kind)                                                  \
+    X(vitrin_powerbox_refusal)
+
+enum { vitrin_enums_listed = 0 VITRIN_EVERY_ENUM(VITRIN_COUNT_ONE) };
+_Static_assert((int)vitrin_enums_listed == (int)VITRIN_ENUM_COUNT,
+               "protocol/vitrin-v0.xml defines an enum missing from (or "
+               "extra in) VITRIN_EVERY_ENUM, so this file no longer "
+               "type-checks every generated validity predicate");
 
 /* One macro per function *shape* (every *_encode shares the same parameter
  * list modulo the struct type; likewise every *_decode and every
@@ -139,11 +197,11 @@ _Static_assert((int)vitrin_messages_listed == (int)VITRIN_MESSAGE_COUNT,
         sink += (dec != NULL) ? 1 : 0;                                       \
     } while (0);
 
-#define CHECK_IS_VALID(fn_name)                                              \
+#define CHECK_IS_VALID_ONE(base)                                             \
     do {                                                                     \
-        bool (*p)(uint32_t) = fn_name;                                       \
+        bool (*p)(uint32_t) = base##_is_valid;                               \
         sink += (p != NULL) ? 1 : 0;                                         \
-    } while (0)
+    } while (0);
 
 /* Takes the address of every marshal function the header declares, forcing
  * each one's exact signature to be type-checked against this file's own
@@ -184,35 +242,8 @@ static void check_every_symbol_type_checks(void) {
         sink += (status_str != NULL) ? 1 : 0;
     }
 
-    /* ---- enum/bitfield validity predicates, one per enum in the IDL ----
-     *
-     * UNLIKE the message list above, this one has NO count gate: there is no
-     * generated VITRIN_ENUM_COUNT to _Static_assert against, so an enum
-     * appended to the IDL silently goes untype-checked here. It had, twice,
-     * and both were found and closed while adding the two below:
-     * `vitrin_layout_arrange_mode` (WS-E.1.4) and
-     * `vitrin_shim_session_selection_status` (WS-E.2.1) were missing. That
-     * is the exact failure the banner comment records for the MESSAGE list
-     * before it gained its gate; whoever next touches the generator should
-     * consider emitting an enum count so this list gets one too. */
-    CHECK_IS_VALID(vitrin_handshake_error_is_valid);
-    CHECK_IS_VALID(vitrin_grant_verb_is_valid);
-    CHECK_IS_VALID(vitrin_grant_persistence_is_valid);
-    CHECK_IS_VALID(vitrin_grant_outcome_is_valid);
-    CHECK_IS_VALID(vitrin_grant_refusal_is_valid);
-    CHECK_IS_VALID(vitrin_consent_consent_state_is_valid);
-    CHECK_IS_VALID(vitrin_view_format_is_valid);
-    CHECK_IS_VALID(vitrin_view_frame_flags_is_valid);
-    CHECK_IS_VALID(vitrin_actuator_pointer_button_state_is_valid);
-    CHECK_IS_VALID(vitrin_actuator_pointer_axis_is_valid);
-    CHECK_IS_VALID(vitrin_shim_session_selection_status_is_valid);
-    CHECK_IS_VALID(vitrin_shim_surface_kind_is_valid);
-    CHECK_IS_VALID(vitrin_shim_surface_buffer_status_is_valid);
-    CHECK_IS_VALID(vitrin_shim_seat_key_state_is_valid);
-    CHECK_IS_VALID(vitrin_shim_seat_origin_is_valid);
-    CHECK_IS_VALID(vitrin_shim_seat_gesture_kind_is_valid);
-    CHECK_IS_VALID(vitrin_shim_seat_gesture_state_is_valid);
-    CHECK_IS_VALID(vitrin_layout_arrange_mode_is_valid);
+    /* ---- every enum's validity predicate, in header (document) order ---- */
+    VITRIN_EVERY_ENUM(CHECK_IS_VALID_ONE)
 
     /* ---- every message's encode + decode, in header (document) order ---- */
     VITRIN_EVERY_MESSAGE(CHECK_MESSAGE)

@@ -60,22 +60,29 @@ fn invalid_enum_value_is_rejected() {
 
 #[test]
 fn invalid_bitfield_value_is_rejected() {
-    // `vitrin_grant.verb` is a bitfield with VALID_MASK 1|2|4|8|16|32|512 =
-    // 575. Whether a defined bit is *served* is a property of a deployment
+    // `vitrin_grant.verb` is a bitfield with VALID_MASK 1|2|4|8|16|32|64|512
+    // = 639. Whether a defined bit is *served* is a property of a deployment
     // and is settled at petition admission (`unsupported`), deliberately not
     // a decode error, so the codec must accept every defined bit whatever
     // any core does with it. That is unchanged by WS-E.1.4 serving
     // `layout_arrange` (16) and `layout_focus` (32), and by WS-E.1.1 serving
     // `realm_launch` (512), in the reference core: this file is the codec's,
     // and the codec never knew which bits were served. Bit 8
-    // (`observe_cursor`) remains defined-and-unserved there (D-017).
+    // (`observe_cursor`) remains defined-and-unserved there (D-017), and
+    // P2.6.5's bit 64 (`designate_file`) joins it there -- unserved by
+    // *every* deployment until the picker and its consent copy exist, and
+    // in range here regardless, which is the whole point of defining a bit
+    // before serving it.
     //
-    // The 64/128/256 gap is not free space: those bits are allocated (to
-    // `designate_file`, `egress`, `publish_tree`) but not yet defined in the
-    // IDL, so today they are still out of range and fatal. That is exactly
-    // why `realm_launch` took 512 rather than the next unused-looking bit.
-    assert_eq!(gen::vitrin_grant::Verb::VALID_MASK, 575);
-    for reserved in [64u32, 128, 256] {
+    // **Re-pinned once for E2.6**, 575 -> 639, per the repo-wide registry in
+    // `docs/plan/02-phase-2-semantic-epochs.md` §5, which re-pins the mask
+    // once per epic rather than once per task. The 128/256 gap is still not
+    // free space: those bits are allocated (to `egress`, `publish_tree`) but
+    // not yet defined in the IDL, so today they are still out of range and
+    // fatal. That is exactly why `realm_launch` took 512 rather than the next
+    // unused-looking bit.
+    assert_eq!(gen::vitrin_grant::Verb::VALID_MASK, 639);
+    for reserved in [128u32, 256] {
         let err = gen::vitrin_grant::Verb::from_bits(reserved).unwrap_err();
         assert_eq!(
             err,
@@ -87,10 +94,10 @@ fn invalid_bitfield_value_is_rejected() {
         );
     }
     // every subset of the defined bits, including all of them together, is
-    // legal -- enumerated as (low six bits) x (bit 512 present or not) rather
-    // than a flat `0..=575` range, which would sweep through the reserved
-    // bits above.
-    for low in 0..=63u32 {
+    // legal -- enumerated as (low seven bits) x (bit 512 present or not)
+    // rather than a flat `0..=639` range, which would sweep through the
+    // reserved bits above.
+    for low in 0..=127u32 {
         for high in [0u32, 512] {
             gen::vitrin_grant::Verb::from_bits(low | high)
                 .expect("every subset of defined bits is valid");
@@ -101,7 +108,7 @@ fn invalid_bitfield_value_is_rejected() {
     // second argument, after a valid `outcome`.
     let bytes = craft_frame(gen::vitrin_grant::events::Resolved::OPCODE, 0, |out| {
         vitrin_protocol::wire::write_uint(out, gen::vitrin_grant::Outcome::ALL[0].to_wire());
-        vitrin_protocol::wire::write_uint(out, 64); // invalid verbs bit
+        vitrin_protocol::wire::write_uint(out, 128); // invalid verbs bit
         vitrin_protocol::wire::write_uint(out, gen::vitrin_grant::Persistence::ALL[0].to_wire());
         vitrin_protocol::wire::write_uint(out, 0); // expiry_ms
     });
@@ -111,8 +118,87 @@ fn invalid_bitfield_value_is_rejected() {
         DecodeError::InvalidBitfieldValue {
             interface: "vitrin_grant",
             enum_name: "verb",
-            value: 64,
+            value: 128,
         }
+    );
+}
+
+/// `vitrin_powerbox.designated` declares exactly one fd, so a frame whose
+/// header disagrees dies fatal `fd_violation` -- P2.6.5's own case of the
+/// invariant `00-conventions.md` §2.4 makes framing-level rather than
+/// signature-level.
+///
+/// Both directions are covered, because the cheap check (`fd.is_some()` vs
+/// `HAS_FD`) passes one of them: a header claiming **one** fd for a message
+/// that carries one, decoded with none supplied, and a header claiming
+/// **none** for the same message while the fd really is supplied.
+#[test]
+fn designated_fd_count_mismatch_is_rejected_in_both_directions() {
+    let (reader, writer) = std::io::pipe().unwrap();
+    let value = gen::vitrin_powerbox::events::Designated {
+        fd: std::os::fd::OwnedFd::from(reader),
+        designation_id: 7,
+        kind: gen::vitrin_powerbox::Kind::File,
+        mode: gen::vitrin_powerbox::Mode::Read,
+        name: "notes.txt".to_string(),
+    };
+    let mut bytes = value.encode(3);
+    assert_eq!(bytes[7], 1, "fd_count byte for a one-fd message must be 1");
+
+    // (a) the header is honest, but no fd accompanies the frame.
+    let err = gen::vitrin_powerbox::events::Designated::decode(&bytes, None).unwrap_err();
+    assert_eq!(
+        err,
+        DecodeError::FdCountMismatch {
+            expected: 1,
+            actual: 0,
+        }
+    );
+    assert_eq!(
+        err.to_wire_error(),
+        gen::vitrin_handshake::Error::FdViolation,
+        "an fd_count mismatch is the fatal wire code fd_violation"
+    );
+
+    // (b) the header lies low: it declares 0 fds while the fd is really
+    // there. `fd.is_some() == HAS_FD` alone would wave this through.
+    bytes[7] = 0;
+    let err =
+        gen::vitrin_powerbox::events::Designated::decode(&bytes, Some(writer.into())).unwrap_err();
+    assert_eq!(
+        err,
+        DecodeError::FdCountMismatch {
+            expected: 1,
+            actual: 0,
+        }
+    );
+    assert_eq!(
+        err.to_wire_error(),
+        gen::vitrin_handshake::Error::FdViolation
+    );
+}
+
+/// The shim-side half of the same designation carries exactly one fd too,
+/// and an unsolicited fd on a message that declares none is the other arm of
+/// `fd_violation`. `request_dir` is the zero-argument, zero-fd request that
+/// makes the arm testable on this epic's own surface.
+#[test]
+fn request_dir_rejects_an_unsolicited_fd() {
+    let bytes = gen::vitrin_powerbox::requests::RequestDir {}.encode(3);
+    assert_eq!(bytes[7], 0, "fd_count byte for a zero-fd message must be 0");
+    let fd = std::io::pipe().unwrap().0;
+    let err = gen::vitrin_powerbox::requests::RequestDir::decode(&bytes, Some(fd.into()))
+        .expect_err("an unsolicited fd must be fatal");
+    assert_eq!(
+        err,
+        DecodeError::FdCountMismatch {
+            expected: 0,
+            actual: 1,
+        }
+    );
+    assert_eq!(
+        err.to_wire_error(),
+        gen::vitrin_handshake::Error::FdViolation
     );
 }
 

@@ -612,9 +612,12 @@ the bullet below states in full.
   each kernel in the CI matrix", cannot be satisfied by any byte-stable
   checked-in page and was replaced rather than met — so do not read the closure
   as more than it is: every one of those rows is a kernel reading in a bare
-  initramfs rather than a distribution, the per-rung *behavioural* statements
-  are still measured on one box, and nobody but the collector's author has
-  re-run its failure levers.
+  initramfs rather than a distribution, the *values* in the per-rung
+  behavioural statements were recorded on one box on one date — the tests that
+  take them run here and on the CI runner, whose job declares
+  `VITRIN_REQUIRE_LANDLOCK_ABI=7` so a skip is a panic there, and on no third
+  machine — and nobody but the collector's author has re-run its failure
+  levers.
   Each row records the build it was taken with as well as the kernel's answers,
   and `cargo xtask kernel-matrix --check` holds that half to this tree: it reads
   each row's own recorded mechanism set and goes **red the day the floor moves

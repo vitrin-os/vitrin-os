@@ -205,9 +205,11 @@ open question.
 
 What has **not** changed is the axis this section was careful about. Those are
 **kernel** rows taken in a bare initramfs, so the number of *distributions*
-measured as such is still one; the per-rung *behavioural* statements are still
-measured on one box; and nobody other than the collector's author has re-run its
-failure levers. **Nothing may describe P2.6.3 as complete** on the strength of
+measured as such is still one; the *values* in the per-rung *behavioural*
+statements were recorded on one box on one date (the tests that take them run
+here and on the CI runner, which declares `VITRIN_REQUIRE_LANDLOCK_ABI=7` so a
+skip is a panic, and on no third machine); and nobody other than the collector's
+author has re-run its failure levers. **Nothing may describe P2.6.3 as complete** on the strength of
 the kernel table alone, and `docs/book/src/limits.md` states the same three
 residuals in the same terms.
 
@@ -319,6 +321,14 @@ criteria below are unchanged by it. (Correction 5 below records what a
 generated table could and could not be after this decision, and what landed.)
 Nothing may read this correction as P2.6.3 closing.
 
+*Scope note added 2026-08-19.* That sentence stands exactly as written —
+Correction 4 did not close P2.6.3 and nothing here claims it did. **Correction 7
+below is what closed it**, on criteria this correction is one of the
+restatements of. The pointer is added here rather than by editing the sentence,
+because this document corrects by appending; without it a reader meets the
+forbidding sentence and never learns that the thing it forbids has since
+happened for other reasons.
+
 **Restated acceptance criteria for the undone half**, so the next task has a
 target rather than the false one: a checked-in ladder table **generated** by a
 subcommand (`cargo xtask isolation-matrix` or its successor) from
@@ -375,10 +385,12 @@ What was built instead, and what it is honestly worth:
 about any kernel and it does not close PRD §20's caveat. The
 machine half stays `vitrind --print-isolation`, which the page tells a
 reader how to read against the table. **Nothing may read this correction as
-P2.6.3 closing either.** The two behavioural per-rung tests the criterion asks
+P2.6.3 closing either** — and, as at Correction 4, that sentence is about *this*
+correction and is not superseded: what closed P2.6.3 is **Correction 7 below**
+(2026-08-19), on a dated owner's decision rather than on anything here. The two behavioural per-rung tests the criterion asks
 for do exist (`the_truncate_rung_is_measured_and_its_absence_is_measured_with_it`,
-`rung_one_forbids_reparenting_that_the_rung_above_permits`) and were measured on
-one box on one date. The first clause of the restated criterion — a row per ABI
+`rung_one_forbids_reparenting_that_the_rung_above_permits`) and the values they
+pin were recorded on one box on one date. The first clause of the restated criterion — a row per ABI
 a kernel actually reported — was taken up separately; see Correction 6.
 
 **Correction 6 — the per-kernel rows exist, they are taken under QEMU rather
@@ -472,14 +484,18 @@ the same words on `docs/book/src/limits.md`: five kernels answered five ABIs and
 four of the nine rungs are reported by none of them; those are **kernel** rows
 in a bare initramfs, so the number of distributions measured as such is still
 one; nobody but the collector's author has re-run its failure levers; the suite
-itself has still only ever run on two machines; and the per-rung behavioural
-statements are one box on one date; those behavioural tests are **not** in
+itself has still only ever run on two machines; and the values in the per-rung
+behavioural statements are one box on one date, their tests running on this
+repository's development box and on the CI runner and nowhere else; those behavioural tests are **not** in
 `tests/integration/` and are **not** table-driven off the ladder data the matrix
 is generated from, which is a clause of the original task list that no
 correction above restates as replaced and that closing this task does not meet;
 and no mock-free gate measures the *write* denial at all — the shipped default's
 mock-free measurement is a **read**, its probe opening `O_RDONLY`, so the
-write criterion rests on a component test in `vitrin-realm-init`'s own suite.
+write criterion rests on a component test in `vitrin-realm-init`'s own suite;
+that gap is **owed to P2.6.9** ([#193](https://github.com/vitrin-os/vitrin-os/issues/193)),
+whose payload realm reports every write it attempted with the errno each got,
+and it is not closed by anything that lands before it.
 **PRD §20's caveat is answered for those
 five kernels and for no others** — the sentence above stands.
 

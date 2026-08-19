@@ -328,8 +328,13 @@ command = "/usr/bin/foot"
 # "one row per ABI actually reported" the original criteria asked for: five
 # kernels answered five ABIs, and four of the nine rungs are reported by none
 # of them. Every row there is a KERNEL reading taken in a bare initramfs rather
-# than a distribution, and every per-rung BEHAVIOURAL claim about this ruleset
-# is still prose measured once on one box.
+# than a distribution. The per-rung BEHAVIOURAL claims are NOT uniform, and
+# docs/book/src/isolation-matrix.md counts which is which rather than leaving it
+# to be inferred: rungs 1, 2, 3 and 7 are entered by tests in
+# crates/vitrin-realm-init/src/main.rs, which run here and on the CI runner;
+# every other rung's behaviour is derived from this build's own source and
+# measured against nothing. The VALUES those tests pin were recorded on one box
+# on one date.
 #
 # Since P2.6.4 there IS a seccomp filter, and it is a DENY-LIST -- which is a
 # named-class claim and never a completeness one. It closes the

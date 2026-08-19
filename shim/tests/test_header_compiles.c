@@ -18,12 +18,21 @@
  *     file expects;
  *   - every enum's validity predicate likewise (CHECK_IS_VALID_ONE);
  *   - the frame-header and raw little-endian helpers are checked directly;
- *   - a handful of representative messages (a plain zero-argument request,
- *     a string-and-scalar-heavy request, a bitfield-and-enum-heavy event,
- *     and both of the two fd-bearing messages) are actually *called* with
- *     dummy buffers, end to end (encode then decode), to prove the API is
- *     genuinely callable from an external C translation unit, not merely
- *     syntactically present.
+ *   - a handful of representative messages are actually *called* with dummy
+ *     buffers, end to end (encode then decode), to prove the API is genuinely
+ *     callable from an external C translation unit, not merely syntactically
+ *     present: a plain zero-argument request, a string-and-scalar-heavy
+ *     request, a bitfield-and-enum-heavy event, and fd-bearing messages in
+ *     both directions -- vitrin_view.frame_ready, vitrin_shim_surface.attach
+ *     and, since P2.6.5, vitrin_shim_session.designation, the first fd-bearing
+ *     core -> shim event this protocol has defined.
+ *
+ *     This set is REPRESENTATIVE and is not claimed to be exhaustive;
+ *     exhaustiveness is the two _Static_assert'd lists' job, not this one's.
+ *     It is also NAMED rather than counted, deliberately: the line above read
+ *     "both of the two fd-bearing messages" until the IDL defined more than
+ *     two, and nothing said so -- the same closed-count failure the message
+ *     list below records for itself.
  *
  * "Every message" is asserted, not trusted: VITRIN_EVERY_MESSAGE below is
  * counted at compile time and _Static_assert'd against the generated
@@ -79,7 +88,7 @@ static int sink = 0;
     X(vitrin_grant_req_get_launcher)                                         \
     X(vitrin_grant_req_get_layout_focus)                                     \
     X(vitrin_grant_req_get_layout_arrange)                                   \
-    X(vitrin_grant_req_get_powerbox)                                        \
+    X(vitrin_grant_req_get_powerbox)                                         \
     X(vitrin_grant_evt_resolved)                                             \
     X(vitrin_grant_evt_refused)                                              \
     X(vitrin_consent_evt_state)                                              \
@@ -123,11 +132,23 @@ static int sink = 0;
     X(vitrin_powerbox_evt_designated)                                        \
     X(vitrin_powerbox_evt_refused)
 
-/* The exhaustiveness gate. VITRIN_MESSAGE_COUNT is generated from the IDL,
- * so an appended message makes this a compile error here rather than a
- * silent hole in the coverage the file's banner comment claims. */
+/* The exhaustiveness gate, in two halves, because a count alone is not a set.
+ *
+ * VITRIN_COUNT_ONE + VITRIN_MESSAGE_COUNT (generated from the IDL) catch an
+ * omission: a message appended to the IDL and not to the list makes the
+ * lengths disagree. On their own they do NOT catch a DUPLICATE -- listing one
+ * message twice while dropping another keeps the count right and leaves the
+ * dropped one untype-checked, which is precisely the hole a count gate has.
+ * VITRIN_NAME_ONE closes it: each entry also declares an enumerator named
+ * after itself, so a repeated entry is a duplicate enumerator and does not
+ * compile. Between the two, the assertion text below is true as written --
+ * "missing from (or extra in)" -- rather than an overclaim about a length
+ * comparison. (An entry naming a message the header does not declare fails
+ * even earlier, at CHECK_MESSAGE's function-pointer initialisation.) */
 #define VITRIN_COUNT_ONE(base) +1
+#define VITRIN_NAME_ONE(base) base##_listed_exactly_once,
 enum { vitrin_messages_listed = 0 VITRIN_EVERY_MESSAGE(VITRIN_COUNT_ONE) };
+enum { VITRIN_EVERY_MESSAGE(VITRIN_NAME_ONE) vitrin_message_names_end };
 _Static_assert((int)vitrin_messages_listed == (int)VITRIN_MESSAGE_COUNT,
                "protocol/vitrin-v0.xml defines a message missing from (or "
                "extra in) VITRIN_EVERY_MESSAGE, so this file no longer "
@@ -175,6 +196,7 @@ _Static_assert((int)vitrin_messages_listed == (int)VITRIN_MESSAGE_COUNT,
     X(vitrin_powerbox_refusal)
 
 enum { vitrin_enums_listed = 0 VITRIN_EVERY_ENUM(VITRIN_COUNT_ONE) };
+enum { VITRIN_EVERY_ENUM(VITRIN_NAME_ONE) vitrin_enum_names_end };
 _Static_assert((int)vitrin_enums_listed == (int)VITRIN_ENUM_COUNT,
                "protocol/vitrin-v0.xml defines an enum missing from (or "
                "extra in) VITRIN_EVERY_ENUM, so this file no longer "
@@ -338,8 +360,8 @@ static void call_enum_and_bitfield_message(void) {
     sink += (decoded.outcome == msg.outcome) ? 1 : 0;
 }
 
-/* Encodes then decodes vitrin_view.frame_ready: one of the two fd-bearing
- * messages, exercising the plain `int fd` field, a cross-interface plain
+/* Encodes then decodes vitrin_view.frame_ready: an fd-bearing message,
+ * exercising the plain `int fd` field, a cross-interface plain
  * enum (vitrin_view_format_t, defined on this same interface here but
  * referenced from vitrin_shim_surface.attach too -- see
  * call_other_fd_bearing_message below), and a bitfield in the same struct. */
@@ -374,8 +396,8 @@ static void call_fd_bearing_message(void) {
     sink += (decoded.format == msg.format) ? 1 : 0;
 }
 
-/* Encodes then decodes vitrin_shim_surface.attach: the other fd-bearing
- * message, and the one that references vitrin_view.format from a *different*
+/* Encodes then decodes vitrin_shim_surface.attach: the shim -> core
+ * fd-bearing message, and the one that references vitrin_view.format from a *different*
  * interface (vitrin_shim_surface is defined after vitrin_view in
  * protocol/vitrin-v0.xml, so this is a backward reference; request_grant's
  * forward reference to vitrin_grant's enums is exercised structurally by
@@ -409,6 +431,55 @@ static void call_other_fd_bearing_message(void) {
     sink += (decoded.kind == msg.kind) ? 1 : 0;
 }
 
+/* Encodes then decodes vitrin_shim_session.designation: the FIRST fd-bearing
+ * core -> shim event this protocol has ever defined (P2.6.5, issue #189), and
+ * the reason it is called here rather than only type-checked. Every other fd
+ * this transport has had to marshal travels shim -> core, so shim/include/wire.h
+ * implements SCM_RIGHTS on the send side only and closes an arriving
+ * descriptor as a violation -- see its own header comment, which says so and
+ * names P2.6.7 as owing the receive path. This call proves the *marshalling*
+ * half a C shim will need is already there and correct, including the
+ * fd-present precondition (HAS_FD is 1, so decoding with fd < 0 must be
+ * refused) and the 255-byte bound on `name`.
+ *
+ * vitrin_powerbox.designated, the agent-facing half of the same designation,
+ * is type-checked through VITRIN_EVERY_MESSAGE like every message and is not
+ * called here: it travels on a principal connection this shim never opens. */
+static void call_core_to_shim_fd_bearing_message(void) {
+    vitrin_shim_session_evt_designation_t msg;
+    uint8_t buf[128];
+    int32_t written;
+    uint32_t object_id_out;
+    vitrin_shim_session_evt_designation_t decoded;
+    vitrin_decode_status_t st;
+    int dummy_fd = 5;
+    static const char name[] = "notes.txt";
+
+    msg.fd = dummy_fd;
+    msg.designation_id = 7;
+    msg.kind = VITRIN_POWERBOX_KIND_FILE;
+    msg.mode = VITRIN_POWERBOX_MODE_READ;
+    msg.name.data = (const uint8_t *)name;
+    msg.name.len = (uint32_t)(sizeof(name) - 1u);
+
+    written = vitrin_shim_session_evt_designation_encode(&msg, 2, buf, sizeof(buf));
+    sink += (written > 0) ? 1 : 0;
+
+    /* HAS_FD is 1 for this message: decoding it with no descriptor is the
+     * fd_count mismatch conventions 2.4 makes fatal. */
+    st = vitrin_shim_session_evt_designation_decode(buf, (size_t)written, -1,
+                                                    &object_id_out, &decoded);
+    sink += (st == VITRIN_DECODE_ERR_FD_MISMATCH) ? 1 : 0;
+
+    st = vitrin_shim_session_evt_designation_decode(buf, (size_t)written, dummy_fd,
+                                                    &object_id_out, &decoded);
+    sink += (st == VITRIN_DECODE_OK) ? 1 : 0;
+    sink += (decoded.fd == dummy_fd) ? 1 : 0;
+    sink += (decoded.kind == msg.kind) ? 1 : 0;
+    sink += (decoded.mode == msg.mode) ? 1 : 0;
+    sink += (decoded.name.len == msg.name.len) ? 1 : 0;
+}
+
 int main(void) {
     check_every_symbol_type_checks();
     call_zero_arg_message();
@@ -416,5 +487,6 @@ int main(void) {
     call_enum_and_bitfield_message();
     call_fd_bearing_message();
     call_other_fd_bearing_message();
+    call_core_to_shim_fd_bearing_message();
     return sink >= 0 ? 0 : 1;
 }

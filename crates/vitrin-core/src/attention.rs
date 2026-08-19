@@ -993,18 +993,16 @@ mod tests {
         // adds one -- and moving it is the point, because it forces the next
         // author to check that the new bit is not an attention verb before
         // re-pinning. `designate_file` is not: nothing about the human's
-        // attention key is exempted for it, and it is not in `EXEMPT_VERBS`.
+        // attention key is exempted for it, and the equality on the line
+        // above -- an equality against a two-element array, not a membership
+        // test -- is already what forbids adding it.
+        //
+        // TWO FURTHER ASSERTIONS STOOD HERE AND WERE DELETED RATHER THAN
+        // KEPT. `VALID_MASK & DESIGNATE_FILE == DESIGNATE_FILE` cannot fail
+        // while the pin below holds, and `!EXEMPT_VERBS.contains(..)` cannot
+        // fail while the equality above holds. Neither could ever go red, and
+        // a check that cannot go red is the exact thing the pin below is for.
         assert_eq!(Verb::VALID_MASK, 639);
-        assert_eq!(
-            Verb::VALID_MASK & Verb::DESIGNATE_FILE.bits(),
-            Verb::DESIGNATE_FILE.bits(),
-            "sanity: the bit that moved the pin is the one P2.6.5 allocated"
-        );
-        assert!(
-            !EXEMPT_VERBS.contains(&Verb::DESIGNATE_FILE),
-            "designate_file is not lifted by the attention key, and adding it here \
-             would be a decision about the human's own hand, not a bookkeeping edit"
-        );
     }
 
     // -- the marker ----------------------------------------------------------

@@ -33,9 +33,23 @@ no ambient reach for it to be a convenience over.
 
 **No deployment serves `designate_file`, including the reference core.** Every
 petition naming the verb resolves `unsupported`, so no grant carries the bit,
-so every use of this facet refuses `not_granted`.
+so a server that implements this facet refuses every use `not_granted`.
 
-That is the [defined-but-unserved](./04-vitrin_grant.md#defined-but-unserved)
+**The reference core does not implement the facet at all yet, and that is
+stated rather than implied by the sentence above.** `vitrind` negotiates
+exactly version 2 but has no dispatch arm for
+[`get_powerbox`](./04-vitrin_grant.md#get_powerbox): sending it kills the
+connection with fatal `invalid_opcode`, so today the facet cannot be obtained
+from that core and therefore cannot refuse anything. That is a conformance gap
+in the reference implementation rather than a property of this interface, it
+is the first mint the IDL has declared without one, and it closes in **P2.6.6**
+alongside the picker. `crates/vitrin-core/src/principal.rs` pins the gap with a
+test that asserts the fatal answer, so the arm cannot land without this
+paragraph, the IDL's, and
+[page 04's](./04-vitrin_grant.md#get_powerbox) going with it.
+
+**The verb's refusal** is the
+[defined-but-unserved](./04-vitrin_grant.md#defined-but-unserved)
 staging, and unlike `observe_cursor`'s it has a **scheduled** end. Two things
 are owed, both named in `docs/plan/02-phase-2-semantic-epochs.md` §2 E2.6:
 
@@ -110,6 +124,16 @@ the least-trusted process a socket into the TCB would add an attacker-facing
 surface to the core for no gain, while the shim is already the app's
 confinement peer and holds nothing it did not already hold.
 
+**The shipped shim cannot receive the second half yet.** `designation` is the
+first fd-bearing core→shim event this protocol has ever defined, and
+`shim/include/wire.h` says in as many words that its transport implements
+`SCM_RIGHTS` on the **send side only**: an arriving descriptor is a violation,
+closed immediately, and then fatal. So a `designation` delivered to today's
+shim would close the descriptor and kill the realm's connection. It costs
+nothing today — no deployment serves the verb, so the core never sends the
+event — and the receive-side machinery, along with the per-realm designation
+socket, is what **P2.6.7** owes.
+
 ## Revocation cannot recall a delivered descriptor
 
 **This is the limitation of this interface that will be misread if it is left
@@ -159,8 +183,9 @@ The facet comes into existence when a principal calls
 [`get_powerbox`](./04-vitrin_grant.md#get_powerbox) on a grant, which allocates
 the client-supplied `new_id` and binds it to this interface. Minting is always
 structurally successful and is **not an authority oracle** — and today that is
-doing visible work: since no deployment serves the verb, minting succeeds
-everywhere and using the facet refuses everywhere.
+doing visible work: since no deployment serves the verb, a server that
+implements the mint mints successfully and refuses every use. No shipped
+server implements it yet; see [Served status](#served-status).
 
 It is grant-derived, so it follows the inert-object rule: when its grant dies
 (expiry or revocation) the facet goes **inert**, and requests on it are refused
@@ -426,18 +451,20 @@ mint into an oracle for what a grant holds.
 
 ## Growth
 
-- **`request_connect` and the `egress` verb — planned, and blocked on a
-  dialect question.** `docs/plan/02-phase-2-semantic-epochs.md` E2.7 (P2.7.2)
-  plans a `request_connect(host, port)` on **this** interface, delivering a
-  connected socket, on the reasoning that egress is "the socket analog of
+- **`request_connect` and the `egress` verb — a facet of its own, not a
+  request here.** `docs/plan/02-phase-2-semantic-epochs.md` E2.7 (P2.7.2) was
+  drafted as a `request_connect(host, port)` on **this** interface, delivering
+  a connected socket, on the reasoning that egress is "the socket analog of
   `request_file`". `interface/@verb` is **one value per interface** — it is what
   generates the single-site authority check — and this interface already
   declares `designate_file`, so a second verb's requests would reach the
   chokepoint with no entry. That is precisely the failure the
-  [layout split](./04-vitrin_grant.md#get_layout_arrange) exists to prevent.
-  Whoever lands egress therefore chooses: a separate facet, as the layout pair
-  did, or a change to the dialect. Named here so the choice is made rather than
-  discovered.
+  [layout split](./04-vitrin_grant.md#get_layout_arrange) exists to prevent, so
+  **`egress` takes its own facet interface and its own `get_*` mint on
+  `vitrin_grant`**, exactly as the layout pair was forced to. The plan's
+  sentence is the thing that was wrong, and it is corrected under E2.7's own
+  issue rather than here; this interface stays a `designate_file` facet at
+  every version.
 - **A chrome-selecting `mode` for `request_dir`.** A `since`-gated sibling
   request, never arguments added to `request_dir`.
 - **Further `mode` or `kind` entries.** Appended enum entries; values are

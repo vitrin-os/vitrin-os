@@ -71,7 +71,9 @@ object the core can address before the shim has done anything but read
 counterparty is not the one the interface it would otherwise belong to was
 built around* — and the lesson recorded rather than smoothed over is that a
 rule which quietly widens to admit whatever arrives next is worth no more than
-the closed count it replaced.
+the closed count it replaced. Reversing a remedy a decision recorded is itself
+a decision, so it is logged rather than only applied here: see D-042's
+2026-08-19 amendment in [the decision log](../plan/20-decision-log.md).
 
 Three naming rules apply to everything below, and each is load-bearing. **Call
 it a *pointer constraint* or a *pointer lock*, never a bare "constraint"** — in
@@ -595,6 +597,15 @@ The core's half of a completed designation: an agent holding
 core-drawn picker, and this event delivers the resulting descriptor into the
 realm. The shim relays it to its app over the realm's own designation socket
 (P2.6.7); it is the app, not the shim, that the descriptor is for.
+
+**The shipped shim does not implement receiving this event.** Its transport
+(`shim/include/wire.h`) carries `SCM_RIGHTS` on the send side only, because
+until this event no core→shim message had ever carried a descriptor: an
+arriving fd is a violation, closed immediately, and then fatal. A `designation`
+sent to today's shim therefore closes the descriptor and kills the connection
+rather than delivering it. Nothing is lost by it today — no deployment serves
+`designate_file`, so the core never sends the event — and the receive-side
+machinery is part of what **P2.6.7** owes alongside the designation socket.
 
 **Exactly one fd per event**, which is the framing invariant rather than a
 property of this signature ([conventions § 2.4](./00-conventions.md)). A

@@ -94,7 +94,7 @@ authentication, because the core created both ends itself.
 | `vitrin_launcher` | Realm-launch facet (since wire version 2) — fork a new realm instance from an operator-written template, under a core-minted id; `launch` carries no arguments, so the command never crosses the wire |
 | `vitrin_layout_focus` | Focus facet (since wire version 2) — bind the output to the granted realm and send the human's own input there, one act |
 | `vitrin_layout_arrange` | Arrangement facet (since wire version 2) — fill the output, or compose at the app's own size; `place`, `resize`, `raise` and stacking are absent rather than refused |
-| `vitrin_powerbox` | Designation facet (since wire version 2) — ask the human to pick one file or one directory subtree and have the **descriptor** delivered to the realm; no path crosses the wire in either direction. **No deployment serves the verb yet** |
+| `vitrin_powerbox` | Designation facet (since wire version 2) — ask the human to pick one file or one directory subtree and have the **descriptor** delivered to the realm; no path crosses the wire in either direction. **Vocabulary only so far**: no deployment serves the verb, and `vitrind` does not answer `get_powerbox` at all yet — it kills the connection with `invalid_opcode` until the picker lands |
 
 Each has a prose page under
 [`docs/protocol/`](https://github.com/vitrin-os/vitrin-os/tree/main/docs/protocol).
@@ -191,7 +191,9 @@ Version 0 is frozen for Phase 1 — **not forever**. The wire integer is now
 - the `designate_file` verb, the `file:`/`dir:` resource prefixes, and
   `vitrin_shim_session.designation` — the powerbox vocabulary, refused
   `unsupported` by every deployment until the core-drawn picker and its
-  consent copy exist;
+  consent copy exist, and **not yet implemented by this core at all**:
+  `get_powerbox` is the one message in the list above that `vitrind` has no
+  handler for, so sending it is fatal `invalid_opcode` rather than a mint;
 - the `capacity` refusal code and the `layout_held` outcome;
 - on `vitrin_shim_session`, the cross-realm clipboard, the pointer
   constraints and the idle inhibit (`request_selection`, `offer_selection`,

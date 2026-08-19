@@ -90,11 +90,16 @@ def test_the_unserved_marker_is_actually_a_phrase_the_idl_uses() -> None:
     D-017 recorded. So pin that the phrase is still load-bearing: at least one
     entry carries it, and at least one does not.
 
-    At wire version 2 the unserved side is `observe_cursor` alone;
-    `realm_launch` stays out of the SERVED set for a reason about the version
-    rather than the deployment (a version-1 connection cannot mint
-    `vitrin_launcher` at all), and the IDL's own summary says so, which is why
-    deriving from the IDL rather than from a second list is the point.
+    At wire version 2 the marked side is `observe_cursor`, `designate_file`
+    (added by P2.6.5, and unserved by every deployment until its picker and
+    its consent copy exist) and `realm_launch` — the last of which stays out
+    of the SERVED set for a reason about the version rather than the
+    deployment (a version-1 connection cannot mint `vitrin_launcher` at all),
+    and the IDL's own summary says so, which is why deriving from the IDL
+    rather than from a second list is the point. No count is stated here: the
+    assertions below are over the derived sets, and the one sentence that did
+    state a count ("`observe_cursor` alone") went false the moment a second
+    verb landed.
     """
     summaries = [(e.get("summary") or "") for e in _verb_entries()]
     marked = [s for s in summaries if UNSERVED_MARKER in s]

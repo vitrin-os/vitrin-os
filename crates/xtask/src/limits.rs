@@ -2908,6 +2908,56 @@ pub const MIRRORS: &[Derived] = &[
             context: "pub(crate) const MAX_LIVE_REALMS: usize = ",
         }],
     },
+    Derived {
+        id: "verb-valid-mask",
+        says: "the `vitrin_grant.verb` bitfield's VALID_MASK -- the boundary between a \
+               recoverable `unsupported` and a fatal `invalid_argument`. It moves whenever \
+               an epic allocates a verb bit, and the renderings below restate it as a \
+               literal, on purpose: re-pinning each is what forces a human to classify \
+               the new bit rather than let it widen the mask silently.",
+        issue: "Refs #189: the plan's re-pin registry named three sites, and measured \
+                against the tree it was wrong in both directions -- attention.rs holds a \
+                literal pin and was not named, and test_verb_parity.py holds no literal at \
+                all. Following that list on the next verb would have left attention.rs red. \
+                The list is now checked here rather than remembered.",
+        // The generated constant, not either test's copy of it: a row whose
+        // source is one of the surfaces it holds would agree with its own
+        // drift.
+        source: Source::File {
+            path: "crates/vitrin-protocol/src/generated/vitrin_grant.rs",
+            reads: &[Read {
+                after: "pub const VALID_MASK: u32 = ",
+                shape: Shape::UpTo(";"),
+            }],
+        },
+        renderings: &[
+            Rendering {
+                path: "crates/vitrin-protocol/tests/decode_errors.rs",
+                render: verb_mask_assert,
+                context: "Verb::VALID_MASK, ",
+            },
+            Rendering {
+                path: "crates/vitrin-core/src/attention.rs",
+                render: verb_mask_assert,
+                context: "Verb::VALID_MASK, ",
+            },
+            Rendering {
+                path: "docs/plan/02-phase-2-semantic-epochs.md",
+                render: verb_mask_plan_sentence,
+                context: "`Verb::VALID_MASK` is **",
+            },
+            Rendering {
+                path: "docs/protocol/04-vitrin_grant.md",
+                render: verb_mask_page_sentence,
+                context: "`VALID_MASK` is therefore **",
+            },
+            Rendering {
+                path: "docs/plan/20-decision-log.md",
+                render: verb_mask_log_sentence,
+                context: "`Verb::VALID_MASK == ",
+            },
+        ],
+    },
 ];
 
 // ---------------------------------------------------------------------------
@@ -3013,6 +3063,7 @@ pub const COVERED_MIRRORS: &[&str] = &[
     "demo-identity",
     "demo-token",
     "max-live-realms-mirrors-the-surface-cap",
+    "verb-valid-mask",
 ];
 
 /// Hold a table to its coverage roll: same ids, no duplicates, order free.
@@ -3195,6 +3246,53 @@ fn kernels_on_n_of_them(v: &[String]) -> String {
 
 fn core_fd_define(v: &[String]) -> String {
     format!("#define VITRIN_CORE_FD {}", v[0])
+}
+
+/// `1 | 2 | 4 | 8 | 16 | 32 | 64 | 512` -> `639`.
+///
+/// The generated constant is an OR of the IDL's entry values, and every
+/// surface below states the decimal. Summing here rather than reading a second
+/// decimal from somewhere is the whole point of the row: there is one
+/// definition, and the renderings are renderings.
+///
+/// `None` rather than a panic when a term does not parse, so that
+/// `changing_the_canonical_value_alone_fails_every_rendering` -- which
+/// perturbs the read value by appending a marker to it -- exercises this row
+/// like every other instead of aborting the whole test.
+fn verb_mask_bits(v: &[String]) -> Option<u32> {
+    let mut mask = 0u32;
+    for term in v[0].split('|') {
+        mask |= term.trim().parse::<u32>().ok()?;
+    }
+    Some(mask)
+}
+
+/// The decimal, or a form no surface can contain when the source is not an OR
+/// of decimals -- never a value that might accidentally match.
+fn verb_mask_decimal(v: &[String]) -> String {
+    match verb_mask_bits(v) {
+        Some(mask) => mask.to_string(),
+        None => format!("<not-an-or-of-decimals:{}>", v[0].trim()),
+    }
+}
+
+fn verb_mask_assert(v: &[String]) -> String {
+    format!("Verb::VALID_MASK, {})", verb_mask_decimal(v))
+}
+
+fn verb_mask_plan_sentence(v: &[String]) -> String {
+    format!("`Verb::VALID_MASK` is **{}** today", verb_mask_decimal(v))
+}
+
+fn verb_mask_page_sentence(v: &[String]) -> String {
+    match verb_mask_bits(v) {
+        Some(mask) => format!("`VALID_MASK` is therefore **{mask}** (`{mask:#x}`)"),
+        None => format!("`VALID_MASK` is therefore **{}**", verb_mask_decimal(v)),
+    }
+}
+
+fn verb_mask_log_sentence(v: &[String]) -> String {
+    format!("`Verb::VALID_MASK == {}`", verb_mask_decimal(v))
 }
 
 fn py_demo_identity(v: &[String]) -> String {
@@ -4792,6 +4890,103 @@ mod tests {
             .and_then(Path::parent)
             .expect("crates/xtask -> crates -> workspace root")
             .to_path_buf()
+    }
+
+    /// **The half a `Derived` row cannot hold: the SET of literal
+    /// `Verb::VALID_MASK` pins, not their values.**
+    ///
+    /// The `verb-valid-mask` row above holds every rendering it names in
+    /// agreement with the generated constant. It is blind to a pin it does
+    /// *not* name -- which is precisely how the re-pin registry in
+    /// `docs/plan/02-phase-2-semantic-epochs.md` §5 came to list three sites
+    /// of which one held no literal and one that did was missing
+    /// (`crates/vitrin-core/src/attention.rs`, added by WS-E.4.2 and never
+    /// registered). Following that list on the next verb bit would have left
+    /// `attention.rs` red for a reason its author had already written down.
+    ///
+    /// So this scans the tree for the literal and asserts two things: the set
+    /// of files holding one is exactly the set the row renders into, and the
+    /// registry paragraph names each of them by path.
+    ///
+    /// **Its honest bound**: it matches the one spelling a pin has ever taken,
+    /// `Verb::VALID_MASK, <decimal>`. A pin written against a hex literal, or
+    /// through a re-export under another name, is invisible to it. That is
+    /// narrower than "every pin" and is said here rather than implied.
+    #[test]
+    fn the_verb_mask_literal_pins_are_exactly_the_sites_the_registry_names() {
+        const REGISTRY: &str = "docs/plan/02-phase-2-semantic-epochs.md";
+        let root = root();
+        let row = MIRRORS
+            .iter()
+            .find(|d| d.id == "verb-valid-mask")
+            .expect("the row this test is the set-half of");
+        let values = read_source(&root, &row.source).expect("the generated constant");
+        let mask = verb_mask_decimal(&values);
+        let needle = format!("Verb::VALID_MASK, {mask}");
+
+        let mut found: Vec<String> = Vec::new();
+        collect_rust_sources_with(&root.join("crates"), &root, &needle, &mut found);
+        found.sort();
+
+        // Every rendering of the row that is a Rust source is a pin site; the
+        // documents are not. Derived from the row so the two cannot disagree.
+        let mut expected: Vec<String> = row
+            .renderings
+            .iter()
+            .map(|r| r.path.to_string())
+            .filter(|p| p.ends_with(".rs"))
+            .collect();
+        expected.sort();
+
+        // Non-vacuity first: a scan that found nothing would make the
+        // equality below trivially true if the row ever lost its Rust
+        // renderings too.
+        assert!(
+            !found.is_empty(),
+            "no file holds {needle:?}. Either the pins were deleted -- which is a              decision, not a cleanup -- or this scan stopped matching the spelling              a pin takes."
+        );
+        assert_eq!(
+            found, expected,
+            "the set of files pinning `Verb::VALID_MASK` at its literal value is not              the set `verb-valid-mask` renders into. A pin the row does not name is a              pin nothing holds to the generated constant, and it is what the re-pin              registry in {REGISTRY} will send the next author past."
+        );
+
+        let registry = fs::read_to_string(root.join(REGISTRY)).expect("the plan document");
+        for path in &expected {
+            assert!(
+                registry.contains(path.as_str()),
+                "{REGISTRY} does not name {path} among the sites to re-pin. That list is                  followed by whoever lands the next verb bit; a site missing from it is a                  red test they will meet without having been told why."
+            );
+        }
+    }
+
+    /// Recursive `*.rs` walk collecting workspace-relative paths whose text
+    /// contains `needle`. Skips `src/generated` (regenerated from the IDL, so
+    /// nothing there is a hand-maintained pin) and anything vendored.
+    fn collect_rust_sources_with(dir: &Path, root: &Path, needle: &str, out: &mut Vec<String>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if is_vendored(root, &path) {
+                continue;
+            }
+            if path.is_dir() {
+                if path.file_name().is_some_and(|n| n == "generated") {
+                    continue;
+                }
+                collect_rust_sources_with(&path, root, needle, out);
+            } else if path.extension().is_some_and(|e| e == "rs")
+                && fs::read_to_string(&path).is_ok_and(|t| t.contains(needle))
+            {
+                out.push(
+                    path.strip_prefix(root)
+                        .unwrap_or(&path)
+                        .display()
+                        .to_string(),
+                );
+            }
+        }
     }
 
     /// The shipping table passes against the tree it ships with. If this fails,

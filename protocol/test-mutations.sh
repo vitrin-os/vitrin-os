@@ -175,11 +175,31 @@ check_rejected designated-name-without-bound \
 check_rejected designation-kind-enum-on-string \
   's|<arg name="name" type="string" summary="basename of what the human chose, for display only - never a path (max 255 bytes)"/>|<arg name="name" type="string" enum="vitrin_powerbox.kind" summary="basename of what the human chose, for display only - never a path (max 255 bytes)"/>|'
 
-# The closed set of seven admits no `array`. A designation delivered as an
-# array of descriptors is exactly the shape the one-fd-per-message invariant
-# forbids, and the type system is where it is forbidden.
+# The argument-type set is closed at seven and admits no `array`. Retyping
+# `request_file`'s `mode` is the cheapest way to exercise that on a message
+# this issue added -- the mutation also drops the enum reference, so a schema
+# that had quietly stopped rejecting `array` would be caught by either half.
+# (This comment described an array OF DESCRIPTORS until the review of #189
+# pointed out that no such mutation runs; the one-fd rule is a framing
+# invariant the schema does not model at all, and the case that does exercise
+# it is `designated-fd-allow-null` below plus decode_errors.rs's runtime
+# fd_count pair.)
 check_rejected powerbox-mode-as-array \
   's|<arg name="mode" type="uint" enum="mode" summary="the access this ask is for; the human may narrow it, and designated.mode carries what was actually approved"/>|<arg name="mode" type="array" summary="the access this ask is for; the human may narrow it, and designated.mode carries what was actually approved"/>|'
+
+# `get_powerbox` is a structural mint, and a new_id argument MUST name the
+# interface it mints -- an untyped new_id would leave codegen with nothing to
+# emit and a client with no way to know what it just allocated. Pinned on the
+# mint this issue added rather than on one of the three that came before it.
+check_rejected get-powerbox-new-id-without-interface \
+  's|<arg name="powerbox" type="new_id" interface="vitrin_powerbox" |<arg name="powerbox" type="new_id" |'
+
+# Enum references are legal only on int and uint arguments. `vitrin_powerbox`
+# defines a refusal voice of its own, distinct from vitrin_grant.refused, and
+# its one argument is the enum that carries the code: a string form of it
+# would put an unbounded, uncheckable name where a closed set belongs.
+check_rejected powerbox-refused-code-as-string \
+  's|<arg name="code" type="uint" enum="refusal" summary="why the ask produced no descriptor"/>|<arg name="code" type="string" enum="refusal" summary="why the ask produced no descriptor (max 32 bytes)"/>|'
 
 # Enum entry values are required and immutable. An unvalued `refusal` entry
 # would leave the wire value to document order -- the renumbering hazard the

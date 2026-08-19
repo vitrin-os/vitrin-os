@@ -1133,12 +1133,22 @@ impl PrincipalServer {
                                 Err(PrincipalViolation::UnknownOpcode { object_id, opcode }.into())
                             }
                         },
-                        // vitrin_grant carries exactly three requests, all
-                        // since="2" structural mints; every
-                        // other opcode on it, and every opcode at all on
-                        // vitrin_consent (which defines no requests at any
-                        // version), is grammar (invalid_opcode), never an
-                        // authority judgement.
+                        // vitrin_grant carries four requests as of P2.6.5,
+                        // all since="2" structural mints, and THIS CORE
+                        // SERVES ONLY THE FIRST THREE. The fourth,
+                        // `get_powerbox` (opcode 3), is on the wire with no
+                        // arm here, so it falls to the catch-all below and
+                        // is answered fatal invalid_opcode -- a version-2
+                        // conformance gap owed by P2.6.6, not a decision.
+                        // It is pinned by
+                        // `get_powerbox_is_defined_at_version_2_and_this_core_answers_it_fatally`
+                        // below, which goes red the moment an arm lands and
+                        // names the four texts that must move with it.
+                        //
+                        // Every other opcode on a grant, and every opcode at
+                        // all on vitrin_consent (which defines no requests
+                        // at any version), is grammar (invalid_opcode),
+                        // never an authority judgement.
                         ObjectKind::Grant(_) => match opcode {
                             grant::requests::GetLauncher::OPCODE => self.handle_get_launcher(msg),
                             grant::requests::GetLayoutFocus::OPCODE => {
@@ -5259,23 +5269,30 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_consent_defines_no_requests_and_a_grant_defines_only_its_three_mints() {
+    fn a_consent_defines_no_requests_and_a_grant_defines_no_mint_past_the_idl() {
         let _fd = crate::capture::tests::fd_lock();
-        // vitrin_consent defines no requests at any version, and
-        // vitrin_grant defines exactly three, all since=2 structural mints:
-        // opcode 0 `get_launcher`, 1 `get_layout_focus`, 2
-        // `get_layout_arrange`. Everything else on either object is grammar
+        // vitrin_consent defines no requests at any version. vitrin_grant
+        // defines four, all since=2 structural mints: opcode 0
+        // `get_launcher`, 1 `get_layout_focus`, 2 `get_layout_arrange`, 3
+        // `get_powerbox`. Everything PAST them on either object is grammar
         // (invalid_opcode), never an authority judgement -- including
         // opcode 0 on the consent object, which is `get_launcher`'s
         // opcode on the *other* interface and must not be routed by
         // number alone.
         //
-        // The grant's probes are 3 and 9, one past the last defined mint
-        // and well past it: 1 and 2 stopped being invalid when WS-E.1.4
-        // appended the layout mints, and this test going red on that append
-        // is exactly what an append-only opcode space should do.
+        // The grant's probes are 4 and 9, one past the last DEFINED mint
+        // and well past it. They moved 3 -> 4 when P2.6.5 appended
+        // `get_powerbox` at opcode 3, exactly as 1 and 2 stopped being
+        // invalid when WS-E.1.4 appended the layout mints; this test going
+        // red on an append is what an append-only opcode space should do.
+        //
+        // Opcode 3 is deliberately NOT probed here any more. It is defined
+        // by the IDL and unserved by this core, which is a different fact
+        // from "undefined", and conflating the two is what let the old
+        // probe keep passing while the IDL grew under it. It has its own
+        // test below.
         let verifier = demo_verifier();
-        for (object_id, opcode) in [(4u32, 3u8), (4, 9), (5, 0), (5, 1)] {
+        for (object_id, opcode) in [(4u32, 4u8), (4, 9), (5, 0), (5, 1)] {
             let (mut server, mut core, mut client, mut shared) = setup();
             bind_with_realm(&mut server, &mut core, &mut client, &verifier, &mut shared);
             client
@@ -5299,6 +5316,62 @@ pub(crate) mod tests {
             );
             expect_error(&mut client, WireError::InvalidOpcode);
         }
+    }
+
+    /// **The pin on P2.6.5's conformance gap, and the tripwire that forces
+    /// four documents to move when P2.6.6 closes it.**
+    ///
+    /// `vitrin_grant.get_powerbox` (opcode 3, `since="2"`) is on the wire,
+    /// this core negotiates exactly version 2 and nothing else, and it has
+    /// no dispatch arm for that opcode -- so it answers the request with
+    /// fatal `invalid_opcode` and the connection dies. That is a
+    /// **conformance gap**, not a design: a defined request of the
+    /// negotiated version must never kill a connection. `get_powerbox` is
+    /// the first mint this IDL has declared without a core arm; the arm,
+    /// the picker behind it and the facet's own use path are P2.6.6's.
+    ///
+    /// It is asserted rather than described because four texts state what
+    /// the *protocol* asks for -- mint succeeds, use refuses `not_granted`
+    /// -- and every one of them would be a false statement about this
+    /// binary if the gap were left silent:
+    ///
+    /// * `protocol/vitrin-v0.xml`, `get_powerbox`'s `<description>`;
+    /// * `docs/protocol/04-vitrin_grant.md`, "### get_powerbox";
+    /// * `docs/protocol/13-vitrin_powerbox.md`, "Served status";
+    /// * the dispatch comment on `ObjectKind::Grant` above.
+    ///
+    /// **When P2.6.6 adds the arm this test goes red**, which is the point:
+    /// it cannot land without the four paragraphs above being deleted in
+    /// the same change.
+    #[test]
+    fn get_powerbox_is_defined_at_version_2_and_this_core_answers_it_fatally() {
+        let _fd = crate::capture::tests::fd_lock();
+        let verifier = demo_verifier();
+        let (mut server, mut core, mut client, mut shared) = granted_rig(&verifier, 0, 0);
+        // A well-formed mint on the standard granted handle (id 4) -- the
+        // exact frame the IDL says is always legal.
+        let frame = grant::requests::GetPowerbox { powerbox: 9 }.encode(4);
+        client.send_message(&frame, None).unwrap();
+        expect_violation(
+            process_n(&mut server, &mut core, &verifier, &mut shared, 1),
+            "invalid_opcode",
+        );
+        expect_error(&mut client, WireError::InvalidOpcode);
+        assert_eq!(
+            server.objects.get(&9),
+            None,
+            "no facet is minted: there is no handler to mint one"
+        );
+        // The two facts this test is about, stated as constants so a
+        // renumbered opcode or a version bump cannot leave the prose
+        // above pointing at nothing.
+        assert_eq!(grant::requests::GetPowerbox::OPCODE, 3);
+        assert_eq!(
+            grant::requests::GetPowerbox::SINCE,
+            vitrin_protocol::generated::PROTOCOL_VERSION,
+            "the gap only matters because this core negotiates the very \
+             version that defines the request"
+        );
     }
 
     // -- acceptance: the version-2 launch facet (WS-E.1.1, issue #207) -----

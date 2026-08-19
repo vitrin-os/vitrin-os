@@ -1318,8 +1318,12 @@ mod tests {
         // Six since WS-E.1.1 (issue #207): `realm_launch` joined the two
         // layout verbs WS-E.1.4 added and the three original facet verbs.
         // Each has an interface declaring it, a chokepoint arm exercising
-        // it and a consent-prompt line naming it. `observe_cursor` is the
-        // one defined verb that stays out -- see the sibling test.
+        // it and a consent-prompt line naming it. The defined verbs that
+        // stay out are whatever `UNSERVED_VERB_BITS` derives, and the
+        // sibling test is where that set is enumerated and held. This
+        // comment names no count of them on purpose: it said
+        // "`observe_cursor` is the one defined verb that stays out" and was
+        // false from the moment P2.6.5 (issue #189) added a second.
         assert_eq!(
             SERVED_VERB_BITS,
             (Verb::OBSERVE

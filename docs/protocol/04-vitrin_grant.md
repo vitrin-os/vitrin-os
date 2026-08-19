@@ -175,11 +175,23 @@ exist on a version-1 connection.
 
 **The mint is not an oracle, and today that is doing visible work.** No
 deployment serves [`designate_file`](#defined-but-unserved), so no grant
-carries the bit and no petition naming it resolves `granted`. Minting
-therefore succeeds *everywhere* and using the facet refuses *everywhere* —
-which is the defined-but-unserved staging behaving exactly as designed, not a
-defect. Refusing at mint time would leak what a grant holds; that is why the
-mint never answers an authority question.
+carries the bit and no petition naming it resolves `granted`. A server that
+implements this request therefore mints successfully *everywhere* and refuses
+every use of the facet *everywhere* — the defined-but-unserved staging
+behaving exactly as designed, not a defect. Refusing at mint time would leak
+what a grant holds; that is why the mint never answers an authority question.
+
+**The reference core does not implement this request yet.** `vitrind`
+negotiates exactly version 2 and has no dispatch arm for this opcode, so
+`get_powerbox` sent to it is answered with fatal `invalid_opcode` and the
+connection dies — not the mint-then-refuse above, and not the
+`resource_exhausted` cap either, since no cap is reached by a request nothing
+handles. It is the first mint this IDL has declared without a core arm, it is a
+conformance gap in that implementation rather than a property of the request,
+and it closes in **P2.6.6** with the picker. `crates/vitrin-core/src/principal.rs`
+pins it with a test that asserts the fatal answer, so the arm cannot land
+without this paragraph and its two siblings (the IDL's, and
+[page 13's](13-vitrin_powerbox.md#served-status)) going with it.
 
 ## Events
 
@@ -290,7 +302,7 @@ The **served** column describes the reference core. Whether a defined verb is
 served is a property of a *deployment*, so a client reads `unsupported` as
 "not here, not now", never as "not in this protocol".
 
-`VALID_MASK` is therefore `0x27f` (639), not `0xff`. It was `0x23f` (575) until P2.6.5 added bit 64; the plan's registry re-pins it **once per epic**, not once per task, in the three places that hold it.
+`VALID_MASK` is therefore **639** (`0x27f`), not `0xff`. It was 575 until P2.6.5 added bit 64. The plan's registry re-pins it **once per epic**, never once per task, and [names every site that holds it](../plan/02-phase-2-semantic-epochs.md) rather than leaving them to be found — a list `cargo xtask limits-check` holds to the tree in both directions, so a pin the registry does not name is a red build. The same gate holds this sentence's own number against the generated constant, which is why no count of sites is repeated here.
 
 This enum is the type of `request_grant`'s `verbs` argument, of
 `resolved.verbs`, and of `refused.verb`. Seven verbs map one-to-one to a facet

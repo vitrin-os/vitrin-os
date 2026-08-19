@@ -107,7 +107,7 @@ const HARNESS_PY: &str = "tests/integration/harness.py";
 /// The two claims D-043 (2026-08-19) put on the rows below the floor. Exactly
 /// one belongs on each such row, and which one is decided by
 /// [`Rung::behavioural_tests`] rather than by whoever last edited the corpus --
-/// see step (5b) of [`render`].
+/// see step (7b) of [`render`].
 const EXERCISED_CLAIM: &str = "sub-floor-rungs-hold-the-dial-not-the-floor";
 const UNEXERCISED_CLAIM: &str = "sub-floor-rungs-are-not-all-exercised";
 
@@ -1404,7 +1404,7 @@ fn sub_floor_tally(corpus: &Corpus, c: &Constants) -> String {
 /// row below the floor, including the two rows nothing exercises. A reader
 /// cannot tell those rows apart from the table, so the page now says which is
 /// which, and says it from [`Rung::behavioural_tests`] — the same field
-/// step (5b) of [`render`] holds the claims against.
+/// step (7b) of [`render`] holds the claims against.
 fn render_exercised_rungs(p: &mut String, corpus: &Corpus, c: &Constants) {
     let exercised: Vec<&Rung> = corpus
         .rungs

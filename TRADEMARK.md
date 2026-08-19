@@ -75,9 +75,12 @@ lawsuit. That is the outcome this policy aims at.
 - **A modified trusted core distributed under the Vitrin OS name.** The
   trigger is precise, and it is the same line the security model draws: if
   your change alters what [`crates/vitrin-core`](crates/vitrin-core) — or
-  [`crates/vitrin-ipc`](crates/vitrin-ipc) beneath it — enforces (the
-  enforcement chokepoint, the grant lifecycle, the consent surface, the
-  dead-man switch, input origin tagging), then rename, or ask.
+  [`crates/vitrin-ipc`](crates/vitrin-ipc) beneath it, or
+  [`crates/vitrin-realm-init`](crates/vitrin-realm-init), the second
+  trusted binary the core `execve`s — enforces (the enforcement
+  chokepoint, the grant lifecycle, the consent surface, the dead-man
+  switch, input origin tagging, and a realm's own namespaces, mount
+  table, Landlock ruleset and seccomp deny-list), then rename, or ask.
 
   Note what is deliberately *not* on that list: [`shim/`](shim/) is
   untrusted by design and sits outside the TCB. Patching a shim, or

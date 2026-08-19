@@ -114,7 +114,7 @@ are labelled as what they are.
 What exists today, on `main`:
 
 - **Protocol spec v0** — [protocol/vitrin-v0.xml](protocol/vitrin-v0.xml)
-  (12 interfaces at wire version 2, wire format, error taxonomy; the source of truth), its
+  (14 interfaces at wire version 2, wire format, error taxonomy; the source of truth), its
   RELAX NG schema [protocol/vitrin-v0.rng](protocol/vitrin-v0.rng), and a
   prose page per interface under [docs/protocol/](docs/protocol/00-conventions.md)
   kept in lockstep with every landing PR.
@@ -124,9 +124,17 @@ What exists today, on `main`:
   [shim/include/vitrin-protocol.h](shim/include/vitrin-protocol.h) from the
   IDL.
 - **`vitrind`, the trusted core** ([`crates/vitrin-core`](crates/vitrin-core))
-  — a real [Smithay](https://github.com/Smithay/smithay) compositor with both output backends (`--nested`, a host
+  — a real [Smithay](https://github.com/Smithay/smithay) compositor with three output backends (`--nested`, a host
   Wayland client; `--headless --size WxH`, GPU-less pixman software
-  rendering for CI); the capability kernel and in-memory grant table
+  rendering for CI; and `--drm`, the display controller itself — mode setting,
+  a GBM swapchain, libinput and libseat — compiled only under the non-default
+  `drm-backend` feature, because two of the crates it pulls `.unwrap()` a
+  pkg-config probe in their build script and panic a build without the
+  graphics dev packages. CI compiles that backend and runs its device-free
+  unit tests; it sets no mode, commits no frame and delivers no key, because a
+  runner has no display controller, no seat and no GPU — see [what session mode
+  does not give you](#running-it-as-a-desktop-what-session-mode-does-not-give-you));
+  the capability kernel and in-memory grant table
   (request → pending → consent → resolved, sender-constrained, rate-limited,
   revocable); the realm/spawn manager (fork/exec the shim with a private
   runtime dir and a scrubbed, allow-listed environment); the core-rendered
@@ -260,15 +268,24 @@ is a different promise from one that is scheduled.
   and no **AT-SPI2** bus *advertised* to a realm. Read that word as carefully as
   the portals bullet below asks you to: the core injects no
   `DBUS_SESSION_BUS_ADDRESS` and repoints `XDG_RUNTIME_DIR`, so a well-behaved
-  toolkit finds no `org.a11y.Bus` — but under D9 the host session bus, which is
-  where that name is activated, is still on the filesystem and still connectable
-  by any process of this uid, and an operator running Firefox allow-lists
-  `DBUS_SESSION_BUS_ADDRESS` and thereby hands that realm the host's
+  toolkit finds no `org.a11y.Bus` — but at `--isolation=off` the host session
+  bus, which is where that name is activated, is still on the filesystem and
+  still connectable by any process of this uid, and an operator running Firefox
+  allow-lists `DBUS_SESSION_BUS_ADDRESS` and thereby hands that realm the host's
   accessibility bridge too. **This is a missing service, never a confinement**;
-  [#160](https://github.com/vitrin-os/vitrin-os/issues/160) is what would make
-  the absence real, and the adversarial probe that would prove it (Phase 2's
-  P2.1.10) does not exist yet. The semantic tree Phase 2
-  builds ([#175](https://github.com/vitrin-os/vitrin-os/issues/175)) is derived
+  at `--isolation=default` what closes that route is the kernel rather than this
+  absence — the realm's `/run` holds one entry, `vitrin`, and abstract sockets
+  are scoped to the realm's own network namespace, so the same allow-list line
+  names a bus that is not there, unless that same operator names a host path in
+  `binds` and puts the socket back inside the realm under a key that says
+  nothing about buses. That is the reachability half
+  [#160](https://github.com/vitrin-os/vitrin-os/issues/160) named, delivered by
+  the kernel; the *designated-egress* half — reachability as a granted,
+  host:port-scoped capability rather than as nothing at all — is still P13's and
+  unbuilt. It is read off the mount table rather than measured, and the
+  adversarial probe that would prove it (Phase 2's P2.1.10) does not exist yet.
+  The semantic tree Phase 2 builds
+  ([#175](https://github.com/vitrin-os/vitrin-os/issues/175)) is derived
   from accessibility technology and is **not a substitute for it**: it serves an
   agent, over this project's own wire protocol, under a grant a human approved.
   It does not make Orca work. This is stated as an **exclusion, not a deferral** —
@@ -307,11 +324,20 @@ is a different promise from one that is scheduled.
 - **No portals, and that absence is a missing service rather than a
   confinement.** There is no `xdg-desktop-portal` here and a realm is advertised
   no session bus, so no portal file chooser, no screen sharing, no notifications,
-  no "open this link". It buys **no security**: under D9 the host bus is still on
-  the filesystem and still connectable by any process of this uid — see
-  [Security notes](#security-notes--what-the-mvp-does-and-does-not-confine).
-  Phase-2 confinement ([#160](https://github.com/vitrin-os/vitrin-os/issues/160)) is what makes the absence real; **serving
-  portals properly has no issue at all.**
+  no "open this link". It buys **no security**: at `--isolation=off` the host bus
+  is still on the filesystem and still connectable by any process of this uid —
+  see [Security notes](#security-notes--what-the-mvp-does-and-does-not-confine).
+  At `--isolation=default` what closes that route is the confinement rather than
+  this row: the realm's `/run` holds one entry, `vitrin`, and abstract sockets
+  are scoped to the realm's own network namespace, so an operator who allow-lists
+  `DBUS_SESSION_BUS_ADDRESS` there hands the realm a variable naming something
+  that is not there — unless that same operator names a host path in `binds`,
+  which puts the socket back inside the realm under a key that says nothing about
+  buses. Read that as a consequence of how the mount table is built rather than
+  as a measurement. It is the reachability half
+  ([#160](https://github.com/vitrin-os/vitrin-os/issues/160)) that the kernel
+  delivered; the *designated-egress* half is still P13's and unbuilt, and
+  **serving portals properly has no issue at all.**
 - **A shell crash loses window management.** The switcher is an unprivileged
   client by design, so there is no core-side fallback. Kill it and the core, the
   realms and their apps all survive and the last-focused realm keeps taking your
@@ -523,7 +549,7 @@ scheduled closure**, not oversights — and they are stated here, at the front
 of the security story, rather than buried in a module doc, because a
 half-believed confinement claim is worse than an honest gap.
 
-**Realm confinement today is environment-structural only.** When the core
+**Environment structure is the floor of realm confinement, not the whole of it.** When the core
 launches a realm's app it forks a per-app shim, hands it one end of a
 socketpair as its identity (no credential, no handshake — holding the
 descriptor *is* being that realm's shim), gives it a private `0700` runtime
@@ -538,7 +564,11 @@ whatever the operator's shell happened to be ignoring. Both are enforced by
 the fork itself (a `close_range` sweep and a disposition reset between `fork`
 and `execve`), not by every other module remembering to be careful.
 
-That is the complete list of what confines a realm right now.
+That is the complete list at `--isolation=off`, and it is the layer underneath
+every other mode. At the default — `--isolation=default`, which is what an
+operator who names no mode gets — P2.6.2, P2.6.3 and P2.6.4 put six namespaces,
+a Landlock ruleset and a seccomp deny-list on top of it, each with the costs
+the bullet below states in full.
 
 - **Half a sandbox (decisions D9, D-020, D-036).** At the default
   `--isolation=default`, P2.6.2 spawns the realm into **six namespaces** —
@@ -675,7 +705,7 @@ That is the complete list of what confines a realm right now.
   `--isolation=off` is not a remedy — it starts an unconfined session.
   **There is an AppArmor profile for this, at `packaging/apparmor/vitrind`, and
   it works — measured on one kernel, on one CI image.** It is the per-binary
-  grant Ubuntu ships a mechanism for — the shape Chromium, Firefox and flatpak
+  grant Ubuntu ships a mechanism for — the shape Chrome, Firefox and flatpak
   already use — chosen over asking operators to weaken a system-wide default.
   The `apparmor-profile` CI job is what says so: it
   runs on a runner whose userns sysctl it never touches (the only job in that
@@ -739,41 +769,74 @@ That is the complete list of what confines a realm right now.
   ran a 6.17 kernel, four years past Landlock's 5.13 — and the
   [limits page](docs/book/src/limits.md) carries the table that tells them
   apart, plus the bound on what has actually been measured about either.
-- **The session [D-Bus](https://www.freedesktop.org/wiki/Software/dbus/) is reachable (known hole, closes with P13 in Phase
-  2).** The core advertises no `DBUS_SESSION_BUS_ADDRESS` and points
-  `XDG_RUNTIME_DIR` at the realm's private directory, so a well-behaved
-  client finds no bus. But advertisement is not reachability:
-  `/run/user/<uid>/bus` is still on the filesystem and still connectable by
-  any process of that uid, and the abstract-socket namespace is still
-  shared. In practice, running Firefox — the Phase-1 acceptance app —
-  means allow-listing `DBUS_SESSION_BUS_ADDRESS` explicitly, which turns
-  the implicit hole into an audited one. This is a lateral-escape path of
-  exactly the shape [PRD](docs/PRD.md) §15 catalogues (D-Bus activation of a
-  privileged helper); **P13** closes it with a loopback-only network
-  namespace plus an empty mount namespace, so that there is nothing to
-  reach rather than nothing advertised.
-- **On bare metal, a realm's app can plausibly open `/dev/input/event*` and
-  keylog the human (published ahead of the code, closes with E2.6/E2.7).**
+- **The session [D-Bus](https://www.freedesktop.org/wiki/Software/dbus/) is reachable at `--isolation=off`, and has no path at the
+  default (P13's remaining half is still Phase 2).** The core advertises no
+  `DBUS_SESSION_BUS_ADDRESS` and points `XDG_RUNTIME_DIR` at the realm's
+  private directory, so a well-behaved client finds no bus. But advertisement
+  is not reachability: at `--isolation=off`, `/run/user/<uid>/bus` is still on
+  the filesystem and still connectable by any process of that uid, and the
+  abstract-socket namespace is still shared — which is why running Firefox
+  there means allow-listing `DBUS_SESSION_BUS_ADDRESS` explicitly, turning the
+  implicit hole into an audited one. Since P2.6.2 the default tier removes both
+  routes structurally: `/run/user/<uid>` is not in the realm's mount table (its
+  `/run` holds one entry, `vitrin`), and abstract sockets are scoped to a
+  network namespace, which the realm has its own of — so an allow-listed
+  `DBUS_SESSION_BUS_ADDRESS` at `--isolation=default` names something that is
+  not there. That closure has a residual the mount table itself hands an
+  operator: `binds` names any absolute path outside `/` and `/home`, so an
+  operator who binds the host's runtime directory into a realm puts the bus
+  socket back inside it under a key that says nothing about buses. Read the rest
+  for what it is: the mount table plus the namespace inodes the core verifies at
+  spawn, not an escape survey — `tests/integration/test_real_confinement.py`
+  puts *a full escape survey*, and any route to the network beyond the
+  verified `CLONE_NEWNET` inode, among the things it states it does **not**
+  assert. The session bus is on that list by name — "That a realm cannot reach
+  the session bus by other means" is one of the gate's own non-assertions — so
+  read it as measuring neither the closure nor a route around it. This
+  is a lateral-escape path of exactly the shape [PRD](docs/PRD.md) §15
+  catalogues (D-Bus activation of a privileged helper); what **P13** still owes
+  is the designated-egress half, not this one.
+- **On bare metal at `--isolation=off`, a realm's app can plausibly open
+  `/dev/input/event*` and keylog the human — including into other realms.**
   This is the sandbox hole above pointed at the one device the architecture
   exists to mediate. `logind` ACLs the active session's input nodes to that
-  user, and the app runs as the core's own uid with no namespace, so it can
-  open them directly — bypassing the input router, the human/agent origin tag,
-  the consent grab and the lock screen, none of which it goes through. **It is
-  not reachable today**: there is no DRM/KMS backend, and under `--nested` the
-  host compositor is the only reader of those devices. It becomes reachable the
-  moment a bare-metal backend lands (WS-E.3.2), and it is written here first
-  rather than with that code. `crates/vitrin-core/src/spawn/isolation.rs`
-  already probes the facilities that would close it and enforces none of them.
+  user, and an unconfined app runs as the core's own uid with the core's full
+  filesystem view, so it can open them directly — bypassing the input router,
+  the human/agent origin tag, the consent grab and the lock screen, none of
+  which it goes through. **This entry was published ahead of the code and has
+  since been overtaken twice, in opposite directions; both are recorded rather
+  than quietly edited, because the pair is the honest history of the hole.**
+  First it got *worse*: the sentence "it is not reachable today — there is no
+  DRM/KMS backend" was true when written and stopped being true when WS-E.3.2
+  landed `--drm`, which has since been run on the target machine and recorded
+  ([`docs/drm-bringup.md`](docs/drm-bringup.md)). Then it got *better*: P2.6.2's
+  mount namespace closes it at `--isolation=default`, and by exactly one
+  mechanism — the realm's `/dev` is built from scratch and `/dev/input` is not
+  among the six nodes plus render nodes it holds, and the realm cannot mount one
+  in. The `input` group membership **survives** into the realm, so the app still
+  holds the credential that would open those nodes; it is the mount namespace
+  alone that denies it the path, and that is a single point of failure stated as
+  one. `tests/integration/test_real_confinement.py` measures both halves from
+  inside a real realm — the retained groups, and `/dev/input` unreachable beside
+  them — as a mock-free property gate rather than a milestone acceptance. Under
+  `--nested` the host compositor remains the only reader of those devices. The
+  [limits page](docs/book/src/limits.md) states the whole of it.
 - **Same-uid separation is not attempted.** The `0700` runtime directory
   bounds other *users* on the machine, not other processes of this user.
-  Note what the realm's `XDG_RUNTIME_DIR` therefore is and is not: its value,
-  `$XDG_RUNTIME_DIR/vitrin-0/<realm>`, sits one level below the directory
-  holding the core's own agent socket and this run's flight-recorder log, so
-  it names the control plane as much as it hides it. Redirecting it means a
-  well-behaved client finds its own realm's socket instead of the host
-  session's — it does not mean the app cannot reach the rest, because under
-  D9 it runs as the core's uid and can derive those paths with or without a
-  variable pointing at them.
+  Note what the realm's `XDG_RUNTIME_DIR` therefore is and is not, which
+  stopped being one answer at P2.6.2. At `--isolation=off` its value is
+  `$XDG_RUNTIME_DIR/vitrin-0/<realm>`, one level below the directory holding
+  the core's own agent socket and this run's flight-recorder log, so it names
+  the control plane as much as it hides it. At `--isolation=default` the value
+  is the fixed in-realm `/run/vitrin`, a bind of that same core-created
+  directory, and `..` resolves to the realm's own `/run`, where there is no
+  `core.sock` and no recorder log — checked rather than argued, since both are
+  canaries every confined spawn probes. That closure is the mount namespace's,
+  not the path's: redirecting the variable means a well-behaved client finds
+  its own realm's socket instead of the host session's — it does not mean the
+  app cannot reach the rest, because it runs as the core's uid in either mode
+  and derives `/run/user/<uid>` from `getuid()` with or without a variable
+  pointing at it.
 
 The spawn path and every decision above are documented in full in
 [`crates/vitrin-core/src/spawn.rs`](crates/vitrin-core/src/spawn.rs);
@@ -791,13 +854,15 @@ The spawn path and every decision above are documented in full in
 | [`docs/protocol/`](docs/protocol/00-conventions.md) | Normative conventions + one prose page per interface, kept in lockstep with the IDL |
 | [`docs/plan/`](docs/plan/README.md) | Phase/epic/task breakdown, decision log, roadmap |
 | [`docs/demo/`](docs/demo/README.md) | The demo screencast — the recorded artifact, what it shows, and the operator runbook |
+| [`docs/book/`](docs/book/src/SUMMARY.md) | The published user book: getting started, the grant/consent model, and the wire protocol — plus the end matter this README links throughout, the limits page, the recovery page, the session app matrix, the Landlock ABI matrix and the per-kernel table |
 | [`crates/vitrin-core/`](crates/vitrin-core) | `vitrind` — the trusted core (compositor, capability kernel, grant store, realms, consent) |
 | [`crates/vitrin-protocol/`](crates/vitrin-protocol) | Generated message types + codec (no I/O, no sockets) |
 | [`crates/vitrin-scanner/`](crates/vitrin-scanner) | Code generator: IDL XML → Rust + C header |
 | [`crates/vitrin-ipc/`](crates/vitrin-ipc) | Unix-socket transport: framing, `SCM_RIGHTS`, `SO_PEERCRED`, backpressure policy |
+| [`crates/vitrin-realm-init/`](crates/vitrin-realm-init) | The confinement helper, and a second trusted binary — at the shipped `--isolation=default` the core `execve`s it per realm, and it unshares six namespaces, builds the mount table, `pivot_root`s, installs the Landlock ruleset and the seccomp deny-list, then `execve`s the shim. At `--isolation=off` no helper runs at all |
 | [`crates/vitrin-mock-shim/`](crates/vitrin-mock-shim) | Fixture-only shim stand-in for component tests. Never a demo venue and never milestone evidence (plan §5 D12) |
 | [`crates/vitrin-golden/`](crates/vitrin-golden) | Per-pixel + SSIM frame comparison, used by the golden and real-app fidelity tests |
-| [`crates/xtask/`](crates/xtask) | `cargo xtask codegen [--check]` / `bless` / `demo [--headless]` |
+| [`crates/xtask/`](crates/xtask) | `cargo xtask codegen [--check]` / `bless` / `demo [--headless]` / `session-matrix [--check]` / `isolation-matrix [--check]` / `kernel-matrix [--check]` / `limits-check [--tracker]` / `skip-scan` / `skip-census --min-tests N` — every one but `bless` and `demo` is a drift or honesty gate CI runs; each subcommand's contract is its own doc comment in [`crates/xtask/src/main.rs`](crates/xtask/src/main.rs) |
 | [`shim/`](shim/README.md) | The wlroots-based per-app Wayland shim (C + Meson, outside the Cargo workspace) |
 | [`sdk/python/`](sdk/python) | The pure-Python agent SDK (`vitrin_os` package, D8) |
 | [`examples/agent-demo/run_demo.py`](examples/agent-demo/run_demo.py) | The Phase-1 demo agent — also the M1.5 integration test, run via `cargo xtask demo` |
@@ -886,7 +951,14 @@ Condensed from [docs/PRD.md](docs/PRD.md) §8:
 - **Phase 4 — Horizon.** Session mode on bare DRM/KMS, Flutter/iced/egui
   semantic backends, capability-remoting protocol hardened for third-party
   clients, EUDI/OID4VC conformance — entered only when adoption justifies the
-  support burden.
+  support burden. **Annotated, not rewritten:** the first of those was moved out
+  of the horizon tier as workstream WS-E by D-021, which is where the `--drm`
+  session-mode section above comes from — and D-021(2) is the boundary that
+  entry exists to hold. The horizon item is *a display server other people can
+  run*: a hardware matrix, HDR, colour management, fractional scaling, human
+  accessibility, IME for every user. WS-E is one maintainer's one laptop. The
+  two differ by an order of magnitude, the M4 gate is untouched, and **no WS-E
+  deliverable may be cited as evidence toward it.**
 
 ## Contributing
 

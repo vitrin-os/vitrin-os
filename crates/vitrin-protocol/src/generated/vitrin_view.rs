@@ -295,6 +295,14 @@ impl FrameFlags {
     /// bit set is invalid.
     pub const VALID_MASK: u32 = 1 | 2;
 
+    /// Every defined entry as `(wire name, bit value)`, in IDL document
+    /// order. `VALID_MASK` is the union of the values here; this constant
+    /// adds the *names*, so a partition of the bitfield (served vs.
+    /// unserved, facet-bearing vs. facetless) can be derived by name
+    /// instead of transcribed into a list a human has to remember to
+    /// update.
+    pub const ENTRIES: &'static [(&'static str, u32)] = &[("y_invert", 1), ("dmabuf", 2)];
+
     /// Decode a wire value, rejecting any bit outside `VALID_MASK`.
     pub fn from_bits(value: u32) -> Result<Self, crate::error::DecodeError> {
         if value & !Self::VALID_MASK != 0 {

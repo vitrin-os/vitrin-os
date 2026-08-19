@@ -245,6 +245,7 @@ it never escalates to a fatal error.
 
 Bitfield. The grantable verbs. Every entry has one SDK-level dotted name,
 formed by replacing the first underscore of the wire name with a dot:
+<!-- vitrin-verb-set: all-verbs = observe, actuate_pointer, actuate_text, observe_cursor, layout_arrange, layout_focus, realm_launch, egress -->
 `observe`, `actuate.pointer`, `actuate.text`, `observe.cursor`,
 `layout.arrange`, `layout.focus`, `realm.launch`, `egress`. The spelling is
 fixed by the IDL so a second implementation transcribing this enum has no name
@@ -270,7 +271,9 @@ served is a property of a *deployment*, so a client reads `unsupported` as
 `VALID_MASK` is therefore `0x2bf` (703), not `0x7f`.
 
 This enum is the type of `request_grant`'s `verbs` argument, of
-`resolved.verbs`, and of `refused.verb`. **Six** verbs map one-to-one to a
+`resolved.verbs`, and of `refused.verb`.
+<!-- vitrin-verb-set: facet-verbs = observe, actuate_pointer, actuate_text, layout_arrange, layout_focus, realm_launch | count: six -->
+**Six** verbs map one-to-one to a
 facet interface and to that interface's `@verb` annotation, which drives the
 scanner-generated chokepoint table; `observe_cursor` is the one that does not,
 by construction, and `egress` is the one whose facet has not landed yet — see
@@ -401,11 +404,18 @@ Consequences worth stating rather than deriving:
 
 **What has not landed, stated so it is findable.** The verb bit and this
 grammar are P2.7.2's; the facet through which a connection is *asked for* —
-`vitrin_powerbox.request_connect` and its connected-socket delivery event — is
-not in the IDL yet, because the interface itself is P2.6.5's and this page's
-sibling page 13 does not exist. Until both land, `egress` is a verb no request
-exercises, which is precisely why every deployment refuses it `unsupported`:
-a granted verb with nothing to exercise it would be authority nobody checks.
+`request_connect` and its connected-socket delivery event — is not in the IDL
+yet. It is **an interface of its own**, not a request on
+[`vitrin_powerbox`](13-vitrin_powerbox.md), and the dialect settles that
+rather than taste: `interface/@verb` is one value per interface, so the
+interface that declares `verb="designate_file"` cannot also declare
+`verb="egress"` (see [Growth](#growth) for the full argument, and
+[`get_layout_arrange`](#get_layout_arrange) for the same rule splitting the
+layout facet). It is allocated as page 19 and is owned by **P2.7.3**, the task
+that first needs a connection to be asked for. Until it lands, `egress` is a
+verb no request exercises, which is precisely why every deployment refuses it
+`unsupported`: a granted verb with nothing to exercise it would be authority
+nobody checks.
 The reference core's parser for this grammar exists
 (`crates/vitrin-core/src/grants.rs`, `NetSelector`) and **nothing in the
 admission path calls it yet** — a `net:` petition is refused like any other
@@ -421,8 +431,8 @@ list that reads complete:
   behaviour.
 - **The host is not validated as a DNS name or an IP literal.** The parser
   enforces a *denylist* — `*`, `/`, `,`, `[`, `]`, `:`, whitespace, control
-  characters, a leading `.` and an empty label — and keeps whatever else it was
-  given. So `net:-:443`, `net:user@evil.com:443`, `net:999.999.999.999:443` and
+  characters, and an empty label in any position (a leading `.`, a doubled
+  `..`, or a trailing `.`) — and keeps whatever else it was given. So `net:-:443`, `net:user@evil.com:443`, `net:999.999.999.999:443` and
   a Unicode homograph of a real name all parse today. None of them *widens*
   authority — `covers` is exact match, so no accepted selector can ever name
   more than one endpoint, which is the sense in which the grammar is
@@ -445,6 +455,7 @@ copy naming its consequence in plain language. `layout_arrange` and
 core gained the spawn path, the realm cap and the prompt line its refusal had
 stood for.
 
+<!-- vitrin-verb-set: unserved-verbs = observe_cursor, egress | count: two -->
 **Two remain**, and for two different missing mechanisms.
 
 `observe_cursor`'s reason has not moved: the per-principal cursor *delivery*
@@ -453,8 +464,10 @@ verb would promise something no capture carries.
 
 `egress` is refused by **every** deployment, and unlike the others that is not
 yet a statement about deployments at all — the wire has no request the verb
-could be exercised through. The facet is P2.6.5's and the out-of-core
-mediating proxy that would ask the chokepoint per connection is P2.7.3's.
+could be exercised through. Its facet is an interface of its own rather than a
+request on the filesystem powerbox (see [Growth](#growth)), so it is **not**
+`vitrin_powerbox`'s task that lands it: both the facet and the out-of-core
+mediating proxy that would ask the chokepoint per connection are P2.7.3's.
 Landing the bit first is the same staging `realm_launch` used and for the same
 reason: a petition naming it is answered rather than killed.
 
@@ -494,6 +507,7 @@ Two rules hold for every verb a deployment does not serve:
   a silent server-side edit would leave the agent believing it holds authority
   nobody checks.
 
+<!-- vitrin-verb-set: facetless-verbs = observe_cursor, egress -->
 Not every verb has a facet interface. `observe_cursor` has none by
 construction: it widens what
 [`vitrin_view.capture_frame`](06-vitrin_view.md) composites rather than adding

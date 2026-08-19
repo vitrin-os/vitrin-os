@@ -79,14 +79,29 @@ check_rejected bad-verb-value \
 # interface is rejected too: the set is the facet-bearing verbs, not the
 # whole vitrin_grant.verb bitfield.
 #
-# `observe_cursor` is the standing example, and it is the only one left:
-# `layout_arrange` and `layout_focus` were facetless when this case was
-# written and each has an interface now (WS-E.1.4), so the old mutation
-# ("realm_launch" -> "layout_arrange") became a *legal* document and this
-# case reported the schema as broken when the schema was right. Re-pinned on
-# the verb that is facetless by construction -- it widens what capture_frame
-# composites rather than adding a request -- so this case cannot go stale the
-# same way again.
+# vitrin-verb-set: facetless-verbs = observe_cursor, egress
+#
+# TWO verbs can play that part today, and this case is pinned on the one that
+# can never stop playing it. `observe_cursor` is facetless BY CONSTRUCTION --
+# it widens what capture_frame composites rather than adding a request, so no
+# interface will ever carry the attribute for it. `egress` is facetless only
+# YET: P2.7.2 landed the bit with no message at all, and the moment its facet
+# interface lands the schema admits the name and a mutation pinned on it
+# becomes a legal document.
+#
+# That is not hypothetical, it is this case's own history. The mutation was
+# ("realm_launch" -> "layout_arrange") until WS-E.1.4 gave `layout_arrange`
+# an interface, at which point the mutated document was legal and this case
+# reported the schema as broken when the schema was right. The comment that
+# re-pinned it claimed the case "cannot go stale the same way again" and then
+# went stale the same way again -- not the CASE, which still works, but the
+# claim above it, which said `observe_cursor` was the only facetless verb
+# left three months before `egress` became the second one.
+#
+# So the claim is now a marker rather than a sentence: `cargo xtask
+# verb-sets` derives the facetless set from the IDL and fails if the line
+# above disagrees with it. Choosing the by-construction verb for the mutation
+# is still the right choice; it just is not a claim about how many there are.
 check_rejected verb-without-facet \
   's|verb="realm_launch"|verb="observe_cursor"|'
 

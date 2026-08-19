@@ -306,9 +306,13 @@ the [`net:` resource selector](04-vitrin_grant.md#the-net-resource-prefix):
 `covers` is exact match, so no accepted selector can ever name more than one
 endpoint and a blanket egress grant is inexpressible rather than refused.
 
+<!-- vitrin-verb-set: unserved-verbs = observe_cursor, egress | count: two -->
 So the count this enumeration exists to answer is **two**: `observe_cursor`
 and `egress` are the verbs no deployment serves today, and `layout_arrange`,
-`layout_focus` and `realm_launch` have each left that posture.
+`layout_focus` and `realm_launch` have each left that posture. That count is
+not a sentence anyone has to remember: `cargo xtask verb-sets --check`
+derives the set from the IDL and from the reference core's `SERVED_VERB_BITS`
+and fails on every surface still enumerating the old one.
 
 ---
 
@@ -1013,7 +1017,15 @@ The dialect adds exactly two attributes beyond the Wayland shape:
 | Attribute | Where | Why |
 |---|---|---|
 | `protocol/@version` (`positiveInteger`) | root element | single source of truth for the `hello` version integer |
-| `interface/@verb` ∈ {`observe`, `actuate_pointer`, `actuate_text`, `realm_launch`} | `vitrin_view`, `vitrin_actuator_pointer`, `vitrin_actuator_text`, `vitrin_launcher` | declares that **every request on the interface exercises the named grant verb**; the scanner derives the enforcement chokepoint's `(interface, opcode) → required-verb` table from it |
+| `interface/@verb` ∈ {`observe`, `actuate_pointer`, `actuate_text`, `layout_arrange`, `layout_focus`, `realm_launch`} | `vitrin_view`, `vitrin_actuator_pointer`, `vitrin_actuator_text`, `vitrin_launcher`, `vitrin_layout_focus`, `vitrin_layout_arrange` | declares that **every request on the interface exercises the named grant verb**; the scanner derives the enforcement chokepoint's `(interface, opcode) → required-verb` table from it |
+<!-- vitrin-verb-set: facet-verbs = observe, actuate_pointer, actuate_text, layout_arrange, layout_focus, realm_launch -->
+<!-- vitrin-verb-set: facet-interfaces = vitrin_view, vitrin_actuator_pointer, vitrin_actuator_text, vitrin_launcher, vitrin_layout_focus, vitrin_layout_arrange -->
+
+Both halves of that row were stale for two workstreams — it read four values
+and four interfaces from WS-E.1.4 (which added the layout pair) until issue
+#196's third review — so neither is transcribed by hand any more: `cargo xtask
+verb-sets --check` derives both from `interface/@verb` and fails when this row
+falls behind.
 
 `@verb` is the codegen chokepoint: one attribute per capability interface
 generates the single-site authority check, so there is no second enforcement
@@ -1022,11 +1034,25 @@ location to keep in sync.
 The `@verb` value set is **closed by the schema**, so widening it is a
 **dialect** change: `protocol/vitrin-v0.rng` moves in the same commit as the
 IDL, and `xmllint --relaxng` gates the pair. The set tracks the
-*facet-bearing* verbs, not the whole `verb` bitfield — `observe_cursor` has no
-interface to annotate, because it widens what `capture_frame` composites
-rather than adding a request, so naming it here is rejected by the schema
-(`protocol/test-mutations.sh` covers both directions: an invented verb name
-and a real-but-facetless one).
+*facet-bearing* verbs, not the whole `verb` bitfield, so it is **shorter than
+the bitfield by two**, for two different reasons:
+
+<!-- vitrin-verb-set: facetless-verbs = observe_cursor, egress -->
+
+- **`observe_cursor` has no interface to annotate, by construction.** It
+  widens what `capture_frame` composites rather than adding a request, so
+  there is nothing for the attribute to sit on and there never will be.
+- **`egress` has none yet.** P2.7.2 landed the verb bit and no message at all;
+  when its facet lands it is an interface of its own (see
+  [`vitrin_grant`'s `net:` prefix](04-vitrin_grant.md#the-net-resource-prefix)),
+  and the schema's value set gains `egress` in that commit.
+
+Naming either here today is rejected by the schema, and
+`protocol/test-mutations.sh` covers both directions: an invented verb name and
+a real-but-facetless one. `xmllint` can only see one direction of the pairing
+— an IDL using a name the schema omits — so `cargo xtask verb-sets --check`
+holds the other, and fails if the schema ever admits a verb no interface
+declares.
 
 `layout_arrange` and `layout_focus` were in that facetless list until they
 gained one each. They are **two** interfaces rather than one, and this

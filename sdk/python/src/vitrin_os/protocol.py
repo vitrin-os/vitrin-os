@@ -78,6 +78,7 @@ class Verb(enum.IntFlag):
     next bit after 512.
     """
 
+    # vitrin-verb-set: all-verbs = observe, actuate_pointer, actuate_text, observe_cursor, layout_arrange, layout_focus, realm_launch, egress
     OBSERVE = 1
     ACTUATE_POINTER = 2
     ACTUATE_TEXT = 4

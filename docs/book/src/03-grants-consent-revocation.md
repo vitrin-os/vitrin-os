@@ -30,6 +30,7 @@ A row in the core's grant table:
 - **principal** — who. Authenticated at handshake, never asserted by the
   requester afterwards.
 - **resource** — what. A realm, or a specific surface within it.
+<!-- vitrin-verb-set: unserved-verbs = observe_cursor, egress | count: two -->
 - **verbs** — which actions. `observe`, `actuate.pointer`, `actuate.text`, the
   two `layout.*` verbs and `realm.launch` (added at wire version 2) today; two
   more are defined and refuse `unsupported` — `observe.cursor`, and `egress`

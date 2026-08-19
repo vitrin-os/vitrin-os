@@ -88,6 +88,30 @@ fn mod_file(protocol: &Protocol) -> String {
     buf.line("/// untested.");
     buf.line(format!("pub const MESSAGE_COUNT: usize = {message_count};"));
     buf.blank();
+    let facet_verbs: Vec<&str> = protocol
+        .interfaces
+        .iter()
+        .filter_map(|i| i.verb.as_deref())
+        .collect();
+    buf.line("/// Every `interface/@verb` in the document, in interface document order:");
+    buf.line("/// the grant verbs that have a facet interface to be exercised through.");
+    buf.line("///");
+    buf.line("/// Exists so the facet-bearing/facetless partition of `vitrin_grant.verb`");
+    buf.line("/// can be *derived* rather than hand-listed. Before this constant the");
+    buf.line("/// partition was a hand-maintained array of per-interface `VERB` consts, and");
+    buf.line("/// the check over it could not see a seventh facet appearing on an existing");
+    buf.line("/// verb -- which is exactly the next scheduled protocol change. Adding an");
+    buf.line("/// `interface/@verb` now moves this length, and the assertions that pin it");
+    buf.line("/// go red.");
+    buf.line(format!(
+        "pub const FACET_VERBS: &[&str] = &[{}];",
+        facet_verbs
+            .iter()
+            .map(|v| format!("\"{v}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+    buf.blank();
     for iface in &protocol.interfaces {
         buf.line(format!("pub mod {};", iface.name));
     }
@@ -594,6 +618,22 @@ fn gen_bitfield_enum(buf: &mut Buf, iface: &Interface, enum_def: &EnumDef) {
     buf.line("    /// Union of every defined entry's bits; a wire value with any other");
     buf.line("    /// bit set is invalid.");
     buf.line(format!("    pub const VALID_MASK: u32 = {mask_expr};"));
+    buf.blank();
+    buf.line("    /// Every defined entry as `(wire name, bit value)`, in IDL document");
+    buf.line("    /// order. `VALID_MASK` is the union of the values here; this constant");
+    buf.line("    /// adds the *names*, so a partition of the bitfield (served vs.");
+    buf.line("    /// unserved, facet-bearing vs. facetless) can be derived by name");
+    buf.line("    /// instead of transcribed into a list a human has to remember to");
+    buf.line("    /// update.");
+    let entries_expr = enum_def
+        .entries
+        .iter()
+        .map(|e| format!("(\"{}\", {})", e.name, format_u32_literal(e.value)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    buf.line(format!(
+        "    pub const ENTRIES: &'static [(&'static str, u32)] = &[{entries_expr}];"
+    ));
     buf.blank();
     buf.line("    /// Decode a wire value, rejecting any bit outside `VALID_MASK`.");
     buf.line("    pub fn from_bits(value: u32) -> Result<Self, crate::error::DecodeError> {");

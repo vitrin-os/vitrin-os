@@ -241,10 +241,18 @@ no wire message to withdraw a pending petition in version 1 (see
 that are **defined on [`vitrin_grant`](./04-vitrin_grant.md)** and documented
 there:
 
+<!-- vitrin-verb-set: all-verbs = observe, actuate_pointer, actuate_text, observe_cursor, layout_arrange, layout_focus, realm_launch, egress -->
+
 - `verbs` uses the bitfield [`vitrin_grant.verb`](./04-vitrin_grant.md#verb)
   (`observe` = 1, `actuate_pointer` = 2, `actuate_text` = 4,
-  `layout_arrange` = 16, `layout_focus` = 32, `realm_launch` = 512, plus the
-  defined-but-unserved `observe_cursor` = 8).
+  `observe_cursor` = 8, `layout_arrange` = 16, `layout_focus` = 32,
+  `egress` = 128, `realm_launch` = 512). Two of them —
+  `observe_cursor` and `egress` — are
+  [defined but unserved](./04-vitrin_grant.md#defined-but-unserved): in range,
+  so naming one is never fatal, and refused `unsupported` whole. The values are **not** consecutive
+  bits and must be transcribed rather than counted: 64 and 256 are allocated
+  to verbs this document does not define yet, and 128 was one of them until
+  `egress` landed on it.
 - `persistence` uses the enum
   [`vitrin_grant.persistence`](./04-vitrin_grant.md#persistence) (`once` = 0,
   `while_running` = 1, `until_revoked` = 2, `always` = 3).

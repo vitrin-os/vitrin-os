@@ -87,6 +87,7 @@ def test_verb_mask_covers_exactly_the_defined_bits() -> None:
     assert protocol.VERB_MASK == defined
 
 
+# vitrin-verb-set: unserved-verbs = observe_cursor, egress
 def test_the_unserved_marker_is_actually_a_phrase_the_idl_uses() -> None:
     """The served/unserved split below is derived from a STRING MATCH.
 
@@ -97,7 +98,8 @@ def test_the_unserved_marker_is_actually_a_phrase_the_idl_uses() -> None:
     D-017 recorded. So pin that the phrase is still load-bearing: at least one
     entry carries it, and at least one does not.
 
-    At wire version 2 the unserved side is `observe_cursor` and `egress`;
+    At wire version 2 the verbs no deployment serves are `observe_cursor` and
+    `egress`;
     `realm_launch` stays out of the SERVED set for a reason about the version
     rather than the deployment (a version-1 connection cannot mint
     `vitrin_launcher` at all), and the IDL's own summary says so, which is why

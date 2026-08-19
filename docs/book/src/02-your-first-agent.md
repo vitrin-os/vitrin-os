@@ -94,12 +94,20 @@ from vitrin_os import Verb
 verbs = Verb.OBSERVE | Verb.ACTUATE_POINTER
 ```
 
-Four more verbs exist in the enum. `LAYOUT_ARRANGE` and `LAYOUT_FOCUS` are
-**served** — a grant can carry them, and `grant.focus()` and
-`grant.set_fullscreen()` exercise them. `OBSERVE_CURSOR` and `REALM_LAUNCH`
-are defined and resolve `unsupported`: whether a verb is served is a property
-of the *deployment*, not of the protocol, so read `unsupported` as "not here,
-not now" rather than "not in this protocol".
+<!-- vitrin-verb-set: all-verbs = observe, actuate_pointer, actuate_text, observe_cursor, layout_arrange, layout_focus, realm_launch, egress | count: eight -->
+
+The enum has **eight** members, and the two above are the ones this page has
+used so far. Of the rest, `LAYOUT_ARRANGE`, `LAYOUT_FOCUS` and `REALM_LAUNCH`
+are **served** by this core — a grant can carry them, and `grant.focus()`,
+`grant.set_fullscreen()` and `grant.launch()` exercise them. `OBSERVE_CURSOR`
+and `EGRESS` are defined and resolve `unsupported`, the first because
+per-principal cursor delivery does not exist yet and the second because the
+facet a connection would be asked for through is not in the protocol at all.
+
+Whether a verb is served is a property of the *deployment*, not of the
+protocol — a deployment that will not host process creation refuses
+`REALM_LAUNCH` even though this one serves it — so read `unsupported` as "not
+here, not now" rather than "not in this protocol".
 
 The SDK carries every defined bit either way, for a precise reason: an
 out-of-range verb bit is a **fatal** `invalid_argument` that kills the

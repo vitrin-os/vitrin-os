@@ -132,46 +132,72 @@ fn every_verb_is_classified_as_facet_bearing_or_not() {
     // same number, and neither should be a sentence a human has to remember
     // to update, so this is where it lives instead.
     //
-    // FACET_VERBS is the `VERB` constant the scanner emits for every
-    // interface carrying `interface/@verb`; UNFACETED is the rest, listed
-    // with the reason each has no facet. The partition is checked against
-    // the *generated* bitfield, so appending a ninth verb to the IDL turns
-    // this red until someone puts it on one side of the line -- which is the
-    // moment the doc sentence needs editing too.
-    const FACET_VERBS: &[&str] = &[
-        gen::vitrin_view::VERB,
-        gen::vitrin_actuator_pointer::VERB,
-        gen::vitrin_actuator_text::VERB,
-        gen::vitrin_layout_focus::VERB,
-        gen::vitrin_layout_arrange::VERB,
-        gen::vitrin_launcher::VERB,
-    ];
-    // `observe_cursor` has none by construction (it widens what
-    // `capture_frame` composites rather than adding a request); `egress` has
-    // none yet, and when it lands it is a separate interface of its own,
-    // because `interface/@verb` is one value per interface.
-    const UNFACETED_VERBS: &[&str] = &["observe_cursor", "egress"];
+    // **Nothing here is hand-listed any more, and that is the point of this
+    // revision.** The first cut held `FACET_VERBS` as an array of six
+    // per-interface `VERB` constants and the facetless pair as a literal.
+    // Both halves were transcriptions: adding a *seventh* `interface/@verb`
+    // to the IDL -- which is exactly what P2.7.3 does when it lands the
+    // egress facet -- left this test green while the two doc sentences it
+    // exists to hold became false. Issue #196's round-2 review levered that
+    // by adding `verb="egress"` to `vitrin_consent` and watching the test
+    // pass. Both sides now come out of the generator:
+    //
+    //   * `gen::FACET_VERBS` is emitted from `interface/@verb`, so a seventh
+    //     facet moves its length;
+    //   * `Verb::ENTRIES` is emitted from the verb bitfield's entries, so the
+    //     facetless remainder is a set difference rather than a literal.
+    let facet: Vec<&str> = gen::FACET_VERBS.to_vec();
+    let facetless: Vec<&str> = gen::vitrin_grant::Verb::ENTRIES
+        .iter()
+        .map(|(name, _)| *name)
+        .filter(|name| !facet.contains(name))
+        .collect();
 
-    assert_eq!(
-        FACET_VERBS.len(),
-        6,
-        "the IDL no longer declares six `interface/@verb` facets; \
-         docs/protocol/04-vitrin_grant.md states this count twice"
-    );
-    assert_eq!(
-        FACET_VERBS.len() + UNFACETED_VERBS.len(),
-        gen::vitrin_grant::Verb::VALID_MASK.count_ones() as usize,
-        "a verb bit is defined that is on neither side of the \
-         facet-bearing/unfaceted line -- classify it, and update the two \
-         counts in docs/protocol/04-vitrin_grant.md that state it"
-    );
-    // No verb is on both sides.
-    for faceted in FACET_VERBS {
+    // Every `interface/@verb` names a verb the bitfield actually defines --
+    // the direction the RELAX NG schema's closed `@verb` value set cannot
+    // check, since it knows the names and not the bits.
+    for verb in &facet {
         assert!(
-            !UNFACETED_VERBS.contains(faceted),
-            "`{faceted}` is listed as both facet-bearing and unfaceted"
+            gen::vitrin_grant::Verb::ENTRIES
+                .iter()
+                .any(|(name, _)| name == verb),
+            "`interface/@verb=\"{verb}\"` names no entry of `vitrin_grant.verb`"
         );
     }
+
+    // The two literals below are TRIPWIRES, in this repo's established sense:
+    // their whole job is to go red on the next verb or facet so that a human
+    // re-reads the prose that states them. Neither is load-bearing for the
+    // partition itself, which is derived above.
+    assert_eq!(
+        facet.len(),
+        6,
+        "the IDL no longer declares six `interface/@verb` facets ({facet:?}); \
+         docs/protocol/04-vitrin_grant.md states this count twice, and \
+         `cargo xtask verb-sets --check` holds every surface that enumerates it"
+    );
+    // vitrin-verb-set: facetless-verbs = observe_cursor, egress
+    assert_eq!(
+        facetless,
+        ["observe_cursor", "egress"],
+        "the facetless verb set moved. It is enumerated in prose on six \
+         surfaces; `cargo xtask verb-sets --check` names them and fails on \
+         each one that still lists the old set"
+    );
+
+    // ...and the partition really is a partition of the wire bitfield.
+    assert_eq!(
+        facet.len() + facetless.len(),
+        gen::vitrin_grant::Verb::VALID_MASK.count_ones() as usize,
+        "a verb bit is defined that is on neither side of the \
+         facet-bearing/facetless line"
+    );
+    // Non-vacuity: the per-interface `VERB` constants and the generated
+    // `FACET_VERBS` are two renderings of one attribute, and this test would
+    // still pass if the generator emitted an empty slice for either.
+    assert!(facet.contains(&gen::vitrin_view::VERB));
+    assert!(facet.contains(&gen::vitrin_launcher::VERB));
+    assert!(!facetless.is_empty());
 }
 
 #[test]

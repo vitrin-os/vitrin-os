@@ -695,11 +695,17 @@ impl PetitionRegistry {
         if req.flags != 0 {
             return declined(Outcome::Unsupported);
         }
-        // A verb bit the IDL defines but this core does not enforce --
-        // today exactly `observe_cursor` (D-017). `layout_arrange` and
-        // `layout_focus` left that set at WS-E.1.4 and `realm_launch` at
-        // WS-E.1.1, each when the core gained the mechanism its refusal
-        // stood for. Refused **whole**, never narrowed to the served
+        // A verb bit the IDL defines but this core does not enforce.
+        // vitrin-verb-set: unserved-verbs = observe_cursor, egress
+        // Two today: `observe_cursor` (D-017) and `egress` (P2.7.2).
+        // `layout_arrange` and `layout_focus` left that set at WS-E.1.4 and
+        // `realm_launch` at WS-E.1.1, each when the core gained the
+        // mechanism its refusal stood for; `egress` joined it when the IDL
+        // gained the bit and this core gained nothing to enforce by it. The
+        // set itself is derived (`UNSERVED_VERB_BITS`), so this comment is
+        // the only thing here that could go stale -- and `cargo xtask
+        // verb-sets --check` reads the marker line above so that it cannot.
+        // Refused **whole**, never narrowed to the served
         // remainder: narrowing is the human's move at consent time, and
         // silently dropping a requested verb would leave the agent
         // believing it holds authority nothing checks. The wire keeps
@@ -1423,8 +1429,10 @@ mod tests {
         //
         // The bit is on the wire (P2.7.2's IDL half) and this core serves
         // nothing by it: the mediating proxy that would ask the chokepoint per
-        // connection is P2.7.3's, and the facet a connection would be asked
-        // for through is P2.6.5's. Two halves, and both matter. In range, so
+        // connection is P2.7.3's, and so is the facet a connection would be
+        // asked for through -- an interface of its own rather than a request
+        // on P2.6.5's filesystem powerbox, since `interface/@verb` is one
+        // value per interface. Two halves, and both matter. In range, so
         // naming it is never a killed connection; unserved, so it is never
         // granted. A deployment MUST NOT grant a verb it does not enforce.
         assert_eq!(

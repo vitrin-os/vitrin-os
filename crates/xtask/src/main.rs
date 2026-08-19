@@ -138,6 +138,23 @@
 //!                                choice of drift mechanism and has not made
 //!                                it. See that module's docs for what replaces
 //!                                this under each of #172's three options.
+//!
+//! cargo xtask verb-sets --check  Verify that every surface which ENUMERATES a
+//!                                verb set -- the whole bitfield, the
+//!                                facet-bearing verbs, the facetless ones, the
+//!                                facet interfaces, the verbs this core does
+//!                                not serve -- still lists the set the IDL
+//!                                actually derives, and that its stated count
+//!                                word matches. Reads only; writes nothing.
+//!                                Also runs as a test, so `cargo test
+//!                                --workspace` gates it.
+//!
+//!                                Exists because three consecutive reviews of
+//!                                issue #196 found the same defect and nothing
+//!                                else: one of those sets, written out in
+//!                                prose, corrected in one place and left stale
+//!                                in another. See the module docs for what it
+//!                                deliberately does NOT catch.
 //! ```
 //!
 //! Calls straight into the `vitrin_scanner` library (`parse`, `rust_gen`,
@@ -160,6 +177,7 @@ mod limits;
 mod session_matrix;
 mod skip_census;
 mod test_census;
+mod verb_sets;
 #[cfg(test)]
 mod testtree;
 
@@ -179,7 +197,7 @@ fn main() -> ExitCode {
 }
 
 fn usage() -> &'static str {
-    "usage: cargo xtask codegen [--check]\n       cargo xtask demo [--headless] [--task K=V]...\n       cargo xtask bless [--filter SUBSTR]\n       cargo xtask session-matrix [--check]\n       cargo xtask isolation-matrix [--check]\n       cargo xtask kernel-matrix [--check]\n       cargo xtask limits-check [--tracker]\n       cargo xtask skip-scan\n       cargo xtask skip-census --min-tests N [--expect-self-marker] -- CMD [ARG...]"
+    "usage: cargo xtask codegen [--check]\n       cargo xtask demo [--headless] [--task K=V]...\n       cargo xtask bless [--filter SUBSTR]\n       cargo xtask session-matrix [--check]\n       cargo xtask isolation-matrix [--check]\n       cargo xtask kernel-matrix [--check]\n       cargo xtask limits-check [--tracker]\n       cargo xtask verb-sets [--check]\n       cargo xtask skip-scan\n       cargo xtask skip-census --min-tests N [--expect-self-marker] -- CMD [ARG...]"
 }
 
 fn run() -> Result<()> {
@@ -322,6 +340,25 @@ fn run() -> Result<()> {
                 return limits::tracker_report(&root);
             }
             limits::limits_check(&root)
+        }
+        "verb-sets" => {
+            // Reads the IDL and the surfaces that enumerate its verb sets;
+            // writes nothing. `--check` is accepted and is the only mode, so
+            // the command reads like its siblings on a CI line; there is no
+            // generator half, because no surface here is generated.
+            for arg in &args[1..] {
+                match arg.as_str() {
+                    "--check" => {}
+                    "-h" | "--help" => {
+                        println!("{}", usage());
+                        return Ok(());
+                    }
+                    other => bail!("unknown flag '{other}' for 'verb-sets'\n\n{}", usage()),
+                }
+            }
+            let report = verb_sets::check(&workspace_root()?)?;
+            println!("{report}");
+            Ok(())
         }
         "skip-scan" => {
             // Reads sources, writes nothing -- one mode, like limits-check.

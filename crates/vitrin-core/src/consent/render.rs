@@ -794,21 +794,28 @@ mod tests {
         // its copy existed, and its copy exists here.
         //
         // WS-E.1.4 (issue #210) moved `layout_arrange` and `layout_focus`
-        // out on the same terms. `observe_cursor` stays, and for a reason
-        // that has not moved: per-principal cursor *delivery* is still M2's
-        // (D-017/D-019 both say so in as many words), so serving the verb
-        // would widen a capture with a cursor the core does not have.
+        // out on the same terms.
+        //
+        // vitrin-verb-set: unserved-verbs = observe_cursor, egress
+        //
+        // Two verbs are pinned here. `observe_cursor` stays, and for a
+        // reason that has not moved: per-principal cursor *delivery* is
+        // still M2's (D-017/D-019 both say so in as many words), so serving
+        // the verb would widen a capture with a cursor the core does not
+        // have.
         //
         // **`egress` (128) JOINED the pin at P2.7.2 (issue #196)**, which is
         // this tripwire firing exactly as designed: the IDL gained a bit and
         // this line went red until a human classified it. It is classified
         // **unserved**, and there is no catalogue line above for it, because
         // the mechanism the verb names does not exist — the out-of-core
-        // mediating proxy is P2.7.3's and the facet a connection would be
-        // asked for through is P2.6.5's. Prompt copy for authority no code
-        // enforces would be the exact lie the catalogue exists to prevent.
-        // It leaves this pin when P2.7.3 lands the proxy and P2.6.8's Q13
-        // copy review clears its line, not before.
+        // mediating proxy is P2.7.3's, and so is the facet a connection
+        // would be asked for through, which is an interface of its own
+        // rather than a request on P2.6.5's filesystem powerbox (one
+        // `interface/@verb` per interface). Prompt copy for authority no
+        // code enforces would be the exact lie the catalogue exists to
+        // prevent. It leaves this pin when P2.7.3 lands the proxy and
+        // P2.6.8's Q13 copy review clears its line, not before.
         assert_eq!(
             crate::grants::UNSERVED_VERB_BITS,
             (Verb::OBSERVE_CURSOR | Verb::EGRESS).bits(),

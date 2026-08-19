@@ -609,8 +609,9 @@
         durable rungs (until_revoked, always) exist in the enum from day
         one but resolve "unsupported" in version 1, pending provenance
         verification in a later phase. verbs obeys the same rule: a bit a
-        deployment does not serve (observe_cursor everywhere; whichever
-        others a given deployment declines) is in-range, so naming one is
+        deployment does not serve (observe_cursor and egress everywhere;
+        whichever others a given deployment declines) is in-range, so
+        naming one is
         never fatal, and such
         a petition resolves "unsupported" WHOLE - the server never quietly
         drops an unserved bit and grants the remainder, because an agent
@@ -842,6 +843,7 @@
         next unused-looking power of two, which is the whole point of
         allocating repo-wide.
 
+        <!-- vitrin-verb-set: unserved-verbs = observe_cursor, egress -->
         DEFINED BUT UNSERVED. A verb may be defined here and refused
         "unsupported" by a deployment that does not serve it, exactly as
         the durable persistence rungs are. observe_cursor is refused by
@@ -871,6 +873,7 @@
         time, never a silent server-side edit that would leave the agent
         believing it holds authority nobody checks.
 
+        <!-- vitrin-verb-set: facetless-verbs = observe_cursor, egress -->
         Not every verb has a facet interface. observe_cursor has none by
         construction - it widens what capture_frame composites rather than
         adding a request. layout_arrange has
@@ -906,7 +909,22 @@
         waiting to be lifted:
 
           - exactly one HOST - a DNS name or a literal IP address. No "*",
-            no leading dot, no CIDR suffix, no comma-separated list.
+            no leading dot, no CIDR suffix, no comma-separated list. THAT
+            THE HOST IS A DNS NAME OR AN IP LITERAL IS SPECIFIED HERE AND
+            IS ENFORCED NOWHERE. What a parser is required to reject is the
+            wildcard-bearing punctuation just named, plus an empty label in
+            any position; the reference parser rejects exactly that and
+            keeps whatever else it is handed, so net:-:443,
+            net:user@evil.com:443, net:999.999.999.999:443 and a Unicode
+            homograph of a real name all parse today. None of them WIDENS
+            authority - covers is byte-exact, so no accepted selector can
+            name more than one endpoint, which is the whole of what
+            "wildcard-free" buys - but a homograph is a confusion attack on
+            the HUMAN, and the task that first renders one of these strings
+            on a consent card owns deciding the host charset before it
+            does. Said here rather than only in the reference
+            implementation so that both unimplemented rules in this
+            description are labelled the same way.
           - exactly one PORT - a single decimal integer in 1-65535, in its
             canonical spelling. No ranges, no lists, no sign, no leading
             zero. The reason is narrower than it looks: the port is the
@@ -2510,10 +2528,13 @@
       whether a petition for it is refused "unsupported" is a property of
       the deployment rather than of the wire: a deployment that will not
       host process creation answers "unsupported" rather than killing the
-      connection. observe_cursor is the one bit left in that
-      defined-but-unserved posture, refused by every deployment. Defining a
-      verb before serving it is what makes a petition for it an answer
-      rather than a connection death.
+      connection. observe_cursor and egress are the TWO bits left in
+      that defined-but-unserved posture, refused by every deployment - the
+      first because per-principal cursor delivery does not exist, the
+      second because the facet a connection would be asked for through is
+      not in this document at all. Defining a verb before serving it is
+      what makes a petition for it an answer rather than a connection
+      death.
     </description>
 
     <request name="launch" since="2">

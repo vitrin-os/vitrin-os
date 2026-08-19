@@ -55,7 +55,9 @@ writing a Go, TypeScript or C++ SDK forks it.
   for any user who petitions it. Which of them a deployment *serves* is that
   deployment's business and can change under you — this core serves the two
   layout verbs and `realm.launch`, and refuses `observe.cursor` and
-  `egress` — so never
+  `egress`
+  <!-- vitrin-verb-set: unserved-verbs = observe_cursor, egress -->
+  — so never
   bake the served set into a
   client. Transcribe the *values* from the IDL rather than assuming
   consecutive bits — `realm.launch` is 512, because 64 and 256 are allocated

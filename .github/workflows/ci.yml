@@ -715,6 +715,44 @@ jobs:
         # workspace member.
         run: cargo xtask limits-check
 
+      - name: cargo xtask verb-sets --check
+        # Issue #196's third review. Three consecutive reviews of that branch
+        # found the SAME defect and no other: a set of verbs written out in
+        # prose, corrected in one place and left stale in another --
+        # "`observe_cursor` is the only one left" in a comment that also
+        # explains that facetless verbs gain facets over time; a schema header
+        # that accounted for one of two missing verbs; a table row that had
+        # named four `interface/@verb` values since two more landed.
+        #
+        # Every one of those sets is derivable, so this step derives them --
+        # from `protocol/vitrin-v0.xml` via the real scanner, and (for the
+        # unserved set) from the reference core's `SERVED_VERB_BITS` -- and
+        # holds every registered surface to them. A surface declares what it
+        # enumerates with a one-line marker comment invisible in the rendered
+        # document. The load-bearing check is that the marker's list EQUALS the
+        # derived set, in document order: that fires at every carrier the
+        # moment a set moves, and no rewording can satisfy it. Two softer
+        # checks sit on top -- that the twenty lines around the marker name
+        # every member, and that a spelled-out count word is the right word --
+        # and the first of those is a heuristic whose limits the module's
+        # `PASSAGE_LINES` docs state outright rather than leave to a review to
+        # find.
+        #
+        # It also holds `protocol/vitrin-v0.rng`'s closed `@verb` value set to
+        # the facets the IDL declares. `xmllint --relaxng` above already sees
+        # one direction of that pairing -- an IDL using a name the schema
+        # omits -- and can never see the other.
+        #
+        # What it does NOT catch is stated in the module's own docs: a brand
+        # new file that enumerates one of these sets and registers no marker
+        # is invisible to it. The registry is a list a human extends, exactly
+        # as `limits-check`'s claim table is.
+        #
+        # Reads files, writes nothing. It runs here AND as a test in `cargo
+        # test --workspace` (xtask is a workspace member), so the gate does
+        # not depend on this step existing.
+        run: cargo xtask verb-sets --check
+
   deny:
     name: deny (TCB dependency budget - plan risk R7)
     runs-on: ubuntu-latest

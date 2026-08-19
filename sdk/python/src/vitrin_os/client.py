@@ -85,11 +85,19 @@ def _parse_verbs(verbs: int | Verb | Iterable[str | Verb]) -> int:
     if bits & ~protocol.VERB_MASK:
         # An out-of-range verb bit is fatal invalid_argument server-side.
         raise ValueError(f"verb bits {bits:#x} outside the IDL's verb bitfield")
-    # Bits inside the mask a given deployment may not serve (observe.cursor,
-    # realm.launch, and layout.* on a deployment that declines them) are NOT
-    # refused here: the core answers them "unsupported" on the grant, which is
+    # Bits inside the mask a given deployment may not serve are NOT refused
+    # here: the core answers them "unsupported" on the grant, which is
     # recoverable and is the answer the caller is entitled to see. Pre-empting
     # it locally would hide a deployment difference behind a client-side error.
+    #
+    # vitrin-verb-set: unserved-verbs = observe_cursor, egress
+    #
+    # Two of them -- observe.cursor and egress -- are refused by EVERY
+    # deployment today (no cursor delivery; no facet at all), and realm.launch
+    # and the layout.* pair by any deployment that declines them. The first
+    # list is derived from the reference core by `cargo xtask verb-sets
+    # --check`, so it cannot fall behind the way it did when `egress` landed;
+    # the second is a deployment property and cannot be listed at all.
     return bits
 
 

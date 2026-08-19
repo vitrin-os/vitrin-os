@@ -372,9 +372,9 @@ pub(crate) enum NetSelectorError {
     /// was shown the same string.
     BadPort,
     /// The host contains something the wildcard-free grammar forbids: `*`,
-    /// `/` (a CIDR suffix), `,` (a list), a leading `.` (the
-    /// any-subdomain spelling), an empty label, whitespace, or a control
-    /// character.
+    /// `/` (a CIDR suffix), `,` (a list), an empty label in any position
+    /// (a leading `.` -- the any-subdomain spelling -- a doubled `..`, or a
+    /// trailing `.`), whitespace, or a control character.
     ForbiddenHostSyntax,
     /// A bracketed host that is not a well-formed IPv6 literal, or an
     /// unbracketed host containing a `:` (which would make the final colon
@@ -398,7 +398,8 @@ impl NetSelector {
     /// **What this does NOT do, stated so nobody infers it**: it does not
     /// validate that the host is a well-formed DNS name or IP literal. It
     /// enforces a *denylist* -- `*`, `/`, `,`, `[`, `]`, `:`, whitespace,
-    /// control characters, a leading `.` and an empty label -- and keeps
+    /// control characters, and an empty label in any position (a leading
+    /// `.`, a doubled `..`, a trailing `.`) -- and keeps
     /// whatever else it was handed, so `net:-:443`,
     /// `net:user@evil.com:443`, `net:999.999.999.999:443` and a Unicode
     /// homograph of a real name all parse. None of them widens authority
@@ -456,10 +457,27 @@ impl NetSelector {
             {
                 return Err(NetSelectorError::ForbiddenHostSyntax);
             }
-            // A leading dot is the any-subdomain spelling in every syntax
-            // that has one, and an empty label is how a parser is talked
-            // into treating one. Both are wildcards wearing punctuation.
-            if host_part.starts_with('.') || host_part.contains("..") {
+            // An EMPTY LABEL IN ANY POSITION, which is three spellings of
+            // one rule. A leading dot is the any-subdomain spelling in every
+            // syntax that has one; a doubled dot is how a parser is talked
+            // into treating one; a trailing dot is the DNS root label, which
+            // names the *same* endpoint as the dotless spelling and would
+            // therefore be a second selector string for it, bought for
+            // nothing. `covers` is byte-exact, so admitting it would not
+            // widen authority -- it would only mean a human who approved
+            // `net:example.com:443` sees a connection to
+            // `net:example.com.:443` refused, which is the surprising
+            // direction of a rule with no upside. Erring narrow is free
+            // here: nothing renders or accepts one of these strings yet.
+            //
+            // The trailing case was MISSING while all three carriers of this
+            // rule said "an empty label" -- the parse doc, the error
+            // variant's doc and docs/protocol/04-vitrin_grant.md's gap list.
+            // Issue #196's round-2 review found `net:example.com.:443`
+            // parsing and round-tripping. Closed by making the code match
+            // the three sentences rather than by narrowing the three
+            // sentences, because the rule they state is the one intended.
+            if host_part.starts_with('.') || host_part.ends_with('.') || host_part.contains("..") {
                 return Err(NetSelectorError::ForbiddenHostSyntax);
             }
             NetHost::Plain(host_part.to_string())
@@ -497,21 +515,30 @@ impl NetSelector {
 /// the served set is a property of *this build*, and it did not widen
 /// when the wire went from 1 to 2.
 ///
-/// The wire bitfield ([`Verb::VALID_MASK`]) is deliberately wider: D-017
-/// and D-018 define `observe_cursor`, `layout_arrange` and `layout_focus`
-/// from day one so the decided cursor and layout models are expressible
-/// before v0 freezes, and version 2 added `realm_launch` on exactly the
-/// same terms -- so a petition for one is a *recoverable* `unsupported`
-/// rather than an out-of-range bit that kills the connection.
+/// The wire bitfield ([`Verb::VALID_MASK`]) is deliberately wider, and has
+/// been widened on the same terms five times: D-017 and D-018 define
+/// `observe_cursor`, `layout_arrange` and `layout_focus` from day one so the
+/// decided cursor and layout models are expressible before v0 freezes,
+/// version 2 added `realm_launch`, and P2.7.2 added `egress` -- so a
+/// petition for any of them is a *recoverable* `unsupported` rather than an
+/// out-of-range bit that kills the connection.
 ///
-/// **Three of those four are now served.** `layout_arrange` (16) and
+/// **Three of those five are now served.** `layout_arrange` (16) and
 /// `layout_focus` (32) joined at WS-E.1.4 (issue #210), and
 /// `realm_launch` (512) at WS-E.1.1 (issue #207): each has a facet
 /// interface, a chokepoint arm and consent-prompt copy naming the
 /// consequence in plain language, which is the whole of what "this core
-/// serves the verb" means. `observe_cursor` (8) is the one that stays
-/// out -- per-principal cursor *delivery* is M2's, and serving the verb
-/// would promise a capture widened with a cursor this core does not have.
+/// serves the verb" means.
+///
+/// <!-- vitrin-verb-set: unserved-verbs = observe_cursor, egress -->
+/// **Two stay out**, for two different missing mechanisms.
+/// `observe_cursor` (8) because per-principal cursor *delivery* is M2's, so
+/// serving the verb would promise a capture widened with a cursor this core
+/// does not have; `egress` (128) because the out-of-core mediating proxy a
+/// connection would be made through does not exist, and neither does the
+/// facet it would be asked for through. Neither name is transcribed: the set
+/// is [`UNSERVED_VERB_BITS`], derived below, and `cargo xtask verb-sets
+/// --check` holds every surface that spells it out to this constant.
 ///
 /// **Moving `realm_launch` in is the single largest widening this
 /// constant has taken**, and it is worth naming here rather than only at
@@ -1603,9 +1630,12 @@ mod tests {
         // **`egress` joined at P2.7.2 (issue #196)**, and for the mirror
         // reason `realm_launch` left: the mechanism its refusal stands for
         // does not exist. The out-of-core mediating proxy that would ask
-        // the chokepoint per connection is P2.7.3's, and the facet the ask
-        // would arrive through is P2.6.5's. A bit on the wire with no
-        // enforcement behind it is exactly what `unsupported` is for.
+        // the chokepoint per connection is P2.7.3's, and so is the facet
+        // the ask would arrive through -- that facet is an interface of its
+        // own rather than a request on P2.6.5's filesystem powerbox,
+        // because `interface/@verb` is one value per interface. A bit on
+        // the wire with no enforcement behind it is exactly what
+        // `unsupported` is for.
         //
         // A list, deliberately: this is a SET that has shrunk three times
         // (D-018's two verbs, then `realm_launch` at WS-E.1.1) and grown
@@ -1679,6 +1709,10 @@ mod tests {
         for bad in [
             "net:*.example.com:443",    // wildcard host
             "net:*:443",                // bare wildcard
+            "net:.example.com:443",     // leading dot: the any-subdomain spelling
+            "net:example..com:443",     // doubled dot: an empty label mid-name
+            "net:example.com.:443",     // trailing dot: the DNS root label
+            "net:.:443",                // nothing but the separator
             "net:10.0.0.0/8:443",       // CIDR
             "net:a.com:443,b.com:443",  // list (the comma is in the host)
             "net:example.com:443-8443", // port range
@@ -1800,6 +1834,7 @@ mod tests {
         "*.example.com",
         ".example.com",
         "example..com",
+        "example.com.",
         "10.0.0.0/8",
         "192.0.2.0/24",
         "a.com,b.com",
@@ -1839,6 +1874,17 @@ mod tests {
             );
         }
         assert!(HOST_FORMS.contains(&""), "no empty host is generated");
+        // An empty label in each of its three positions. The trailing one
+        // is here because it was the one the parser missed while three
+        // separate comments said it did not: a generator that emits only
+        // the leading and doubled spellings tests two thirds of the rule.
+        for empty_label in [".example.com", "example..com", "example.com."] {
+            assert!(
+                HOST_FORMS.contains(&empty_label),
+                "`{empty_label}` is no longer generated, so the empty-label \
+                 rule is only partly exercised"
+            );
+        }
         assert!(PORT_FORMS.contains(&"0"), "port 0 is not generated");
         assert!(PORT_FORMS.contains(&"65536"), "port 65536 is not generated");
         assert!(
@@ -1896,12 +1942,14 @@ mod tests {
         /// hand-listed table of bad strings.
         ///
         /// **Its accept side is nearly vacuous on its own** -- only a
-        /// small fraction of the cross product parses (35 of 2772 when
-        /// this was written), so a 256-case run exercises the round-trip
-        /// property a handful of times and occasionally not at all. The
-        /// cross-product sweep below is the non-vacuity guard: it walks
-        /// every combination the alphabets admit, counts the acceptances
-        /// and fails if there are none.
+        /// small fraction of the cross product parses, so a 256-case run
+        /// exercises the round-trip property a handful of times and
+        /// occasionally not at all. The cross-product sweep below is the
+        /// non-vacuity guard: it walks every combination the alphabets
+        /// admit, counts the acceptances, fails if there are none, and
+        /// **asserts the fraction is small** rather than leaving a measured
+        /// pair of numbers in a comment that the next alphabet edit would
+        /// falsify.
         #[test]
         fn every_accepted_net_selector_round_trips_and_names_one_endpoint(
             prefix in proptest::sample::select(PREFIX_FORMS),
@@ -1919,15 +1967,19 @@ mod tests {
     fn the_alphabet_cross_product_accepts_a_selector_and_every_one_holds() {
         // Non-vacuity for the proptest's ACCEPT side, the mirror of what
         // `the_generator_really_emits_the_forbidden_forms` does for its
-        // refuse side. The proptest draws 256 samples from a space in
-        // which only a small fraction parses (35 of 2772 when this was
-        // written), so a run can legitimately accept nothing at all and
-        // still pass -- a green property asserting nothing, the failure
-        // mode this repo keeps finding.
+        // refuse side. The proptest draws 256 samples from a space in which
+        // only a small fraction parses, so a run can legitimately accept
+        // nothing at all and still pass -- a green property asserting
+        // nothing, the failure mode this repo keeps finding.
         //
         // Sweeping the whole cross product is both the guard and strictly
         // more coverage: every accepted combination is checked on every
         // run, not a sampled few.
+        //
+        // The fraction is MEASURED here and asserted, not written into a
+        // comment: an earlier draft stated "35 of 2772", which stopped
+        // being true the moment one form was added to one alphabet.
+        let total = PREFIX_FORMS.len() * HOST_FORMS.len() * PORT_FORMS.len();
         let mut accepted = 0usize;
         for prefix in PREFIX_FORMS {
             for host in HOST_FORMS {
@@ -1943,8 +1995,20 @@ mod tests {
         assert!(
             accepted > 0,
             "the alphabets no longer cross to a single selector the parser \
-             accepts, so the proptest's round-trip, idempotence and \
-             covers-itself properties assert nothing at all"
+             accepts ({accepted} of {total}), so the proptest's round-trip, \
+             idempotence and covers-itself properties assert nothing at all"
+        );
+        // ...and the sampled half really is nearly vacuous, which is the
+        // whole reason this sweep exists. If the alphabets are ever
+        // rebalanced so that most combinations parse, the proptest stops
+        // needing a guard -- and this assertion is where a human is told
+        // that, rather than the comment above quietly becoming false.
+        assert!(
+            accepted * 10 < total,
+            "{accepted} of {total} combinations now parse. The proptest's \
+             accept side is no longer nearly vacuous, so this sweep's \
+             stated reason for existing has changed -- rewrite it rather \
+             than deleting the assertion"
         );
     }
 

@@ -11,10 +11,31 @@
   interface/@verb is a closed value set, and widening it is a DIALECT change
   that moves with the IDL: a verb name the schema does not admit is rejected
   here rather than reaching a backend that would emit an unenforceable
-  chokepoint entry. The set tracks the facet-bearing verbs of
-  vitrin_grant.verb, not the whole bitfield; observe_cursor still has no
-  facet interface to annotate, because it widens what capture_frame
-  composites rather than adding a request.
+  chokepoint entry. The set below tracks the facet-bearing verbs of
+  vitrin_grant.verb, and is therefore SHORTER than that bitfield.
+
+  vitrin-verb-set: facetless-verbs = observe_cursor, egress
+
+  TWO verbs are missing from it, for two different reasons, and both belong
+  here because a reader meeting a list shorter than the bitfield will ask
+  why:
+
+    - observe_cursor has no facet interface BY CONSTRUCTION. It widens what
+      capture_frame composites rather than adding a request, so there is no
+      interface for the attribute to sit on and there never will be.
+    - egress has none YET (P2.7.2 landed the verb bit and no message at
+      all). When its facet lands it is an interface of its own, since @verb
+      is one value per interface and it therefore cannot be a request on the
+      filesystem powerbox, and this value set gains "egress" in that same
+      commit.
+
+  Those two names are also what protocol/test-mutations.sh's
+  verb-without-facet case draws on: it mutates a legal @verb into a real
+  grant verb the set does not admit, and only a facetless verb can play that
+  part. The two marker lines above are read by `cargo xtask verb-sets`,
+  which derives both sets from protocol/vitrin-v0.xml, holds the value set
+  below to the first of them, and fails when this comment (or any other
+  surface enumerating either set) falls behind.
 
   layout_arrange and layout_focus were in that no-facet list until they
   gained one each (vitrin_layout_arrange, vitrin_layout_focus). They are two
@@ -23,6 +44,8 @@
   facet could name only one verb and the other would reach the chokepoint
   with no entry. D-018(3) requires the two to be independently attenuable,
   and one attribute per interface is how the dialect makes that structural.
+  The same rule split the powerbox: egress cannot be a second verb on the
+  interface that already declares designate_file.
 
   Structural rules this schema enforces beyond wayland.dtd:
     - argument types are a closed set of seven (no array);
@@ -133,6 +156,7 @@
     </attribute>
     <optional>
       <attribute name="verb">
+        <!-- vitrin-verb-set: facet-verbs = observe, actuate_pointer, actuate_text, layout_arrange, layout_focus, realm_launch -->
         <choice>
           <value>observe</value>
           <value>actuate_pointer</value>

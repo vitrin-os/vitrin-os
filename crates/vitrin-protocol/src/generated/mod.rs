@@ -21,6 +21,25 @@ pub const PROTOCOL_VERSION: u32 = 2;
 /// untested.
 pub const MESSAGE_COUNT: usize = 48;
 
+/// Every `interface/@verb` in the document, in interface document order:
+/// the grant verbs that have a facet interface to be exercised through.
+///
+/// Exists so the facet-bearing/facetless partition of `vitrin_grant.verb`
+/// can be *derived* rather than hand-listed. Before this constant the
+/// partition was a hand-maintained array of per-interface `VERB` consts, and
+/// the check over it could not see a seventh facet appearing on an existing
+/// verb -- which is exactly the next scheduled protocol change. Adding an
+/// `interface/@verb` now moves this length, and the assertions that pin it
+/// go red.
+pub const FACET_VERBS: &[&str] = &[
+    "observe",
+    "actuate_pointer",
+    "actuate_text",
+    "realm_launch",
+    "layout_focus",
+    "layout_arrange",
+];
+
 pub mod vitrin_handshake;
 pub mod vitrin_principal;
 pub mod vitrin_realm;

@@ -14,9 +14,11 @@
 //!
 //! Two prior issues in this repository are the same shape -- #229 (a
 //! harness exiting 0 while silently skipping the whole real-app ladder)
-//! and #186 (nine gates whose mock-freeness check would have passed for
-//! the mock). The class is *a green count standing in for absent
-//! evidence*.
+//! and #186 (nine gates whose mock-freeness check confinement had already
+//! stopped: both binaries answered to the bind target's basename, so the
+//! check identified neither -- #283 corrected the earlier telling, which
+//! said it "would have passed for the mock"). The class is *a green count
+//! standing in for absent evidence*.
 //!
 //! # The mechanism: a capability answer cannot be observed silently
 //!

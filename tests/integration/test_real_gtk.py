@@ -239,8 +239,9 @@ class RealGtk(IntegrationTest):
             (comm_of(core.pid), exe_identity(shim_pid), comm_of(app_pid)),
             ("vitrind", file_identity(self.shim_bin), APP_NAME),
             f"the spine must be exactly vitrind -> the real C shim -> {APP_NAME}; the "
-            "middle link is matched by inode because a confined shim's comm is `shim` "
-            "whichever binary it is (P2.6.2, #186)",
+            "middle link is matched by inode because a confined shim runs from the "
+            "bind target /vitrin/vitrin-shim and its comm is that basename whichever "
+            "binary it is (P2.6.2, #186; renamed from /vitrin/shim by #283)",
         )
 
         conn = core.connect()

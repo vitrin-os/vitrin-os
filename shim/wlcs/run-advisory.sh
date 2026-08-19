@@ -58,12 +58,30 @@ fi
 
 mkdir -p "$OUT_DIR"
 
+# SINCE ISSUE #283 THIS BLOCK IS NORMALLY INERT, AND THAT IS THE POINT.
+# `shim/meson.build`'s `project()` defaults now carry `default_library=static`
+# (D-043), which subprojects inherit, so a vendored build produces
+# `libwlroots-0.19.a` and no `.so` at all: the `find` below yields nothing and
+# LD_LIBRARY_PATH is never exported. Measured 2026-08-19 on both build shapes
+# this repo has -- the plain vendored build and a nested build configured with
+# `--force-fallback-for=wayland-server,wayland-client,wayland-scanner,wayland`
+# -- zero `.so*` files under the build tree in each.
+#
+# It is KEPT rather than deleted because it is still the mitigation for the
+# shape that produces it: `-Ddefault_library=shared` on the command line, or a
+# subproject that overrides the inherited default. The reasoning below is what
+# that shape costs, and it has not been re-measured since the static default
+# landed -- so read it as "why this exists", not as a description of what CI
+# builds today. What CI builds today needs none of it.
+#
+# THE ORIGINAL REASONING, for a SHARED vendored build.
+#
 # Meson's wlroots-0.19 dependency() has a fallback to a vendored subproject
 # build (see shim/ci/install-deps.sh's note: Ubuntu 24.04 ships wayland 1.22,
 # below wlroots 0.19's >=1.23.1 floor, so the fallback compiles a newer
-# wayland from source too). Those fallback libraries are UNINSTALLED --
-# they live as plain .so files inside the build tree, never copied
-# anywhere ld.so's default search path would find them.
+# wayland from source too). Built shared, those fallback libraries are
+# UNINSTALLED -- they live as plain .so files inside the build tree, never
+# copied anywhere ld.so's default search path would find them.
 #
 # $WLCS_BIN is a foreign, already-linked process (the apt `wlcs` package):
 # by the time it dlopen()s $MODULE, ld.so has already resolved $WLCS_BIN's
@@ -84,13 +102,20 @@ mkdir -p "$OUT_DIR"
 # and $MODULE agree on the SAME (newer) libwayland-client from the start
 # -- there is then only ever one copy of the soname loaded, and it is the
 # one that actually has the symbols wlroots needs. Harmless when nothing
-# under $MODULE_DIR is an uninstalled fallback build (e.g. a system
-# wlroots-0.19 was found and no subprojects were compiled): the `find`
-# below then yields nothing to add.
+# under $MODULE_DIR is an uninstalled shared fallback build -- a system
+# wlroots-0.19 was found and no subprojects were compiled, or (since #283,
+# the usual case) they were compiled static: the `find` below then yields
+# nothing to add, and the line after it does nothing.
 MODULE_DIR="$(cd "$(dirname "$MODULE")" && pwd)"
 EXTRA_LIBDIRS="$(find "$MODULE_DIR" -name '*.so*' -exec dirname {} \; 2>/dev/null | sort -u | paste -sd: -)"
 if [ -n "$EXTRA_LIBDIRS" ]; then
 	export LD_LIBRARY_PATH="$EXTRA_LIBDIRS${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+	echo "note: exporting LD_LIBRARY_PATH=$EXTRA_LIBDIRS -- a SHARED vendored build was found" >&2
+	echo "      under $MODULE_DIR. Since #283 the shim links vendored libraries statically," >&2
+	echo "      so this is a non-default build shape; see the comment above." >&2
+else
+	echo "note: no shared objects under $MODULE_DIR, so LD_LIBRARY_PATH is untouched." >&2
+	echo "      That is the expected shape since #283 (static vendored libraries)." >&2
 fi
 
 # THE SCOPE (issue #47: "xdg-shell+seat groups"). Chosen empirically by

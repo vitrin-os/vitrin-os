@@ -126,7 +126,10 @@ SUPERVISOR_COMM = "vitrin-realm-in"
 #: which compares inodes rather than strings. Since #283 the bind target is
 #: `/vitrin/vitrin-shim`, so a confined shim reads back as `vitrin-shim`
 #: again -- that restores `ps` legibility and grants the name no more evidence
-#: value than it had before.
+#: value than it had before. Measured, so nobody has to take it on trust: a
+#: `--isolation=default` core started with `vitrin-mock-shim` yields comm
+#: `vitrin-shim`, `/proc/<pid>/exe -> /vitrin/vitrin-shim`, and the MOCK's
+#: inode. `vitrin-mock-shi` below is therefore the UNCONFINED spelling only.
 SHIM_COMMS = ("vitrin-shim", "vitrin-mock-shi")
 
 #: The paths a **confined** realm sees, mirroring the constants in

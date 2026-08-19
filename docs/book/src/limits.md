@@ -98,7 +98,7 @@ could open nothing cannot satisfy a denial. **Eight** paths were refused
 |---|---|
 | `/` | the realm root |
 | `/run`, `/vitrin` | the parents of `/run/vitrin`, `/vitrin/home` and the shim binary |
-| `/home`, `/home/<user>`, `…/projects`, `…/projects/vitrin`, `…/vitrin/shim` | the parents of this development tree's app-directory and shim-library binds |
+| `/home`, `/home/<user>`, `…/projects`, `…/projects/vitrin`, `…/projects/vitrin/shim` | the parents of this development tree's app-directory and shim-library binds — the build tree's own paths, mirrored into the realm at the same spelling, and **not** the core-chosen `/vitrin/…` above |
 
 Every one of the eight is a directory the realm's **own** mount table created on
 its root tmpfs purely to hold a bind target beneath it, and each holds nothing
@@ -114,16 +114,24 @@ path answered identically at both settings: `/usr`, `/etc`, `/proc`, `/sys`,
 files inside them all opened in both; `/dev/tty` answered `ENXIO` in both, which
 is a realm with no controlling terminal and not a ruleset denial.
 
-**Two things this measurement's spellings predate, neither of which moves the
-boundary it reports.** Issue [#283](https://github.com/vitrin-os/vitrin-os/issues/283)
+**Two things this measurement predates, neither of which moves the boundary it
+reports.** Issue [#283](https://github.com/vitrin-os/vitrin-os/issues/283)
 (a) renamed the shim's bind target from `/vitrin/shim` to
 `/vitrin/vitrin-shim`, which changes a leaf's name and no grant, and (b) removed
 the shim-library bind the `/home` chain's deeper components existed for, by
 linking anything the shim vendors statically instead. So a re-run today should
 deny four paths rather than eight when the app is relocated, and should mint no
-`…/projects/vitrin/shim` chain at all. **That is a prediction, not a
-measurement: the table above is what was actually probed on 2026-08-14 and it
-has not been re-collected since.**
+`…/projects/vitrin/shim` chain at all.
+
+**That last sentence is a prediction, and this page does not publish
+predictions as measurements.** The table above is exactly what was probed on
+2026-08-14 and it has **not** been re-collected since; where the two disagree,
+the table is the measurement and the paragraph is an expectation about a run
+nobody has done. Re-collecting it means `solid-client --probe` over all 31
+paths in batches of eight, twice per batch, which is a measurement session
+rather than an edit — it is owed, it is not scheduled here, and until it
+happens this page reports **eight** because eight is the number that was
+observed.
 
 So what the enumeration buys over the realm-root grant #187 declined is, on this
 host, that the realm cannot **list its own root** and cannot list the handful of

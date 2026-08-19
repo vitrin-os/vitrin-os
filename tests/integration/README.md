@@ -83,13 +83,22 @@ will hit at least one of them:
    in-realm path, so the kernel derives `comm` from *that* basename and not
    from whatever the operator called the binary. From #186 to #283 the target
    was `/vitrin/shim`, which made the real C shim and `vitrin-mock-shim` both
-   read back as `shim`: every `comm_of(shim).startswith("vitrin-shim")`
-   mock-freeness check would have gone green for the mock. They are now
+   read back as `shim`. Nine gates spelled their mock-freeness check
+   `comm_of(shim).startswith("vitrin-shim")`, and confined that check went
+   **red for the real shim** — `"shim"` does not start with `"vitrin-shim"`.
+   It did not go green for the mock either: unconfined, `vitrin-mock-shim` is
+   16 bytes and `comm` truncates it to `vitrin-mock-shi`, which fails the same
+   test. There was no configuration in which the mock passed it; the check had
+   simply stopped identifying anything. They are now
    `exe_identity(shim) == file_identity(self.shim_bin)`, which is strictly
    stronger — a name says what a program is called, an inode says which file
    is executing. Since #283 the target is `/vitrin/vitrin-shim`, so `ps` is
-   legible again; that is legibility and **not** a restored check, and no gate
-   here has gone back to reading the name.
+   legible again — and the *mock* reads back as `vitrin-shim` too when it is
+   confined (measured: `comm` `vitrin-shim`, `/proc/<pid>/exe ->
+   /vitrin/vitrin-shim`, the mock's inode). The rename is legibility and
+   **not** a restored check; it makes the old name test green for both
+   binaries rather than red for both. No gate here has gone back to reading
+   the name.
 3. **An app's stdout is not the core's any more.** A confined realm writes to
    `<realm>/realm.log` rather than inheriting the core's descriptors — on a
    real session those are the operator's tty, and no mount flag revokes a

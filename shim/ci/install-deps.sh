@@ -31,6 +31,14 @@
 # that only ever reports SKIP in CI is a criterion nobody is holding. It is a
 # pure C/GLib package, so the no-Rust invariant below is untouched.
 #
+# binutils is for `meson test loader-independence` (issue #283), which reads
+# the shim's dynamic section with `readelf` and FAILS rather than skips when
+# the tool is absent -- that policy is the point of the test, so the tool has
+# to be named here rather than inherited. The container gets binutils
+# transitively from gcc today; an unnamed dependency means a change to gcc's
+# dependency chain would turn the shim job red with a message about realms.
+# `ldd` needs no line of its own: it ships in libc-bin, which is Essential.
+#
 # Invariant checked by CI after this script runs: nothing here may pull
 # rustc/cargo onto PATH (the shim job's no-Rust acceptance criterion).
 set -euo pipefail
@@ -38,7 +46,7 @@ set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq \
-  meson ninja-build pkg-config \
+  meson ninja-build pkg-config binutils \
   libwayland-dev wayland-protocols \
   libpixman-1-dev libxkbcommon-dev \
   libdrm-dev libgbm-dev libinput-dev libudev-dev libseat-dev \

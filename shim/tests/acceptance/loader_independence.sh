@@ -20,7 +20,7 @@
 # `default_library=static` in meson.build's `project()` defaults; this script
 # is what stops it from silently coming undone.
 #
-# THREE CHECKS, AND NONE OF THEM IS REDUNDANT:
+# FOUR CHECKS, AND NONE OF THEM IS REDUNDANT:
 #
 #   1. The shim, COPIED to an empty directory and run with a scrubbed
 #      environment, gets into `main`. This is the property itself, measured
@@ -31,10 +31,15 @@
 #      does NOT cover this: an ABSOLUTE RUNPATH into the build tree resolves
 #      perfectly well on the host, so check 1 would pass while a realm --
 #      which cannot see the build tree -- still failed.
-#   3. Every library the copy actually resolves lives under `/usr`, `/lib` or
-#      `/lib64`. Those are the prefixes a realm's stock mount table carries
-#      (crates/vitrin-realm-init/src/main.rs, K3/K4); anything else is
-#      reachable on this machine and not in a realm.
+#   2b. The PT_INTERP program interpreter is under one of those prefixes too.
+#      `ldd` prints it WITHOUT a `=>`, so check 3's loop never sees it, and
+#      it is the one path the kernel resolves before the process exists at
+#      all. Check 1 would only catch a non-stock interpreter on a machine
+#      that happens not to have it.
+#   3. Every library the copy actually resolves lives under one of
+#      REALM_LIB_PREFIXES below -- the library-bearing prefixes a realm's
+#      stock mount table mirrors (crates/vitrin-realm-init/src/main.rs,
+#      K3/K4); anything else is reachable on this machine and not in a realm.
 #
 # A missing `readelf` or `ldd` is a FAILURE here, not a skip. A check that
 # quietly skips itself when its instrument is absent is a check that has
@@ -55,11 +60,25 @@ SHIM_BIN="${1:-${SHIM_BIN:-$BUILD_DIR/vitrin-shim}}"
 [[ -x "$SHIM_BIN" ]] || { echo "FAIL: missing $SHIM_BIN (run: meson compile -C $BUILD_DIR)" >&2; exit 1; }
 SHIM_BIN="$(cd "$(dirname "$SHIM_BIN")" && pwd)/$(basename "$SHIM_BIN")"
 
-# The prefixes a confined realm's mount table actually carries: `/usr` and
-# `/etc` are bound at their own paths and `/lib`, `/lib64`, `/bin`, `/sbin`
-# are the compatibility shape mirrored beside `/usr`. Keep this in step with
-# `COMPAT_NAMES` and `open_sources` in crates/vitrin-realm-init/src/main.rs.
-REALM_LIB_PREFIXES=(/usr/ /lib/ /lib64/)
+# The prefixes a confined realm's mount table carries that a LIBRARY can come
+# out of: `/usr` is bound at its own path, and `lib`, `lib64`, `lib32`,
+# `libx32` are the entries of `COMPAT_NAMES` in
+# crates/vitrin-realm-init/src/main.rs that name library directories --
+# mirrored beside `/usr` as whatever they are on the host, symlink or real
+# directory.
+#
+# `COMPAT_NAMES` also carries `bin` and `sbin`, and the realm mounts `/etc`.
+# They are DELIBERATELY absent here, so this array is a strict subset of what
+# a realm can reach rather than a copy of it: a shared library resolved out of
+# `/bin`, `/sbin` or `/etc` would load inside a realm perfectly well and is
+# still something this project wants to hear about. That is why the failure
+# message below says "not under a prefix a realm mirrors for libraries" and
+# not "outside the realm's mount table" -- the second would be false.
+#
+# Keep this in step with `COMPAT_NAMES` and `open_sources` in
+# crates/vitrin-realm-init/src/main.rs; a Rust-side change that drops a
+# library prefix from the mount table has to drop it here too.
+REALM_LIB_PREFIXES=(/usr/ /lib/ /lib64/ /lib32/ /libx32/)
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/vitrin-loader.XXXXXX")"
 cleanup() { rm -rf "$WORK"; }
@@ -67,6 +86,21 @@ trap cleanup EXIT
 
 FAILED=0
 fail() { echo "FAIL: $*" >&2; FAILED=1; }
+
+# Set by check 2b; declared here so `set -u` cannot turn a missing readelf
+# (already a FAIL) into an unbound-variable error further down.
+INTERP=""
+
+# Is $1 under one of the prefixes above? Used by BOTH the PT_INTERP check and
+# the ldd loop, so the two cannot drift into disagreeing about what a realm
+# can reach.
+prefix_ok() {
+  local path="$1" prefix
+  for prefix in "${REALM_LIB_PREFIXES[@]}"; do
+    [[ "$path" == "$prefix"* ]] && return 0
+  done
+  return 1
+}
 
 # --- 1. Run it from somewhere that is not the build tree ------------------
 # A COPY, not a symlink: the loader expands `$ORIGIN` from the resolved path,
@@ -119,6 +153,20 @@ else
     echo "       A realm's mount table does not create the build tree, whether the path" >&2
     echo "       is \$ORIGIN-relative or absolute. Link the vendored library IN." >&2
   fi
+
+  # 2b. The PT_INTERP loader itself. Check 3 below reads `ldd`'s `=>` lines,
+  # and the program interpreter is printed WITHOUT one -- so without this the
+  # one path the kernel resolves before any of the others is the one path
+  # never prefix-checked. Check 1 would catch a non-stock interpreter by
+  # failing to run at all, but only on a machine that happens to lack it;
+  # this states the requirement instead of relying on that.
+  INTERP="$(LC_ALL=C readelf -l "$LONE_DIR/vitrin-shim" \
+    | sed -n 's/.*\[Requesting program interpreter: \(.*\)\]/\1/p')"
+  if [[ -z "$INTERP" ]]; then
+    fail "readelf found no PT_INTERP segment in the shim. A dynamically linked executable has one; without it this check inspected nothing."
+  elif ! prefix_ok "$INTERP"; then
+    fail "the shim's program interpreter is $INTERP, which is not under a prefix a realm mirrors for libraries (${REALM_LIB_PREFIXES[*]}). The kernel resolves PT_INTERP before the process exists, so a realm would refuse to start it at all."
+  fi
 fi
 
 # --- 3. Everything it loads is in the realm's stock mount table ------------
@@ -146,12 +194,8 @@ else
     path="${line#*=> }"
     path="${path%% (*}"
     path="${path%"${path##*[![:space:]]}"}"
-    ok=0
-    for prefix in "${REALM_LIB_PREFIXES[@]}"; do
-      [[ "$path" == "$prefix"* ]] && ok=1 && break
-    done
-    if [[ $ok -eq 0 ]]; then
-      fail "the shim loads $path, which is outside the realm's stock mount table (${REALM_LIB_PREFIXES[*]}). A realm would have to grow a bind mount for it, making the confinement boundary a function of this build's flags."
+    if ! prefix_ok "$path"; then
+      fail "the shim loads $path, which is not under a prefix a realm mirrors for libraries (${REALM_LIB_PREFIXES[*]}). A realm would have to grow a bind mount for it, making the confinement boundary a function of this build's flags."
     fi
   done <<<"$LDD_OUT"
 fi
@@ -161,4 +205,5 @@ if [[ $FAILED -ne 0 ]]; then
 fi
 
 echo "PASS: the shim runs from an empty directory with an empty environment,"
-echo "      carries no RPATH/RUNPATH, and loads only from ${REALM_LIB_PREFIXES[*]}."
+echo "      carries no RPATH/RUNPATH, and resolves its interpreter ($INTERP)"
+echo "      and every library it loads from ${REALM_LIB_PREFIXES[*]}."

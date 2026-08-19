@@ -154,13 +154,27 @@ pub const IN_REALM_PREFIX: &str = "/vitrin";
 /// # Why the basename is `vitrin-shim` and not `shim` (issue #283)
 ///
 /// The kernel takes a process's `comm` from the **basename of the file it
-/// `execve`d**, so binding at `/vitrin/shim` made every confined shim answer
-/// to `shim` -- the same string `vitrin-mock-shim` truncates to nothing like,
-/// but close enough that nine integration gates which read `comm` to prove a
-/// run was mock-free were left checking a name neither binary owned. Those
-/// gates now compare `(st_dev, st_ino)` of `/proc/<pid>/exe`, which is the
-/// check that actually holds; this basename costs nothing and gives `ps` back
-/// its legibility beside it.
+/// `execve`d**, and this constant is that basename for every confined shim.
+/// Binding at `/vitrin/shim` therefore made `ps` report `shim` -- a name
+/// neither binary owned. Nine integration gates read `comm` to prove a run
+/// was mock-free, spelled `comm_of(shim).startswith("vitrin-shim")`, and
+/// under confinement that assertion went **red for the real shim**, because
+/// `"shim"` does not start with `"vitrin-shim"`. It did not go green for
+/// `vitrin-mock-shim` either, confined or not: unconfined the kernel
+/// truncates that basename to `vitrin-mock-shi`, which fails the same test.
+/// The check had stopped identifying anything at all, which is why those
+/// gates now compare `(st_dev, st_ino)` of `/proc/<pid>/exe`.
+///
+/// **This rename gives `comm` no evidence value back; it takes the last of
+/// it away.** `main.rs` binds whatever host binary the core named *to this
+/// constant*, so a confined `vitrin-mock-shim` answers to `vitrin-shim` too
+/// -- measured 2026-08-19 against a `--isolation=default` core started with
+/// the mock: `comm` `vitrin-shim`, `/proc/<pid>/exe -> /vitrin/vitrin-shim`,
+/// inode the mock's. A `startswith("vitrin-shim")` check that was red for
+/// both binaries is now green for both. What the name buys is `ps`
+/// legibility for a human reading a process tree, and nothing else. The test
+/// `a_confined_comm_is_decided_by_the_bind_target_not_the_host_binary` below
+/// holds that reading to `main.rs` rather than to this paragraph.
 ///
 /// The in-realm path is a **core-chosen constant**, not the host basename, so
 /// this is not a claim about what the operator called their binary.
@@ -1422,42 +1436,90 @@ mod tests {
         assert!(IN_REALM_HOME.starts_with(IN_REALM_PREFIX));
     }
 
-    /// Issue #283. The kernel derives `comm` from the basename of the
-    /// `execve`d file, so the bind target's LAST COMPONENT is what `ps` shows
-    /// for every confined shim -- and what a reader comparing it against
-    /// `vitrin-mock-shim` sees.
-    ///
-    /// This asserts the two things that make that name useful and neither
-    /// more nor less: it is not truncated (`TASK_COMM_LEN` is 16, so 15 bytes
-    /// survive), and it does not collide with the mock's own truncated
-    /// `comm`. It deliberately does **not** assert that `comm` proves
-    /// mock-freeness -- it does not, which is why the integration gates
-    /// compare `(st_dev, st_ino)` of `/proc/<pid>/exe` instead. This is
-    /// legibility, not evidence.
-    #[test]
-    fn the_confined_shim_answers_to_its_own_name() {
-        /// `TASK_COMM_LEN - 1`: the kernel copies at most this many bytes of
-        /// the basename into `comm` and NUL-terminates.
-        const COMM_MAX: usize = 15;
-        /// The component after the last `/` is what `__set_task_comm` gets.
-        fn comm_of(path: &str) -> &str {
-            let base = path.rsplit('/').next().unwrap_or(path);
-            &base[..base.len().min(COMM_MAX)]
-        }
+    /// `TASK_COMM_LEN - 1`: the kernel copies at most this many bytes of the
+    /// `execve`d file's basename into `comm` and NUL-terminates.
+    const COMM_MAX: usize = 15;
 
+    /// What `ps` will show for a process that `execve`d `path`: the component
+    /// after the last `/`, truncated the way `__set_task_comm` truncates it.
+    fn comm_of(path: &str) -> &str {
+        let base = path.rsplit('/').next().unwrap_or(path);
+        &base[..base.len().min(COMM_MAX)]
+    }
+
+    /// Issue #283. The kernel derives `comm` from the basename of the
+    /// `execve`d file, so this constant's LAST COMPONENT is what `ps` shows
+    /// for every confined shim.
+    ///
+    /// Two properties, and the pair is the whole of what the name is worth:
+    /// it is the shim's own name rather than the bare `shim` the old bind
+    /// target produced, and it survives `TASK_COMM_LEN` truncation whole, so
+    /// what `ps` prints is the name and not a prefix of it.
+    #[test]
+    fn the_confined_shims_comm_is_this_constants_basename() {
         assert_eq!(
             comm_of(IN_REALM_SHIM),
             "vitrin-shim",
             "the bind target's basename IS the confined shim's comm; \
              `/vitrin/shim` made it `shim`, which is issue #283's second half"
         );
-        // Not merely "different strings": different AFTER the truncation the
-        // kernel applies, which is where a longer name would have hidden the
-        // collision.
-        assert_ne!(
-            comm_of(IN_REALM_SHIM),
-            comm_of("/usr/bin/vitrin-mock-shim"),
-            "the real shim and the mock must be distinguishable in `ps`"
+        assert_eq!(
+            IN_REALM_SHIM.rsplit('/').next(),
+            Some(comm_of(IN_REALM_SHIM)),
+            "the basename must survive the kernel's {COMM_MAX}-byte truncation \
+             whole, or `ps` shows a prefix and the legibility this rename \
+             bought is spent"
+        );
+    }
+
+    /// Issue #283, and the half a sentence in a doc comment kept getting
+    /// wrong. A confined process's `comm` is decided by **this constant**,
+    /// not by the binary the core was handed: `main.rs` binds whatever host
+    /// path arrived in `sources.shim` *to this target*, so a confined
+    /// `vitrin-mock-shim` answers to `vitrin-shim` exactly as the real shim
+    /// does. Measured 2026-08-19 against a `--isolation=default` core started
+    /// with the mock: `comm` `vitrin-shim`, `/proc/<pid>/exe ->
+    /// /vitrin/vitrin-shim`, and the inode the mock's.
+    ///
+    /// So `comm` is **not** a mock-freeness check and no rename can make it
+    /// one -- the integration gates compare `(st_dev, st_ino)` of
+    /// `/proc/<pid>/exe`. This test asserts the mechanism rather than
+    /// restating the conclusion, because the conclusion is the part that
+    /// rots: if the bind ever stops taking `sources.shim`, or a second bind
+    /// starts writing this target, the reasoning above is void and this goes
+    /// red instead of a comment quietly becoming false.
+    #[test]
+    fn a_confined_comm_is_decided_by_the_bind_target_not_the_host_binary() {
+        const MAIN_RS: &str = include_str!("main.rs");
+        const TARGET: &str = "strip_leading_slash(IN_REALM_SHIM)";
+
+        let sites: Vec<usize> = MAIN_RS.match_indices(TARGET).map(|(at, _)| at).collect();
+        assert_eq!(
+            sites.len(),
+            1,
+            "main.rs mentions `{TARGET}` {} times, not once. This test reads \
+             the single bind that creates the shim's in-realm path; with more \
+             than one it is reading an arbitrary one of them, and with none \
+             the path is created somewhere this check cannot see.",
+            sites.len()
+        );
+
+        // Back up to a char boundary: `main.rs` is not pure ASCII, and
+        // slicing a `&str` mid-codepoint panics with a message about UTF-8
+        // rather than about the bind this test is here to check.
+        let at = sites[0];
+        let mut from = at.saturating_sub(120);
+        while from < at && !MAIN_RS.is_char_boundary(from) {
+            from += 1;
+        }
+        let call = &MAIN_RS[from..at];
+        assert!(
+            call.contains("sources.shim"),
+            "the bind that creates `{IN_REALM_SHIM}` no longer takes \
+             `sources.shim`, so `comm` may no longer be a function of the \
+             bind target alone -- the doc comment on IN_REALM_SHIM, \
+             tests/integration/README.md and D-043 all reason from that and \
+             have to be re-checked. What precedes the target is: {call:?}"
         );
     }
 }

@@ -358,8 +358,10 @@ function of a build flag. See issue
 
 `meson test loader-independence` is what holds it: it copies the built shim to
 an empty directory, runs it there with an emptied environment, and fails if the
-binary carries any `RPATH`/`RUNPATH` or needs a library outside `/usr`, `/lib`
-or `/lib64`. Passing `-Ddefault_library=shared` is therefore loud rather than
+binary carries any `RPATH`/`RUNPATH`, or if its program interpreter or any
+library it needs falls outside the prefixes a realm mirrors (that script's
+`REALM_LIB_PREFIXES`, currently `/usr`, `/lib`, `/lib64`, `/lib32`,
+`/libx32`). Passing `-Ddefault_library=shared` is therefore loud rather than
 silent.
 
 ## Running
@@ -463,10 +465,16 @@ built binary to an empty directory, runs it there with an emptied environment
 (so `$ORIGIN` moves and no `LD_LIBRARY_PATH` can help), and requires it to
 reach `main`; separately requires no `DT_RPATH`/`DT_RUNPATH` at all, because an
 **absolute** RUNPATH into the build tree passes the first check and still
-breaks every realm; and separately requires every library it resolves to live
-under `/usr`, `/lib` or `/lib64`, the prefixes a realm's mount table carries. A
-missing `readelf` or `ldd` **fails** this test rather than skipping it. Wired
-into `meson test`; needs nothing but the shim.
+breaks every realm; separately requires its `PT_INTERP` program interpreter to
+be under a mirrored prefix, since `ldd` prints the interpreter without a `=>`
+and the loop below would otherwise never inspect the one path the kernel
+resolves before the process exists; and separately requires every library it
+resolves to live under one of that script's `REALM_LIB_PREFIXES` — the
+library-bearing subset of what a realm's mount table mirrors, read from the
+script rather than restated here. A missing `readelf` or `ldd` **fails** this
+test rather than skipping it, which is why `shim/ci/install-deps.sh` names
+`binutils` instead of inheriting it from `gcc`. Wired into `meson test`; needs
+nothing but the shim.
 
 ```bash
 bash tests/acceptance/loader_independence.sh ./build/vitrin-shim

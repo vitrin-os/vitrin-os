@@ -40,10 +40,10 @@ project(
     #
     # HELD BY A TEST, not by this comment: `meson test loader-independence`
     # copies the built shim to an empty directory, runs it there with a
-    # scrubbed environment, and fails if it needs anything outside the
-    # realm's stock `/usr`, `/lib`, `/lib64`. Overriding this option on the
-    # command line (`-Ddefault_library=shared`) is therefore loud, not
-    # silent.
+    # scrubbed environment, and fails if its interpreter or anything it needs
+    # falls outside the prefixes a realm mirrors (that script's
+    # REALM_LIB_PREFIXES). Overriding this option on the command line
+    # (`-Ddefault_library=shared`) is therefore loud, not silent.
     'default_library=static',
   ],
 )

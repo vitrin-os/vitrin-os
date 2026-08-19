@@ -58,8 +58,15 @@ with an enumerated read set, enforced before the shim's `execve`, and a
 generated [ABI matrix](isolation-matrix.md) of what that ruleset requires of a
 kernel. P2.6.3 is nevertheless **not finished**: that matrix probes nothing, so
 it is a table about the build rather than about kernels; the per-kernel one its
-criteria ask for does not exist; and the ABI floor that replaced the
-degradation ladder narrowed the task rather than finishing it. But there is
+criteria ask for now exists separately, and is **measured** — [which kernels
+this build starts on](isolation-kernels.md), five distribution kernels booted
+under QEMU with the shipped `vitrind`, three of them refused below the floor and
+two admitted — though every row there is a **kernel** reading taken in a bare
+initramfs and not a statement about the distribution that ships that kernel, so
+the number of *distributions* measured as such is still one, and five machines
+somebody might be refused on is not a sweep of the ABI ladder; and the ABI floor
+that replaced the degradation ladder narrowed the task rather than finishing it.
+But there is
 since P2.6.4 a **seccomp deny-list** rather than a syscall boundary: it closes
 the 13 rows `vitrind --print-seccomp` prints and leaves the rest of the
 kernel's syscall surface unenumerated, so the realm is filesystem-confined and

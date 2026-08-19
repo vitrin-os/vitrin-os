@@ -268,7 +268,7 @@ meson setup shim/build shim &amp;&amp; meson compile -C shim/build</pre>
         <p>Write your own — the SDK is pure Python, standard library only.</p>
 <pre><span class="p">import</span> vitrin_os
 
-conn  = vitrin_os.connect(sock, identity=<span class="p">"agent://demo"</span>)
+conn  = vitrin_os.connect(sock, identity=<span class="p">"vitrin://local/agent/demo"</span>)
 grant = conn.request_grant(verbs=(<span class="p">"observe"</span>, <span class="p">"actuate.pointer"</span>),
                            expiry_ms=300_000)
 grant.await_consent()          <span class="c"># a human decides</span>
@@ -405,7 +405,7 @@ grant.pointer.click(640, 84)</pre>
       <p><strong>There is an AppArmor profile for exactly this, at
       <code>packaging/apparmor/vitrind</code>, and it is measured working on one
       kernel on one CI image.</strong> It is the per-binary grant Ubuntu ships a
-      mechanism for &mdash; the shape Chromium, Firefox and flatpak already use
+      mechanism for &mdash; the shape Chrome, Firefox and flatpak already use
       &mdash; taken instead of asking operators to weaken a system-wide
       default. A CI job that
       runs on a runner whose userns sysctl it never touches (installing the
@@ -496,14 +496,29 @@ grant.pointer.click(640, 84)</pre>
     </p>
 
     <p><strong>Everything below was measured on one machine, on the dates
-    given.</strong> One laptop: an Intel iGPU on <code>/dev/dri/card1</code>
+    given.</strong> One laptop: an Intel iGPU
     driving the only connected output, <code>eDP-1</code>, at 2560×1600 @ 240 Hz,
-    scale 1, on one mesa version and two consecutive Arch kernels. The bring-up
-    runbook was executed twice on <strong>2026-08-09</strong>
-    (<code>7.1.5-arch1-2</code>) and the session-lifecycle checklist once on
-    <strong>2026-08-11</strong> (<code>7.1.6-arch1-1</code>); neither was a clean
-    pass, and the 2026-08-11 session produced five defects — four from the
-    checklist rungs and one from driving real applications. Nothing here
+    scale 1, on one mesa version and — on the two runs that recorded a
+    kernel — two consecutive Arch ones. Not even the device node is
+    stable: the core's own selection chose <code>/dev/dri/card1</code> on
+    2026-08-09 and <code>/dev/dri/card2</code> on 2026-08-13, two answers from
+    the same machine. The bring-up runbook was executed twice on
+    <strong>2026-08-09</strong> (<code>7.1.5-arch1-2</code>), and its touchpad
+    rung once more on <strong>2026-08-13</strong>; the session-lifecycle
+    checklist was executed on <strong>2026-08-11</strong>
+    (<code>7.1.6-arch1-1</code>), again on <strong>2026-08-12</strong> for the
+    blank rung alone, and again on <strong>2026-08-13</strong>, which is the run
+    where its suspend and lid rungs first reached the counts they ask for. No
+    full execution of either has been a clean pass: the 2026-08-11 session
+    produced five defects — four from the checklist rungs and one from driving
+    real applications — and the 2026-08-13 sessions produced two more, a gesture
+    interrupted by a VT switch that ends <code>completed</code> where it must say
+    <code>cancelled</code>
+    (<a href="https://github.com/vitrin-os/vitrin-os/issues/275">issue #275</a>)
+    and a published recovery command that is inert against the wedge it is
+    published against
+    (<a href="https://github.com/vitrin-os/vitrin-os/issues/277">issue
+    #277</a>). Nothing here
     generalises to any other GPU, panel or kernel.</p>
 
     <div class="tw">
@@ -514,10 +529,21 @@ grant.pointer.click(640, 84)</pre>
           <td>No accessibility of any kind</td>
           <td>No screen reader, no magnifier, no on-screen keyboard, no sticky or
           slow keys, and no <strong>AT-SPI2</strong> bus <em>advertised</em> to a
-          realm — a missing service, never a confinement. Under decision D9 the
+          realm — a missing service, never a confinement. At
+          <code>--isolation=off</code> the
           host session bus, where <code>org.a11y.Bus</code> is activated, stays
-          connectable; nothing here blocks it, and the adversarial probe that
-          would prove otherwise has not been written.
+          connectable and nothing here blocks it. At the shipped
+          <code>--isolation=default</code> the core's own spawn docs record
+          it closed twice over — the realm's <code>/run</code> holds
+          one entry, <code>vitrin</code>, and the abstract socket the bus also
+          listens on is scoped to the realm's own network namespace —
+          so an operator who allow-lists <code>DBUS_SESSION_BUS_ADDRESS</code>
+          there gets a variable naming something that is not there, unless that
+          same operator names a host path in <code>binds</code>. That is the
+          confinement doing it, not this absence, and it is <em>derived from the
+          mount table rather than measured</em>: the adversarial probe that would
+          attempt <code>org.a11y.Bus</code> activation on every bus reachable from
+          inside a realm has still not been written.
           The semantic tree Phase 2 builds for <em>agents</em> is derived from
           accessibility technology and is <strong>not a substitute for
           it</strong> — different consumer, different transport, and only under a
@@ -556,9 +582,27 @@ grant.pointer.click(640, 84)</pre>
           <td>No portals</td>
           <td>No <code>xdg-desktop-portal</code>, and a realm is advertised no
           session bus: no portal file chooser, no screen sharing, no
-          notifications. It buys no security. Under decision D9 there is no
-          sandbox, so the host bus is still on the filesystem and still
-          connectable by any process of this uid.</td>
+          notifications. It buys no security — the absence is advertisement, not
+          reachability, and what closes it is the confinement rather than this
+          row. At <code>--isolation=off</code> every word of the older claim
+          still holds: <code>/run/user/&lt;uid&gt;/bus</code> is on the
+          filesystem, connectable by any process of this uid, and the
+          abstract-socket namespace is shared. At the shipped default the realm
+          is spawned into a mount namespace whose <code>/run</code> holds one
+          entry, <code>vitrin</code>, and into a network namespace, which scopes
+          the abstract-socket namespace away with it, so an operator who
+          allow-lists <code>DBUS_SESSION_BUS_ADDRESS</code> hands the realm a
+          variable naming something that is not there, unless that same operator
+          names a host path in <code>binds</code> (D-037 supersedes D9 for
+          that path only). Read that as a consequence of how the mount table is
+          built rather than as a measurement: no test asserts the absence of
+          <code>/run/user</code>, and the real-app confinement gate
+          (<code>tests/integration/test_real_confinement.py</code>) names the
+          session bus itself among the things it does <em>not</em> assert —
+          "That a realm cannot reach the session bus by other means", where the
+          gate's own words are that "a full escape survey is not this" —
+          so nothing in the tree rules out a route to the bus this row has not
+          thought of.</td>
         </tr>
         <tr>
           <td>One output, one visible realm</td>

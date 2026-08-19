@@ -1,4 +1,4 @@
-/* idle_probe.c -- the app side of WS-E.4.4 (issue #306): a Wayland client that
+/* idle_probe.c -- the app side of D-042 (issue #306): a Wayland client that
  * binds `zwp_idle_inhibit_manager_v1` and holds an inhibitor, so the shim's
  * relay can be driven at all.
  *

@@ -116,6 +116,16 @@ TRADEMARKS — not licensed by any of the above
     exists to prevent. Nominative use needs no permission; TRADEMARK.md
     states where the line falls.
 
+    The carve-out follows the mark, not the path. site/favicon.svg,
+    site/apple-touch-icon.png and site/social-card.png are byte-identical
+    copies of assets/brand/vitrin-favicon.svg,
+    assets/brand/apple-touch-icon.png and assets/brand/social-card.png —
+    duplicates kept so the landing page renders from a plain checkout,
+    while the published site is assembled from the assets/brand/
+    originals, which .github/workflows/pages.yml copies over the site/
+    tree at build time. They are the same trademarks under a second path,
+    so the catch-all below does not reach them either.
+
     assets/brand/generate.py is the exception inside the exception: the
     generator is repository tooling and is Apache-2.0 like the rest, and
     carries an SPDX header saying so. What it emits is not.

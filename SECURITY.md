@@ -7,7 +7,12 @@ blunt about where it actually is. Per decision **D-014**
 ([`docs/plan/20-decision-log.md`](docs/plan/20-decision-log.md)) the
 protocol spec is published early, versioned `0.x`, and explicitly tracks
 the reference implementation; every crate is `0.1.0`, the Python SDK is
-`0.1.0a0`, and the repository is in late Phase 1. There has been no
+`0.1.0a0`, and Phase 1 is complete while Phase 2 has only begun: its
+confinement track has landed through the seccomp deny-list of P2.6.4 — P2.6.3
+itself is not finished — and nothing of the powerbox, the egress path or the
+semantic work exists. The other work since has been the maintainer
+session-mode workstream WS-E, which **D-021** scopes as dogfooding rather than
+as a phase. There has been no
 release, no external audit, and no third-party security review.
 
 **The project makes no security guarantees at this stage.**
@@ -89,6 +94,22 @@ the same line.
   passing, `SO_PEERCRED` capture, and the backpressure / oversized-frame /
   fd-bomb termination policy. Anything that lets a connection stall or
   crash the compositor loop belongs here.
+- [`crates/vitrin-realm-init/`](crates/vitrin-realm-init) — the confinement
+  helper, and the second trusted binary in this tree. At
+  `--isolation=default` the core `execve`s it in the shim's place, and it is
+  what unshares the six namespaces, builds the mount table, `pivot_root`s,
+  enforces the Landlock ruleset (`landlock.rs`) and installs the seccomp
+  deny-list (`seccomp.rs`) before the shim's own `execve`; at
+  `--isolation=off` no helper runs at all. Much of what it does is not taken
+  on its word: the core writes `setgroups` and the uid/gid map itself and
+  reads all three back, reads the supervisor's namespace inodes, proves the
+  pid the helper names really is the supervisor's child and init of exactly
+  one nested pid namespace, and probes the realm's filesystem from outside
+  through `/proc/<pid>/root` — refusing the spawn wherever it cannot. A path
+  *past* that outside verification, or a confinement reported as applied and
+  not applied where no outside read can catch it, is a core finding and is
+  wanted; the Landlock rung is the named case of the latter, and the known
+  gap below says why.
 - [`crates/vitrin-protocol/`](crates/vitrin-protocol) — decoders reachable
   from untrusted input.
 - [`protocol/vitrin-v0.xml`](protocol/vitrin-v0.xml) — design-level
@@ -281,10 +302,42 @@ does not spend a weekend on something the project already says out loud:
   is not a remedy for a kernel that could be configured; it starts realms with
   no ruleset at all, and every grant described above stops applying to that
   session.
-- **The session D-Bus is reachable.** The core advertises no
-  `DBUS_SESSION_BUS_ADDRESS`, but `/run/user/<uid>/bus` is still on the
-  filesystem and still connectable, and the abstract-socket namespace is
-  still shared. Closed by P13 in Phase 2.
+- **The session D-Bus is reachable at `--isolation=off`, and not at
+  `--isolation=default`.** The core injects no `DBUS_SESSION_BUS_ADDRESS` and
+  points `XDG_RUNTIME_DIR` at the realm's private directory in either mode.
+  Unconfined that is advertisement rather than reachability:
+  `/run/user/<uid>/bus` is still on the filesystem, still connectable by any
+  process of this uid, and the abstract-socket namespace is still shared —
+  and an operator who allow-lists `DBUS_SESSION_BUS_ADDRESS` in `realm.toml`
+  there hands that realm the host's own bus. Since P2.6.2 the closure is the
+  kernel's rather than this project's cleverness: the realm's mount table
+  publishes a `/run` holding one entry, `vitrin`, so the bus has no path, and
+  `CLONE_NEWNET` — in the same six-flag `unshare` as the rest
+  (`crates/vitrin-realm-init/src/main.rs`, `CLONE_FLAGS`) — takes the
+  abstract-socket namespace with it, because abstract sockets are scoped to a
+  network namespace. That hedge is a mechanism hedge, and the evidentiary one
+  belongs beside it rather than instead of it: the closure is read off the
+  realm's mount table and the namespace inodes the core verifies at spawn, not
+  off any probe. **No test in the tree attempts the bus from inside a realm** —
+  `tests/integration/test_real_confinement.py` says in as many words that it
+  asserts nothing about a realm reaching the session bus by other means, and
+  P2.1.10's adversarial probe, which would attempt every route from inside a
+  realm to the host session's bus, does not exist (E2.1,
+  `docs/plan/02-phase-2-semantic-epochs.md`). On a page about reporting
+  vulnerabilities that distinction is the whole point: "the kernel closed it"
+  and "nobody has tried to open it" are different claims, and only the first is
+  being made here. So a report here has to name the isolation mode it was taken
+  under — and naming `default` is not sufficient on its own. The `binds` key
+  names any absolute path outside `/` and `/home`, so an operator who binds the
+  host's runtime directory into a realm puts the bus socket back inside it
+  under a key that says nothing about buses; name the `realm.toml` `binds` list
+  too, because a `default` realm carrying that bind is not the configuration
+  this bullet describes as closed. What P13 still owes is not the namespaces but **designated
+  egress**: the per-realm proxy, host:port-scoped grants, DNS resolution
+  pinned at grant time, and the scripted `ssh localhost` adversarial gate
+  (E2.7, `docs/plan/02-phase-2-semantic-epochs.md`) — none of which has
+  landed, and there is no `tests/integration/test_real_ssh_localhost.py` in
+  the tree.
 - **Same-uid separation is not attempted.** The `0700` runtime directory
   bounds other *users* of the machine, not other processes of this user.
 - **Realm identity is possession of a file descriptor.** The core hands
@@ -295,14 +348,32 @@ does not spend a weekend on something the project already says out loud:
   explicitly *not* the signed, append-only journal the PRD describes for a
   later phase. It is not tamper-evident and nothing in the tree claims it
   is.
-- **Consent occlusion has no mock-free gate.**
-  [#109](https://github.com/vitrin-os/vitrin-os/issues/109)'s consent half
-  is proven only by an in-process Rust test, not against the shipped
-  binary — which under this repo's own definition of done (plan D12) means
-  the property is **not proven** for `vitrind` as shipped. Treat it as an
-  open question rather than an established guarantee. A concrete
-  occlusion demonstrated against the shipped binary is genuinely valuable
-  and should go through the advisory channel.
+- **The consent gate proves occlusion, not the physical click.**
+  [#138](https://github.com/vitrin-os/vitrin-os/issues/138) closed the half
+  [#109](https://github.com/vitrin-os/vitrin-os/issues/109) left open:
+  `tests/integration/test_real_consent.py` drives the shipped
+  `target/debug/vitrind` over a real socket against a real app, shows the
+  exported footprint to *be* a raster of the core's own card on exactly the
+  rectangle the core named — accent ring on all four edges, its exact
+  perimeter count, body, buttons — *before* the absence of the app's pixels is
+  read out of it, and shows the capture path moving zero pixels while the
+  agent's own mid-prompt `observe()` still carries the live app. What it does
+  **not** prove is enumerated under "What the consent gate still does not
+  prove" in [`tests/integration/README.md`](tests/integration/README.md), and
+  the largest item is this one: headless has no pointer for a human to click
+  with, so the click is stood in for by a build-gated injector socket, and
+  while the injected decision is drained by the same `service_consent_round`
+  and `resolve_human` a real click reaches, it **bypasses `judge` entirely**.
+  The hit test, the 500 ms guard interval, the press-arms/release-commits
+  ladder and the origin check that stops an agent answering its own prompt are
+  held only by `crates/vitrin-core/src/consent/grab.rs`'s own tests and by a
+  human at a mouse (`shim/docs/firefox.md` §9). Nor does the gate say anything
+  about whether the card is framed in a colour a confined app cannot forge —
+  that is [#139](https://github.com/vitrin-os/vitrin-os/issues/139)'s half of
+  [#85](https://github.com/vitrin-os/vitrin-os/issues/85), adjudicated as not
+  an M1.4 criterion. A concrete occlusion demonstrated against the shipped
+  binary is still genuinely valuable and should go through the advisory
+  channel.
 - **The nested backend falls back to CPU compose while an overlay is up**,
   so the host window can show stale content for as long as a consent
   prompt or dead-man indicator lasts (argued in full at
@@ -310,11 +381,18 @@ does not spend a weekend on something the project already says out loud:
   own mock-free gate,
   [#117](https://github.com/vitrin-os/vitrin-os/issues/117), has not
   landed.
-- **Everything from Phase 2 onward does not exist.** Semantic trees,
-  epoch/CAS staleness rejection, the powerbox, the credential wallet,
-  network sessions, the X11 shim, the mission-control shell — no code, and
-  therefore no vulnerabilities. See
-  [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §6.
+- **Everything from Phase 2's *semantic* half onward does not exist.**
+  Semantic trees, epoch/CAS staleness rejection, the powerbox, the credential
+  wallet, network sessions, the X11 shim, the mission-control shell — no code,
+  and therefore no vulnerabilities. **Phase 2's confinement track is the
+  exception, and is very much code**: P2.6.1 landed as
+  `crates/vitrin-core/src/spawn/isolation.rs`, and P2.6.2–P2.6.4 plus P2.7.1
+  as the core-owned `crates/vitrin-realm-init` helper, so this sentence must
+  not be read as covering them — what they do and do not confine is the first
+  bullet of this list rather than a concept awaiting an implementation. See
+  [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §6, which records the same
+  two exceptions to the same omission rule, for the same reason — that
+  paragraph had already gone stale once.
 
 Two things that list does **not** mean. If a documented gap turns out to
 be materially worse than documented — a wider blast radius, an easier

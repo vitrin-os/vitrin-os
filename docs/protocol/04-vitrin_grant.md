@@ -1,6 +1,6 @@
 # vitrin_grant — capability handle and enforcement voice
 
-**Interface version:** 2 · **Connection class:** principal · **Messages:** 1 request *(since 2)* + 2 events
+**Interface version:** 2 · **Connection class:** principal · **Messages:** 3 requests *(all since 2)* + 2 events
 
 ## Purpose
 
@@ -257,7 +257,7 @@ IDL so a second implementation transcribing this enum has no name to invent.
 | `observe_cursor` | 0x8 | **no** — resolves `unsupported` | capture frames that include the human principal's cursor; meaningful only alongside `observe` |
 | `layout_arrange` | 0x10 | yes | arrange the granted realm's view, through the [`vitrin_layout_arrange`](18-vitrin_layout_arrange.md) facet; **one holder per output** — a live grant carrying it, or a petition still pending for it — so a second petition while either exists resolves `layout_held` |
 | `layout_focus` | 0x20 | yes | bind the output to the granted realm and direct the human's input there, through the [`vitrin_layout_focus`](17-vitrin_layout_focus.md) facet |
-| `realm_launch` | 0x200 | **no** — resolves `unsupported` | launch the realm template this grant addresses into a new realm instance, through the [`vitrin_launcher`](16-vitrin_launcher.md) facet |
+| `realm_launch` | 0x200 | yes | launch the realm template this grant addresses into a new realm instance, through the [`vitrin_launcher`](16-vitrin_launcher.md) facet |
 
 The **served** column describes the reference core. Whether a defined verb is
 served is a property of a *deployment*, so a client reads `unsupported` as
@@ -601,10 +601,12 @@ than fixed. Three consequences worth being explicit about:
   `realm_launch`.
 - **The rate ceiling is the only bound.** `max_event_rate` bounds the polling
   frequency, hence the channel's bandwidth. It is not a fix.
-- **A deployment that cannot afford it must not serve the verb.** No
-  deployment serves `realm_launch` today, so the channel is currently
-  unreachable; this paragraph is what the first deployment to serve it has to
-  weigh, written now while the enum entry is being frozen rather than after.
+- **A deployment that cannot afford it must not serve the verb.** The
+  reference core serves `realm_launch` (WS-E.1.1), so the channel is
+  reachable there rather than hypothetical, bounded by nothing but
+  `max_event_rate`; this paragraph was written while the enum entry was
+  being frozen, and is now what a deployment declining to serve the verb
+  is declining on.
 
 ## Flows
 
@@ -740,15 +742,18 @@ rules](00-conventions.md) guarantee.
   [`get_launcher`](#get_launcher) is the first facet minted this way rather
   than co-minted, and it is the worked example the layout mint follows: a
   structural mint on the grant, an inert facet, and a verb
-  (`realm_launch`) that stays refused `unsupported` until a deployment serves
-  it. The row stays here because *how it arrived* is what the next seam
-  copies.
+  (`realm_launch`) that was refused `unsupported` until a deployment served it
+  — the reference core did, at WS-E.1.1. The staging outlives its example: a
+  deployment that does not serve a defined verb still answers `unsupported`
+  rather than killing the connection, which is the whole of what defining a bit
+  ahead of serving it buys. The row stays here because *how it arrived* is what
+  the next seam copies.
 
 ## Version history
 
 | Version | Change |
 |---|---|
 | 1 | `resolved`, `refused`; no requests |
-| 2 | `get_launcher` (structural mint, request opcode 0); `verb` gains `realm_launch` = 512; `refusal` gains `capacity` = 8 |
+| 2 | `get_launcher` (structural mint, request opcode 0), `get_layout_focus` (opcode 1) and `get_layout_arrange` (opcode 2); `verb` gains `realm_launch` = 512; `outcome` gains `layout_held` = 6; `refusal` gains `capacity` = 8 |
 
 Neither version-1 event's signature changed, and no existing enum value moved.

@@ -36,7 +36,7 @@ conn.close()
 
 | Module | What it is |
 |---|---|
-| `vitrin_os.errors` | typed exception hierarchy (skeleton; ergonomics in P1.8.3) |
+| `vitrin_os.errors` | typed exception hierarchy — one distinct class per fatal code, petition outcome and refusal code, exhaustive by module-level assertion |
 | `vitrin_os.protocol` | enums and constants transcribed by hand from `protocol/vitrin-v0.xml` |
 | `vitrin_os.wire` | framing primitives: 8-byte header, the seven argument types, string padding |
 | `vitrin_os.messages` | per-message encoders (requests) and decoders (events) with opcode tables |
@@ -101,7 +101,7 @@ the core. Regenerate (deliberately only) through the single documented flow,
 `tests/golden/README.md`), which drives that test with
 `VITRIN_REGEN_GOLDEN=1`.
 
-## Error hierarchy (skeleton — fleshed out in P1.8.3)
+## Error hierarchy
 
 ```
 VitrinError

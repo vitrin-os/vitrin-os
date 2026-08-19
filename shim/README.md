@@ -292,7 +292,7 @@ log line it came from):
 | `zwp_relative_pointer_manager_v1` | `wlr_relative_pointer_manager_v1_create` — **WS-E.4.2**, carries `vitrin_shim_seat.relative_motion` |
 | `zwp_pointer_gestures_v1` | `wlr_pointer_gestures_v1_create` — **WS-E.4.2**, carries the four gesture events |
 | `zwp_pointer_constraints_v1` | `vitrin_constraint_create` (`src/constraint.c`) — **WS-E.4.2**, relays the app's pointer lock/confinement ask to the core and the core's verdict back; see `include/constraint.h` |
-| `zwp_idle_inhibit_manager_v1` | `vitrin_idle_create` (`src/idle.c`) — **WS-E.4.4**, relays "do not blank the screen" to the core as one bit per realm. No verdict comes back, because `zwp_idle_inhibitor_v1` defines no events; see `include/idle.h` |
+| `zwp_idle_inhibit_manager_v1` | `vitrin_idle_create` (`src/idle.c`) — **D-042** (#306), relays "do not blank the screen" to the core as one bit per realm. No verdict comes back, because `zwp_idle_inhibitor_v1` defines no events; see `include/idle.h` |
 | `zxdg_decoration_manager_v1` | `wlr_xdg_decoration_manager_v1_create` (declines SSD) |
 | `zwp_linux_dmabuf_v1` | `wlr_linux_dmabuf_v1_create_with_renderer` — **only with `--dmabuf`** |
 
@@ -333,7 +333,7 @@ the published site is fetched with no checksum at all
 ```bash
 meson setup build            # uses system wlroots-0.19 if available
 ninja -C build
-meson test -C build          # header-compiles, xdg-conformance, focus-succession
+meson test -C build          # header-compiles, idle-inhibit, xdg-conformance, focus-succession
 
 # Build the vendored wlroots from source (e.g. CI, or no system wlroots-0.19),
 # taking wlroots' own dependencies from the system:
@@ -382,10 +382,17 @@ reasoning for each assertion is in its header comment, and the wlcs failures
 that provoked it are annotated in
 [`wlcs/README.md`](wlcs/README.md). It and
 [`tests/acceptance/focus_succession.sh`](tests/acceptance/focus_succession.sh)
-are the two scripts here wired into `meson test`, because they are the two
-that need nothing but this tree's own binaries.
+and [`tests/acceptance/idle_inhibit.sh`](tests/acceptance/idle_inhibit.sh)
+are the three scripts here wired into `meson test`, because they are the ones
+that need nothing but this tree's own binaries — the last of them only where
+`wayland-protocols` ships the idle-inhibit XML `idle-probe` is generated from
+(`meson.build` gates it on its own `fs.exists`, so a moved XML costs the test
+rather than the shim), and only against
+[`tests/mock_core.c`](tests/mock_core.c), which makes it a **component** test of
+what the shim sends upstream and never milestone acceptance.
 
-Each of the three was measured failing before the code that makes it pass:
+Each of the three xdg-shell facts was measured failing before the
+code that makes it pass:
 the popup checks go red on the tree as it stood one commit earlier, with
 `xdg_surface#9: error 3: xdg_surface has never been configured` on the
 client's side and `globals-error: seq=13 code=3` in the shim's own ledger.
@@ -415,8 +422,8 @@ wlroots defers every focus change to an active keyboard grab and a menu is
 one, so that is the input that makes the whole mechanism silently do nothing.
 Every assertion's reasoning is in the client's header comment.
 
-This is the second script here wired into `meson test`, on the same grounds as
-`xdg_conformance.sh`: headless, GPU-free, no seat device and no core
+This is another of the three scripts here wired into `meson test`, on the same
+grounds as `xdg_conformance.sh`: headless, GPU-free, no seat device and no core
 (`--no-upstream`), because `vitrin_seat_init` runs unconditionally at bring-up
 so the virtual keyboard exists and real `wl_keyboard.enter`/`leave` events can
 be observed. It is a **component** test of the shim, not milestone evidence:
@@ -467,6 +474,49 @@ with `VITRIN_SKIP_GTK_GATE=1`).
 
 ```bash
 BUILD_DIR=./build bash tests/acceptance/seat_input_replay.sh
+```
+
+[`tests/acceptance/app_spawn.sh`](tests/acceptance/app_spawn.sh)
+— the P1.6.5 criteria (**#104**): the shim itself forks and execs the app, so
+the process spine is one line — `mock-core` → `vitrin-shim` → `weston-terminal`
+— rather than an app launched beside a shim already running. Four mechanical
+checks on the real process tree and the real wire: ancestry (the terminal is
+the shim's child), at least one committed frame reaching the core (it rendered,
+it did not merely start), descriptor isolation (the app's `/proc/<pid>/fd`
+holds none of the shim's private descriptors, above all not the shim's core
+socket on fd 3, compared by inode so descriptor-number reuse cannot fool it),
+and teardown (`SIGTERM` to the shim reaps the app rather than orphaning it or
+leaving a zombie). Missing `weston-terminal` is a **fail**, not a skip, unless
+`VITRIN_SKIP_APP_SPAWN=1` declares the gap. The core here is
+[`tests/mock_core.c`](tests/mock_core.c), so like the two scripts above it this
+is a **component** test of the shim, not milestone evidence; it has its own CI
+step in the `shim` job.
+
+```bash
+BUILD_DIR=./build bash tests/acceptance/app_spawn.sh
+```
+
+[`tests/acceptance/idle_inhibit.sh`](tests/acceptance/idle_inhibit.sh)
+— **#306**: the idle-inhibit relay, driven from the only side that
+can produce one. An inhibit is *requested* by the app, so no core-side stimulus
+can synthesise it; [`tests/idle_probe.c`](tests/idle_probe.c) binds
+`zwp_idle_inhibit_manager_v1` and holds inhibitors while
+[`tests/mock_core.c`](tests/mock_core.c) reads the `idle_inhibit` requests off
+the wire. Two scenarios: (A) an app creating three inhibitors and destroying
+them all must produce exactly one `held` and one `released` — the aggregation
+the wire's one-bit-per-realm shape requires, with a second `held` failed by the
+mock core so "the shim relays levels instead of edges" is red rather than
+invisible; and (B) an app killed while still holding one must still leave the
+shim releasing, which is the leak that pins a human's panel awake forever. It
+is wired into `meson test` alongside `xdg_conformance.sh` and
+`focus_succession.sh`, and is built only where `wayland-protocols` ships the
+idle-inhibit XML. **It runs under the mock core, so it is a component test and
+never milestone evidence**; the bare-metal half — that a panel actually stayed
+lit — is [`../docs/drm-bringup.md`](../docs/drm-bringup.md) step 17, written
+and not yet run.
+
+```bash
+BUILD_DIR=./build bash tests/acceptance/idle_inhibit.sh
 ```
 
 [`tests/acceptance/firefox_bringup.sh`](tests/acceptance/firefox_bringup.sh)

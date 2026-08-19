@@ -452,7 +452,7 @@ pub(crate) struct Kernel {
     /// cannot reach, which is why [`crate::deadman::apply`] clears it
     /// explicitly.
     pub clipboard_slot: crate::clipboard::ClipboardSlot,
-    /// **Which realms are asking that the screen not blank** (WS-E.4.4, issue
+    /// **Which realms are asking that the screen not blank** (D-042, issue
     /// #306, D-042): the core-side record behind
     /// `vitrin_shim_session.idle_inhibit`.
     ///
@@ -2336,7 +2336,7 @@ pub(crate) fn service_lock_round<H: PreemptionHook>(
 /// [`note_seat_presence`] already takes — rather than a `bool` a future caller
 /// could pass wrongly and nothing would catch.
 ///
-/// **And an idle inhibit does not reach the lock either** (WS-E.4.4, issue
+/// **And an idle inhibit does not reach the lock either** (D-042, issue
 /// #306). This round reads [`Kernel::idle_inhibits`] and hands the answer to
 /// [`crate::backend::blank::SessionActivity::tick`], which is the *blank's* own
 /// decision and nothing else. It writes no clock, so `--lock-idle 600` still
@@ -2372,7 +2372,7 @@ pub(crate) fn service_blank_round<H: PreemptionHook>(
     surface: &mut crate::backend::blank::BlankSurface,
     now: Instant,
 ) -> bool {
-    // **Recomputed every round from live records, never stored** (WS-E.4.4,
+    // **Recomputed every round from live records, never stored** (D-042,
     // issue #306): does the realm the human's input is bound to hold an idle
     // inhibit? Level-triggered for `reconcile_pointer_constraints`' reason -- an
     // inhibit that stops counting because the human looked elsewhere is a change
@@ -4415,7 +4415,7 @@ fn apply_pointer_constraint_ask<H: RuntimeHost>(host: &mut H, realm_id: &RealmId
     send_constraint_verdicts(realms, owed);
 }
 
-/// Fold a shim's parked `idle_inhibit` ask into the table (WS-E.4.4, issue
+/// Fold a shim's parked `idle_inhibit` ask into the table (D-042, issue
 /// #306).
 ///
 /// The third sibling of [`apply_selection_answer`] and
@@ -4773,7 +4773,7 @@ fn dispatch_shim<H: RuntimeHost>(
             // (WS-E.4.2): a `pointer_constraint` ask from a shim that has just
             // violated the protocol must not reach the constraint table.
             apply_pointer_constraint_ask(host, realm_id);
-            // ...and the third, on the same terms (WS-E.4.4): an `idle_inhibit`
+            // ...and the third, on the same terms (D-042): an `idle_inhibit`
             // from a shim the core is about to bury must not hold the human's
             // panel awake for a realm that is already dying.
             apply_idle_inhibit_ask(host, realm_id);
@@ -8698,7 +8698,7 @@ mod tests {
     }
 
     /// **An app's idle inhibit reaches the blank's own round, and dies with its
-    /// realm** (WS-E.4.4, issue #306).
+    /// realm** (D-042, issue #306).
     ///
     /// The unit tests in `backend::blank` hold the table and the guard; this one
     /// holds the **wiring**, which is what would silently break: a
@@ -10659,7 +10659,7 @@ mod tests {
         // cannot re-express a principal's actuation either. A constraint is
         // also derived from no grant, so it adds no verb whose requests the
         // server could fail to enforce. That is D-032, not this invariant.
-        // Re-pinned 47 -> 48 by WS-E.4.4 (issue #306), decision taken rather
+        // Re-pinned 47 -> 48 by D-042 (issue #306), decision taken rather
         // than skipped. The one added message is
         // `vitrin_shim_session.idle_inhibit`, a REQUEST on the shim bootstrap
         // object, on the shim connection class no principal can address. It is

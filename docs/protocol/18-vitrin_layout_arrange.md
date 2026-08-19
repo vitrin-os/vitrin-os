@@ -169,7 +169,7 @@ is [`layout_focus`](17-vitrin_layout_focus.md)'s alone.
 is `invalid_opcode`, as is any opcode this interface does not define. A
 `mode` value outside the enum is `invalid_argument` — plain enums decode by
 whole-value membership, and an out-of-range value is grammar the client could
-have known, which is the [error razor](00-conventions.md#5-the-error-razor)'s
+have known, which is the [error razor](00-conventions.md#51-the-razor)'s
 own test. A frame whose declared size or fd count disagrees with the signature
 is `oversized` or `fd_violation`.
 

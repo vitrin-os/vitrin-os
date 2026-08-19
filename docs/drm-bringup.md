@@ -28,9 +28,9 @@ in this repository, and it is published as such in
 
 | | |
 |---|---|
-| **The backend it describes** | **Exists and has been run once** (#218, merged; first light 2026-08-09). `crates/vitrin-core/src/backend/drm.rs` is WS-E.3.2 / issue #218 and has not landed. `grep -rn drm crates/vitrin-core/src/main.rs` returns nothing today. |
+| **The backend it describes** | **Exists and has been run on hardware** (#218, merged; first light 2026-08-09, with further rungs recorded on 2026-08-11 and 2026-08-13 below). `crates/vitrin-core/src/backend/drm.rs` landed with it, behind the `drm-backend` feature — which is **off by default**, because two of the crates it pulls panic the build when their `pkg-config` probe is absent (`crates/vitrin-core/Cargo.toml`, "Why it is not in `default`"), so a bare-metal `vitrind` is a build with that feature ON and step 2 below passes `--features drm-backend` explicitly. `grep -rn drm crates/vitrin-core/src/main.rs` names the `--drm` arm and the `--drm`-only flags today. |
 | **Why it is written first** | #220's decision 1: the honest limit and the escape route must never be the thing that slipped behind the code. The `limits.md` entry and this page land with or ahead of #218's PR. |
-| **Has it been executed?** | **No.** See [Record the run](#record-the-run) at the bottom, and the outstanding acceptance criterion recorded with it. |
+| **Has it been executed?** | **Yes, and more than once.** Two runs on 2026-08-09 — first light, then the fix-confirming run — are recorded under [Record the run](#record-the-run), and step 13a has its own record block, executed 2026-08-13. Steps 12a, 16 and 17 are still marked NOT YET RUN, and #220's frame-cadence field was never captured in fps; the record says so where it stands. |
 | **Who wrote it** | Not a human at the machine. Every fact below is marked verified or inferred — see the convention immediately below. |
 
 ### Verified vs inferred — the convention, and why it is here
@@ -86,11 +86,23 @@ backend that takes the first DRM device it finds can take `card2`, which has
 zero connected connectors. #218's own rule ("refuse to start with a named error
 on zero or more than one connected connector") then fires on the *wrong card* and
 the error will read like a hardware fault rather than a device-selection bug.
-**RESOLVED 2026-08-09 — there is no card argument, and none was needed.**
-`--drm` takes no card selector; the backend calls smithay's
+**MARKED RESOLVED 2026-08-09 — REOPENED 2026-08-13. The 2026-08-09 entry is
+kept below word for word, because what it got wrong is the reusable part:**
+"RESOLVED 2026-08-09 — there is no card argument, and none was needed. `--drm`
+takes no card selector; the backend calls smithay's
 `udev::primary_gpu(&seat_name)` and picks the seat's primary GPU itself. On the
 first run it selected `/dev/dri/card1` — the iGPU, which is the one with the
-panel — unprompted and correctly. Hazard H1 below did not materialise.
+panel — unprompted and correctly. Hazard H1 below did not materialise."
+
+**Why it is reopened:** the step 13a run of 2026-08-13 opened `/dev/dri/card2`
+on the same machine, with the same absent card argument — see that run's own
+record block below. The choice is now observed twice with two different answers:
+`card1` on 2026-08-09, `card2` on 2026-08-13. "There is no card argument" was
+never the same statement as "the automatic choice is stable", and the 2026-08-09
+entry read the first as proof of the second. Do not hard-code either node as the
+right one, here or in a command line: read the node the run itself names in
+`DRM device opened card=`, and write it into the record. Why the answer changed
+has not been established.
 
 **H2 — `seatd` is not running, so libseat must use its logind backend.**
 `libseat.so.1` links `libsystemd` and carries both `seatd_impl` and
@@ -408,13 +420,16 @@ ls -l /dev/dri/
 | Your tty3 session, `Active=yes` | as step 4 | — |
 | You can `test -r /dev/dri/card1` | Permission denied | The logind ACL did not follow you to this session. You are in `video` [verified] so this should not happen; if it does, do not `chmod` anything — it means logind is not treating this as your active session |
 
-**No card argument exists, and the automatic choice was right.** The backend
+**No card argument exists, and the automatic choice is not stable.** The backend
 resolves the card through `udev::primary_gpu(&seat_name)`, and on 2026-08-09 it
 chose `/dev/dri/card1` — the iGPU driving the panel. Hazard H1 (the NVIDIA card
-present, `nvidia_drm` loaded, nothing connected) did **not** materialise: the
-run's log records `DRM device opened card=/dev/dri/card1`. Keep the hazard
-written down anyway — it is a property of this machine, not of the code, and a
-future `primary_gpu` or a docked external display could still land on card2.
+present, `nvidia_drm` loaded, nothing connected) did **not** materialise on that
+run: the run's log records `DRM device opened card=/dev/dri/card1`. The choice
+did not hold, though — on 2026-08-13 the same absent argument opened
+`/dev/dri/card2` (step 13a's record block), which is why H1 is reopened above
+rather than historical. Keep the hazard written down — it is a property of this
+machine, not of the code — and read the node out of the run's own
+`DRM device opened card=` line before you believe either one of them.
 
 ## 6. Start it — this is the irreversible step
 

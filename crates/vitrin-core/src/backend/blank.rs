@@ -29,7 +29,7 @@
 //!
 //! # An app may ask the blank not to fire, and it may not ask the lock
 //!
-//! WS-E.4.4 (issue #306) added the fourth suppression term to
+//! D-042 (issue #306) added the fourth suppression term to
 //! [`SessionActivity::tick`]: a confined app holding a
 //! `zwp_idle_inhibit_manager_v1` inhibitor, relayed to the core as
 //! `vitrin_shim_session.idle_inhibit` and recorded in [`IdleInhibitTable`].
@@ -504,7 +504,7 @@ impl SessionActivity {
     /// thing to keep in step. Worst-case lateness is one second against a
     /// multi-minute timeout.
     ///
-    /// # This is the only place the blank is decided (WS-E.4.4, issue #306)
+    /// # This is the only place the blank is decided (D-042, issue #306)
     ///
     /// Four suppression terms, all of them here: the wrong phase, a seat that
     /// is somebody else's (D-030(7)), no `--blank-idle` at all, and — since
@@ -656,7 +656,7 @@ impl SessionActivity {
 }
 
 /// One shim's `vitrin_shim_session.idle_inhibit` request, decoded and parked
-/// (WS-E.4.4, issue #306).
+/// (D-042, issue #306).
 ///
 /// The wire message with nothing added: `crate::shim` has already checked that
 /// `surface` names a live surface on that connection (an id this connection
@@ -672,7 +672,7 @@ pub(crate) struct IdleInhibitAsk {
     pub state: IdleInhibitState,
 }
 
-/// **Which realms are asking that the screen not blank** (WS-E.4.4, issue
+/// **Which realms are asking that the screen not blank** (D-042, issue
 /// #306): the whole core-side record behind
 /// `vitrin_shim_session.idle_inhibit`.
 ///
@@ -1374,7 +1374,7 @@ mod tests {
         );
     }
 
-    // ---- the idle inhibit (WS-E.4.4, issue #306) ---------------------------
+    // ---- the idle inhibit (D-042, issue #306) ---------------------------
 
     fn realm(name: &str) -> RealmId {
         RealmId::new(name)

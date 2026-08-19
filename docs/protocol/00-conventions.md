@@ -612,7 +612,8 @@ mint**. This classification, together with the ordering guarantee (§4), is what
 lets the SDK stay single-threaded and blocking.
 
 The structural mints are `get_realm`, `create_surface`, `get_seat`, and (since
-version 2) `get_launcher`: the request only mints an object, so it is neither
+version 2) `get_launcher`, `get_layout_focus` and `get_layout_arrange`: the
+request only mints an object, so it is neither
 reply-bearing nor refusable — no terminal event, no wire acknowledgement. A
 malformed mint is a fatal object-graph error; a mint whose target is unknown
 or vacant surfaces that on first *use* (e.g. petitions resolving
@@ -641,15 +642,18 @@ distinct event rather than a sentinel string.
 
 `move`, `button`, `scroll` (`vitrin_actuator_pointer`); `type`
 (`vitrin_actuator_text`); `attach`, `damage`, `commit`
-(`vitrin_shim_surface`); `selection` and `pointer_constraint`
-(`vitrin_shim_session`, both *since 2*). These carry no reply. Their **refusals
+(`vitrin_shim_surface`); `focus` ([`vitrin_layout_focus`](17-vitrin_layout_focus.md))
+and `set_fullscreen` ([`vitrin_layout_arrange`](18-vitrin_layout_arrange.md));
+`selection`, `pointer_constraint` and `idle_inhibit`
+(`vitrin_shim_session`). Every message named after `commit` is *since 2*. These
+carry no reply. Their **refusals
 MAY be coalesced**:
 
 - at most one `refused(rate_limited)` per grant per bucket-refill window;
 - at most one `refused` per grant per `(verb, code)` pair until a subsequent
   request on that grant succeeds.
 
-Two qualifications on the shim-connection pair, both stated rather than left to
+Three qualifications on the shim-connection trio, all stated rather than left to
 be inferred. `selection` was **missing from this list** until WS-E.4.2 and is
 added here with the message that noticed it; it has no refusal at all, so the
 coalescing rule is vacuous for it. `pointer_constraint` **does** get an answer —
@@ -661,6 +665,23 @@ one-to-one to the ask would leave an app locked with no message able to tell it
 otherwise. For that message the coalescing licence above is **overridden in the
 strict direction**: the core sends at most one `pointer_constraint_state` per
 transition and never coalesces two different states.
+`idle_inhibit`, the third, needs no override in either direction: it carries no
+serial and has no verdict event ([`vitrin_shim_session`](09-vitrin_shim_session.md)),
+so there is no answer to coalesce and none to hold stricter.
+
+This list is a **closed enumeration**, and it has now gone stale twice.
+`selection` above records the first. The second is this edit: `focus`,
+`set_fullscreen` and `idle_inhibit` all landed at version 2 without arriving
+here, and are added after the fact rather than in the change that shipped them.
+What would catch the next omission without inventing a tool: §6's three classes
+partition every `<request>` in `protocol/vitrin-v0.xml`, of which there are
+**twenty-three** — five
+reply-bearing ([§6.1](#61-reply-bearing-requests)), six structural mints
+([§6](#6-delivery-classification)), and the **twelve** named above. Those counts
+are stated as numbers *and* as lists for the same reason the version table's
+enum count is ([§7.3](#73-version-semantics)): counting `<request name=` in
+`protocol/vitrin-v0.xml` and comparing it against the number is the cheapest way
+for a reader to notice a drop, and nothing in CI does it for them.
 
 ### 6.3 Non-error, legal-but-noteworthy cases
 
@@ -807,15 +828,16 @@ else:
 | `vitrin_shim_session` | events `request_selection`, `offer_selection`, `pointer_constraint_state`; requests `selection`, `pointer_constraint`, `idle_inhibit` |
 | `vitrin_shim_seat` | events `relative_motion`, `gesture_begin`, `gesture_swipe_update`, `gesture_pinch_update`, `gesture_end` |
 
-Plus, at the same version and for the same reason, seven enums that carry
+Plus, at the same version and for the same reason, eight enums that carry
 arguments of those messages and are defined nowhere else:
 `vitrin_shim_session.selection_status`,
 `vitrin_shim_session.pointer_constraint_kind`,
 `vitrin_shim_session.pointer_constraint_lifetime`,
 `vitrin_shim_session.pointer_constraint_status`,
 `vitrin_shim_session.idle_inhibit_state`,
-`vitrin_shim_seat.gesture_kind` and
-`vitrin_shim_seat.gesture_state`. Enum entries carry no `since` of their own
+`vitrin_shim_seat.gesture_kind`,
+`vitrin_shim_seat.gesture_state` and
+`vitrin_layout_arrange.mode`. Enum entries carry no `since` of their own
 (see [§7.4](#74-growth-rules-wayland-style)), so the version a new enum belongs
 to is recorded here or nowhere.
 
@@ -838,23 +860,49 @@ to is recorded here or nowhere.
 > Three enums in one change is the largest single addition this paragraph has
 > taken, and therefore the likeliest to be dropped next time.
 >
-> **It did not go stale a third time.** WS-E.4.4 (issue #306) appended
-> `vitrin_shim_session.idle_inhibit` and its `idle_inhibit_state` enum, and both
-> rows above were extended in that same edit — the first addition since the rule
-> below was written down that had the warning above already in front of it. The
-> enum count in the paragraph *above* is stated as a number ("seven") *and* as a
-> list on purpose: the number is what a reader checks the list against, and a
-> disagreement between the two is the cheapest possible way to notice a drop.
+> **It did not go stale a third time by omission of a message.** Issue #306
+> appended `vitrin_shim_session.idle_inhibit` and its `idle_inhibit_state` enum,
+> and both rows above were extended in that same edit — the first addition since
+> the rule below was written down that had the warning above already in front of
+> it. The enum count in the paragraph *above* is stated as a number ("eight")
+> *and* as a list on purpose: the number is what a reader checks the list
+> against, and a disagreement between the two is the cheapest possible way to
+> notice a drop.
+>
+> **It went stale a third time by omission of an enum, and the check fired with
+> nobody acting on it.** The enum list has been short by one since the edit that
+> created it: WS-E.4.2 (#255) built it out of the enums *that* change was
+> landing plus the clipboard's, and never swept the enums already reachable from
+> the message table above it. `vitrin_layout_arrange.mode` carries
+> `set_fullscreen`'s only argument, is defined nowhere else, and landed at
+> WS-E.1.4 (#210) — before the list existed, and before WS-E.1.7 (#232)
+> put `set_fullscreen` into the message table it is checked against. So the
+> count read "seven" over a list that should have held eight for the whole of
+> its life, and the number-versus-list disagreement advertised one paragraph up
+> as "the cheapest possible way to notice a drop" was sitting there to be
+> noticed the entire time. It reads "eight" now, and the enum is listed. Cheap
+> to notice is not the same as noticed: a check nobody re-runs has stopped being
+> a check, which is the failure mode this whole block exists to document rather
+> than the one it was written to prevent.
 
 A version-1
 connection is served exactly as before: it never sees a `since="2"` event, and
 sending a `since="2"` opcode on it is fatal `invalid_opcode`. One thing is
 deliberately *not* version-gated: a **verb bit**. The `verb` bitfield is a
 single mask checked identically on every negotiated version, so a version-1
-connection may petition for `realm_launch` and is answered `unsupported`
-rather than killed — which is the entire reason a bit is defined before it is
-served (§5.1's razor: a well-formed request the deployment will not serve is
-recoverable).
+connection may petition for `realm_launch` (512) and is answered rather than
+killed — `unsupported` there, because version 1 cannot mint the
+[`vitrin_launcher`](16-vitrin_launcher.md) facet at all. A recoverable answer
+standing where a fatal `invalid_argument` would otherwise fall is the entire
+reason a bit is defined **before it is served** (§5.1's razor: a well-formed
+request the deployment will not serve is recoverable). `realm_launch` was that
+staging's worked example, and a briefer one than the argument implies: the bit
+went on the wire in **WS-E.1.1**'s protocol half (#225), the reference core
+refused every petition naming it `unsupported`, and WS-E.1.1's core half (#207)
+served it two PRs later. It is served now — `observe_cursor` is the bit left
+standing in that posture — and the rule the example stood for did not move with
+it: a deployment that does not serve a defined verb answers `unsupported`,
+never a killed connection.
 
 > **Implementation status, stated rather than implied.** The rule above binds
 > the *protocol*. The shipped core does not yet implement it: `vitrind`
@@ -1002,6 +1050,7 @@ record of *how* it arrived, which is what a later seam copies.
 | **relative pointer motion** *(landed, version 2)* | one `since="2"` event `relative_motion(dx, dy, dx_unaccel, dy_unaccel, origin)` on [`vitrin_shim_seat`](11-vitrin_shim_seat.md#relative_motion), at event opcode 5, and **no verb bit** | Appended beside `motion` rather than changing it, because a signature is immutable forever and because the two are not alternatives: one physical movement produces both, and an app binds whichever it understands. It ends with `origin`, so B2 holds structurally. **Both an accelerated and an unaccelerated delta are carried**, since an app that wants the raw one cannot reconstruct it and a shim asked to supply one from the other would be inventing a value. **No timestamp**, deliberately — the shim stamps its own replay clock, and a device clock beside it would be a second unsynchronised one; the cost (a consumer integrating over `dt` gets arrival time, not event time) is paid rather than argued away. **No verb bit, positively**: this is core→shim delivery on the physical path, `vitrin_shim_seat` carries no `@verb` and no requests, and an emulated source stays additive because the tag is already there |
 | **pinch and multi-finger swipe** *(landed, version 2)* | four `since="2"` events on [`vitrin_shim_seat`](11-vitrin_shim_seat.md#gesture_begin) at opcodes 6–9 — `gesture_begin(kind, fingers, origin)`, `gesture_swipe_update(dx, dy, origin)`, `gesture_pinch_update(dx, dy, scale, rotation, origin)`, `gesture_end(kind, state, origin)` — plus the `gesture_kind` and `gesture_state` enums, and **no verb bit** | Swipe and pinch **share** their begin and end because those two signatures are identical in the gesture vocabulary being served, and a signature is immutable forever: four events with no dead argument, rather than six with duplicated ones or two phase-tagged events whose deltas and completion flag are meaningless in two phases out of three. A further kind (a hold, say) is therefore an **appended `gesture_kind` entry and no new event** — which is what makes the shared begin/end pay for itself. Two-finger scroll was **already served** by `scroll`, so this row closes a narrower gap than "gestures". The one non-obvious cost is a *pairing* obligation, not a signature one: the core owes exactly one `gesture_end` per `gesture_begin` it sent, on every path, or a begin with no end is the latched-modifier failure wearing a new shape — an obligation, not yet fully discharged: the core mints a `cancelled` end on a realm switch and a seat pause, and **not** when a consent card or the lock screen raises, which withhold the updates and then deliver the device's own end. `gesture_end`'s IDL description names that gap and says closing it is owed |
 | **pointer lock: the ask and the core's verdict** *(landed, version 2)* | two `since="2"` messages on [`vitrin_shim_session`](09-vitrin_shim_session.md#pointer_constraint-since-2) — the `pointer_constraint` request at request opcode 3 and the `pointer_constraint_state` event at event opcode 3 — plus the `pointer_constraint_kind`, `pointer_constraint_lifetime` and `pointer_constraint_status` enums, and **no verb bit**; **not** on `vitrin_shim_seat` | **The interface choice was forced by B2, not chosen.** Every `vitrin_shim_seat` event ends with `origin`, and `origin` names a human's device or a principal's actuator; a lock is asked for by the *confined app*, which is neither, so any tag it carried would be false on the one interface whose design idea is that the tag never drifts. `vitrin_shim_seat` also defines no requests by schema, so it could not carry the ask at all. The session bootstrap already carries shim→core requests and reuses the cross-realm clipboard's shape *with the asking party reversed*: the app asks, the core decides, and the state lives where nothing outside the core can strand it. The input half had already landed as `relative_motion`, so this pair added no seat event and took no seat opcode. **One message is the whole state machine's input** — `kind = none` is the withdrawal — so a withdrawal cannot race a set, and the verdict is deliberately **not** a terminal event (§6.2): a constraint deactivates for reasons the shim never asked about, and an answer bound one-to-one to the ask would leave an app locked with nothing able to tell it otherwise. `surface` is the protocol's **first `object` argument**, and its first nullable one. **No verb bit, positively**: the asking party is a confined app rather than a wire principal, so a constraint is derived from no grant and revoking every grant in a session leaves it untouched. Two costs are named on the request itself rather than left to be discovered: the region is one **rectangle**, so a non-rectangular confinement is widened to its bounding box without the app being told, and `lifetime` carries Wayland's `oneshot` though nothing here has yet needed it. Qualify it **`pointer_constraint`** or *pointer lock*: bare `constraint` already means a **petition** constraint here (`request_grant`'s `flags`, and the `set_constraint` builder row above) |
+| **idle inhibition** *(landed, version 2)* | one `since="2"` request on [`vitrin_shim_session`](09-vitrin_shim_session.md#idle_inhibit-since-2) — `idle_inhibit(surface, state)` at request opcode 4 — plus the `idle_inhibit_state` enum, and **no verb bit** and **no event** | App-asked like the pointer constraint and landing in the same place, for one further reason: what it asks about is not input at all but the human's own panel. No signature changed and a version-1 shim never sends it. **No verdict event, positively**: `zwp_idle_inhibitor_v1` defines no events at all, so an app's only observable is whether its screen blanked, which makes a refusal both unobservable and harmless — [§5.1](#51-the-razor)'s recoverable half has nothing to carry, and this is the one place the pair differs from `pointer_constraint`, whose app *is* waiting for an activation and would latch forever without one. **No verb bit, positively**: an inhibit is asked for by a confined app rather than by a wire principal, so no grant confers it, no revocation reaches it, and the dead-man chord leaves it alone ([D-042](../plan/20-decision-log.md)). One bit per realm rather than a count, because the core is deciding one question about one panel and object lifetimes are visible only to the shim that holds them. **Three** things are named on the request itself rather than left to be discovered: an inhibit held by a realm the human is not looking at holds nothing; an inhibit suppresses the **blank** and never the **lock**; and the realm gate **bounds Wayland's own "only while this surface is visible" advice without discharging it** — a shim aggregates inhibitor *objects* and is not required to stop counting one whose surface has been unmapped but not destroyed, so an app holding a live inhibitor over a surface it has hidden still holds off the blank for as long as the human is looking at that realm. That is per-realm gating's accepted cost and a named gap, not a defect in either side's implementation. **One cost this column cannot argue away**: appending at a version that already shipped means the integer `2` no longer names one message set, so a shim built against this IDL and pointed at an older version-2 `vitrind` is answered with the `UnknownOpcode` catch-all — log-and-close on a shim connection — and loses its realm with nothing on the wire naming a version mismatch as the cause. Within [§7.4](#74-growth-rules-wayland-style)'s letter, an exception to [§7.3](#73-version-semantics)'s semantics, taken knowingly and owed to P2.1.2's version matrix ([D-042](../plan/20-decision-log.md)(4)) |
 | touch and tablet events | new `since="2"` events on `vitrin_shim_seat`, each ending with `origin` | **Not yet served, not refused** — the distinction is load-bearing. The decision that left them out rests on one machine's measured device set (no `INPUT_PROP_DIRECT` node, no pen tool), which is evidence about a laptop rather than a property of a class, and a permanent wire protocol may not foreclose a device class on that ground. Each carries the evidence that reopens it: for **touch**, a touchscreen in the measured device set *and* an application that needs it; for **tablet**, a tablet or stylus device, the application half already being banked. Purely additive whenever either arrives — appended events, B2 satisfied structurally, nothing already here changed — and until then the correct behavior is the one already shipped: **do not advertise a `wl_seat` capability the wire cannot deliver**, because a class advertised and never delivered is worse than an absent one |
 | `hello_fd` credential sibling | new `since="2"` fd-borne request on `vitrin_handshake` | `hello`'s signature is frozen forever; oversized credentials arrive via a sibling carrying one fd, so the 32768-byte in-frame bound is never a wall |
 | proof-of-possession credential exchange | new `since="2"` challenge event + response request on `vitrin_handshake` | version-0 schemes are bearer-shaped (presented whole in `hello`); a `credential_type` demanding proof of possession (e.g. X.509-SVID) adds a server-driven exchange inside VERIFYING as appended messages — the exchange is part of the handshake itself, so the response request is exempt from the queued-until-BOUND rule (which scopes to non-handshake requests, §7.1) and the unauthenticated deadline stays armed while the server awaits the response; `hello` and `bound` stay frozen, and version-1 connections and bearer schemes never see the new messages |

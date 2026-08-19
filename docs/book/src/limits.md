@@ -1150,16 +1150,29 @@ than budgetary. Eight of them, named rather than summarised:
 
   Say the second GPU precisely, because the loose word is the misleading one.
   That laptop has a second DRM device — `/dev/dri/card2`, `nvidia`, with
-  `nvidia_drm` loaded and all four of its connectors disconnected. It is
-  **entirely unexercised, not "supported and untested"**: the backend resolves
-  its card through `udev::primary_gpu(&seat_name)` and opens exactly that one,
-  there is no PRIME path, no multi-GPU renderer and no buffer import between
-  devices anywhere in this repository, and on 2026-08-09 the selection chose
-  `card1` on its own. Nothing here has ever opened `card2`, so there is no
-  result about it to report in either direction. "Untested" would imply a path
-  exists that nobody exercised; none exists. **No issue tracks a hardware
-  matrix**, and none should: a matrix is a support treadmill the PRD names as
-  the thing that consumed prior alternative display servers, not a defect.
+  `nvidia_drm` loaded and all four of its connectors disconnected, which is how
+  [`docs/drm-bringup.md`](https://github.com/vitrin-os/vitrin-os/blob/main/docs/drm-bringup.md)'s
+  hazard H1 records it. What this project has exercised is **one device node at
+  a time, whichever one the seat's primary GPU resolves to**: the backend
+  resolves its card through `udev::primary_gpu(&seat_name)` and opens exactly
+  that one — and **that selection has now been observed twice with two different
+  answers**, `card1` on 2026-08-09 and `/dev/dri/card2` on the step-13a run of
+  2026-08-13, from the same machine. An earlier version of this paragraph said
+  "nothing here has ever opened `card2`"; that is retracted, and it was already
+  false when this page last said it, which is the more useful half of the
+  correction. What opening `card2` established is narrow: that session lit a
+  2560x1600 output and carried six touchpad rungs through it, so the node the
+  selection chose worked. What it did **not** establish is which device sat
+  behind the node — the record names the node and not the driver, so whether
+  the selection took the NVIDIA GPU or took the iGPU under a renumbered node is
+  **not recorded either way**, and nothing here is evidence that this backend
+  drives an NVIDIA card. Hard-code neither node. Nothing about a *multi-GPU*
+  path changed either: there is no PRIME path, no multi-GPU renderer and no
+  buffer import between devices anywhere in this repository, so no result from
+  one node generalises to two. "Untested" would imply a multi-device path exists
+  that nobody exercised; none exists. **No issue tracks a hardware matrix**, and
+  none should: a matrix is a support treadmill the PRD names as the thing that
+  consumed prior alternative display servers, not a defect.
 - **The trusted band has an automated witness, and it covers one backend — not
   the one you would daily drive.** `backend/band_witness.rs` measures the
   negative half of the band's unspoofability property: that a confined app's own
@@ -1175,33 +1188,58 @@ than budgetary. Eight of them, named rather than summarised:
   reach, which is not a check. [#173](https://github.com/vitrin-os/vitrin-os/issues/173) tracks the *human* half nobody has
   evidence for; **the DRM half has no issue**, because there is nothing a CI
   change could do about it.
-- **The bring-up runbook has been executed twice, both on 2026-08-09**, and it
-  carries a dated record block for each. Neither was a clean pass: three defects
-  came out of the first, one of which was that the page's own first line of
-  recovery did not exist. A runbook nobody has executed is a plan, and the wlcs
-  number above is this repository's standing example of how a manual result
-  ages once it is taken.
+- **The bring-up runbook has been executed twice in full, both on 2026-08-09**,
+  and it carries a dated record block for each. Neither was a clean pass: three
+  defects came out of the first, one of which was that the page's own first line
+  of recovery did not exist. **A third, partial execution followed on
+  2026-08-13**: step 13a, the touchpad-class rung, which carries its own
+  "Record block — EXECUTED 2026-08-13" and whose six sub-rungs came back five
+  PASS and one defect —
+  [#275](https://github.com/vitrin-os/vitrin-os/issues/275), a gesture
+  interrupted by a VT switch that ends `completed` where it must say
+  `cancelled`. Read that as **one rung, not a third pass of the runbook**:
+  steps 12a, 16 and 17 are still marked NOT YET RUN on that page, and #220's
+  frame-cadence field was never captured in fps. A runbook nobody has executed
+  is a plan, and the wlcs number above is this repository's standing example of
+  how a manual result ages once it is taken.
 - <!-- limit: lifecycle-checklist-run-once -->
-  **The session-lifecycle checklist has been executed once, on 2026-08-11, and
-  it is not a clean pass either.** Blanking, suspend, lid handling,
+  **The session-lifecycle checklist has been executed twice, on 2026-08-11 and
+  2026-08-13 — plus a 2026-08-12 re-read of one rung — and neither full run was
+  a clean pass.** Blanking, suspend, lid handling,
   deliberate-wedge recovery and returning from another VT are rungs `L1`–`L7`
   in [Getting out of a wedged session](recovery.md#the-hardware-checklist),
-  where the dated record now lives. What it establishes, at the counts the rungs
+  where the dated records now live. What they establish, at the counts the rungs
   themselves ask for: `L1` 10 of 10 VT switches with a stable band colour; `L2`
-  **4 of the 5** suspend/resume cycles, each returning a working panel; `L3`
-  **2 of the 5** lid cycles, and only one of those two ever reached sleep, so
-  **one usable sample** and nothing established about a short lid close; `L4`
+  **5 of 5** suspend/resume cycles, four on 2026-08-11 and the fifth on
+  2026-08-13, each returning a working panel — with **liveness proven on the
+  second run only**, because the first had no keymap passed and therefore no way
+  to tell an idle app from a frozen one; `L3`
+  **5 of 5** lid cycles, two on 2026-08-11 of which only one ever reached sleep,
+  and three more on 2026-08-13 that all did, each with the same
+  typed-after-resume liveness proof — plus a fourth close reopened inside one
+  second that correctly never suspended at all, which is the short-lid-close
+  case a single sample could never have established; `L4`
   blank at 61.2 s with the panel returning on physical input, and `L5` no lock
-  card. `L6` recovered in ~69 s but **by which route could not be reconstructed
-  afterwards**, so the rung's actual question — which route got you out — is
-  unanswered. **The rungs filed four defects (#257–#260)**, one of them that the
-  recovery page's own published command was wrong — and a **fifth, #268, came
-  out of the same 2026-08-11 session**, from driving alacritty and nautilus
+  card. **`L6`'s answer was lost once and is now recovered**: the 2026-08-11
+  wedge came back in ~69 s by a route that could not be reconstructed afterwards
+  — not from the journal, not from either flight recorder, not from the process
+  tree — and 2026-08-13 settled it, `kill -CONT` against a 163.8 s `SIGSTOP`
+  wedge, recovering in the next logged millisecond, with route 1's chord found
+  to have been *queued* rather than defeated. `L7` is now a measurement rather
+  than an impression: **61.214 s lit, counted from the seat's return** against a
+  60 s timeout on 2026-08-13. **The rungs filed four defects (#257–#260)**, one
+  of them that the recovery page's own published command was wrong — and a
+  **fifth, #268, came out of the same 2026-08-11 session**, from driving alacritty and nautilus
   rather than from any rung, so a reader counting defects against that date
   should count five. The generated
   [session app matrix](session-app-matrix.md) is where that fifth one is
   recorded; understating a defect count is the direction this page holds to be
-  the more corrosive one. **`L4` is therefore not a
+  the more corrosive one. **The second run filed a sixth,
+  [#277](https://github.com/vitrin-os/vitrin-os/issues/277)**, and it is #260's
+  class again: `kill -TERM`, the command route 2 published, is inert against a
+  `SIGSTOP`ed core, so the recovery page has now been wrong twice about its own
+  central instruction — which is the reason to read it sceptically rather than a
+  reason to leave the count at five. **`L4` is therefore not a
   clean pass**: [#257](https://github.com/vitrin-os/vitrin-os/issues/257),
   [#258](https://github.com/vitrin-os/vitrin-os/issues/258) and
   [#259](https://github.com/vitrin-os/vitrin-os/issues/259) — the panel blanking
@@ -1210,16 +1248,26 @@ than budgetary. Eight of them, named rather than summarised:
   **#257's fix has since been observed on hardware** — rung `L7` was written
   from it and run later the same day, at a 20 s timeout: the panel stayed lit on
   the return and the lock did not raise, so both symptoms are gone on the
-  machine that produced them. That pass was **by eye and produced no figure**,
-  so how long the panel stayed lit is still unmeasured. **#258 and #259 have
+  machine that produced them. That pass was **by eye and produced no figure**;
+  the figure exists now, from the 2026-08-13 `L7` run at a 60 s timeout, and it
+  is the 61.214 s above rather than anything the 20 s pass could distinguish
+  from 17 s. **#258 and #259 have
   since been observed on hardware too** — a second `L4` execution on 2026-08-12
   read the log and the recorder rather than only the panel, and found the wake
   line and the `screen_blanked`/`screen_woke` pair carrying
-  `outcome: flip_landed`. One caveat travels with it: the failed-wake `WARN` has
-  still never been emitted on hardware, since no wake has failed
-  there. **Still unexecuted:** the SysRq route (route 3),
-  and the advisory VKMS rung, which was never attempted. One run on one laptop
-  is a report about that laptop and nothing more.
+  `outcome: flip_landed`, and 2026-08-13's `L7` run re-observed that same log
+  line and recorder pair in passing. One caveat travels with it: the failed-wake
+  `WARN` has still never been emitted on hardware, since no wake has failed
+  there. **Still unexecuted, and named rather than implied:** the SysRq route
+  (route 3) and route 4, both still careful predictions; `L7`'s second pass,
+  which was attempted on 2026-08-13 and caught no absence to measure; and step
+  12a's `immediate` and `idle` seat policies — only `never` has ever run on
+  hardware, and `idle` is the branch that would return you *locked*. The
+  advisory VKMS rung is no longer "never attempted" and is worse than that: CI
+  attempts it on every pull request and it **currently covers nothing** — read
+  on 2026-08-13, the module loads and no card node appears behind it, so no
+  connector enumeration, no mode set and no GBM/EGL probe run at all. Two runs
+  on one laptop are a report about that laptop and nothing more.
 
 This is a recorded decision with a scheduled closure in the sense that page's
 last section means: the closure is a dated human run, not a job. The alternative
@@ -2023,24 +2071,31 @@ sentence is corrected here rather than quietly replaced, because a limits page
 that acquires the right words without saying how it had the wrong ones is a page
 you cannot check.
 
-**The blanking behaviour above was confirmed on hardware once, on 2026-08-11,
-and the confirmation is narrower than the section.** No test in this project can
+**The blanking behaviour above was confirmed on hardware across three dated
+sessions — 2026-08-11, 2026-08-12 and 2026-08-13 — and the confirmation is
+still narrower than the section.** No test in this project can
 take DRM master, a seat, an ACPI event or a backlight, so all of it is knowable
 only by a human running
 [the recovery runbook's checklist](recovery.md#the-hardware-checklist) on the one
-machine that has the hardware, and one human did. What that run settled: the
-panel does go dark on the timeout (61.2 s against `--blank-idle 60`), it does
+machine that has the hardware, and one human did. What that first run settled:
+the panel does go dark on the timeout (61.2 s against `--blank-idle 60`), it does
 come back on ordinary physical input, and the wake leaves the session as you
 left it with **no lock card** — idle blank and idle lock are uncoupled in fact
-and not only in design. What it did **not** settle: suspend ran 4 of the 5
+and not only in design. What it did **not** settle, and what the third run did:
+suspend ran 4 of the 5
 cycles the rung asks for and lid ran 2 of 5, of which only one suspended at all,
-so there is a single usable lid sample and no basis at all for a claim about a
-short lid close. The run also found the defects that are the honest headline
-here — returning to a paused session blanks the panel in ~1.5 s (#257), the
-unblank is silent so success and failure look identical (#258), and blank and
+so 2026-08-11 left a single usable lid sample and no basis at all for a claim
+about a short lid close; 2026-08-13 took both rungs to **5 of 5**, added the
+typed-after-resume liveness the first run had no keymap to prove, and observed
+the short-lid-close case directly — a close reopened inside one second correctly
+never reached sleep. The first run also found the defects that are the honest
+headline here — returning to a paused session blanks the panel in ~1.5 s (#257),
+the unblank is silent so success and failure look identical (#258), and blank and
 unblank leave no flight-recorder event (#259). **All three are since fixed, and
 all three fixes have since been observed on this same panel** — #257 by the L7
-run on 2026-08-11, #258 and #259 by a second L4 execution on 2026-08-12 that
+run on 2026-08-11 and again, measured rather than eyeballed, by the 2026-08-13
+L7 run that timed the panel at 61.214 s lit from the seat's return against a
+60 s timeout; #258 and #259 by a second L4 execution on 2026-08-12 that
 read the log and the recorder instead of only the screen. Treat this section as
 confirmed to that depth and no further: the frame-clock halt, the agent's
 indefinitely stale frame and the prompt-suppression rules were **not** observed
@@ -2259,20 +2314,38 @@ draws itself, which cannot reach a file the application could not already open),
 browser" — a click that would hand a URL to another application does nothing.
 
 Read the next sentence as the whole point of this entry. **This is not a
-security property, and it must never be cited as one.** Under D9 there is no
-sandbox: `/run/user/<uid>/bus` is still on the filesystem and still connectable
-by any process of this uid, and the abstract-socket namespace is shared, so a
-determined application connects to the host session bus with no help from
-anybody. In practice an operator running Firefox allow-lists
+security property, and it must never be cited as one — in either mode.** Where
+a realm is confined, the confinement is the kernel's, not the missing portal: no
+version of "we serve no bus" is a boundary, and the paragraph below is about
+what is reachable, not about what is advertised. At `--isolation=off` there is
+no sandbox at all: `/run/user/<uid>/bus` is still on the filesystem and still
+connectable by any process of this uid, and the abstract-socket namespace is
+shared, so a determined application connects to the host session bus with no
+help from anybody. In practice an operator running Firefox allow-lists
 `DBUS_SESSION_BUS_ADDRESS` in `realm.toml`, which turns the implicit hole into an
 audited one — and hands that realm the **host's** bus, with whatever services the
 host happens to be running on it, entirely outside anything this project
 mediates. What a toolkit then does with a host portal from inside a realm is
-**unmeasured**; nobody has run it. The thing that will make the absence real is
-Phase-2 confinement ([#160](https://github.com/vitrin-os/vitrin-os/issues/160),
-E2.6/E2.7), which gives the realm a mount and network namespace so there is
-nothing to reach rather than nothing advertised. Serving portals *properly* — a
-core-mediated file chooser under a grant — is the Phase-2 powerbox's job and is a
+**unmeasured**; nobody has run it. What has changed since this entry was written
+is the default, and it changed the reachability half only: P2.6.2's mount
+namespace removes `/run/user/<uid>/bus` as a path — the realm's `/run` holds one
+entry, `vitrin` — and its network namespace removes the abstract-socket namespace
+the bus also listens on, because abstract sockets are scoped to a network
+namespace, so at `--isolation=default` the same allow-list line names something
+that is not there. That is the half Phase-2 confinement
+([#160](https://github.com/vitrin-os/vitrin-os/issues/160), E2.6/E2.7) named,
+delivered by the kernel; it makes the bus unreachable and it does not make the
+unserved portal a confinement. Read that closure as *derived from the mount
+table rather than measured*, because that is a different claim from "the kernel
+did it": **no test asserts the absence of `/run/user`**, and
+`tests/integration/test_real_confinement.py` lists "that a realm cannot reach
+the session bus by other means" among the things it explicitly does *not*
+prove, saying in as many words that a full escape survey is not what it does.
+One residual is narrower than the closure and survives it: `binds` names any
+absolute path outside `/` and `/home`, so an operator who binds the host's
+runtime directory into a realm puts the bus socket back inside it at
+`--isolation=default`, under a key that says nothing about buses. Serving
+portals *properly* — a core-mediated file chooser under a grant — is the Phase-2 powerbox's job and is a
 different thing again from restoring the toolkit's. **Serving portals has no
 issue and appears in no plan document**, so read this as an absence nobody has
 scheduled rather than as work in a queue.
@@ -2338,19 +2411,31 @@ Concretely, and this is the whole list rather than a sample:
   for the stated reason *"neither exists here"*.
 
   **That is advertisement, not reachability, and it is a missing service rather
-  than a confinement.** `crates/vitrin-core/src/spawn.rs` says it about the
-  session bus in exactly those words, and `org.a11y.Bus` is activated *on* that
-  bus: under D9 `/run/user/<uid>/bus` is still on the filesystem, still
-  connectable by any process of this uid, and neither
+  than a confinement.** `crates/vitrin-core/src/spawn.rs` says *"That is
+  advertisement, not reachability"* about the session bus in exactly those
+  words; the missing-service framing is this page's. And `org.a11y.Bus` is
+  activated *on* that bus: at `--isolation=off` `/run/user/<uid>/bus` is still
+  on the filesystem, still connectable by any process of this uid, and neither
   `DBUS_SESSION_BUS_ADDRESS` nor `AT_SPI_BUS_ADDRESS` is in `RESERVED_ENV`, so
   either can be allow-listed in `realm.toml`. In practice an operator running
   Firefox allow-lists `DBUS_SESSION_BUS_ADDRESS` — which hands that realm the
   **host's** accessibility bridge along with everything else on that bus.
-  [#160](https://github.com/vitrin-os/vitrin-os/issues/160) (E2.6/E2.7) is what
-  makes the absence real; the test that would *prove* it — P2.1.10's adversarial
+  At `--isolation=default` the mount and network namespaces P2.6.2 landed close
+  the reachability half — the realm's `/run` holds one entry, `vitrin`, and
+  abstract sockets are scoped to a network namespace — so the same allow-list
+  line names a bus that is not there; that is the half
+  [#160](https://github.com/vitrin-os/vitrin-os/issues/160) (E2.6/E2.7) named,
+  delivered by the kernel, and it makes the bus unreachable rather than making
+  the unserved bridge a confinement — with the same residual the portals entry
+  names, since an operator who binds the host's runtime directory in with
+  `binds` puts the socket back at `--isolation=default` too. That closure is
+  *derived from the mount table rather than measured*: **no test asserts the
+  absence of `/run/user`**, and the test that would *prove* it — P2.1.10's adversarial
   probe, which attempts `org.a11y.Bus` activation on every reachable bus from
-  inside a realm — **does not exist yet**, and it is scheduled precisely because
-  the route is open today. Grep the core, the shim, the wire protocol and the
+  inside a realm — **does not exist yet**. It is scheduled for what it settles
+  in both modes: the route is open today at `--isolation=off`, and at
+  `--isolation=default` nothing has yet measured the closure from inside a
+  realm. Grep the core, the shim, the wire protocol and the
   SDK for `AT-SPI` and there are no hits, and `cargo xtask limits-check` holds
   that absence; the only mentions anywhere in this repository are prose about
   the backdoor this project exists to close, and the gate that holds this

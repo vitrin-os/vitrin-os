@@ -80,7 +80,8 @@ separately choreographed demo:
 2. **Realm boot.** Firefox ESR starts inside the realm and renders
    `about:blank` in the nested window — via the real wlroots shim, not the
    mock (confirm the terminal log names `vitrin-shim`, not
-   `vitrin-mock-shim`; see the root README's tracked gap on this point).
+   `vitrin-mock-shim`; [Prerequisite — met](#prerequisite--met) below says
+   what makes that check a confirmation rather than a hope).
 3. **Consent.** The agent's `request_grant` raises the core-rendered consent
    card over the Firefox window. A human clicks **Allow** — show the card
    occluding real Firefox pixels underneath, proving it is a compositor
@@ -151,14 +152,18 @@ proof, not production values.
 5. Close out the corresponding acceptance-criterion checkbox on issue
    [#48](https://github.com/vitrin-os/vitrin-os/issues/48).
 
-## Prerequisite
+## Prerequisite — met
 
-Per the root README's tracked gap, the screencast is most convincing once
-`cargo xtask demo` itself drives the real shim (issue
-[#110](https://github.com/vitrin-os/vitrin-os/issues/110), open PR
-[#127](https://github.com/vitrin-os/vitrin-os/pull/127)) rather than
-`vitrin-mock-shim`. Recording against today's mock-shim default would show
-the consent/actuation choreography correctly but not the "real Firefox
-under nested mode" framing the issue asks for; recording against the real
-shim directly (as `tests/integration/test_real_firefox.py` already proves
-in CI) sidesteps that until #110 lands.
+The prerequisite this section once named is met. Issue
+[#110](https://github.com/vitrin-os/vitrin-os/issues/110) (PR
+[#127](https://github.com/vitrin-os/vitrin-os/pull/127)) moved both demo venues
+onto the real shim: `resolve_shim_bin` in `crates/xtask/src/main.rs` takes
+`VITRIN_C_SHIM_BIN` or falls back to `shim/build/vitrin-shim`, and refuses to
+start — with a build instruction rather than a substitute — if neither is
+executable, so `vitrin-mock-shim` appears in no demo venue at all, a property
+`tests/integration/test_demo.py`'s `DemoUsesNoMockShim` grep-proves against the
+two launcher files rather than trusting. That is why
+[`RECORDING.md`](RECORDING.md) §1's terminal check — the log must name
+`vitrin-shim`, **not** `vitrin-mock-shim` — confirms what the launcher already
+guarantees rather than hoping for it, and why the recording at the top of this
+page could be taken in nested mode against a real Firefox at all.

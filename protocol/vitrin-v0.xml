@@ -237,9 +237,13 @@
     decoy and mislead the human about where input is going. Version 1
     composites an AGENT principal's cursor, and only into human-visible
     output - never into any captured frame - so the ordering rule above
-    binds the compositor now rather than vacuously. No HUMAN cursor is
-    composited: in nested operation the host desktop draws the human's
-    cursor outside the realm view entirely.
+    binds the compositor now rather than vacuously. Whether a HUMAN cursor
+    is composited depends on who owns the display: in nested operation the
+    core composites none, because the host desktop draws it outside the
+    realm view entirely; on bare metal, where there is no host desktop, the
+    core draws the human's pointer itself, or the human has none. Both
+    answers sit at the human-visible output stage, alongside the consent
+    overlay and the trust indicator, so neither can reach a captured frame.
 
     WHAT ARRANGEMENT CAN AND CANNOT SAY. The two layout verbs are served
     through two facets, vitrin_layout_focus and vitrin_layout_arrange, and
@@ -1354,7 +1358,7 @@
       in the protocol whose asking party is not the one the interface it
       would otherwise belong to was built around.
 
-      THIS PARAGRAPH SAID "THE ONLY TWO" UNTIL WS-E.4.4 (issue #306), and
+      THIS PARAGRAPH SAID "THE ONLY TWO" UNTIL D-042 (issue #306), and
       it is corrected here rather than left standing: a closed count in a
       normative description is the same tripwire 00-conventions.md 7.3
       records going stale twice, and a third conversation makes a shipped
@@ -2388,11 +2392,16 @@
       do.
 
       Version 1 does not define this interface's messages at all - it is
-      reachable only through a since="2" mint - and realm_launch is refused
-      "unsupported" until a deployment serves it, the same staging
-      observe_cursor, layout_arrange and layout_focus already use. Defining
-      it before serving it is what makes a petition for it an answer rather
-      than a connection death.
+      reachable only through a since="2" mint. The realm_launch bit was
+      defined before it was served, and the reference core has served it
+      since WS-E.1.1 - a chokepoint arm and prompt copy of its own - so
+      whether a petition for it is refused "unsupported" is a property of
+      the deployment rather than of the wire: a deployment that will not
+      host process creation answers "unsupported" rather than killing the
+      connection. observe_cursor is the one bit left in that
+      defined-but-unserved posture, refused by every deployment. Defining a
+      verb before serving it is what makes a petition for it an answer
+      rather than a connection death.
     </description>
 
     <request name="launch" since="2">

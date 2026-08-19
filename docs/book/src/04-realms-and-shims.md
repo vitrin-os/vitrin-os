@@ -106,7 +106,7 @@ condition with a different remedy: the kernel must actually have Landlock —
 **≥ 5.13**, built with `CONFIG_SECURITY_LANDLOCK=y`, and with `landlock` in the
 active LSM list (`/sys/kernel/security/lsm`) — **and, since 2026-08-15, an ABI
 at or above this build's declared floor** (`build.landlock_min_abi` from
-`vitrind --print-floor`, **7** here). The ruleset below is part of the
+`vitrind --print-floor`, **6** here). The ruleset below is part of the
 confinement floor, so without all four the core refuses to start rather than
 confining a realm one mechanism less than its own journal claims. The fourth is
 the one a correctly configured kernel can still fail, and its remedy is a newer
@@ -128,7 +128,13 @@ without spawning anything.
 > for each additional one). What that ruleset requires of a kernel is published
 > as a generated, CI-held table — [the Landlock ABI matrix](isolation-matrix.md)
 > — but P2.6.3 is **still not finished**: that table measures no kernel, the
-> per-kernel one its criteria ask for is not built, and the ABI floor narrowed
+> per-kernel one its criteria ask for exists now, on a page of its own —
+> [which kernels this build starts on](isolation-kernels.md), five distribution
+> kernels booted under QEMU with the shipped `vitrind`, two admitted and three
+> refused `below-floor` — but every row there is a **kernel** reading taken in a
+> bare initramfs and not a statement about the distribution that ships that
+> kernel, so the number of *distributions* measured as such is still one, and
+> the ABI floor narrowed
 > the task rather than closing it.
 > Since P2.6.4 there is also a **seccomp deny-list**, installed immediately
 > before the shim's `execve` and inherited by every process the shim forks: it
@@ -159,24 +165,47 @@ on [the limits page](limits.md).
 
 Two further specifics worth naming rather than leaving to be discovered:
 
-**The session D-Bus is reachable.** The core advertises no
-`DBUS_SESSION_BUS_ADDRESS` and redirects `XDG_RUNTIME_DIR`, so a
-well-behaved client finds no bus. But advertisement is not reachability:
+**The session D-Bus is reachable at `--isolation=off`, and closed twice over at
+`--isolation=default`.** The core advertises no `DBUS_SESSION_BUS_ADDRESS` and
+redirects `XDG_RUNTIME_DIR` either way, so a well-behaved client finds no bus —
+but advertisement is not reachability, and at `off` that is the whole of it:
 `/run/user/<uid>/bus` is still on the filesystem, still connectable by any
-process of that uid, and the abstract-socket namespace is still shared. In
-practice, running Firefox means allow-listing `DBUS_SESSION_BUS_ADDRESS`
-explicitly — which at least turns an implicit hole into an audited one.
-Closing it properly (P13, Phase 2) means a loopback-only network namespace
-and an empty mount namespace, so there is nothing to reach rather than
-nothing advertised.
+process of that uid, and the abstract-socket namespace is still shared. Since
+P2.6.2 the default closes both halves, and neither closure is this project's
+cleverness: the mount namespace removes `/run/user/<uid>/bus` as a path — the
+realm's `/run` holds one entry, `vitrin` — and the network namespace removes the
+abstract-socket namespace the bus also listens on, because abstract sockets are
+scoped to a network namespace. So an operator who allow-lists
+`DBUS_SESSION_BUS_ADDRESS` in `realm.toml` at `off` turns an implicit hole into
+an audited one, and the same line at `default` names something that is not
+there. That closure is not the same claim as a measurement, though, and the
+distinction is worth its own sentence: it is *derived from the mount table
+rather than measured* — **no test asserts the absence of `/run/user`**, and
+`tests/integration/test_real_confinement.py` lists "that a realm cannot reach
+the session bus by other means" among the things it explicitly does *not*
+prove. The adversarial probe that would attempt `org.a11y.Bus` activation on
+every bus reachable from inside a realm has still not been written. Two
+residuals survive that, and both are narrower than what closed:
+`binds` names any absolute path outside `/` and `/home`, so an operator who
+binds the host's runtime directory into a realm puts the bus socket back inside
+it under a key that says nothing about buses; and the *designated-egress* half
+of the network answer — reachability as a granted, host:port-scoped capability
+rather than as nothing at all — is still P13's, unbuilt.
 
-**Same-uid separation is not attempted.** The `0700` runtime directory
-bounds other *users* on the machine, not other processes of this user. Note
-what the realm's `XDG_RUNTIME_DIR` therefore is: `$XDG_RUNTIME_DIR/vitrin-0/<realm>`
-sits one level below the directory holding the core's own agent socket and
-the run's flight-recorder log. It names the control plane as much as it
-hides it. Under D9 the app runs as the core's uid and can derive those paths
-with or without a variable pointing at them.
+**Same-uid separation is not attempted.** The `0700` runtime directory bounds
+other *users* on the machine, not other processes of this user, and the app runs
+as the core's uid in either isolation mode. What the realm's `XDG_RUNTIME_DIR`
+*names* stopped being the same thing at P2.6.2, though. At `--isolation=off` it
+is `$XDG_RUNTIME_DIR/vitrin-0/<realm>`, one level below the directory holding the
+core's own agent socket and the run's flight-recorder log — it names the control
+plane as much as it hides it, and relocating the tree would not help, since a
+child of the core's uid derives `/run/user/<uid>` from `getuid()` with or without
+a variable pointing at it. At `--isolation=default` the value is the fixed
+in-realm `/run/vitrin`, a bind of that same core-created directory, and `..`
+resolves to the realm's own `/run`, where there is no `core.sock` and no recorder
+log. The closure is the mount namespace's rather than the path's, and it is
+checked rather than argued: both are canaries every confined spawn probes through
+`/proc/<shim>/root`.
 
 Environment hygiene confines the well-behaved. It does not contain the
 hostile. Real sandboxing arrives with the Phase-2 powerbox (E2.6/E2.7).
@@ -194,7 +223,7 @@ args = ["--no-remote", "--new-window", "about:blank"]
 env_allow = [
     "HOME", "LANG", "XDG_SESSION_TYPE",
     "MOZ_ENABLE_WAYLAND", "GDK_BACKEND",
-    "DBUS_SESSION_BUS_ADDRESS",   # see above -- an audited hole
+    "DBUS_SESSION_BUS_ADDRESS",   # see above -- an audited hole at --isolation=off
 ]
 ```
 
@@ -218,10 +247,13 @@ a grant over a realm whose app has died refuses `no_surface` regardless of
 what its siblings are doing. What it does *not* get is its own **output**:
 the core composites one output from one realm's scene, so with several
 realms running only the realm the output is bound to is visible — the first
-one to attach. Nothing *chooses* to move that binding, because who may choose
-is a separate, unlanded authority question; the one thing that moves it is the
-bound realm's app exiting, after which the output follows to the first realm
-still serving, and to no realm at all once none is. Every other realm still
+one to attach. Which realm that is **is now somebody's to choose**: a client
+holding the `layout.focus` verb moves the output, and the human's own keyboard
+and pointer move with it — one act, because showing a realm and typing into it
+must never come apart. Absent such a client the binding moves on the one event
+nobody chooses: the bound realm's app exiting, after which the output follows to
+the first realm still serving, and to no realm at all once none is. Every other
+realm still
 renders, and pays for it. Read [Known limits](limits.md) before configuring
 more than one.
 

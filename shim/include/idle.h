@@ -1,4 +1,4 @@
-/* idle.h -- the shim half of idle inhibition (WS-E.4.4, issue #306).
+/* idle.h -- the shim half of idle inhibition (D-042, issue #306).
  *
  * SPDX-License-Identifier: MPL-2.0
  *

@@ -34,7 +34,7 @@ Example:
 ```
 feat(protocol): author v0 interfaces and error taxonomy
 
-protocol/vitrin-v0.xml — 11 interfaces, 29 messages, 14 enums. See
+protocol/vitrin-v0.xml — every v0 interface, its messages and its enums. See
 docs/protocol/00-conventions.md for the normative rules this implements.
 
 Closes #10

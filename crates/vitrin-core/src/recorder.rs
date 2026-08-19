@@ -2150,10 +2150,12 @@ fn refusal_label(code: Refusal) -> &'static str {
         Refusal::ConsentHeld => "consent_held",
         Refusal::NoSurface => "no_surface",
         Refusal::Internal => "internal",
-        // Reachable only through `realm_launch`, which this core does not
-        // serve yet -- the label exists because the match is deliberately
-        // exhaustive (an appended IDL code must fail the build here rather
-        // than journal as something else), not because anything emits it.
+        // Emitted only through `realm_launch`, which this core has served
+        // since WS-E.1.1: a launch past `MAX_REALMS` refuses `capacity` in
+        // `session.rs`, and `enforcement.rs` voices it. The arm is still
+        // spelled out rather than folded into a catch-all because the match
+        // is deliberately exhaustive -- an appended IDL code must fail the
+        // build here rather than journal as something else.
         Refusal::Capacity => "capacity",
     }
 }

@@ -1,6 +1,6 @@
 # Roadmap
 
-The master sequencing view: four engineering phases and three parallel workstreams, hung on a five-rung milestone ladder. The [PRD](../PRD.md) (§8, §19) is normative for *what and why*; this document owns *when and in what order*.
+The master sequencing view: four engineering phases and five parallel workstreams, hung on a five-rung milestone ladder. The [PRD](../PRD.md) (§8, §19) is normative for *what and why*; this document owns *when and in what order*.
 
 **No calendar dates.** Sequencing is milestone-relative only — with a single maintainer through at least Phase 1 (risk R8), dates would be fiction. The one external cadence that matters (NLnet call cycles) is handled milestone-relatively in [11-workstream-funding.md](11-workstream-funding.md).
 
@@ -28,6 +28,8 @@ WS-C comm.   licensing ──── ANNOUNCE ───── 2nd beat ───�
              files, quiet   (demo-first)   (security demos) trigger zone
 ```
 
+**WS-D and WS-E have no lane above, and that is a statement about them rather than an omission.** Both were opened after M1 closed — [13-workstream-agent-integration.md](13-workstream-agent-integration.md) on 2026-07-26, [14-workstream-session-mode.md](14-workstream-session-mode.md) by [D-021](20-decision-log.md#d-021--session-mode-is-scheduled-as-a-maintainer-dogfooding-workstream-ws-e-and-that-is-not-the-horizon-item) on 2026-08-06 — so neither has an M0→M1 history to draw, and neither is sequenced milestone-relatively here. WS-D's ordering lives in its §5, whose first item, an MCP server, is unbuilt. WS-E's lives in its §4 stage table, where Stage 4 is still estimated *open* and Stage 1's shell client is not yet struck through; D-021(2) additionally forbids reading any WS-E deliverable as evidence toward M4, so it can never acquire an M4 lane.
+
 Coupling arrows that drive sequencing:
 
 - **M1 demo → NLnet application** (an application with a runnable demo is categorically stronger — WS-B §1).
@@ -40,7 +42,7 @@ Coupling arrows that drive sequencing:
 
 - **Phase 2 epics that may start before M1 fully closes:** E2.6 and E2.7 depend only on the realm-spawn model (A2) and consent (A3), not on semantics — they can begin as soon as those artifacts stabilize. E2.8 (IME) is parallel by design.
 - **Phase 3 long-lead pre-study during Phase 2:** E3.7's standards tracking (OID4VC/eIDAS pins) and E3.1's codec evaluation (Q6) both start early via the WS-A liaison table.
-- **The earliest hard decision gate is Q11** (realm vs. Unix-user boundary) at Phase 2 start — it shapes E2.6/E2.7's namespace/UID layout.
+- **The earliest hard decision gate was Q11** (realm vs. Unix-user boundary) at Phase 2 start — it shaped E2.6/E2.7's namespace/UID layout, and it was **closed by [D-020](20-decision-log.md#d-020--the-realm-boundary-is-a-namespace-boundary-intra-user-by-default-in-namespace-uidgid-and-a-residue-that-lives-outside-every-realm)** (2026-08-06). [D-037](20-decision-log.md#d-037--the-realms-namespaces-are-built-by-a-helper-that-execs-first-and-unshares-second-the-core-proves-the-confinement-from-outside-before-it-commits-and-the-measured-ceiling-and-the-selected-policy-are-two-vocabularies-whose-bottoms-may-never-share-a-word) executes D-020(1)(4)(6) in P2.6.2; D-020(3)'s per-UID provisioning (E3.3), D-020(5)'s host-level sidecar residue (M3) and [D-010](20-decision-log.md#d-010--per-realm-isolation-dial)'s hardened and paranoid tiers (unscheduled) remain open, and R2.9 is not retired.
 - **Within Phase 1**, the only hard serialization point is the IDL freeze; see the dependency graph in [01-phase-1-mvp.md](01-phase-1-mvp.md) §4.
 
 ## 4. Open-question cross-reference (compact)
@@ -59,7 +61,7 @@ Full entries with rationale live in [20-decision-log.md](20-decision-log.md) Par
 | Q8 bus factor | M4 gate input | ongoing (WS-C) |
 | Q9 standing-grant ergonomics | E2.6 / E3.7 | v0 at E2.6; full at E3.7 |
 | Q10 atomic-save over FUSE | E3.6 | matrix at M3 |
-| Q11 realm vs. Unix-user boundary | E2.6 + E2.7 | **Phase 2 start** |
+| Q11 realm vs. Unix-user boundary | E2.6 + E2.7 | **Phase 2 start** — closed there by D-020 (2026-08-06) |
 | Q12 egress ergonomics | E2.7 | v0 at E2.7; full by M3 |
 | Q13 consent-ladder human factors | E2.6 / E3.7 | review at E2.6; re-review before durable rungs |
 | Q14 trust-root governance | E3.7 | before any durable grant ships |

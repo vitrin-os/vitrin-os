@@ -227,9 +227,10 @@ do *not* advertise is otherwise completely invisible — is documented in
 | `zwp_relative_pointer_manager_v1` | 1 | 1 | **added in WS-E.4.2.** `class=probe` at the time of *this* run (seq=81) — the demand line is what admitted it; see below. |
 | `zwp_pointer_gestures_v1` | 3 | 1 and 3 | **added in WS-E.4.2.** `class=probe` at the time of this run (seq=36 and seq=82), two binds from two connections. |
 | `zwp_pointer_constraints_v1` | 1 | 1 | **added in WS-E.4.2.** `class=probe` at the time of this run (seq=80); see below for why it took the wire's request/verdict pair to serve it. |
+| `zwp_idle_inhibit_manager_v1` | 1 | 1 | **added for #306.** `class=probe` at the time of this run (seq=83) — the second *ask* here, admitted on its demand line once the wire grew a verb to carry it; see below. |
 
-The last three rows are **anachronistic on purpose**: at the time this run was
-recorded all three were probe globals, which is precisely why the run contains
+The last four rows are **anachronistic on purpose**: at the time this run was
+recorded all four were probe globals, which is precisely why the run contains
 their `globals-demand` lines at all (`in_v0_contract` never arms a probe for an
 interface already in the v0 set). They are listed here rather than only in the
 prose below so the two tables stay a complete partition of what the run
@@ -284,7 +285,7 @@ renders, repaints, scrolls and navigates without them, which is the empirical
 part of "no more than is genuinely needed".
 
 It was fifteen until WS-E.4.2 (issue #222), twelve after it, and eleven since
-WS-E.4.4 (issue #306). Protocol
+D-042 (issue #306). Protocol
 version 2 grew `relative_motion` and the four gesture events, so
 `zwp_relative_pointer_manager_v1` and `zwp_pointer_gestures_v1` entered the v0
 set — each added on the evidence rule, citing the `globals-demand` lines this
@@ -308,7 +309,7 @@ the only party that can weigh an app's ask against a human's screen. See
 `docs/plan/20-decision-log.md` D-032 for the decision.
 
 **`zwp_idle_inhibit_manager_v1` left the list the same way, one workstream
-later** (WS-E.4.4, issue #306, seq=83). It is the second *ask* here, and the row
+later** (D-042, issue #306, seq=83). It is the second *ask* here, and the row
 that used to stand against it read: "A realm has no screen and no idle timer;
 the host's screen is the core's, and inhibiting it from inside a confined app is
 a decision for the core." Every clause of that is still true, and none of it was

@@ -1696,11 +1696,15 @@ fn drop_all_capabilities() -> Result<(), Fail> {
 ///   it is the instrument every per-rung measurement in this repository is
 ///   taken with. Rungs 1–5 are unreachable as a kernel's answer and entirely
 ///   reachable as an operator's.
-/// - **They are the only evidence the generated ladder's lower half is not
-///   fiction.** `docs/book/src/isolation-matrix.md` is *derived*: the rungs
-///   are parsed out of [`landlock`], cross-checked against
+/// - **They are the only evidence that any part of the generated ladder's
+///   lower half is not fiction.** `docs/book/src/isolation-matrix.md` is *derived*:
+///   the rungs are parsed out of [`landlock`], cross-checked against
 ///   `the_rung_masks_pin_a_measured_table`, and rendered. Nothing in that
-///   chain observes a kernel *answering* — these three do.
+///   chain observes a kernel *answering* — these three do, at rungs 1, 2 and
+///   3. **Rungs 4 and 5 are below the floor too and nothing enters a domain at
+///   either**, so their rows are derived and measured against nothing; the
+///   matrix page counts that out loud rather than letting "the sub-floor rungs
+///   are exercised" cover all five.
 /// - **The `REFER` result is not derivable from the table.** Rung 1 is
 ///   *stricter* than rung 2 about reparenting, so the dial is not a one-way
 ///   weakening; two tests asserting the opposite invariant were replaced
@@ -2352,10 +2356,19 @@ mod tests {
         // **Sub-floor, and kept for a stated reason (D-043).** Rung 1 is below
         // `LANDLOCK_MIN_ABI`; this is evidence about the DIAL and about the
         // primitive, never about the floor and never about a rung a shipped
-        // session runs at. The mock-free evidence for the SHIPPED default's
-        // write denial is `tests/integration/test_real_confinement.py`, which
-        // opens an ungranted path inside a real realm and gets `EACCES` at the
-        // default and success at `--landlock=off`. Module docs above.
+        // session runs at.
+        //
+        // **And no mock-free gate measures the WRITE half at all.** The
+        // nearest one is `RealConfinementLandlockDenial` in
+        // `tests/integration/test_real_confinement.py`, and what it measures
+        // is a READ: its probe opens with `O_RDONLY | O_CLOEXEC | O_NOCTTY`
+        // (`shim/tests/solid_client.c`, `probe_one`) and the assertion is that
+        // the open fails `EACCES` at the shipped default and succeeds at
+        // `--landlock=off`. Same ruleset, same path set, different verb -- so
+        // it corroborates that the domain is on and denying, and it does not
+        // discharge this criterion. The write denial is measured HERE and
+        // nowhere else: in a forked child, at rung 1, which makes it a
+        // component test and never milestone evidence. Module docs above.
         vitrin_skip::skip_unless!(
             vitrin_skip::LANDLOCK_ABI,
             landlock_abi_at_least(1, "the write-set floor")

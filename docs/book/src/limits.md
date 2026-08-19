@@ -293,22 +293,25 @@ inferred from the word "Landlock":
   a same-directory rename succeeds at every rung. Practically, `--landlock=abi:1`
   breaks every app that writes by rename-into-place (GTK, Firefox). Do not read
   the ladder as "higher is always tighter"; read it as "rung N is ABI N".
-- **The rungs below the floor are still exercised, on purpose: those tests
-  hold the dial honest, not the floor.** Three behavioural measurements in
-  `crates/vitrin-realm-init/src/main.rs` enforce a domain at rung 1, 2 or 3 —
+- **Some of the rungs below the floor are exercised, on purpose: those tests
+  hold the dial honest, not the floor. The rest are exercised by nothing, and
+  this page says which is which rather than leaving it to be inferred.** Three
+  behavioural measurements in `crates/vitrin-realm-init/src/main.rs` enforce a
+  domain at rung 1, 2 or 3 —
   `rung_one_forbids_reparenting_that_the_rung_above_permits`,
   `the_truncate_rung_is_measured_and_its_absence_is_measured_with_it` and
   `a_realm_can_write_where_it_was_granted_and_nowhere_else`. Every one of those
   rungs is **below `build.landlock_min_abi`**, so a kernel reporting one is
   refused at startup rather than confined weakly, and no shipped session has
-  ever run at any of them. They are kept deliberately — decision **D-043**
-  (`docs/plan/20-decision-log.md`, 2026-08-19), taken as a dated decision
-  precisely because this task's *previous* narrowing was settled by attrition
-  and reached these pages as a deferral nobody could date. The reasons are two,
-  and neither is "deleting tests feels wrong": they are the only evidence that
-  the lower half of the [ABI matrix](isolation-matrix.md) is not fiction, that
-  page being *derived* from this build's own source and observing no kernel
-  answering anything; and the `REFER` result in the bullet above — rung 1 being
+  ever run at any of them. They are kept deliberately — decision
+  [**D-043**](https://github.com/vitrin-os/vitrin-os/blob/main/docs/plan/20-decision-log.md#d-043--the-sub-floor-landlock-rung-tests-are-kept-and-what-they-are-evidence-about-is-published-beside-them-the---landlockabin-dial-never-the-floor)
+  (2026-08-19), taken as a dated decision precisely because this task's
+  *previous* narrowing was settled by attrition and reached these pages as a
+  deferral nobody could date. The reasons are two, and neither is "deleting
+  tests feels wrong": they are the only evidence that any part of the
+  [ABI matrix](isolation-matrix.md)'s lower half is not fiction, that page being
+  *derived* from this build's own source and observing no kernel answering
+  anything; and the `REFER` result in the bullet above — rung 1 being
   **stricter** than rung 2 — cannot be read off the mask column at all, which
   is why two tests asserting the opposite invariant were replaced when it was
   measured. What they are **not** evidence about is said in the same breath:
@@ -317,6 +320,21 @@ inferred from the word "Landlock":
   about a kernel: which kernels report which ABI is [the kernel
   page](isolation-kernels.md) and its checked-in boot rows, measured elsewhere
   and by other means.
+
+  **And the sub-floor rungs the three do not reach are exercised by nothing at
+  all.** Counted from the same list the generator checks:
+
+  > below the floor of 6, rungs 1, 2 and 3 are exercised and rungs 4 and 5 are not.
+
+  So the sub-floor half of the ladder is exercised in part, not throughout.
+  Nothing in this repository enters a Landlock domain at rung 4 or rung 5, so
+  every cell on those two rows of the matrix is derived from this build's own
+  source and measured against nothing. That is a decision rather than an
+  oversight: D-043 was offered the option of *adding* the missing rungs and did
+  not take it, rung 4 buying `handled_access_net` which this build leaves zero.
+  The tally above is **held**, not remembered — `cargo xtask isolation-matrix`
+  computes it from the corpus, prints it on the matrix page, and refuses to
+  emit at all unless this page carries the same sentence.
 - **This build's ladder stops at rung 9, and a newer kernel is clamped to it.**
   ABI 10 exists in mainline and this build does not request it. A kernel
   reporting more than 9 gets a rung-9 ruleset, and that is journaled per realm
@@ -414,7 +432,13 @@ inferred from the word "Landlock":
   table, same argv, it succeeds. Neither half is evidence without the other.
   What is still *not* measured that way is any particular rung's rights inside
   a real realm — those are measured in `vitrin-realm-init`'s own suite, where a
-  forked child can enforce a capped domain and try the syscall.
+  forked child can enforce a capped domain and try the syscall. **Nor is the
+  verb the same**: that gate's probe opens read-only (`O_RDONLY`), so what it
+  measures mock-free is a **read** denial. P2.6.3's criterion about a *write*
+  to a path outside the granted set — with its positive control in the same
+  run — is measured only by `a_realm_can_write_where_it_was_granted_and_nowhere_else`
+  in `vitrin-realm-init`'s own suite, at rung 1, in a forked child. That is a
+  component test and this page will not cite it as anything else.
 - **There is a ladder table now, and it is a table about this build — not
   about kernels. P2.6.3 closed on 2026-08-19, on its *corrected* criteria and
   not on the ones its plan row first wrote, and this page will not round that

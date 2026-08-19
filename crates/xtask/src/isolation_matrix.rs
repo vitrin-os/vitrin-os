@@ -104,6 +104,13 @@ const ISOLATION_RS: &str = "crates/vitrin-core/src/spawn/isolation.rs";
 /// on the ladder no Rust check could reach.
 const HARNESS_PY: &str = "tests/integration/harness.py";
 
+/// The two claims D-043 (2026-08-19) put on the rows below the floor. Exactly
+/// one belongs on each such row, and which one is decided by
+/// [`Rung::behavioural_tests`] rather than by whoever last edited the corpus --
+/// see step (5b) of [`render`].
+const EXERCISED_CLAIM: &str = "sub-floor-rungs-hold-the-dial-not-the-floor";
+const UNEXERCISED_CLAIM: &str = "sub-floor-rungs-are-not-all-exercised";
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -205,6 +212,23 @@ pub struct Rung {
     pub not_bought: &'static str,
     /// Claim ids into [`Corpus::claims`]. **Must be non-empty.**
     pub claims: &'static [&'static str],
+    /// Tests in `crates/vitrin-realm-init/src/main.rs` that **enter a Landlock
+    /// domain at this rung** -- `create_ruleset(N)` then `restrict_self` --
+    /// and assert the kernel's own answer: either the outcome of a syscall
+    /// made inside the resulting domain, or the kernel's verdict on the
+    /// `restrict_self` request itself. A test that builds a rung-N ruleset and
+    /// never enters it is **not** one of these; it measures rule acceptance,
+    /// which is a weaker fact and is not what the sub-floor claims rest on.
+    ///
+    /// Empty is a real and common answer, and it is the honest one for every
+    /// rung nothing exercises. It is a field rather than a sentence because
+    /// the sentence is what went wrong: D-043's first draft published "the
+    /// behavioural tests that exercise them" on the rows for rungs 4 and 5,
+    /// which no test enters a domain at. Every name here is resolved against
+    /// that file before the page is emitted, and
+    /// [`render`] refuses to emit when this list and the sub-floor claims
+    /// disagree, so neither half can drift into a sentence again.
+    pub behavioural_tests: &'static [&'static str],
 }
 
 /// One filesystem denial the ruleset contributes that the realm's mount table
@@ -907,6 +931,7 @@ pub fn render(corpus: &Corpus, sources: &Sources) -> Result<String> {
             );
         }
     }
+
     for denial in corpus.denials {
         if denial.claims.is_empty() {
             bail!(
@@ -965,6 +990,88 @@ pub fn render(corpus: &Corpus, sources: &Sources) -> Result<String> {
                     anchor.needle
                 );
             }
+        }
+    }
+
+    // (7b) Which sub-floor rungs a behavioural test actually enters a domain
+    // at, held against the two claims that talk about it (D-043). The first
+    // draft of that decision published "the behavioural tests that exercise
+    // them" on the rows for rungs 4 and 5, where nothing does -- a sentence a
+    // human had to remember to keep true, on the rows it was least true of.
+    // Here it is a lookup instead: `behavioural_tests` decides which claim a
+    // sub-floor row may carry, every name in it is resolved against the file
+    // it names, and every combination that would publish a false row refuses
+    // to render.
+    for rung in corpus.rungs {
+        for name in rung.behavioural_tests {
+            if !sources.realm_init_main_rs.contains(&format!("fn {name}(")) {
+                bail!(
+                    "isolation-matrix: ABI rung {} names the behavioural test {name:?}, and \
+                     there is no `fn {name}(` in {REALM_INIT_MAIN_RS}. A renamed or deleted test \
+                     leaves the page claiming a rung is exercised by something that is not \
+                     there, so nothing is emitted.",
+                    rung.abi
+                );
+            }
+        }
+        let exercised = !rung.behavioural_tests.is_empty();
+        let says_exercised = rung.claims.contains(&EXERCISED_CLAIM);
+        let says_unexercised = rung.claims.contains(&UNEXERCISED_CLAIM);
+        if rung.abi >= constants.min_abi && (says_exercised || says_unexercised) {
+            bail!(
+                "isolation-matrix: ABI rung {} is at or above the floor of {} and carries a \
+                 SUB-FLOOR claim. Both claims in that pair say \"this rung is below the floor\", \
+                 which this row would publish as false.",
+                rung.abi,
+                constants.min_abi
+            );
+        }
+        if rung.abi < constants.min_abi {
+            if says_exercised == says_unexercised {
+                bail!(
+                    "isolation-matrix: ABI rung {} is below the floor of {} and carries {} of \
+                     {EXERCISED_CLAIM:?} / {UNEXERCISED_CLAIM:?}. Exactly one is required: \
+                     D-043 is the published answer to \"what is a test at an unreachable rung \
+                     evidence about\", and a sub-floor row that names neither, or both, either \
+                     has no answer or two.",
+                    rung.abi,
+                    constants.min_abi,
+                    if says_exercised { "BOTH" } else { "NEITHER" }
+                );
+            }
+            if says_exercised != exercised {
+                bail!(
+                    "isolation-matrix: ABI rung {} lists {} behavioural test(s) and carries \
+                     {:?}. The claims are not interchangeable -- {EXERCISED_CLAIM:?} says a test \
+                     enters a domain at this rung and {UNEXERCISED_CLAIM:?} says none does -- so \
+                     the row is refused rather than published against its own corpus.",
+                    rung.abi,
+                    rung.behavioural_tests.len(),
+                    if says_exercised {
+                        EXERCISED_CLAIM
+                    } else {
+                        UNEXERCISED_CLAIM
+                    }
+                );
+            }
+        }
+    }
+
+    // (7c) And the tally itself, on the surface a security reader meets. The
+    // two claims above hold WHICH rows carry an explanation; this holds the
+    // NUMBER, which is the half that rotted last time -- a count corrected in
+    // one place and left standing in another. It is spelled from the corpus,
+    // so adding or dropping a sub-floor test changes the required sentence and
+    // the generator names the new one.
+    {
+        let tally = sub_floor_tally(corpus, &constants);
+        if !normalize(&sources.limits).contains(&normalize(&tally)) {
+            bail!(
+                "isolation-matrix: {LIMITS} does not carry this corpus's sub-floor tally. It \
+                 must say, in these words:\n  {tally:?}\nThe count of exercised rungs is \
+                 published there and computed here, so the two are held together rather than \
+                 kept in step by hand."
+            );
         }
     }
 
@@ -1238,6 +1345,103 @@ fn render_rung_table(p: &mut String, corpus: &Corpus, ladder: &Ladder, c: &Const
             .map(|(rung, name)| format!("rung {rung} → {name}"))
             .collect::<Vec<_>>()
             .join(", ")
+    ));
+    render_exercised_rungs(p, corpus, c);
+}
+
+/// `1, 2 and 3`, for a list a human reads inside a sentence.
+fn join_and(items: &[String]) -> String {
+    match items {
+        [] => "none".to_string(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+/// The sub-floor tally, in one sentence built from the corpus.
+///
+/// Rendered onto the page **and** required verbatim on the limits page, so the
+/// two cannot disagree and neither can be edited to a number the corpus does
+/// not support. Adding or dropping a `Rung::behavioural_tests` entry below the
+/// floor changes this string, and the generator then refuses to emit until the
+/// limits page carries the new one.
+fn sub_floor_tally(corpus: &Corpus, c: &Constants) -> String {
+    let numbers = |exercised: bool| -> Vec<String> {
+        corpus
+            .rungs
+            .iter()
+            .filter(|r| r.abi < c.min_abi && r.behavioural_tests.is_empty() != exercised)
+            .map(|r| r.abi.to_string())
+            .collect()
+    };
+    let yes = numbers(true);
+    let no = numbers(false);
+    match (yes.is_empty(), no.is_empty()) {
+        (false, true) => format!(
+            "below the floor of {}, every rung ({}) is exercised",
+            c.min_abi,
+            join_and(&yes)
+        ),
+        (true, false) => format!(
+            "below the floor of {}, no rung ({}) is exercised",
+            c.min_abi,
+            join_and(&no)
+        ),
+        _ => format!(
+            "below the floor of {}, rungs {} are exercised and rungs {} are not",
+            c.min_abi,
+            join_and(&yes),
+            join_and(&no)
+        ),
+    }
+}
+
+/// Which rungs a behavioural test enters a domain at — **counted from the
+/// corpus, never typed into a sentence.**
+///
+/// This paragraph exists because the sentence it replaces was wrong. D-043's
+/// first draft published "the behavioural tests that exercise them" on every
+/// row below the floor, including the two rows nothing exercises. A reader
+/// cannot tell those rows apart from the table, so the page now says which is
+/// which, and says it from [`Rung::behavioural_tests`] — the same field
+/// step (5b) of [`render`] holds the claims against.
+fn render_exercised_rungs(p: &mut String, corpus: &Corpus, c: &Constants) {
+    let exercised: Vec<&Rung> = corpus
+        .rungs
+        .iter()
+        .filter(|r| !r.behavioural_tests.is_empty())
+        .collect();
+    p.push_str(
+        "**Which rungs are exercised is counted from this table, not asserted.** A rung is\n\
+         counted here when a test in `crates/vitrin-realm-init/src/main.rs` **enters** a\n\
+         Landlock domain at it and asserts the kernel's own answer — a syscall's outcome\n\
+         inside the domain, or the kernel's verdict on the request. Building a ruleset at a\n\
+         rung and never entering it does not count.\n\n",
+    );
+    for rung in &exercised {
+        p.push_str(&format!(
+            "- **rung {}** — {}\n",
+            rung.abi,
+            rung.behavioural_tests
+                .iter()
+                .map(|t| format!("`{t}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    p.push('\n');
+    p.push_str(&format!(
+        "That is {} of the {} rungs on this page. Below the floor the tally is the one\n\
+         `docs/book/src/limits.md` has to carry word for word:\n\n\
+         > {}.\n\n\
+         Every cell on an unexercised row is derived from this build's own source and\n\
+         measured against nothing — keeping the sub-floor tests that exist and adding none\n\
+         for the rest is decision D-043, not an oversight. Neither half is remembered:\n\
+         every name above is looked up in that file before this page is emitted, and the\n\
+         generator refuses to emit when the limits page does not carry that tally.\n\n",
+        exercised.len(),
+        corpus.rungs.len(),
+        sub_floor_tally(corpus, c),
     ));
 }
 
@@ -1515,22 +1719,40 @@ pub static CLAIMS: &[Claim] = &[
     // The lower half of this ladder is unreachable in production, and until
     // D-043 (2026-08-19) nothing published said what its behavioural tests
     // were therefore evidence *about*. A reader met three tests exercising
-    // rungs no shipped session can run at and had to guess. This claim is the
-    // machine-held half of that decision: it is named by every sub-floor row,
-    // so a rung below the floor can never again render without the
-    // explanation, and the sentence it cites cannot be deleted from the limits
-    // page while the rows still cite it.
+    // rungs no shipped session can run at and had to guess. These two claims
+    // are the machine-held half of that decision, and they are a PAIR because
+    // the first draft was a single claim carried by every sub-floor row --
+    // including the two rows no test enters a domain at, which turned "the
+    // behavioural tests that exercise them" into a published falsehood on
+    // exactly the rows it was least true of. Which of the pair a row carries
+    // is now decided by `Rung::behavioural_tests` and checked in `render`, so
+    // a rung cannot render below the floor without an explanation and cannot
+    // render with the wrong one.
     Claim {
         id: "sub-floor-rungs-hold-the-dial-not-the-floor",
         says: "Rungs below this build's floor are unreachable in production -- a kernel \
-               reporting one is REFUSED at startup rather than confined weakly -- so the \
-               behavioural tests that exercise them hold the `--landlock=abi:N` DIAL honest \
-               and not the floor. They describe no state a stock session can reach, and they \
-               are the only evidence that the lower half of this table is not fiction \
-               (decision D-043, 2026-08-19).",
+               reporting one is REFUSED at startup rather than confined weakly -- so a \
+               behavioural test taken at one of them holds the `--landlock=abi:N` DIAL honest \
+               and not the floor. This row is a rung such a test enters a domain at: it \
+               describes no state a stock session can reach, and those tests are the only \
+               evidence that this part of the table is not fiction (decision D-043, \
+               2026-08-19).",
         anchors: &[Anchor {
             surface: LIMITS,
             needle: "hold the dial honest, not the floor",
+        }],
+    },
+    Claim {
+        id: "sub-floor-rungs-are-not-all-exercised",
+        says: "This rung is below the floor AND no behavioural test enters a Landlock domain at \
+               it, so every cell on this row is derived from this build's own source and \
+               measured against nothing -- the sub-floor half of the ladder is exercised in \
+               part, not throughout. D-043 (2026-08-19) kept the sub-floor tests that exist and \
+               deliberately added none, so this row's status is a decision rather than an \
+               oversight.",
+        anchors: &[Anchor {
+            surface: LIMITS,
+            needle: "exercised in part, not throughout",
         }],
     },
     Claim {
@@ -1707,6 +1929,10 @@ pub static RUNGS: &[Rung] = &[
             "abi-floor-refuses-below-the-number",
             "sub-floor-rungs-hold-the-dial-not-the-floor",
         ],
+        behavioural_tests: &[
+            "a_realm_can_write_where_it_was_granted_and_nowhere_else",
+            "rung_one_forbids_reparenting_that_the_rung_above_permits",
+        ],
     },
     Rung {
         abi: 2,
@@ -1719,6 +1945,10 @@ pub static RUNGS: &[Rung] = &[
         claims: &[
             "refer-makes-the-cap-a-dial",
             "sub-floor-rungs-hold-the-dial-not-the-floor",
+        ],
+        behavioural_tests: &[
+            "rung_one_forbids_reparenting_that_the_rung_above_permits",
+            "the_truncate_rung_is_measured_and_its_absence_is_measured_with_it",
         ],
     },
     Rung {
@@ -1734,6 +1964,7 @@ pub static RUNGS: &[Rung] = &[
             "truncate-arrives-at-abi-3",
             "sub-floor-rungs-hold-the-dial-not-the-floor",
         ],
+        behavioural_tests: &["the_truncate_rung_is_measured_and_its_absence_is_measured_with_it"],
     },
     Rung {
         abi: 4,
@@ -1750,8 +1981,9 @@ pub static RUNGS: &[Rung] = &[
         claims: &[
             "net-scoping-is-carried-by-the-namespace",
             "nine-rungs-are-six-domains",
-            "sub-floor-rungs-hold-the-dial-not-the-floor",
+            "sub-floor-rungs-are-not-all-exercised",
         ],
+        behavioural_tests: &[],
     },
     Rung {
         abi: 5,
@@ -1764,8 +1996,9 @@ pub static RUNGS: &[Rung] = &[
                      buys is denying `ioctl` on every *other* device node in the realm.",
         claims: &[
             "ioctl-dev-does-not-close-the-render-node",
-            "sub-floor-rungs-hold-the-dial-not-the-floor",
+            "sub-floor-rungs-are-not-all-exercised",
         ],
+        behavioural_tests: &[],
     },
     Rung {
         abi: 6,
@@ -1777,6 +2010,7 @@ pub static RUNGS: &[Rung] = &[
                      namespace already denies signalling outward — so this rung is defence in \
                      depth, and no published sentence would become false without it.",
         claims: &["scoped-is-defence-in-depth"],
+        behavioural_tests: &[],
     },
     Rung {
         abi: 7,
@@ -1795,6 +2029,7 @@ pub static RUNGS: &[Rung] = &[
             "restrict-self-flags-are-not-mask-bits",
             "nine-rungs-are-six-domains",
         ],
+        behavioural_tests: &["the_audit_log_flag_is_off_unless_asked_for_and_the_kernel_takes_it"],
     },
     Rung {
         abi: 8,
@@ -1810,6 +2045,7 @@ pub static RUNGS: &[Rung] = &[
             "restrict-self-flags-are-not-mask-bits",
             "nine-rungs-are-six-domains",
         ],
+        behavioural_tests: &[],
     },
     Rung {
         abi: 9,
@@ -1821,6 +2057,7 @@ pub static RUNGS: &[Rung] = &[
                      writable hierarchy, because a socket the realm creates for itself — the \
                      shim's `wayland-0` among them — must stay connectable to it.",
         claims: &["the-ladder-stops-at-the-build-ceiling"],
+        behavioural_tests: &[],
     },
     Rung {
         abi: 10,
@@ -1835,6 +2072,7 @@ pub static RUNGS: &[Rung] = &[
                      ABI value rather than against a machine that reports one — nothing here has \
                      run on such a kernel.",
         claims: &["the-ladder-stops-at-the-build-ceiling"],
+        behavioural_tests: &[],
     },
 ];
 
@@ -2017,6 +2255,7 @@ mod tests {
             requested: r.requested,
             not_bought: r.not_bought,
             claims: r.claims,
+            behavioural_tests: r.behavioural_tests,
         }
     }
 
@@ -2080,6 +2319,98 @@ mod tests {
             text.contains("ioctl-dev-does-not-close-the-render-node")
                 && text.contains("no longer published"),
             "got: {text}"
+        );
+    }
+
+    /// **D-043's own defect, as a gate.** The first draft of that decision
+    /// carried one claim -- "the behavioural tests that exercise them" -- on
+    /// every sub-floor row, including the two rows nothing enters a domain at,
+    /// so the published matrix asserted tests existed where none did. Which
+    /// claim a sub-floor row carries is now a function of that row's
+    /// `behavioural_tests`, and disagreeing with it is refused.
+    #[test]
+    fn a_sub_floor_rung_claiming_tests_it_does_not_have_refuses_to_render() {
+        let mut rungs: Vec<Rung> = RUNGS.iter().map(rung_clone).collect();
+        // Rung 4 (index 3) is below the floor and no test enters a domain at
+        // it. Give it the "exercised" claim and change nothing else -- exactly
+        // the edit the first draft made, and the one a reader cannot catch.
+        rungs[3].claims = &[
+            "net-scoping-is-carried-by-the-namespace",
+            "nine-rungs-are-six-domains",
+            EXERCISED_CLAIM,
+        ];
+        let err = render(&with_rungs(rungs), &sources())
+            .expect_err("a rung with no behavioural test may not claim one exercises it");
+        let text = format!("{err}");
+        assert!(
+            text.contains("ABI rung 4") && text.contains(EXERCISED_CLAIM),
+            "the refusal must name the rung and the claim it may not carry, got: {text}"
+        );
+    }
+
+    /// And the other direction: a sub-floor row that carries neither claim has
+    /// no answer to "what is a test at an unreachable rung evidence about",
+    /// which is the state D-043 exists to end.
+    #[test]
+    fn a_sub_floor_rung_with_no_sub_floor_claim_refuses_to_render() {
+        let mut rungs: Vec<Rung> = RUNGS.iter().map(rung_clone).collect();
+        // Rung 5 keeps a published claim, so this is not step (5)'s check
+        // firing, and rung 4 still carries the unexercised claim, so it is not
+        // step (6)'s either.
+        rungs[4].claims = &["ioctl-dev-does-not-close-the-render-node"];
+        let err = render(&with_rungs(rungs), &sources())
+            .expect_err("a sub-floor row must say which kind of sub-floor row it is");
+        let text = format!("{err}");
+        assert!(
+            text.contains("ABI rung 5") && text.contains("NEITHER"),
+            "the refusal must name the rung and which way it is wrong, got: {text}"
+        );
+    }
+
+    /// The named tests are resolved, not trusted. A rename in
+    /// `vitrin-realm-init` that this corpus has not followed is a page
+    /// claiming a rung is exercised by something that is not there.
+    #[test]
+    fn a_behavioural_test_name_that_is_not_in_the_helper_refuses_to_render() {
+        let mut rungs: Vec<Rung> = RUNGS.iter().map(rung_clone).collect();
+        rungs[0].behavioural_tests = &["a_test_that_was_renamed_and_nobody_followed_it"];
+        let err = render(&with_rungs(rungs), &sources())
+            .expect_err("a behavioural test name that resolves to nothing must not render");
+        let text = format!("{err}");
+        assert!(
+            text.contains("a_test_that_was_renamed_and_nobody_followed_it")
+                && text.contains(REALM_INIT_MAIN_RS),
+            "the refusal must name the missing test and the file it was looked for in, got: \
+             {text}"
+        );
+    }
+
+    /// The tally is a **count**, and a count corrected in one place and left
+    /// stale in another is this repository's dominant defect. So the limits
+    /// page must carry the one this corpus computes, word for word.
+    #[test]
+    fn a_limits_page_carrying_a_stale_sub_floor_tally_refuses_to_render() {
+        let mut src = sources();
+        let tally = sub_floor_tally(
+            &corpus(),
+            &Constants::from_source(&src.realm_init_lib_rs).expect("the constants"),
+        );
+        assert!(
+            src.limits.contains(&tally),
+            "the checked-in limits page must already carry {tally:?}"
+        );
+        // The stale form: the count a reader would have written before rungs 4
+        // and 5 were separated out.
+        src.limits = src.limits.replace(
+            &tally,
+            "below the floor of 6, rungs 1, 2, 3, 4 and 5 are exercised",
+        );
+        let err = render(&corpus(), &src)
+            .expect_err("a limits page whose tally no longer matches the corpus must not render");
+        let text = format!("{err}");
+        assert!(
+            text.contains(&tally) && text.contains(LIMITS),
+            "the refusal must name the surface and quote the tally it must carry, got: {text}"
         );
     }
 

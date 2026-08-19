@@ -83,8 +83,8 @@ so for those rungs there is nothing for a cap to take away.
 | 1 | the base access-mask bits — `EXECUTE`, `WRITE_FILE`, `READ_FILE`, `READ_DIR`, the `REMOVE_*` pair and the seven `MAKE_*` bits | `handled_access_fs` | yes — `--landlock=abi:N` reproduces its absence | **yes** | `0x1fff` | `0x0` | **below the floor** — a session refuses to start with `below-floor(abi=1,required=6)`; reachable only through `--landlock=abi:1`, which warns that no published confinement claim applies | `refer-makes-the-cap-a-dial`, `abi-floor-refuses-below-the-number`, `sub-floor-rungs-hold-the-dial-not-the-floor` |
 | 2 | `LANDLOCK_ACCESS_FS_REFER` | `handled_access_fs` | yes — `--landlock=abi:N` reproduces its absence | **yes** | `0x3fff` | `0x0` | **below the floor** — a session refuses to start with `below-floor(abi=2,required=6)`; reachable only through `--landlock=abi:2`, which warns that no published confinement claim applies | `refer-makes-the-cap-a-dial`, `sub-floor-rungs-hold-the-dial-not-the-floor` |
 | 3 | `LANDLOCK_ACCESS_FS_TRUNCATE` | `handled_access_fs` | yes — `--landlock=abi:N` reproduces its absence | **yes** | `0x7fff` | `0x0` | **below the floor** — a session refuses to start with `below-floor(abi=3,required=6)`; reachable only through `--landlock=abi:3`, which warns that no published confinement claim applies | `truncate-arrives-at-abi-3`, `sub-floor-rungs-hold-the-dial-not-the-floor` |
-| 4 | `handled_access_net` — TCP bind/connect scoping by port | `handled_access_net` | **no** — not an access-mask bit | no — the realm's own network namespace carries that claim structurally and far more completely, since it covers UDP and raw sockets too | `0x7fff` | `0x0` | **below the floor** — a session refuses to start with `below-floor(abi=4,required=6)`; reachable only through `--landlock=abi:4`, which warns that no published confinement claim applies | `net-scoping-is-carried-by-the-namespace`, `nine-rungs-are-six-domains`, `sub-floor-rungs-hold-the-dial-not-the-floor` |
-| 5 | `LANDLOCK_ACCESS_FS_IOCTL_DEV` | `handled_access_fs` | yes — `--landlock=abi:N` reproduces its absence | **yes** | `0xffff` | `0x0` | **below the floor** — a session refuses to start with `below-floor(abi=5,required=6)`; reachable only through `--landlock=abi:5`, which warns that no published confinement claim applies | `ioctl-dev-does-not-close-the-render-node`, `sub-floor-rungs-hold-the-dial-not-the-floor` |
+| 4 | `handled_access_net` — TCP bind/connect scoping by port | `handled_access_net` | **no** — not an access-mask bit | no — the realm's own network namespace carries that claim structurally and far more completely, since it covers UDP and raw sockets too | `0x7fff` | `0x0` | **below the floor** — a session refuses to start with `below-floor(abi=4,required=6)`; reachable only through `--landlock=abi:4`, which warns that no published confinement claim applies | `net-scoping-is-carried-by-the-namespace`, `nine-rungs-are-six-domains`, `sub-floor-rungs-are-not-all-exercised` |
+| 5 | `LANDLOCK_ACCESS_FS_IOCTL_DEV` | `handled_access_fs` | yes — `--landlock=abi:N` reproduces its absence | **yes** | `0xffff` | `0x0` | **below the floor** — a session refuses to start with `below-floor(abi=5,required=6)`; reachable only through `--landlock=abi:5`, which warns that no published confinement claim applies | `ioctl-dev-does-not-close-the-render-node`, `sub-floor-rungs-are-not-all-exercised` |
 | 6 | the `scoped` field — `SCOPE_ABSTRACT_UNIX_SOCKET` and `SCOPE_SIGNAL` | `scoped` | yes — `--landlock=abi:N` reproduces its absence | **yes** | `0xffff` | `0x3` | at or above the floor — a shipped session runs here | `scoped-is-defence-in-depth` |
 | 7 | `landlock_restrict_self` log flags — `LOG_SAME_EXEC_OFF`, `LOG_NEW_EXEC_ON`, `LOG_SUBDOMAINS_OFF` | `landlock_restrict_self` flags | **no** — not an access-mask bit | no — the log flags are observability, not confinement, and no published claim depends on them; the one that is reachable at all is reachable only through the `VITRIN_LANDLOCK_AUDIT` diagnostic in vitrind's own environment | `0xffff` | `0x3` | at or above the floor — a shipped session runs here | `restrict-self-flags-are-not-mask-bits`, `nine-rungs-are-six-domains` |
 | 8 | `landlock_restrict_self` `TSYNC` — apply the domain to every thread of the caller | `landlock_restrict_self` flags | **no** — not an access-mask bit | no — the helper is single-threaded by design and enforces the domain on the one thread that then `execve`s, so its shape already carries what `TSYNC` would buy | `0xffff` | `0x3` | at or above the floor — a shipped session runs here | `restrict-self-flags-are-not-mask-bits`, `nine-rungs-are-six-domains` |
@@ -97,6 +97,28 @@ that rung for. It is parsed out of `handled_access_fs` in
 table pinned in that crate's `the_rung_masks_pin_a_measured_table`; the two
 readings disagreeing stops this page being emitted at all. The rights arrive in
 this order: rung 2 → REFER, rung 3 → TRUNCATE, rung 5 → IOCTL_DEV, rung 6 → the `scoped` field, rung 9 → RESOLVE_UNIX.
+
+**Which rungs are exercised is counted from this table, not asserted.** A rung is
+counted here when a test in `crates/vitrin-realm-init/src/main.rs` **enters** a
+Landlock domain at it and asserts the kernel's own answer — a syscall's outcome
+inside the domain, or the kernel's verdict on the request. Building a ruleset at a
+rung and never entering it does not count.
+
+- **rung 1** — `a_realm_can_write_where_it_was_granted_and_nowhere_else`, `rung_one_forbids_reparenting_that_the_rung_above_permits`
+- **rung 2** — `rung_one_forbids_reparenting_that_the_rung_above_permits`, `the_truncate_rung_is_measured_and_its_absence_is_measured_with_it`
+- **rung 3** — `the_truncate_rung_is_measured_and_its_absence_is_measured_with_it`
+- **rung 7** — `the_audit_log_flag_is_off_unless_asked_for_and_the_kernel_takes_it`
+
+That is 4 of the 10 rungs on this page. Below the floor the tally is the one
+`docs/book/src/limits.md` has to carry word for word:
+
+> below the floor of 6, rungs 1, 2 and 3 are exercised and rungs 4 and 5 are not.
+
+Every cell on an unexercised row is derived from this build's own source and
+measured against nothing — keeping the sub-floor tests that exist and adding none
+for the rest is decision D-043, not an oversight. Neither half is remembered:
+every name above is looked up in that file before this page is emitted, and the
+generator refuses to emit when the limits page does not carry that tally.
 
 ## What each rung does not buy
 
@@ -164,7 +186,8 @@ published sentence cannot be deleted or reworded while this table still cites it
 | claim | what it says | published at |
 |---|---|---|
 | `abi-floor-refuses-below-the-number` | A kernel reporting a Landlock ABI below this build's floor is refused at startup rather than confined at a weaker rung, and the number is printed as `build.landlock_min_abi`. | `docs/book/src/limits.md` — “build.landlock_min_abi”; `README.md` — “build.landlock_min_abi”; `SECURITY.md` — “build.landlock_min_abi” |
-| `sub-floor-rungs-hold-the-dial-not-the-floor` | Rungs below this build's floor are unreachable in production -- a kernel reporting one is REFUSED at startup rather than confined weakly -- so the behavioural tests that exercise them hold the `--landlock=abi:N` DIAL honest and not the floor. They describe no state a stock session can reach, and they are the only evidence that the lower half of this table is not fiction (decision D-043, 2026-08-19). | `docs/book/src/limits.md` — “hold the dial honest, not the floor” |
+| `sub-floor-rungs-hold-the-dial-not-the-floor` | Rungs below this build's floor are unreachable in production -- a kernel reporting one is REFUSED at startup rather than confined weakly -- so a behavioural test taken at one of them holds the `--landlock=abi:N` DIAL honest and not the floor. This row is a rung such a test enters a domain at: it describes no state a stock session can reach, and those tests are the only evidence that this part of the table is not fiction (decision D-043, 2026-08-19). | `docs/book/src/limits.md` — “hold the dial honest, not the floor” |
+| `sub-floor-rungs-are-not-all-exercised` | This rung is below the floor AND no behavioural test enters a Landlock domain at it, so every cell on this row is derived from this build's own source and measured against nothing -- the sub-floor half of the ladder is exercised in part, not throughout. D-043 (2026-08-19) kept the sub-floor tests that exist and deliberately added none, so this row's status is a decision rather than an oversight. | `docs/book/src/limits.md` — “exercised in part, not throughout” |
 | `refer-makes-the-cap-a-dial` | A domain denies cross-directory `rename(2)` unless its ruleset HANDLES `REFER`, so rung 1 is stricter about reparenting than rung 2 -- the rung cap is a dial, not a one-way weakening. | `docs/book/src/limits.md` — “The cap is a dial, not a one-way weakening”; `README.md` — “dial, not a one-way tightening” |
 | `truncate-arrives-at-abi-3` | Below ABI 3 there is no `TRUNCATE` right, so a payload that cannot write a file can still empty it -- measured at rung 2 succeeding and rung 3 refusing. | `docs/book/src/limits.md` — “Below ABI 3 there is no `TRUNCATE` right” |
 | `net-scoping-is-carried-by-the-namespace` | ABI 4 buys network scoping, which this build leaves zero because the realm's own network namespace carries that claim and covers UDP and raw sockets too. | `docs/book/src/limits.md` — “ABI 4 is network scoping” |

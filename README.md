@@ -754,9 +754,10 @@ the bullet below states in full.
   *lowest* rung at which the domain this build enforces is unchanged — rungs 7
   and 8 buy `landlock_restrict_self` flags rather than mask bits, and every
   shipped run passes flags = 0 — so lowering it refuses fewer machines and
-  weakens none. The floor narrowed P2.6.3 rather than
-  completing it, and what completed it was other work plus a dated decision;
-  the [limits page](docs/book/src/limits.md) says what is not built. **Which kernels the floor admits is measured**: five distribution
+  weakens none. The floor narrowed P2.6.3 rather than completing it, and what
+  completed it was other work plus a dated decision; the
+  [limits page](docs/book/src/limits.md) says what is not built. **Which
+  kernels the floor admits is measured**: five distribution
   kernels were booted with the shipped binary, and Debian 13 (ABI 6) and the
   `6.17.0-1020-azure` kernel CI runs (ABI 7) start, while Ubuntu 22.04 (ABI 1),
   Debian 12 (ABI 2) and Ubuntu 24.04's GA kernel (ABI 4) are refused — see

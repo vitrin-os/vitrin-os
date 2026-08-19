@@ -9,7 +9,9 @@ protocol spec is published early, versioned `0.x`, and explicitly tracks
 the reference implementation; every crate is `0.1.0`, the Python SDK is
 `0.1.0a0`, and Phase 1 is complete while Phase 2 has only begun: its
 confinement track has landed through the seccomp deny-list of P2.6.4 — P2.6.3
-itself is not finished — and nothing of the powerbox, the egress path or the
+closed on 2026-08-19 on *corrected* criteria rather than the ones its plan row
+first wrote, and the Landlock paragraph further down says what that closure
+does and does not mean — and nothing of the powerbox, the egress path or the
 semantic work exists. The other work since has been the maintainer
 session-mode workstream WS-E, which **D-021** scopes as dogfooding rather than
 as a phase. There has been no

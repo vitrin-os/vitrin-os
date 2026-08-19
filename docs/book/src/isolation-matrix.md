@@ -109,25 +109,34 @@ rung and never entering it does not count.
 - **rung 3** — `the_truncate_rung_is_measured_and_its_absence_is_measured_with_it`
 - **rung 7** — `the_audit_log_flag_is_off_unless_asked_for_and_the_kernel_takes_it`
 
-That is 4 of the 10 rungs on this page. Below the floor the tally is the one
+That is 4 of the 9 rungs this build can ask for. The one further row on
+this page (ABI 10) is above this build's ceiling of 9 — a clamp, not a rung it
+requests — so it is not in that denominator. Below the floor the tally is the one
 `docs/book/src/limits.md` has to carry word for word:
 
 > below the floor of 6, rungs 1, 2 and 3 are exercised and rungs 4 and 5 are not.
 
 Every cell on an unexercised row is derived from this build's own source and
 measured against nothing — keeping the sub-floor tests that exist and adding none
-for the rest is decision D-043, not an oversight. Neither half is remembered:
-every name above is looked up in that file before this page is emitted, and the
-generator refuses to emit when the limits page does not carry that tally.
+for the rest is decision D-043, not an oversight. **Neither the name nor the rung is
+remembered.** Each name above is resolved against `BEHAVIOURAL_RUNGS` in that same
+file, which declares the rungs that test enters a domain at; a name listed on a rung
+it does not enter refuses to render, a rung it does enter and this page omits refuses
+to render, and the tests themselves assert at runtime that the rungs they entered are
+the rungs they declared. The generator also refuses to emit when the limits page does
+not carry the tally above.
 
 ## What each rung does not buy
 
 The column this table exists for. A ladder printed without it reads as though
-every rung is pure gain, and three of the rows below say otherwise.
+every rung is pure gain, and the rows below say otherwise on the kernel's own
+terms: rungs 4, 7 and 8 add nothing to the enforced domain of the rung beneath,
+counted from the parsed ladder rather than typed here. Rung 1's row is sharper
+still — the *absence* of `REFER` makes its domain stricter, not weaker.
 
 | ABI | what it buys | what it does **not** buy |
 |---|---|---|
-| 1 | the base access-mask bits — `EXECUTE`, `WRITE_FILE`, `READ_FILE`, `READ_DIR`, the `REMOVE_*` pair and the seven `MAKE_*` bits | `REFER`, and its absence makes a rung-1 domain **stricter**: it refuses `rename(2)` and `link(2)` across directories even inside the realm's own writable storage. Measured `EXDEV` at rung 1, success at rungs 2–9. |
+| 1 | the base access-mask bits — `EXECUTE`, `WRITE_FILE`, `READ_FILE`, `READ_DIR`, the `REMOVE_*` pair and the seven `MAKE_*` bits | `REFER`, and its absence makes a rung-1 domain **stricter**: it refuses `rename(2)` and `link(2)` across directories even inside the realm's own writable storage. `EXDEV` at rung 1 and success at rung 2 are re-taken by a test on every run; rungs 3–9 succeeded in a hand run on 2026-08-14 that nothing since repeats. |
 | 2 | `LANDLOCK_ACCESS_FS_REFER` | a tightening of any kind. Handling `REFER` is what **permits** cross-directory rename, which is how GTK and Firefox write files; a ladder read as "higher is tighter" has this rung backwards. |
 | 3 | `LANDLOCK_ACCESS_FS_TRUNCATE` | protection for a path outside every granted write hierarchy, which was never truncatable at any rung. What it adds is that a path the domain grants only `READ_FILE` on can no longer be emptied by `truncate(2)`, `creat(2)` or `O_TRUNC`. |
 | 4 | `handled_access_net` — TCP bind/connect scoping by port | anything this build asks for. `handled_access_net` stays zero, so the enforced domain at rung 4 is byte-identical to rung 3 — and because the cap moves `handled_access_fs`, `--landlock=abi:3` cannot simulate a kernel without rung 4. |
@@ -231,7 +240,9 @@ published sentence cannot be deleted or reworded while this table still cites it
   the nine rungs are reported by none of them; every row on that page is a
   **kernel** reading taken in a bare initramfs rather than a distribution; the
   behavioural per-rung tests this page's numbers rest on still live in
-  `vitrin-realm-init`'s own suite, on one box; and the sub-floor half of those
+  `vitrin-realm-init`'s own suite, running on this repository's development box
+  and on the CI runner and on no third machine, with the values they pin recorded
+  on one box on one date; and the sub-floor half of those
   tests is evidence about the `--landlock=abi:N` dial rather than about any state a
   stock session reaches.
 - **The realm's grant table.** Which hierarchies get which rights is

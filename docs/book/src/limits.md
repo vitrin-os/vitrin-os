@@ -290,7 +290,15 @@ inferred from the word "Landlock":
   storage**, and every rung above it can. Measured on this repo's box (kernel
   `7.1.8-arch1-3`, Landlock ABI 9, 2026-08-14) with the realm's whole writable
   set granted on one hierarchy: rung 1 answers `EXDEV`, rungs 2–9 succeed, and
-  a same-directory rename succeeds at every rung. Practically, `--landlock=abi:1`
+  a same-directory rename succeeds at every rung. **Two of those rungs are
+  re-taken on every run and the rest are not**, which matters because the next
+  bullet says no test in this repository enters a domain at rung 4 or rung 5.
+  `rung_one_forbids_reparenting_that_the_rung_above_permits` enters a Landlock
+  domain at rung 1 and at rung 2 and at no other — that is declared in
+  `BEHAVIOURAL_RUNGS` and asserted by the test itself against the rungs it
+  actually entered — so rungs 3–9 above, and the same-directory result anywhere
+  but rung 1, are a **hand run on that one date**: checked by a reader, and by
+  nothing in CI. Practically, `--landlock=abi:1`
   breaks every app that writes by rename-into-place (GTK, Firefox). Do not read
   the ladder as "higher is always tighter"; read it as "rung N is ABI N".
 - **Some of the rungs below the floor are exercised, on purpose: those tests
@@ -327,14 +335,22 @@ inferred from the word "Landlock":
   > below the floor of 6, rungs 1, 2 and 3 are exercised and rungs 4 and 5 are not.
 
   So the sub-floor half of the ladder is exercised in part, not throughout.
-  Nothing in this repository enters a Landlock domain at rung 4 or rung 5, so
-  every cell on those two rows of the matrix is derived from this build's own
-  source and measured against nothing. That is a decision rather than an
+  **No test in this repository enters a Landlock domain at rung 4 or rung 5**,
+  so every cell on those two rows of the matrix is derived from this build's own
+  source and measured against nothing. (The 2026-08-14 hand run in the `REFER`
+  bullet above did pass through those rungs once and left nothing behind that
+  re-takes it; a measurement nobody can re-run is not coverage.) That is a
+  decision rather than an
   oversight: D-043 was offered the option of *adding* the missing rungs and did
   not take it, rung 4 buying `handled_access_net` which this build leaves zero.
   The tally above is **held**, not remembered — `cargo xtask isolation-matrix`
   computes it from the corpus, prints it on the matrix page, and refuses to
-  emit at all unless this page carries the same sentence.
+  emit at all unless this page carries the same sentence. So is the rung each
+  named test belongs to: the generator resolves every name against
+  `BEHAVIOURAL_RUNGS` in `crates/vitrin-realm-init/src/main.rs`, which declares
+  the rungs that test enters a domain at and which each test asserts against the
+  rungs it actually entered, so a test cannot be published on a rung it never
+  enters and a rung it does enter cannot be left off.
 - **This build's ladder stops at rung 9, and a newer kernel is clamped to it.**
   ABI 10 exists in mainline and this build does not request it. A kernel
   reporting more than 9 gets a rung-9 ruleset, and that is journaled per realm
@@ -438,7 +454,13 @@ inferred from the word "Landlock":
   to a path outside the granted set — with its positive control in the same
   run — is measured only by `a_realm_can_write_where_it_was_granted_and_nowhere_else`
   in `vitrin-realm-init`'s own suite, at rung 1, in a forked child. That is a
-  component test and this page will not cite it as anything else.
+  component test and this page will not cite it as anything else. **Where the
+  write half is scheduled to be measured mock-free is
+  [#193](https://github.com/vitrin-os/vitrin-os/issues/193)** (P2.6.9, the
+  ransomware gate), whose payload reports every write it attempted with the
+  errno each got; nothing before that gate lands closes this, and giving
+  `test_real_confinement.py`'s own probe a write verb was considered here and
+  deliberately left to it rather than done in a review-fix branch.
 - **There is a ladder table now, and it is a table about this build — not
   about kernels. P2.6.3 closed on 2026-08-19, on its *corrected* criteria and
   not on the ones its plan row first wrote, and this page will not round that
@@ -485,7 +507,11 @@ inferred from the word "Landlock":
   "coverage is kernel-dependent" caveat is answered for those five and for no
   others. The per-rung *behavioural* statements quoted above
   (the `TRUNCATE` pair, the `REFER` pair) are held by `vitrin-realm-init`'s own
-  tests on one box; everything else about a rung is now generated and gated,
+  tests, which run on this repository's development box and on the CI runner —
+  whose job declares `VITRIN_REQUIRE_LANDLOCK_ABI=7`, so a skip there is a panic
+  and not a quiet pass — and on no third machine; the *values* they pin were
+  recorded on one box on one date. Everything else about a rung is now generated
+  and gated,
   which is a narrower promise than "measured". **What "P2.6.3 closed" does and
   does not mean.** It closed on the corrected criteria plus decision D-043 (the
   sub-floor rung tests, above), and two of the criteria written in the plan were

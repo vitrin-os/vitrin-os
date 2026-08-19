@@ -91,6 +91,16 @@
 //! inside the realm's own writable storage and rung 2 permits it. Measured
 //! here (kernel `7.1.8-arch1-3`, ABI 9, 2026-08-14): rung 1 answers `EXDEV`,
 //! rungs 2..=9 succeed, and a same-directory rename succeeds at every rung.
+//! **Only the first two of those rungs are re-taken by a test.**
+//! `rung_one_forbids_reparenting_that_the_rung_above_permits` enters a domain
+//! at rungs 1 and 2 and at no other -- it declares that in `BEHAVIOURAL_RUNGS`
+//! and asserts it against the rungs it actually entered -- so rungs 3..=9
+//! above, and the same-directory result at any rung but 1, are a **hand run on
+//! that one date**: checked by a reader, and by nothing in CI. Do not read the
+//! range as coverage; `docs/book/src/limits.md` and
+//! `docs/book/src/isolation-matrix.md` draw the same line, which is why they
+//! can also say no test enters a domain at rung 4 or rung 5 without
+//! contradicting this paragraph.
 //! The cap is a **dial**, not a one-way weakening, and every published
 //! statement of it says so.
 //!
@@ -286,8 +296,11 @@ const LOG_FLAGS_RUNG: u32 = 7;
 /// table is *not* is a per-kernel measurement (see
 /// `docs/plan/02-phase-2-semantic-epochs.md`, "P2.6.3, corrected",
 /// Correction 5): it parses this file rather than probing a machine, so "the
-/// published ladder" is now generated and gated, while the *behaviour* behind
-/// each rung is still measured on one box.
+/// published ladder" is now generated and gated, while the *values* behind each
+/// rung's behaviour were recorded on one box on one date -- the tests that take
+/// them run here and on the CI runner, whose job declares
+/// `VITRIN_REQUIRE_LANDLOCK_ABI=7` so a skip is a panic, and on no third
+/// machine.
 fn restrict_self_flags(rung: u32, audit: bool) -> libc::c_uint {
     if audit && rung >= LOG_FLAGS_RUNG {
         LOG_NEW_EXEC_ON
@@ -336,9 +349,14 @@ struct PathBeneathAttr {
 /// recalled: `0x1fff`, `0x3fff`, `0x7fff`, `0xffff`, `0x1ffff` accepted;
 /// `0x3ffff` (rung 10's) refused `EINVAL`.
 ///
-/// **Five of the ten rungs do not move it at all** (4, 6, 7, 8, 10), and the
+/// **Four of the nine rungs do not move it at all** (4, 6, 7 and 8), and the
 /// flatness is the honest picture of how much of the ABI ladder this ruleset
-/// consumes -- it is shown rather than hidden.
+/// consumes -- it is shown rather than hidden. That sentence is **computed**,
+/// not typed: `cargo xtask isolation-matrix` parses the ladder out of the
+/// function below and refuses to emit unless this comment carries the count it
+/// derives. The form it replaced was hand-written and had drifted -- it
+/// counted ABI 10, a clamp row above this build's ceiling that never reaches
+/// this function, as one of the rungs.
 fn handled_access_fs(rung: u32) -> u64 {
     let mut mask = EXECUTE
         | WRITE_FILE

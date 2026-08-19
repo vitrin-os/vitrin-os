@@ -10624,7 +10624,8 @@ mod tests {
         // bootstrap object, on the shim connection class, which no principal
         // can address at all. None is a request on either layout interface,
         // none adds an arrangement this scene cannot honour, and none allocates
-        // a verb bit (`Verb::VALID_MASK` is still 575). D-018(2) invariant 2 is
+        // a verb bit (`Verb::VALID_MASK` was unchanged by it). D-018(2)
+        // invariant 2 is
         // untouched. What they do add is a cross-realm channel the human drives
         // with two physical chords; that is D-024, not this invariant.
         // Re-pinned 40 -> 45 by WS-E.4.2 (issue #222), decision taken rather
@@ -10634,9 +10635,9 @@ mod tests {
         // schema forbids from defining any request at all (B2), on the shim
         // connection class no principal can address. None is a request on
         // either layout interface, none adds an arrangement this scene cannot
-        // honour, and none allocates a verb bit (`Verb::VALID_MASK` is still
-        // 575). D-018(2) invariant 2 is untouched. What they do add is a
-        // pairing obligation on the core -- one `gesture_end` per
+        // honour, and none allocates a verb bit (`Verb::VALID_MASK` was
+        // unchanged by it). D-018(2) invariant 2 is untouched. What they do
+        // add is a pairing obligation on the core -- one `gesture_end` per
         // `gesture_begin` delivered, on every path input is taken away; that
         // is D-032, not this invariant.
         // Re-pinned 45 -> 47 by WS-E.4.2's second half (issue #222), and this
@@ -10648,8 +10649,8 @@ mod tests {
         // object, on the shim connection class no principal can address.
         // Neither is a request on either layout interface, neither adds an
         // arrangement this scene cannot honour, and neither allocates a verb
-        // bit (`Verb::VALID_MASK` is still 575) -- so D-018(2) invariant 2's
-        // first half is untouched.
+        // bit (`Verb::VALID_MASK` was unchanged by it) -- so D-018(2)
+        // invariant 2's first half is untouched.
         // Its SECOND half is the one worth stating: a pointer constraint
         // changes what the APP is told, never what the core believes. The
         // core's own hit test still decides which surface an input event
@@ -10665,8 +10666,8 @@ mod tests {
         // object, on the shim connection class no principal can address. It is
         // not a request on either layout interface, it adds no arrangement this
         // scene cannot honour, and it allocates no verb bit
-        // (`Verb::VALID_MASK` is still 575) -- so invariant 2's first half is
-        // untouched.
+        // (`Verb::VALID_MASK` was unchanged by it) -- so invariant 2's first
+        // half is untouched.
         // Its second half, in the form #222 put it: an idle inhibit changes
         // what the CORE does with its own panel, and nothing at all about what
         // the app is told or what the core believes about geometry, focus or

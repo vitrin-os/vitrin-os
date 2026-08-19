@@ -1483,6 +1483,36 @@ mod tests {
         req.resource = "net:example.com:443".into();
         expect_declined(reg.admit(req, t0, &realms(), false), Outcome::Unsupported);
 
+        // And a `net:` selector that does NOT parse resolves `unsupported`
+        // too -- normatively required by `03-vitrin_realm.md` and
+        // `04-vitrin_grant.md` ("a `net:` selector that does not parse
+        // likewise resolves `unsupported`, not `invalid_argument`"), because
+        // the wire bound on `resource` is a byte length and its *content* is
+        // a policy question.
+        //
+        // **Today this holds by accident of a coarser rule**, and that is
+        // worth stating rather than letting the green tick imply otherwise:
+        // admission refuses every non-empty selector, so it never reaches the
+        // parser. The case is pinned here anyway, because P2.7.3/P2.7.4 wire
+        // the parser in, and when they do this assertion stops being
+        // incidental and starts being the thing that catches a parse failure
+        // escalated to a fatal `invalid_argument` -- which would kill the
+        // connection where the IDL promises a recoverable answer.
+        for malformed in [
+            "net:*.example.com:443",
+            "net:example.com:0",
+            "net:[bad]:443",
+        ] {
+            assert!(
+                crate::grants::NetSelector::parse(malformed).is_err(),
+                "`{malformed}` must not parse, or this case tests nothing"
+            );
+            let mut req = request(DEMO, conn, 50);
+            req.verbs = Verb::EGRESS;
+            req.resource = malformed.into();
+            expect_declined(reg.admit(req, t0, &realms(), false), Outcome::Unsupported);
+        }
+
         assert_eq!(reg.pending_total(), 0);
     }
 

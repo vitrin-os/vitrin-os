@@ -1222,8 +1222,9 @@ already states, now with a second reason to need it.
 
 **Allocation, checked repo-wide** (§5 of
 [02-phase-2-semantic-epochs.md](02-phase-2-semantic-epochs.md) is the registry
-and this consumes nothing in it): no verb bit — `Verb::VALID_MASK` stays
-**575** — because nothing agent-facing is added; no new prose page, since these
+and this consumes nothing in it): no verb bit — `Verb::VALID_MASK` is
+**unchanged by this workstream** (575 at the time, 703 since P2.7.2's
+`egress`) — because nothing agent-facing is added; no new prose page, since these
 extend [page 11](../protocol/11-vitrin_shim_seat.md) and
 [page 09](../protocol/09-vitrin_shim_session.md), and `docs/protocol/`'s 12–15
 stay reserved; event opcodes 5–9 on `vitrin_shim_seat` were unclaimed, request

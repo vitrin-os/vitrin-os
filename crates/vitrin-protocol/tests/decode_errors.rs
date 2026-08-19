@@ -124,6 +124,57 @@ fn invalid_bitfield_value_is_rejected() {
 }
 
 #[test]
+fn every_verb_is_classified_as_facet_bearing_or_not() {
+    // A count that documents itself. `docs/protocol/04-vitrin_grant.md`
+    // states "Six verbs map one-to-one to a facet interface" and, four
+    // hundred lines later, "the other six do" -- and the second sentence
+    // read "five" until issue #196's review caught it. Both numbers are the
+    // same number, and neither should be a sentence a human has to remember
+    // to update, so this is where it lives instead.
+    //
+    // FACET_VERBS is the `VERB` constant the scanner emits for every
+    // interface carrying `interface/@verb`; UNFACETED is the rest, listed
+    // with the reason each has no facet. The partition is checked against
+    // the *generated* bitfield, so appending a ninth verb to the IDL turns
+    // this red until someone puts it on one side of the line -- which is the
+    // moment the doc sentence needs editing too.
+    const FACET_VERBS: &[&str] = &[
+        gen::vitrin_view::VERB,
+        gen::vitrin_actuator_pointer::VERB,
+        gen::vitrin_actuator_text::VERB,
+        gen::vitrin_layout_focus::VERB,
+        gen::vitrin_layout_arrange::VERB,
+        gen::vitrin_launcher::VERB,
+    ];
+    // `observe_cursor` has none by construction (it widens what
+    // `capture_frame` composites rather than adding a request); `egress` has
+    // none yet, and when it lands it is a separate interface of its own,
+    // because `interface/@verb` is one value per interface.
+    const UNFACETED_VERBS: &[&str] = &["observe_cursor", "egress"];
+
+    assert_eq!(
+        FACET_VERBS.len(),
+        6,
+        "the IDL no longer declares six `interface/@verb` facets; \
+         docs/protocol/04-vitrin_grant.md states this count twice"
+    );
+    assert_eq!(
+        FACET_VERBS.len() + UNFACETED_VERBS.len(),
+        gen::vitrin_grant::Verb::VALID_MASK.count_ones() as usize,
+        "a verb bit is defined that is on neither side of the \
+         facet-bearing/unfaceted line -- classify it, and update the two \
+         counts in docs/protocol/04-vitrin_grant.md that state it"
+    );
+    // No verb is on both sides.
+    for faceted in FACET_VERBS {
+        assert!(
+            !UNFACETED_VERBS.contains(faceted),
+            "`{faceted}` is listed as both facet-bearing and unfaceted"
+        );
+    }
+}
+
+#[test]
 fn invalid_utf8_is_rejected_through_a_generated_message() {
     // get_realm's `name`: a 2-byte string that is not valid UTF-8.
     let bytes = craft_frame(

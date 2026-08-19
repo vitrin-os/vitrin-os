@@ -883,12 +883,18 @@
 
         egress has no facet interface IN THIS DOCUMENT YET, and that is a
         gap rather than a design: the verb is defined here so a petition
-        naming it is answered rather than killed, and the facet through
-        which a connection would be asked for arrives with the powerbox
-        (docs/plan/02-phase-2-semantic-epochs.md artifact C5). Until it
-        does, egress is a verb no request exercises, which is precisely
+        naming it is answered rather than killed. Until the facet lands,
+        egress is a verb no request exercises, which is precisely
         why every deployment refuses it "unsupported" - a granted verb
         with nothing to exercise it would be authority nobody checks.
+        When it lands it is a SEPARATE INTERFACE of its own, not a request
+        on the filesystem powerbox, and the dialect decides that rather
+        than taste: interface/@verb is one value per interface, so an
+        interface declaring verb="designate_file" cannot also declare
+        verb="egress", and its egress requests would reach the enforcement
+        chokepoint with no verb to check them against. Same rule, same
+        answer as the layout facet, which is two interfaces for exactly
+        this reason (see get_layout_arrange).
 
         THE net: RESOURCE PREFIX, and why it has no wildcard. egress is
         the one verb whose authority is not fully named by the realm: a
@@ -903,18 +909,28 @@
             no leading dot, no CIDR suffix, no comma-separated list.
           - exactly one PORT - a single decimal integer in 1-65535, in its
             canonical spelling. No ranges, no lists, no sign, no leading
-            zero: one endpoint must have exactly one selector string,
-            because covers is byte-exact and two spellings of one port
-            would be two selectors a consent card renders identically.
-            Port 0 is not a port a connection can be made to and is
-            refused.
-          - comparison is BYTE-EXACT, case included. DNS is
-            case-insensitive, so net:Example.com:443 and
-            net:example.com:443 name the same endpoint and are still two
-            different selectors; holding one does not cover the other.
-            That errs narrow - the wrong answer is a refusal, never an
-            unapproved connection - which is the only direction this
-            comparison is permitted to be wrong in.
+            zero. The reason is narrower than it looks: the port is the
+            one half of the selector a parser NORMALISES - it becomes an
+            integer - so a non-canonical spelling would re-serialize to a
+            different string from the one the human approved. 0443 is
+            refused so that parse-then-re-serialize is byte-identity, NOT
+            because the selector as a whole is canonical. Port 0 is not a
+            port a connection can be made to and is refused.
+          - comparison is BYTE-EXACT, case included, and the selector as a
+            whole is therefore NOT canonical: ONE ENDPOINT CAN HAVE MORE
+            THAN ONE SELECTOR STRING, and none of them covers another. The
+            host is kept exactly as presented, so net:Example.com:443 and
+            net:example.com:443 name the same endpoint (DNS is
+            case-insensitive) and are two different selectors, and so do
+            net:[2001:db8::1]:443 and
+            net:[2001:0db8:0000:0000:0000:0000:0000:0001]:443 (one IPv6
+            address has many legal literals). Both spellings of each pair
+            parse, both round-trip byte-identically, and holding one does
+            not cover the other. That errs narrow - the wrong answer is a
+            refusal, never an unapproved connection - which is the only
+            direction this comparison is permitted to be wrong in, and
+            normalising instead would make the grant row hold a string the
+            human was never shown.
           - an IPv6 literal is bracketed ("net:[2001:db8::1]:443") so the
             final colon that separates host from port is unambiguous.
             Without the brackets the selector has no parse, and no parse
@@ -935,16 +951,22 @@
         would be widening authority a human never approved.
 
         A NAME IS NOT THE AUTHORITY; THE ADDRESSES BEHIND IT AT GRANT TIME
-        ARE. Where the selector names a DNS name, the addresses it
-        resolved to when the human approved are pinned into the grant row,
-        and resolution happens only in the out-of-core mediating proxy -
-        there is no resolver inside a realm to route around. The proxy
-        asks the enforcement chokepoint per connection and holds no grant
-        of its own, so it decides nothing; a connection to an address the
-        pin does not contain is outside what was approved and is refused
-        "not_granted", including a literal-IP connection under a
-        name-scoped grant. That is what makes a DNS rebind lose rather
-        than win by outlasting a process.
+        ARE - AND THIS RULE IS SPECIFIED HERE, NOT YET IMPLEMENTED
+        ANYWHERE. Where the selector names a DNS name, the addresses it
+        resolved to when the human approved are to be pinned into the
+        grant row, and resolution is to happen only in the out-of-core
+        mediating proxy - there is no resolver inside a realm to route
+        around. The proxy asks the enforcement chokepoint per connection
+        and holds no grant of its own, so it decides nothing; a connection
+        to an address the pin does not contain is outside what was
+        approved and is to be refused "not_granted", including a
+        literal-IP connection under a name-scoped grant. That is what
+        makes a DNS rebind lose rather than win by outlasting a process.
+        No deployment obeys any of this today: the proxy and the resolver
+        do not exist, and the grant row's pinned-address column is
+        present-but-null by construction. The rule is stated in this
+        document because the column and the proxy are BUILT TO it, and a
+        reader must not read it as a behaviour anything currently has.
 
         COMPOSITION. observe_cursor is meaningful only alongside observe.
         It widens what a capture contains, so a petition naming it
@@ -969,7 +991,7 @@
       <entry name="layout_arrange" value="16" summary="arrange the granted realm's view, subject to the ordering invariants no grant can purchase; exercised through vitrin_layout_arrange, which defines set_fullscreen and no other request - place, resize, raise and stacking are absent rather than refused, because a scene showing one unstacked realm cannot honour them; at most one holder per output, counting a live grant that carries this verb AND a petition still pending for it, so a second petition while either exists resolves layout_held"/>
       <entry name="layout_focus" value="32" summary="bind the output to a view of the granted realm and direct input there - one act, because routing keys to a realm the human cannot see is focus theft in its sharpest form; exercised through vitrin_layout_focus; separate from layout_arrange because focus theft is at once the sharpest attack and the most legitimate need, so it must be attenuable alone"/>
       <entry name="realm_launch" value="512" summary="launch the realm template this grant addresses into a new realm instance, through the vitrin_launcher facet; the template names the program and no command ever crosses the wire, so this is authority over an operator-written template rather than over an arbitrary command; bits 64 and 256 are allocated to verbs not yet defined here and were skipped rather than reused (128 was one of them until egress landed on it); refused unsupported in version 1, which cannot mint the facet at all, and by any deployment that does not serve it"/>
-      <entry name="egress" value="128" summary="open one outbound connection to the single host:port named by this grant's net: resource selector, through an out-of-core mediating proxy that asks the enforcement chokepoint per connection and holds no grant of its own; the selector's grammar is wildcard-free, so a blanket egress grant is inexpressible rather than refused, and one selector covers exactly itself; a DNS name resolves only in the proxy and the addresses it resolved to at grant time are pinned into the grant row, so a connection to an unpinned address is refused not_granted even under a name-scoped grant; the dotted SDK name is egress unchanged, the wire name carrying no underscore to replace; refused unsupported in version 1 and by every deployment at version 2, because the facet the connection would be asked for through is not in this document yet"/>
+      <entry name="egress" value="128" summary="open one outbound connection to the single host:port named by this grant's net: resource selector, through an out-of-core mediating proxy that asks the enforcement chokepoint per connection and holds no grant of its own; the selector's grammar is wildcard-free, so a blanket egress grant is inexpressible rather than refused, and one selector covers exactly itself - though not every spelling of one endpoint is one selector, since the host is compared byte-exactly and kept as presented; SPECIFIED BUT NOT IMPLEMENTED ANYWHERE YET: a DNS name is to resolve only in the proxy and the addresses it resolved to at grant time are to be pinned into the grant row, so that a connection to an unpinned address is refused not_granted even under a name-scoped grant - no proxy, no resolver and no pinned column with a value exist today; the dotted SDK name is egress unchanged, the wire name carrying no underscore to replace; refused unsupported in version 1 and by every deployment at version 2, because the facet the connection would be asked for through is not in this document yet, and it will be a separate interface of its own rather than a request on the filesystem powerbox, since interface/@verb is one value per interface"/>
     </enum>
 
     <enum name="persistence">

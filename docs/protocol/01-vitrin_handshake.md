@@ -134,9 +134,15 @@ client that speaks 1 needs no new code to speak 2 beyond the integer it offers.
 One thing is deliberately **not** version-gated: a **verb bit**. `request_grant`'s `verbs` bitfield
 is a single mask, validated identically on every negotiated version, so a version-1 connection may
 petition for `realm_launch` (512) and is answered a recoverable `resolved(unsupported)` rather than
-killed. That asymmetry — messages gated, verb bits not — is stated once in
+killed — `unsupported` there because version 1 cannot mint the
+[`vitrin_launcher`](./16-vitrin_launcher.md) facet at all. That asymmetry — messages gated, verb
+bits not — is stated once in
 [conventions § 7.3](./00-conventions.md#73-version-semantics) and is the whole reason a bit is
-defined before it is served.
+defined before it is served. `realm_launch` was that reason's worked example: the bit went on the
+wire in **WS-E.1.1**'s protocol half (#225) and was refused `unsupported` by the reference core
+until WS-E.1.1's core half (#207) served it two PRs later, so it is served today. What the example
+stood for did not move with it — a deployment that does not serve a defined verb answers
+`unsupported` rather than killing the connection.
 
 Checks run in a **fixed order**: frame grammar first (fatal decode errors as usual), then the
 `version` integer, then — only for a version-accepted `hello` — credential verification.

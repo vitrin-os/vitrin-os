@@ -238,8 +238,8 @@ there:
 
 - `verbs` uses the bitfield [`vitrin_grant.verb`](./04-vitrin_grant.md#verb)
   (`observe` = 1, `actuate_pointer` = 2, `actuate_text` = 4,
-  `layout_arrange` = 16, `layout_focus` = 32, plus the defined-but-unserved
-  `observe_cursor` = 8 and `realm_launch` = 512).
+  `layout_arrange` = 16, `layout_focus` = 32, `realm_launch` = 512, plus the
+  defined-but-unserved `observe_cursor` = 8).
 - `persistence` uses the enum
   [`vitrin_grant.persistence`](./04-vitrin_grant.md#persistence) (`once` = 0,
   `while_running` = 1, `until_revoked` = 2, `always` = 3).

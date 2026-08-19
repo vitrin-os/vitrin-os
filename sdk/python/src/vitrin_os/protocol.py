@@ -71,10 +71,11 @@ class Verb(enum.IntFlag):
     petitioned one. Read "unsupported" as "not here, not now", never as "not
     in this protocol".
 
-    The 64/128/256 gap is deliberate and must not be filled by guesswork:
-    those bits are allocated repo-wide to verbs the IDL does not define yet,
-    so they are still *out of range* and fatal. `realm_launch` took 512 for
-    exactly that reason.
+    The 64/256 gap is deliberate and must not be filled by guesswork: those
+    bits are allocated repo-wide to verbs the IDL does not define yet, so they
+    are still *out of range* and fatal. `realm_launch` took 512 for exactly
+    that reason, and `egress` took 128 from the same registry rather than the
+    next bit after 512.
     """
 
     OBSERVE = 1
@@ -83,6 +84,7 @@ class Verb(enum.IntFlag):
     OBSERVE_CURSOR = 8  # refused "unsupported" by every deployment at version 2
     LAYOUT_ARRANGE = 16  # served by the reference core since WS-E.1.4
     LAYOUT_FOCUS = 32  # served by the reference core since WS-E.1.4
+    EGRESS = 128  # refused "unsupported" by every deployment at version 2
     REALM_LAUNCH = 512  # resolves "unsupported" until a deployment serves it
 
 
@@ -95,6 +97,7 @@ VERB_MASK = int(
     | Verb.OBSERVE_CURSOR
     | Verb.LAYOUT_ARRANGE
     | Verb.LAYOUT_FOCUS
+    | Verb.EGRESS
     | Verb.REALM_LAUNCH
 )
 
@@ -115,6 +118,14 @@ VERB_MASK = int(
 # at all (`get_launcher` is `since="2"`), so there is nothing for a version-1
 # grant carrying the bit to be exercised through. The IDL says exactly that,
 # and this constant is derived from the IDL's own summaries.
+#
+# `egress` (128, P2.7.2 / issue #196) is also out, and its IDL summary carries
+# the same marker phrase for a reason that goes further than the version: the
+# facet a connection would be asked for through is not in the IDL at all yet
+# (P2.6.5), and the mediating proxy that would carry it is P2.7.3's. So the
+# bit is refused by **every** deployment at version 2, not merely by a
+# version-1 connection — which is why this constant does not move when it is
+# eventually served on some deployments and not others.
 # Those are refused "unsupported", and a petition mixing served and unserved
 # verbs is refused whole — the core never silently narrows a verb set.
 VERBS_SERVED_IN_VERSION_1 = int(
@@ -127,7 +138,10 @@ VERBS_SERVED_IN_VERSION_1 = int(
 
 # The SDK-level dotted names are these bits (per the IDL's verb enum text,
 # which fixes the spelling: the first underscore of the wire name becomes a
-# dot, so a second implementation has no name to invent).
+# dot, so a second implementation has no name to invent). A wire name carrying
+# no underscore has nothing to replace, so its dotted name is the wire name
+# unchanged — `egress` is the first, and the IDL states that case rather than
+# leaving it to be derived.
 VERB_BY_DOTTED_NAME: dict[str, Verb] = {
     "observe": Verb.OBSERVE,
     "actuate.pointer": Verb.ACTUATE_POINTER,
@@ -135,6 +149,7 @@ VERB_BY_DOTTED_NAME: dict[str, Verb] = {
     "observe.cursor": Verb.OBSERVE_CURSOR,
     "layout.arrange": Verb.LAYOUT_ARRANGE,
     "layout.focus": Verb.LAYOUT_FOCUS,
+    "egress": Verb.EGRESS,
     "realm.launch": Verb.REALM_LAUNCH,
 }
 

@@ -60,22 +60,25 @@ fn invalid_enum_value_is_rejected() {
 
 #[test]
 fn invalid_bitfield_value_is_rejected() {
-    // `vitrin_grant.verb` is a bitfield with VALID_MASK 1|2|4|8|16|32|512 =
-    // 575. Whether a defined bit is *served* is a property of a deployment
+    // `vitrin_grant.verb` is a bitfield with VALID_MASK 1|2|4|8|16|32|512|128
+    // = 703. Whether a defined bit is *served* is a property of a deployment
     // and is settled at petition admission (`unsupported`), deliberately not
     // a decode error, so the codec must accept every defined bit whatever
     // any core does with it. That is unchanged by WS-E.1.4 serving
     // `layout_arrange` (16) and `layout_focus` (32), and by WS-E.1.1 serving
     // `realm_launch` (512), in the reference core: this file is the codec's,
     // and the codec never knew which bits were served. Bit 8
-    // (`observe_cursor`) remains defined-and-unserved there (D-017).
+    // (`observe_cursor`) and bit 128 (`egress`, P2.7.2) remain
+    // defined-and-unserved there (D-017; and the egress proxy is P2.7.3's).
     //
-    // The 64/128/256 gap is not free space: those bits are allocated (to
-    // `designate_file`, `egress`, `publish_tree`) but not yet defined in the
-    // IDL, so today they are still out of range and fatal. That is exactly
-    // why `realm_launch` took 512 rather than the next unused-looking bit.
-    assert_eq!(gen::vitrin_grant::Verb::VALID_MASK, 575);
-    for reserved in [64u32, 128, 256] {
+    // The 64/256 gap is not free space: those bits are allocated (to
+    // `designate_file`, `publish_tree`) but not yet defined in the IDL, so
+    // today they are still out of range and fatal. That is exactly why
+    // `realm_launch` took 512 rather than the next unused-looking bit, and
+    // why `egress` took 128 from the same registry rather than the next one
+    // after 512.
+    assert_eq!(gen::vitrin_grant::Verb::VALID_MASK, 703);
+    for reserved in [64u32, 256] {
         let err = gen::vitrin_grant::Verb::from_bits(reserved).unwrap_err();
         assert_eq!(
             err,
@@ -87,11 +90,11 @@ fn invalid_bitfield_value_is_rejected() {
         );
     }
     // every subset of the defined bits, including all of them together, is
-    // legal -- enumerated as (low six bits) x (bit 512 present or not) rather
-    // than a flat `0..=575` range, which would sweep through the reserved
-    // bits above.
+    // legal -- enumerated as (low six bits) x (the two high bits present or
+    // not) rather than a flat `0..=703` range, which would sweep through the
+    // reserved bits above.
     for low in 0..=63u32 {
-        for high in [0u32, 512] {
+        for high in [0u32, 128, 512, 128 | 512] {
             gen::vitrin_grant::Verb::from_bits(low | high)
                 .expect("every subset of defined bits is valid");
         }
@@ -101,7 +104,11 @@ fn invalid_bitfield_value_is_rejected() {
     // second argument, after a valid `outcome`.
     let bytes = craft_frame(gen::vitrin_grant::events::Resolved::OPCODE, 0, |out| {
         vitrin_protocol::wire::write_uint(out, gen::vitrin_grant::Outcome::ALL[0].to_wire());
-        vitrin_protocol::wire::write_uint(out, 64); // invalid verbs bit
+        // 256 rather than 64 or 128: it is the reserved bit with the
+        // furthest-off owner (`publish_tree`, P2.4.1), so this case stays a
+        // decode failure for longest. 128 stopped being one when `egress`
+        // landed, which is what moved this line.
+        vitrin_protocol::wire::write_uint(out, 256); // invalid verbs bit
         vitrin_protocol::wire::write_uint(out, gen::vitrin_grant::Persistence::ALL[0].to_wire());
         vitrin_protocol::wire::write_uint(out, 0); // expiry_ms
     });
@@ -111,7 +118,7 @@ fn invalid_bitfield_value_is_rejected() {
         DecodeError::InvalidBitfieldValue {
             interface: "vitrin_grant",
             enum_name: "verb",
-            value: 64,
+            value: 256,
         }
     );
 }

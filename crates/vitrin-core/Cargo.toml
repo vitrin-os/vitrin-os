@@ -849,3 +849,12 @@ vitrin-golden = { path = "../vitrin-golden" }
 # `MARKER` constant, which is what keeps the emitter and the census from
 # desynchronising on a rename.
 vitrin-skip = { path = "../vitrin-skip" }
+# Property testing for the `net:` resource-selector grammar (P2.7.2, issue
+# #196). The grammar's whole security property is negative -- no wildcard, no
+# CIDR, no list -- and a negative property is only as good as the generator
+# that tries to violate it, so the refusals are checked by *generation* rather
+# than by a hand-listed table of bad strings. Test-only, and the same version
+# `crates/vitrin-protocol` already dev-depends on, so this resolves no new
+# package: it must never enter the `vitrind` runtime tree, same posture as the
+# three instruments above.
+proptest = "1"

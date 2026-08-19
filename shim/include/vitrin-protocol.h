@@ -425,11 +425,13 @@ typedef uint32_t vitrin_grant_verb_t;
 #define VITRIN_GRANT_VERB_LAYOUT_ARRANGE ((vitrin_grant_verb_t)16)
 /* bind the output to a view of the granted realm and direct input there - one act, because routing keys to a realm the human cannot see is focus theft in its sharpest form; exercised through vitrin_layout_focus; separate from layout_arrange because focus theft is at once the sharpest attack and the most legitimate need, so it must be attenuable alone */
 #define VITRIN_GRANT_VERB_LAYOUT_FOCUS ((vitrin_grant_verb_t)32)
-/* launch the realm template this grant addresses into a new realm instance, through the vitrin_launcher facet; the template names the program and no command ever crosses the wire, so this is authority over an operator-written template rather than over an arbitrary command; bits 64, 128 and 256 are allocated to verbs not yet defined here and were skipped rather than reused; refused unsupported in version 1, which cannot mint the facet at all, and by any deployment that does not serve it */
+/* launch the realm template this grant addresses into a new realm instance, through the vitrin_launcher facet; the template names the program and no command ever crosses the wire, so this is authority over an operator-written template rather than over an arbitrary command; bits 64 and 256 are allocated to verbs not yet defined here and were skipped rather than reused (128 was one of them until egress landed on it); refused unsupported in version 1, which cannot mint the facet at all, and by any deployment that does not serve it */
 #define VITRIN_GRANT_VERB_REALM_LAUNCH ((vitrin_grant_verb_t)512)
+/* open one outbound connection to the single host:port named by this grant's net: resource selector, through an out-of-core mediating proxy that asks the enforcement chokepoint per connection and holds no grant of its own; the selector's grammar is wildcard-free, so a blanket egress grant is inexpressible rather than refused, and one selector covers exactly itself; a DNS name resolves only in the proxy and the addresses it resolved to at grant time are pinned into the grant row, so a connection to an unpinned address is refused not_granted even under a name-scoped grant; the dotted SDK name is egress unchanged, the wire name carrying no underscore to replace; refused unsupported in version 1 and by every deployment at version 2, because the facet the connection would be asked for through is not in this document yet */
+#define VITRIN_GRANT_VERB_EGRESS ((vitrin_grant_verb_t)128)
 /* Union of every defined entry's bits; a wire value with any other bit
    set is invalid. */
-#define VITRIN_GRANT_VERB_VALID_MASK ((vitrin_grant_verb_t)(1 | 2 | 4 | 8 | 16 | 32 | 512))
+#define VITRIN_GRANT_VERB_VALID_MASK ((vitrin_grant_verb_t)(1 | 2 | 4 | 8 | 16 | 32 | 512 | 128))
 
 /* Bitmask validity check for `vitrin_grant_verb_t`: rejects any bit outside
    VITRIN_GRANT_VERB_VALID_MASK. */

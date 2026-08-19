@@ -33,7 +33,9 @@
 //! allocated**: a grantable "receive the human's attention key" verb would put
 //! the delegation framing on the wire for a signal that delegates nothing
 //! ([`Verb::VALID_MASK`](vitrin_protocol::generated::vitrin_grant::Verb::VALID_MASK)
-//! stays 575).
+//! gained no bit for this signal; it has since moved for reasons that have
+//! nothing to do with attention, so the test below pins its current value
+//! rather than the value it held when this was written).
 //!
 //! Why a bare bit is acceptable at all: **step 5c is not a focus-theft
 //! defence.** It is a 500 ms courtesy
@@ -981,7 +983,18 @@ mod tests {
         // positively, because a grantable "receive the human's attention key"
         // verb would put the delegation framing on the wire for a signal that
         // delegates nothing.
-        assert_eq!(Verb::VALID_MASK, 575);
+        //
+        // **This is a FOURTH mask-pin site**, and
+        // `docs/plan/02-phase-2-semantic-epochs.md` §5 named only three when
+        // it told a verb-adding task where to re-pin. It fires for every verb
+        // addition, not only for one that would betray decision 7 — so a
+        // reader who trusted the registry's list would meet it as a surprise
+        // failure and be tempted to read it as "this change allocated an
+        // attention verb", which it never means. Re-pinned here by P2.7.2
+        // (`egress` = 128, mask 575 -> 703), which allocated a bit for
+        // network authority and none for the attention key; §5's list now
+        // says four.
+        assert_eq!(Verb::VALID_MASK, 703);
     }
 
     // -- the marker ----------------------------------------------------------

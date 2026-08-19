@@ -1346,24 +1346,43 @@ mod tests {
         // the ones it does not implement. The failure this guards is the
         // silent one: accepting the bit and enforcing nothing.
         //
-        // **One bit now**, and each removal was a decision rather than a
-        // subtraction: WS-E.1.4 (issue #210) served the layout pair, and
-        // WS-E.1.1 (issue #207) served `realm_launch` once the core gained
-        // the spawn path, the realm cap and the consent copy its absence
-        // used to stand for. `observe_cursor` is what is left, because
-        // per-principal cursor delivery is still M2's.
+        // **Two bits now**, and every movement in or out was a decision
+        // rather than a subtraction: WS-E.1.4 (issue #210) served the layout
+        // pair, and WS-E.1.1 (issue #207) served `realm_launch` once the core
+        // gained the spawn path, the realm cap and the consent copy its
+        // absence used to stand for. `observe_cursor` remains, because
+        // per-principal cursor delivery is still M2's. `egress` **joined**
+        // at P2.7.2 (issue #196): the bit is on the wire so a petition for
+        // it is answered rather than killed, and this core enforces nothing
+        // by it — the mediating proxy is P2.7.3's — so admission refuses it,
+        // whole. That is the fail-closed default working rather than a
+        // separate rule: `UNSERVED_VERB_BITS` is derived from
+        // `Verb::VALID_MASK`, so the new bit was unserved the moment the IDL
+        // defined it, and `SERVED_VERB_BITS` was not touched.
         let t0 = t0();
         let mut reg = registry(ConsentPolicy::AutoApprove);
         let conn = reg.register_connection();
 
         let mut wire_id = 10;
-        // A one-element list, deliberately: this is a SET that has shrunk
-        // three times (D-018's two verbs, then `realm_launch` at WS-E.1.1) and
-        // will shrink again when cursor delivery lands. Collapsing it to a
-        // straight-line assertion would hide that shape and make the next
-        // removal a rewrite rather than a deletion.
-        #[allow(clippy::single_element_loop)]
-        for verb in [Verb::OBSERVE_CURSOR] {
+        // **Derived from `UNSERVED_VERB_BITS`, not hand-listed.** This set has
+        // shrunk three times (D-018's two verbs, then `realm_launch` at
+        // WS-E.1.1), grown once (`egress` at P2.7.2) and will move again when
+        // cursor delivery and the egress proxy land. A hand-written list would
+        // keep passing while a newly appended, unclassified bit went
+        // unexercised — the shape of failure this repo keeps finding — so the
+        // loop reads the constant instead. The exact membership is pinned in
+        // `consent::render`'s catalogue test, which is what forces a human to
+        // classify a new bit; here the membership is only *used*.
+        let unserved: Vec<Verb> = (0..32)
+            .map(|shift| 1u32 << shift)
+            .filter(|bit| crate::grants::UNSERVED_VERB_BITS & bit != 0)
+            .map(|bit| Verb::from_bits(bit).expect("an unserved bit is a defined wire bit"))
+            .collect();
+        assert!(
+            !unserved.is_empty(),
+            "no unserved verb bits: this test would assert nothing"
+        );
+        for verb in unserved {
             // Alone.
             let mut req = request(DEMO, conn, wire_id);
             req.verbs = verb;
@@ -1393,6 +1412,77 @@ mod tests {
         assert!(matches!(res.verdict, Verdict::Granted { .. }));
 
         // No refusal entered the pending table.
+        assert_eq!(reg.pending_total(), 0);
+    }
+
+    #[test]
+    fn a_petition_naming_egress_resolves_unsupported_whole() {
+        // P2.7.2 (issue #196), named separately from the derived sweep above
+        // so the requirement is findable by the verb's name rather than only
+        // by the constant it happens to be in today.
+        //
+        // The bit is on the wire (P2.7.2's IDL half) and this core serves
+        // nothing by it: the mediating proxy that would ask the chokepoint per
+        // connection is P2.7.3's, and the facet a connection would be asked
+        // for through is P2.6.5's. Two halves, and both matter. In range, so
+        // naming it is never a killed connection; unserved, so it is never
+        // granted. A deployment MUST NOT grant a verb it does not enforce.
+        assert_eq!(
+            Verb::EGRESS.bits() & crate::grants::SERVED_VERB_BITS,
+            0,
+            "SERVED_VERB_BITS gained `egress` without a proxy to enforce it \
+             or consent copy to name it (P2.7.3, P2.6.8's Q13 review)"
+        );
+
+        let t0 = t0();
+        let mut reg = registry(ConsentPolicy::AutoApprove);
+        let conn = reg.register_connection();
+
+        // Alone.
+        let mut req = request(DEMO, conn, 10);
+        req.verbs = Verb::EGRESS;
+        expect_declined(reg.admit(req, t0, &realms(), false), Outcome::Unsupported);
+
+        // Mixed with the whole served set: refused WHOLE, never narrowed to
+        // the served remainder. The IDL states this ("the server never quietly
+        // drops an unserved bit and grants the remainder"), and a narrowing
+        // core would hand the agent five verbs while it believed it also held
+        // network egress.
+        let mut req = request(DEMO, conn, 20);
+        req.verbs = Verb::OBSERVE
+            | Verb::ACTUATE_POINTER
+            | Verb::ACTUATE_TEXT
+            | Verb::LAYOUT_ARRANGE
+            | Verb::LAYOUT_FOCUS
+            | Verb::EGRESS;
+        expect_declined(reg.admit(req, t0, &realms(), false), Outcome::Unsupported);
+
+        // Positive control: the same petition without the bit is granted, so
+        // the two refusals above are about `egress` and not about the shape of
+        // the request.
+        let mut req = request(DEMO, conn, 30);
+        req.verbs = Verb::OBSERVE
+            | Verb::ACTUATE_POINTER
+            | Verb::ACTUATE_TEXT
+            | Verb::LAYOUT_ARRANGE
+            | Verb::LAYOUT_FOCUS;
+        let Admission::Resolved(res) = reg.admit(req, t0, &realms(), false) else {
+            panic!("auto-approve must resolve a served petition");
+        };
+        assert!(matches!(res.verdict, Verdict::Granted { .. }));
+
+        // A `net:` selector does not rescue it either, and for a second,
+        // independent reason: this core serves no resource granularity finer
+        // than the whole realm, so any non-empty selector is `unsupported`
+        // here. `ResourceRef::Net` exists and parses (`grants.rs`), and
+        // **nothing in this admission path calls it yet** -- wiring it in is
+        // P2.7.3/P2.7.4's. Asserted so that stays true by test rather than by
+        // memory.
+        let mut req = request(DEMO, conn, 40);
+        req.verbs = Verb::EGRESS;
+        req.resource = "net:example.com:443".into();
+        expect_declined(reg.admit(req, t0, &realms(), false), Outcome::Unsupported);
+
         assert_eq!(reg.pending_total(), 0);
     }
 

@@ -97,7 +97,7 @@ could open nothing cannot satisfy a denial. **Eight** paths were refused
 | denied at the default, reachable at `--landlock=off` | what it is |
 |---|---|
 | `/` | the realm root |
-| `/run`, `/vitrin` | the parents of `/run/vitrin`, `/vitrin/home` and `/vitrin/shim` |
+| `/run`, `/vitrin` | the parents of `/run/vitrin`, `/vitrin/home` and the shim binary |
 | `/home`, `/home/<user>`, `…/projects`, `…/projects/vitrin`, `…/vitrin/shim` | the parents of this development tree's app-directory and shim-library binds |
 
 Every one of the eight is a directory the realm's **own** mount table created on
@@ -105,14 +105,25 @@ its root tmpfs purely to hold a bind target beneath it, and each holds nothing
 but the next component of that path. Most of the `/home` chain is an artefact of
 running from a build tree: with the app relocated to a directory already inside
 a granted hierarchy, a second run's probed denials were `/`, `/run`, `/vitrin`
-and `/home` — the deeper components stay only because *this tree's shim* needs
-its `subprojects/wlroots` directory bound (`harness.shim_library_dirs`), which a
-packaged install would not. Every other probed
+and `/home` — the deeper components stayed only because *this tree's shim*
+needed its `subprojects/wlroots` directory bound, which a packaged install would
+not. Every other probed
 path answered identically at both settings: `/usr`, `/etc`, `/proc`, `/sys`,
 `/tmp`, `/dev` and its nodes, `/dev/shm`, `/dev/pts`, `/dev/dri`,
-`/vitrin/home`, `/vitrin/shim`, `/run/vitrin`, the `/bin`-class symlinks and
+`/vitrin/home`, the shim binary, `/run/vitrin`, the `/bin`-class symlinks and
 files inside them all opened in both; `/dev/tty` answered `ENXIO` in both, which
 is a realm with no controlling terminal and not a ruleset denial.
+
+**Two things this measurement's spellings predate, neither of which moves the
+boundary it reports.** Issue [#283](https://github.com/vitrin-os/vitrin-os/issues/283)
+(a) renamed the shim's bind target from `/vitrin/shim` to
+`/vitrin/vitrin-shim`, which changes a leaf's name and no grant, and (b) removed
+the shim-library bind the `/home` chain's deeper components existed for, by
+linking anything the shim vendors statically instead. So a re-run today should
+deny four paths rather than eight when the app is relocated, and should mint no
+`…/projects/vitrin/shim` chain at all. **That is a prediction, not a
+measurement: the table above is what was actually probed on 2026-08-14 and it
+has not been re-collected since.**
 
 So what the enumeration buys over the realm-root grant #187 declined is, on this
 host, that the realm cannot **list its own root** and cannot list the handful of

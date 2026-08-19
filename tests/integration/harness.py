@@ -114,9 +114,19 @@ SUPERVISOR_COMM = "vitrin-realm-in"
 
 #: `comm` prefixes a realm's fd-3 peer can have. Both, because `shims_of`
 #: answers "what did this core fork as a realm", and a component test's realm
-#: is the mock. It is deliberately NOT the mock-freeness check: every named
-#: gate asserts `comm_of(shim).startswith("vitrin-shim")` on the pid it gets
-#: back, which `vitrin-mock-shim` (comm-truncated to `vitrin-mock-shi`) fails.
+#: is the mock.
+#:
+#: **It is not the mock-freeness check, and it never was one.** It used to be
+#: asserted as if it were -- nine gates read
+#: `comm_of(shim).startswith("vitrin-shim")` -- and #186's confinement work
+#: showed that check had already stopped checking: a confined shim takes its
+#: `comm` from the bind target, so both binaries answered to the same name
+#: whatever the gate believed. Mock-freeness is now
+#: :func:`exe_identity` against :func:`file_identity` of the named binary,
+#: which compares inodes rather than strings. Since #283 the bind target is
+#: `/vitrin/vitrin-shim`, so a confined shim reads back as `vitrin-shim`
+#: again -- that restores `ps` legibility and grants the name no more evidence
+#: value than it had before.
 SHIM_COMMS = ("vitrin-shim", "vitrin-mock-shi")
 
 #: The paths a **confined** realm sees, mirroring the constants in
@@ -129,7 +139,7 @@ SHIM_COMMS = ("vitrin-shim", "vitrin-mock-shi")
 IN_REALM_RUNTIME_DIR = "/run/vitrin"
 IN_REALM_WAYLAND_SOCKET = "/run/vitrin/wayland-0"
 IN_REALM_HOME = "/vitrin/home"
-IN_REALM_SHIM = "/vitrin/shim"
+IN_REALM_SHIM = "/vitrin/vitrin-shim"
 
 #: The highest Landlock ABI rung this build knows how to request, mirroring
 #: `LANDLOCK_BUILD_MAX_RUNG` in `crates/vitrin-realm-init/src/lib.rs` (P2.6.3,
@@ -229,67 +239,6 @@ def _toml_string(value: str) -> str:
 def _toml_string_array(values: list[str]) -> str:
     """A TOML inline array of basic strings (`[]` when empty)."""
     return "[" + ", ".join(_toml_string(v) for v in values) + "]"
-
-
-#: Directory prefixes a confined realm can already see: `/usr` and `/etc` are
-#: in every realm's mount table at their own paths, and `/lib`, `/lib64`,
-#: `/bin`, `/sbin` are the compatibility shape `vitrin-realm-init` mirrors
-#: (symlink or bind) beside `/usr`.
-_SYSTEM_LIB_PREFIXES = ("/usr/", "/lib/", "/lib64/", "/etc/")
-
-_shim_libs_cache: dict[str, tuple[str, ...]] = {}
-
-
-def shim_library_dirs(shim_bin: str | os.PathLike[str]) -> tuple[str, ...]:
-    """Directories holding shared libraries `shim_bin` needs from **outside**
-    the realm's stock mount table.
-
-    Why this exists, stated plainly because it is a **workaround for a real
-    defect and not a fact of nature** (P2.6.2, #186): `vitrin-realm-init` binds
-    the shim as a single file at `/vitrin/shim`, and Meson gives a build-tree
-    binary the RUNPATH `$ORIGIN/subprojects/wlroots`. Inside the realm
-    `$ORIGIN` is `/vitrin`, so the loader looks in `/vitrin/subprojects/wlroots`
-    -- which the table never creates -- and the shim dies before `main` with
-    `error while loading shared libraries: libwlroots-0.19.so`. The core sees
-    only the config channel's EOF and reports `Broken pipe`.
-
-    That is exactly how CI builds the shim (`shim/ci/install-deps.sh` installs
-    wlroots' *build* deps because Ubuntu ships 0.17.1, so the vendored
-    subproject is always used), so this is not a local-tree quirk.
-
-    Returns the parent directory of every `ldd` dependency that resolves
-    outside :data:`_SYSTEM_LIB_PREFIXES`. Empty on a machine whose shim links
-    only system libraries, which is what makes the workaround self-cancelling
-    rather than permanent scaffolding.
-    """
-    key = os.fspath(shim_bin)
-    cached = _shim_libs_cache.get(key)
-    if cached is not None:
-        return cached
-    dirs: list[str] = []
-    try:
-        report = subprocess.run(
-            ["ldd", key], capture_output=True, text=True, timeout=30
-        )
-    except (OSError, subprocess.SubprocessError):
-        report = None
-    if report is not None and report.returncode == 0:
-        for line in report.stdout.splitlines():
-            _, sep, rest = line.partition("=> ")
-            if not sep:
-                continue
-            path = rest.split(" (")[0].strip()
-            if not path.startswith("/"):
-                continue
-            resolved = os.path.realpath(path)
-            if resolved.startswith(_SYSTEM_LIB_PREFIXES):
-                continue
-            parent = os.path.dirname(resolved)
-            if parent not in dirs:
-                dirs.append(parent)
-    found = tuple(sorted(dirs))
-    _shim_libs_cache[key] = found
-    return found
 
 
 class CoreFailed(Exception):
@@ -900,28 +849,23 @@ class Core:
         # `command` names a genuine Wayland app the C shim fork/execs.
         shim_bin = pathlib.Path(shim) if shim is not None else MOCK_SHIM
 
-        # The realm's read-only bind list (P2.6.2, #186). Two contributions,
-        # and they are different in kind:
+        # The realm's read-only bind list (P2.6.2, #186): exactly what the
+        # caller asked for, and nothing this harness added on its behalf.
         #
-        #  - what the caller asked for, and
-        #  - what the SHIM's own shared-library closure needs, computed rather
-        #    than hardcoded (:func:`shim_library_dirs`). A Meson build-tree
-        #    shim carries the RUNPATH `$ORIGIN/subprojects/wlroots`, and
-        #    `$ORIGIN` inside the realm is `/vitrin` -- so without this the
-        #    dynamic loader kills every real-app realm before `main` and the
-        #    core reports `Broken pipe`. `LD_LIBRARY_PATH` is what makes the
-        #    bound directory findable, since a bind lands at its HOST path and
-        #    no configuration can move `$ORIGIN`.
-        #
-        # Both are inert at `--isolation=off` (the realm can already see the
-        # whole filesystem), and `shim_library_dirs` is empty for a shim that
-        # links only system libraries -- including `vitrin-mock-shim`, so the
-        # component tests' argv and environment are unchanged.
-        self.shim_library_dirs = shim_library_dirs(shim_bin)
-        realm_binds = tuple(binds) + self.shim_library_dirs
+        # It held a second contribution until #283 -- the shim's own `ldd`
+        # closure, bound read-only with `LD_LIBRARY_PATH` forwarded to make it
+        # findable -- because a Meson build-tree shim linked against the
+        # VENDORED wlroots carried the RUNPATH `$ORIGIN/subprojects/wlroots`
+        # and died before `main` inside every realm. **That was a workaround
+        # in the test harness for a defect in the shipped build, and it is
+        # gone because the defect is:** shim/meson.build now links vendored
+        # libraries statically, so the shim needs nothing outside the realm's
+        # stock mount table. `meson test loader-independence` is what keeps it
+        # that way, and the real-app gates below are what prove it end to end
+        # -- if the RUNPATH ever comes back, they fail with `Broken pipe`
+        # instead of passing over a harness that quietly widened the realm.
+        realm_binds = tuple(binds)
         env_allow = tuple(env_allow)
-        if self.shim_library_dirs and "LD_LIBRARY_PATH" not in env_allow:
-            env_allow = env_allow + ("LD_LIBRARY_PATH",)
 
         # `write_config=False` reuses whatever config is already in the tree.
         # The R6 test needs it: it deliberately relaxes the registry's mode
@@ -1133,11 +1077,9 @@ class Core:
         }
         # The core's own environment is the source `env_allow` copies from,
         # so the real-app gate seeds WLR_* here for the allowlist to forward.
-        # `LD_LIBRARY_PATH` travels the same route, for the reason
-        # `shim_library_dirs` states: it is the shim's own runtime closure, not
-        # the app's, but the realm's environment is composed once for both.
-        if self.shim_library_dirs:
-            env["LD_LIBRARY_PATH"] = ":".join(self.shim_library_dirs)
+        # `LD_LIBRARY_PATH` used to be seeded here too, to make #283's
+        # workaround binds findable; it is not, and no realm's environment
+        # carries it any more.
         if extra_env:
             env.update(extra_env)
         self.proc = subprocess.Popen(
@@ -1601,9 +1543,10 @@ def shims_of(pid: int) -> list[int]:
     "the core forked a shim" from "something under the realm did".
 
     **A confined shim is matched by position, not by name, and that is not a
-    shortcut.** `vitrin-realm-init` binds the shim at `/vitrin/shim`, so the
-    kernel derives its `comm` from that path and every confined shim -- real C
-    shim and `vitrin-mock-shim` alike -- reads back as `shim`. A name test
+    shortcut.** `vitrin-realm-init` binds the shim at a core-chosen in-realm
+    path, so the kernel derives its `comm` from *that* basename and every
+    confined shim -- real C shim and `vitrin-mock-shim` alike -- reads back as
+    the same name (`shim` until #283, `vitrin-shim` since). A name test
     there would either miss both or match anything; a supervisor has exactly
     one child and that child is the realm's PID 1, so its identity is
     unambiguous. What the *program* is stays checkable, and more sharply than
@@ -1644,8 +1587,8 @@ def exe_identity(pid: int) -> tuple[int, int] | None:
     own `mm->exe_file`, so a `stat` through it names the real inode even when
     the process lives in a mount namespace this reader cannot walk -- which is
     what makes it usable on a confined realm's shim, where `readlink` answers
-    the in-realm path `/vitrin/shim` and the *name* has stopped being evidence
-    of anything.
+    the in-realm path `/vitrin/vitrin-shim` and the *name* has stopped being
+    evidence of anything.
 
     Comparing inodes is strictly stronger than the `comm` prefix test it
     replaced: a name says what a program is called, an inode says which file

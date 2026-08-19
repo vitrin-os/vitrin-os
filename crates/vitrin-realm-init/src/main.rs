@@ -1413,7 +1413,7 @@ fn exec_shim(chan: &Chan, config: &Config) -> Result<std::convert::Infallible, F
     // MARKS descriptors close-on-exec -- a rule fd opened after it would
     // reach the app unmarked. And everything after it -- the `chdir`, the
     // argv assembly, the `execve` -- must fall inside the granted set, which
-    // is why `/vitrin/shim` and `/run/vitrin` are grants rather than
+    // is why `/vitrin/vitrin-shim` and `/run/vitrin` are grants rather than
     // afterthoughts.
     //
     // The frame is sent *here*, before `execve`, because after it there is no

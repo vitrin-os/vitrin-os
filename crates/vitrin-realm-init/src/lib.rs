@@ -150,7 +150,21 @@ pub const IN_REALM_PREFIX: &str = "/vitrin";
 /// It has to be bound at all because in a development tree the shim lives in
 /// `target/debug` under `$HOME`, which is the exact tree this task exists to
 /// hide from the realm.
-pub const IN_REALM_SHIM: &str = "/vitrin/shim";
+///
+/// # Why the basename is `vitrin-shim` and not `shim` (issue #283)
+///
+/// The kernel takes a process's `comm` from the **basename of the file it
+/// `execve`d**, so binding at `/vitrin/shim` made every confined shim answer
+/// to `shim` -- the same string `vitrin-mock-shim` truncates to nothing like,
+/// but close enough that nine integration gates which read `comm` to prove a
+/// run was mock-free were left checking a name neither binary owned. Those
+/// gates now compare `(st_dev, st_ino)` of `/proc/<pid>/exe`, which is the
+/// check that actually holds; this basename costs nothing and gives `ps` back
+/// its legibility beside it.
+///
+/// The in-realm path is a **core-chosen constant**, not the host basename, so
+/// this is not a claim about what the operator called their binary.
+pub const IN_REALM_SHIM: &str = "/vitrin/vitrin-shim";
 
 /// The realm's private storage, inside the realm, and the value of its
 /// `HOME`.
@@ -1406,5 +1420,44 @@ mod tests {
     fn the_core_owned_prefix_holds_the_shim_and_the_storage() {
         assert!(IN_REALM_SHIM.starts_with(IN_REALM_PREFIX));
         assert!(IN_REALM_HOME.starts_with(IN_REALM_PREFIX));
+    }
+
+    /// Issue #283. The kernel derives `comm` from the basename of the
+    /// `execve`d file, so the bind target's LAST COMPONENT is what `ps` shows
+    /// for every confined shim -- and what a reader comparing it against
+    /// `vitrin-mock-shim` sees.
+    ///
+    /// This asserts the two things that make that name useful and neither
+    /// more nor less: it is not truncated (`TASK_COMM_LEN` is 16, so 15 bytes
+    /// survive), and it does not collide with the mock's own truncated
+    /// `comm`. It deliberately does **not** assert that `comm` proves
+    /// mock-freeness -- it does not, which is why the integration gates
+    /// compare `(st_dev, st_ino)` of `/proc/<pid>/exe` instead. This is
+    /// legibility, not evidence.
+    #[test]
+    fn the_confined_shim_answers_to_its_own_name() {
+        /// `TASK_COMM_LEN - 1`: the kernel copies at most this many bytes of
+        /// the basename into `comm` and NUL-terminates.
+        const COMM_MAX: usize = 15;
+        /// The component after the last `/` is what `__set_task_comm` gets.
+        fn comm_of(path: &str) -> &str {
+            let base = path.rsplit('/').next().unwrap_or(path);
+            &base[..base.len().min(COMM_MAX)]
+        }
+
+        assert_eq!(
+            comm_of(IN_REALM_SHIM),
+            "vitrin-shim",
+            "the bind target's basename IS the confined shim's comm; \
+             `/vitrin/shim` made it `shim`, which is issue #283's second half"
+        );
+        // Not merely "different strings": different AFTER the truncation the
+        // kernel applies, which is where a longer name would have hidden the
+        // collision.
+        assert_ne!(
+            comm_of(IN_REALM_SHIM),
+            comm_of("/usr/bin/vitrin-mock-shim"),
+            "the real shim and the mock must be distinguishable in `ps`"
+        );
     }
 }

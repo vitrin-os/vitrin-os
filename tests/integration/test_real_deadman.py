@@ -251,11 +251,12 @@ class RealDeadManRevocation(IntegrationTest):
         shim_pid = found[0] if found else None
         self.assertIsNotNone(shim_pid, "the core forked no shim")
         # The mock-freeness check, by INODE rather than by name. A confined
-        # shim is bound at `/vitrin/shim`, so its `comm` is `shim` whichever
-        # binary it is (P2.6.2, #186) and a name test stopped telling the real
-        # shim from `vitrin-mock-shim`. The running image's inode does, and
-        # more sharply: a name says what a program is called, an inode says
-        # which file is executing.
+        # shim is bound at the core-chosen `/vitrin/vitrin-shim`, so its
+        # `comm` comes from that basename whichever binary it is (P2.6.2,
+        # #186; renamed from `/vitrin/shim` by #283) and a name test stopped
+        # telling the real shim from `vitrin-mock-shim`. The running image's
+        # inode does, and more sharply: a name says what a program is called,
+        # an inode says which file is executing.
         self.assertEqual(
             exe_identity(shim_pid),
             file_identity(self.shim_bin),

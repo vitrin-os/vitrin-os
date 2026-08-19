@@ -333,7 +333,8 @@ the published site is fetched with no checksum at all
 ```bash
 meson setup build            # uses system wlroots-0.19 if available
 ninja -C build
-meson test -C build          # header-compiles, idle-inhibit, xdg-conformance, focus-succession
+meson test -C build          # header-compiles, loader-independence, idle-inhibit,
+                             # xdg-conformance, focus-succession
 
 # Build the vendored wlroots from source (e.g. CI, or no system wlroots-0.19),
 # taking wlroots' own dependencies from the system:
@@ -341,6 +342,25 @@ meson setup build --force-fallback-for=wlroots-0.19,wlroots
 ```
 
 The build needs no Rust toolchain — only the checked-in generated header.
+
+**Anything vendored is linked in, never loaded beside the shim** — `project()`
+defaults `default_library=static`, which subprojects inherit. That is not a
+size preference, it is what makes the shim runnable inside a confined realm:
+`vitrin-realm-init` binds it as a **single file** at a fixed in-realm path, so
+a build-tree RUNPATH (`$ORIGIN/subprojects/wlroots`, which Meson emits for a
+vendored *shared* library) resolves to a directory the realm's mount table
+never creates and the dynamic loader kills the shim before `main`. The
+alternative — widening every realm's mount table to whatever this build
+happened to link — was refused, because it makes a confinement boundary a
+function of a build flag. See issue
+[#283](https://github.com/vitrin-os/vitrin-os/issues/283) and
+[D-043](../docs/plan/20-decision-log.md).
+
+`meson test loader-independence` is what holds it: it copies the built shim to
+an empty directory, runs it there with an emptied environment, and fails if the
+binary carries any `RPATH`/`RUNPATH` or needs a library outside `/usr`, `/lib`
+or `/lib64`. Passing `-Ddefault_library=shared` is therefore loud rather than
+silent.
 
 ## Running
 
@@ -381,10 +401,11 @@ app that opens a menu maps it instead of being disconnected. The client is
 reasoning for each assertion is in its header comment, and the wlcs failures
 that provoked it are annotated in
 [`wlcs/README.md`](wlcs/README.md). It and
-[`tests/acceptance/focus_succession.sh`](tests/acceptance/focus_succession.sh)
-and [`tests/acceptance/idle_inhibit.sh`](tests/acceptance/idle_inhibit.sh)
-are the three scripts here wired into `meson test`, because they are the ones
-that need nothing but this tree's own binaries — the last of them only where
+[`tests/acceptance/focus_succession.sh`](tests/acceptance/focus_succession.sh),
+[`tests/acceptance/idle_inhibit.sh`](tests/acceptance/idle_inhibit.sh) and
+[`tests/acceptance/loader_independence.sh`](tests/acceptance/loader_independence.sh)
+are the four scripts here wired into `meson test`, because they are the ones
+that need nothing but this tree's own binaries — `idle_inhibit.sh` only where
 `wayland-protocols` ships the idle-inhibit XML `idle-probe` is generated from
 (`meson.build` gates it on its own `fs.exists`, so a moved XML costs the test
 rather than the shim), and only against
@@ -433,6 +454,22 @@ reach.
 
 ```bash
 bash tests/acceptance/focus_succession.sh ./build/vitrin-shim ./build/focus-succession-client
+```
+
+[`tests/acceptance/loader_independence.sh`](tests/acceptance/loader_independence.sh)
+— the shim must load from a directory that holds nothing but the shim
+([#283](https://github.com/vitrin-os/vitrin-os/issues/283)). It copies the
+built binary to an empty directory, runs it there with an emptied environment
+(so `$ORIGIN` moves and no `LD_LIBRARY_PATH` can help), and requires it to
+reach `main`; separately requires no `DT_RPATH`/`DT_RUNPATH` at all, because an
+**absolute** RUNPATH into the build tree passes the first check and still
+breaks every realm; and separately requires every library it resolves to live
+under `/usr`, `/lib` or `/lib64`, the prefixes a realm's mount table carries. A
+missing `readelf` or `ldd` **fails** this test rather than skipping it. Wired
+into `meson test`; needs nothing but the shim.
+
+```bash
+bash tests/acceptance/loader_independence.sh ./build/vitrin-shim
 ```
 
 [`tests/acceptance/shim_globals_and_client.sh`](tests/acceptance/shim_globals_and_client.sh)

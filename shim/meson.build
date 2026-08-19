@@ -16,6 +16,35 @@ project(
     'c_std=c11',
     'warning_level=2',
     'werror=true',
+    # ISSUE #283: anything this build VENDORS is linked INTO the shim, never
+    # loaded from beside it. Subprojects inherit this value, so it covers the
+    # pinned wlroots fallback below and every nested wrap wlroots itself might
+    # resolve.
+    #
+    # The defect it removes is not a build-tree nicety. A confined realm
+    # (`--isolation=default`) binds the shim as a single file at a fixed
+    # in-realm path, and Meson gives an executable that links a vendored
+    # SHARED library the RUNPATH `$ORIGIN/subprojects/<name>`. `$ORIGIN` is
+    # the directory the binary is EXECUTED from, so inside the realm it is
+    # the bind target's directory -- a path the realm's mount table never
+    # creates. The dynamic loader then kills the shim before `main`, and the
+    # core sees only the config channel's EOF and reports `Broken pipe`. CI
+    # always hits this, because Ubuntu ships wlroots 0.17.1 and D11 pins
+    # 0.19, so the vendored fallback is the CI configuration.
+    #
+    # Chosen over the alternative -- have the realm's mount table follow the
+    # shim's own `ldd` closure and forward `LD_LIBRARY_PATH` -- because that
+    # makes the width of a confinement boundary a function of a build flag.
+    # This keeps the mount table fixed and auditable, which is the property
+    # D-037(3) rests on. See docs/plan/20-decision-log.md D-043.
+    #
+    # HELD BY A TEST, not by this comment: `meson test loader-independence`
+    # copies the built shim to an empty directory, runs it there with a
+    # scrubbed environment, and fails if it needs anything outside the
+    # realm's stock `/usr`, `/lib`, `/lib64`. Overriding this option on the
+    # command line (`-Ddefault_library=shared`) is therefore loud, not
+    # silent.
+    'default_library=static',
   ],
 )
 
@@ -391,6 +420,28 @@ shim_exe = executable(
   include_directories: inc,
   dependencies: shim_deps,
   install: true,
+)
+
+# --- The shim must load from a directory holding nothing but itself -------
+# Issue #283. A confined realm binds the shim as a lone file at a fixed
+# in-realm path, so anything the loader has to find NEXT TO the binary, or
+# anywhere else in the build tree, is a shim that dies before `main` inside
+# every realm while working perfectly on the developer's box. This test moves
+# the binary to an empty directory, empties the environment, and runs it --
+# which is the realm's condition without needing a realm.
+#
+# It is a `meson test` on the xdg-conformance precedent: it needs nothing but
+# the shim built here, no wayland-info, no weston, no GTK, no GPU, and it
+# finishes in milliseconds.
+test(
+  'loader-independence',
+  find_program('bash'),
+  args: [
+    files('tests/acceptance/loader_independence.sh'),
+    shim_exe,
+  ],
+  depends: [shim_exe],
+  timeout: 30,
 )
 
 # --- P1.9.4 advisory WLCS integration (issue #47) -----------------------

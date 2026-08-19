@@ -49,7 +49,14 @@ def _verb_entries() -> list[ET.Element]:
 
 
 def _dotted(wire_name: str) -> str:
-    """The IDL's naming rule: the first underscore becomes a dot."""
+    """The IDL's naming rule: the first underscore becomes a dot.
+
+    Degenerate for a wire name that has no underscore — there is nothing to
+    replace, so the dotted name is the wire name unchanged. `egress` (P2.7.2)
+    is the first such entry, and the IDL states the case in as many words
+    rather than leaving a transcriber to guess; `str.replace` already
+    implements it, so this function needs no branch, only the note.
+    """
     return wire_name.replace("_", ".", 1)
 
 
@@ -90,11 +97,13 @@ def test_the_unserved_marker_is_actually_a_phrase_the_idl_uses() -> None:
     D-017 recorded. So pin that the phrase is still load-bearing: at least one
     entry carries it, and at least one does not.
 
-    At wire version 2 the unserved side is `observe_cursor` alone;
+    At wire version 2 the unserved side is `observe_cursor` and `egress`;
     `realm_launch` stays out of the SERVED set for a reason about the version
     rather than the deployment (a version-1 connection cannot mint
     `vitrin_launcher` at all), and the IDL's own summary says so, which is why
     deriving from the IDL rather than from a second list is the point.
+    `egress` (P2.7.2) carries the same marker for a stronger reason: its facet
+    is not in the IDL yet at all, so no deployment at any version serves it.
     """
     summaries = [(e.get("summary") or "") for e in _verb_entries()]
     marked = [s for s in summaries if UNSERVED_MARKER in s]

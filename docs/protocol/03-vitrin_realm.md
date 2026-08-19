@@ -131,7 +131,7 @@ grant handle, its consent observer, and the three authority facets.
 | `view` | `new_id` → [`vitrin_view`](./06-vitrin_view.md) | observation facet, inert until granted with `observe` |
 | `pointer` | `new_id` → [`vitrin_actuator_pointer`](./07-vitrin_actuator_pointer.md) | pointer facet, inert until granted with `actuate_pointer` |
 | `text` | `new_id` → [`vitrin_actuator_text`](./08-vitrin_actuator_text.md) | text facet, inert until granted with `actuate_text` |
-| `resource` | `string` (nullable, max 256 bytes) | resource selector within the realm; **null or empty** = the whole realm (the only granularity version 1 serves). Vocabulary is type-prefixed (`surface:…`, `node:…`) and grows by version. |
+| `resource` | `string` (nullable, max 256 bytes) | resource selector within the realm; **null or empty** = the whole realm (the only granularity version 1 serves). Vocabulary is type-prefixed (`surface:…`, `node:…`, `net:HOST:PORT`) and grows by version. |
 | `verbs` | `uint` — bitfield [`vitrin_grant.verb`](./04-vitrin_grant.md#verb) | requested verb set; **MUST be non-zero** |
 | `expiry_ms` | `uint` | requested lifetime in milliseconds; `0` = bounded only by the persistence rung |
 | `max_event_rate` | `uint` | requested ceiling in **events per second**, governing observation and actuation alike; `0` = server default ceiling, **never** unlimited |
@@ -169,7 +169,12 @@ death.
 **Argument semantics.**
 - `resource` selects what within the realm. Null or empty means the whole
   realm. An unserved resource prefix does not fail structurally; it resolves
-  `unsupported`.
+  `unsupported`. One prefix's grammar is **normative rather than
+  illustrative**: `net:HOST:PORT`, which names the single host and single port
+  an [`egress`](./04-vitrin_grant.md#the-net-resource-prefix) grant covers and
+  admits no wildcard, no CIDR and no list. A `net:` selector that does not
+  parse resolves `unsupported` too — never `invalid_argument`, and never
+  widened to something that does parse.
 - `verbs` is the requested verb bitfield. It MUST be non-zero — a petition for
   nothing is a client bug, not a world change (see failure modes below).
 - `expiry_ms` of `0` defers the lifetime to the persistence rung.
@@ -321,8 +326,10 @@ additive-safety appendix on the [conventions page](./00-conventions.md)):
   because `request_grant`'s signature is frozen forever like every message
   signature.
 - **Additional resource granularities.** The type-prefixed `resource`
-  vocabulary (`surface:…`, `node:…`) grows by version without a new request;
-  unserved prefixes resolve `unsupported` today.
+  vocabulary (`surface:…`, `node:…`, `net:…`) grows by version without a new
+  request; unserved prefixes resolve `unsupported` today, `net:` included —
+  its grammar is defined ([`egress`](./04-vitrin_grant.md#the-net-resource-prefix))
+  but no deployment serves the verb it belongs to yet.
 - **New facets, minted elsewhere.** A verb added after version 1 cannot get a
   co-minted facet, because `request_grant`'s five `new_id` arguments are
   frozen. It arrives as a `since`-gated structural mint on

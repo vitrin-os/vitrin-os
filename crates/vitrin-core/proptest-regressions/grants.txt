@@ -1,0 +1,18 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+#
+# PROVENANCE, stated because it is not the usual one. These two seeds were not
+# produced by a defect in shipped code. They are the shrunk counterexamples
+# proptest found while P2.7.2 (issue #196) DELIBERATELY broke the `net:`
+# selector parser to check that the property is real -- once by letting `*`
+# through the host filter, once by lower-casing the host on re-serialization.
+# Both are checked in on proptest's own advice, because each is now a permanent
+# first-try regression case for one of the two things the grammar exists to
+# hold: no wildcard, and byte-identical round-trip of the string the human
+# approved.
+cc b20bc9b254082a07fa45e66d775ffa01093d2e1404305a4f22cafcc836330848 # shrinks to prefix = "net:", host = "*", port = "1"
+cc 5dc0855180498510124edf0a07cbaf28eb12936a104bbe26e0915d56acb8d624 # shrinks to prefix = "net:", host = "Example.COM", port = "1"

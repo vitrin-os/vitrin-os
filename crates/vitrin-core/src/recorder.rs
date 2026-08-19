@@ -2055,12 +2055,16 @@ fn write_peer(out: &mut String, peer: PeerCred) {
 /// unknown future bit is still visible in `verbs_bits`.
 ///
 /// Every verb the IDL defines is named here, including the ones this core
-/// refuses `unsupported` at admission (D-017/D-018, plus `realm_launch`) -- a
+/// refuses `unsupported` at admission (D-017/D-018, plus `egress`) -- a
 /// journal entry for a refused petition must say *what was asked for*, and "a
 /// defined verb rendered as no name at all" is exactly the audit gap this pair
 /// of fields exists to close. Appending a verb to the IDL means appending it
 /// here in the same change; the unserved-set catalogue test in
-/// [`crate::consent::render`] is what notices a new bit at all.
+/// [`crate::consent::render`] is what notices a new bit at all, and
+/// `every_verb_bit_has_a_journal_label` is what refuses to let it land here
+/// unnamed -- it did exactly that for `egress` (128) at P2.7.2, which is a
+/// refused-petition verb and therefore precisely the case this pair of
+/// fields exists for.
 fn write_verbs(out: &mut String, verbs: Verb) {
     key(out, "verbs");
     out.push('[');
@@ -2073,6 +2077,7 @@ fn write_verbs(out: &mut String, verbs: Verb) {
         (Verb::LAYOUT_ARRANGE, "layout_arrange"),
         (Verb::LAYOUT_FOCUS, "layout_focus"),
         (Verb::REALM_LAUNCH, "realm_launch"),
+        (Verb::EGRESS, "egress"),
     ] {
         if verbs.contains(bit) {
             if named > 0 {
@@ -2128,6 +2133,7 @@ fn verb_label(verb: Verb) -> &'static str {
         Verb::LAYOUT_ARRANGE => "layout_arrange",
         Verb::LAYOUT_FOCUS => "layout_focus",
         Verb::REALM_LAUNCH => "realm_launch",
+        Verb::EGRESS => "egress",
         _ => "unknown",
     }
 }

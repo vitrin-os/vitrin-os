@@ -1984,6 +1984,7 @@ dependencies = [
  "fontdue",
  "gbm",
  "libc",
+ "proptest",
  "rustix 1.1.4",
  "smithay",
  "subtle",

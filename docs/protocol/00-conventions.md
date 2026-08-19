@@ -296,6 +296,16 @@ creation still refuses it. See
 defining a verb before serving it is structural rather than cosmetic, and for
 why "unserved" is a statement about a deployment rather than about the wire.
 
+**A fourth verb sits in that staged posture and is not governed by this
+section at all**, named here because the enumeration above is the one a reader
+checks a claim about "which verbs are unserved" against. **`egress`** (128,
+added at P2.7.2) is refused `unsupported` by *every* deployment — not because
+of what a deployment declines, but because the facet through which an outbound
+connection would be asked for is not in the IDL yet. Its authority is named by
+the [`net:` resource selector](04-vitrin_grant.md#the-net-resource-prefix),
+whose grammar is wildcard-free by construction, so a blanket egress grant is
+inexpressible rather than refused.
+
 ---
 
 ## 2. Wire format
@@ -815,8 +825,8 @@ offering a lower integer — convergence by descending reoffer, bounded by the
 client's own maximum.
 
 **The two versions, and what separates them.** Version 1 is the original wire.
-Version 2 appends the `realm_launch` verb bit and these messages, and nothing
-else:
+Version 2 appends the `realm_launch` and `egress` verb bits and these
+messages, and nothing else:
 
 | interface | message |
 |---|---|
@@ -827,6 +837,13 @@ else:
 | `vitrin_layout_arrange` | request `set_fullscreen` |
 | `vitrin_shim_session` | events `request_selection`, `offer_selection`, `pointer_constraint_state`; requests `selection`, `pointer_constraint`, `idle_inhibit` |
 | `vitrin_shim_seat` | events `relative_motion`, `gesture_begin`, `gesture_swipe_update`, `gesture_pinch_update`, `gesture_end` |
+
+`egress` (128) appends **no message at all**, and it is listed above with
+`realm_launch` rather than beside them for that reason: a verb bit is not
+version-gated (see below), so it is a version-2 addition to the *bitfield*
+without being a version-2 addition to any signature. The facet through which
+it would be exercised has not landed — the row it will occupy in the table
+above is owed by P2.6.5, and until then no request on this wire names the verb.
 
 Plus, at the same version and for the same reason, eight enums that carry
 arguments of those messages and are defined nowhere else:
@@ -894,15 +911,17 @@ connection may petition for `realm_launch` (512) and is answered rather than
 killed — `unsupported` there, because version 1 cannot mint the
 [`vitrin_launcher`](16-vitrin_launcher.md) facet at all. A recoverable answer
 standing where a fatal `invalid_argument` would otherwise fall is the entire
-reason a bit is defined **before it is served** (§5.1's razor: a well-formed
+reason a bit is defined **before it is served** — and `egress` (128) is the
+same staging carried one step further: its facet is not in the IDL at all yet,
+so *every* deployment answers `unsupported`, at every version (§5.1's razor: a well-formed
 request the deployment will not serve is recoverable). `realm_launch` was that
 staging's worked example, and a briefer one than the argument implies: the bit
 went on the wire in **WS-E.1.1**'s protocol half (#225), the reference core
 refused every petition naming it `unsupported`, and WS-E.1.1's core half (#207)
-served it two PRs later. It is served now — `observe_cursor` is the bit left
-standing in that posture — and the rule the example stood for did not move with
-it: a deployment that does not serve a defined verb answers `unsupported`,
-never a killed connection.
+served it two PRs later. It is served now — `observe_cursor` and `egress` are
+the bits left standing in that posture — and the rule the example stood for did
+not move with it: a deployment that does not serve a defined verb answers
+`unsupported`, never a killed connection.
 
 > **Implementation status, stated rather than implied.** The rule above binds
 > the *protocol*. The shipped core does not yet implement it: `vitrind`
@@ -1059,6 +1078,7 @@ record of *how* it arrived, which is what a later seam copies.
 | capture streaming | new `since="2"` sibling messages on `vitrin_view` (a subscription request and its frame-push event, appended after the poll pair) | `capture_frame`/`frame_ready` stay valid forever; refusals still voice through `vitrin_grant.refused`, and each pushed frame carries one fd, so the one-fd rule holds |
 | realm enumeration events | new `since="2"` events on `vitrin_realm` | `vitrin_realm` is authority-free and carries no version-0 events; multi-realm phases add enumeration/lifecycle here instead of re-plumbing addressing |
 | drag intents | new `since="2"` sibling requests on `vitrin_actuator_pointer` | intent-level motion (drag with duration/easing, interpolated server-side) is added beside `move`/`button`/`scroll`, which stay valid forever |
+| **egress vocabulary: the verb bit and the `net:` prefix** *(bit landed at version 2; facet **not** landed)* | one appended `verb` entry (`egress` = 128, from the repo-wide registry) plus a normative grammar for the `net:HOST:PORT` value of `request_grant`'s **existing** `resource` argument — and **no new message, at all** | The bit appends without touching existing bits, and a verb bit is not version-gated, so a version-1 connection naming it is answered `unsupported` rather than killed. The prefix needs no message because `resource` was type-prefixed and growable from day one; an unserved prefix already resolved `unsupported`, so defining one changes no existing client's behaviour. **What is deliberately absent is the load-bearing part of this row**: the facet the verb would be exercised through (`vitrin_powerbox.request_connect` and its connected-socket delivery event) is P2.6.5's interface and has not landed, so `egress` is today a verb **no request exercises** — which is exactly why every deployment refuses it. The grammar is **wildcard-free by construction** (one host, one port; no `*`, no CIDR, no list, no range), so a blanket egress grant is *inexpressible* rather than refused by a policy someone can relax; that in turn is what makes `covers` **exact match** rather than a subsumption rule the server would have to invent. The addresses a name resolved to at grant time are pinned into the **grant row** rather than held in the proxy, so a proxy restart cannot re-resolve away from what the human approved and a DNS rebind cannot win by outlasting a process. **One tension this row does not resolve**: `interface/@verb` is one value per interface — the rule that forced the layout facet to be *two* interfaces — so a single `vitrin_powerbox` carrying both `designate_file` and `egress` requests cannot declare both, and whoever lands the facet owes either a second interface or an explicit answer for how those requests reach the chokepoint |
 | `actuate_key` verb | new appended entry in the `verb` bitfield + a later key-actuation facet | version-0 verb bits are untouched; a new power-of-two bit and its facet are additive — see the landed `realm_launch` row for the shape, including that the bit's *value* comes from the repo-wide allocation registry rather than from the next unused-looking power of two |
 | serving `observe_cursor` | no new message: the verb bit already exists and widens what the *existing* `frame_ready` composites for a grant that holds it | version 0 refuses the verb `unsupported`, so beginning to serve it changes no signature and no version-0 client's behavior (a client that never petitions for it sees nothing new) |
 | ~~layout facet~~ **(landed, version 2)** | **two** `since="2"` structural mints on `vitrin_grant` — `get_layout_focus` and `get_layout_arrange` — minting [`vitrin_layout_focus`](17-vitrin_layout_focus.md) and [`vitrin_layout_arrange`](18-vitrin_layout_arrange.md) | `request_grant`'s five `new_id` arguments are frozen, so neither facet could be co-minted. This row said "a layout facet" singular and **understated the seam**: `@verb` is one value per interface, so one facet could declare only one of the two verbs, and D-018(3) requires them independently attenuable. Corrected here rather than silently, because the row was the record |
@@ -1082,7 +1102,12 @@ named here so their absence is understood as a decision, not an omission:
 - **Epochs** — no compare-and-swap staleness detection; out-of-view coordinates
   are clamped, and stale-observation detection is a later phase's epoch
   mechanism.
-- **Network** — the protocol is local (Unix domain sockets); no remoting.
+- **Network** — the protocol is local (Unix domain sockets); no remoting. The
+  `egress` verb bit (128) is **not** a counter-example and is named here so it
+  is not read as one: it grants a realm's outbound reach to one `host:port`
+  through an out-of-core proxy, and says nothing about carrying *this
+  protocol* over a network. Nor is the verb served — its facet is not in the
+  IDL yet — so what is on the wire today is the vocabulary alone.
 - **Multi-realm** — version 1 serves exactly one well-known realm (`realm-0`).
   Version 2 raises the *count*: a deployment may serve `realm-0` plus further
   realms up to a limit of its own choosing (see

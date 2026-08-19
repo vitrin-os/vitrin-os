@@ -140,6 +140,26 @@ check_rejected clipboard-status-enum-on-string \
 check_rejected clipboard-status-without-description \
   '/<enum name="selection_status">/,/<\/enum>/{/<description summary="why a selection answer carries no data">/,/<\/description>/d}'
 
+# --- P2.7.2 (issue #196): the egress verb bit --------------------------------
+#
+# This task adds no message, so there is no per-message negative case to write;
+# the surface it does add is one `vitrin_grant.verb` entry, and these two cases
+# are pinned there, on the newest surface, for the same reason the clipboard
+# block above is pinned on its own.
+#
+# A verb entry without its value would leave the wire bit to document order --
+# and a verb bit is allocated once, repo-wide, and is immutable, so "whatever
+# position it happens to sit in" is the one thing it must never be.
+check_rejected egress-entry-without-value \
+  's|<entry name="egress" value="128" |<entry name="egress" |'
+
+# A verb entry without a summary is a bit with no stated authority. The
+# consent prompt, the SDK's dotted name and the served/unserved derivation in
+# `sdk/python/tests/test_verb_parity.py` all read that text; an entry that
+# carried none would be an authority nobody can describe to a human.
+check_rejected egress-entry-without-summary \
+  's|<entry name="egress" value="128" summary="[^"]*"/>|<entry name="egress" value="128"/>|'
+
 if [ "$fail" -ne 0 ]; then
   echo "test-mutations: FAILURES"
   exit 1

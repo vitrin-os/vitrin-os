@@ -164,9 +164,9 @@
     bitfield="true" enum argument is checked as a bitmask: any bit set
     outside the union of defined entry values is out-of-range and fatal
     "invalid_argument", while any combination of defined bits is legal.
-    Thus request_grant's verbs accepts any combination of the seven defined
-    verb bits (value 575) but a bit reserved for a future verb (for example
-    value 64) is fatal. A verb bit is NOT version-gated: the bitfield is one
+    Thus request_grant's verbs accepts any combination of the eight defined
+    verb bits (value 703) but a bit reserved for a future verb (for example
+    value 256) is fatal. A verb bit is NOT version-gated: the bitfield is one
     mask, checked identically on every negotiated version, so a version-1
     connection may name realm_launch and is answered "unsupported" rather
     than killed - which is the whole point of defining a bit before it is
@@ -591,8 +591,16 @@
 
         resource selects what within the realm; null or empty means the
         whole realm (the only granularity version 1 serves). The string
-        vocabulary is type-prefixed ("surface:...", "node:...") and grows
-        by version without a new request (max 256 bytes). verbs is the
+        vocabulary is type-prefixed ("surface:...", "node:...",
+        "net:HOST:PORT") and grows
+        by version without a new request (max 256 bytes). The net: prefix
+        is the one whose grammar is normative rather than illustrative -
+        it names the single host and single port an egress grant covers,
+        admits no wildcard, no CIDR and no list, and is defined with the
+        egress verb entry it is inseparable from (see vitrin_grant.verb).
+        A selector whose prefix this deployment does not serve, and a
+        net: selector that does not parse, both resolve "unsupported"
+        rather than being widened to something that does parse. verbs is the
         requested verb set and MUST be non-zero (an empty petition is fatal
         "invalid_argument"). expiry_ms of 0 means bounded only by the
         persistence rung. max_event_rate is in events per second, governs
@@ -814,22 +822,35 @@
         bits, whose values are immutable. Every entry has one SDK-level
         dotted name, formed by replacing the first underscore of the wire
         name with a dot: observe, actuate.pointer, actuate.text,
-        observe.cursor, layout.arrange, layout.focus, realm.launch. The
-        spelling is
+        observe.cursor, layout.arrange, layout.focus, realm.launch,
+        egress. The rule degenerates for a wire name that carries no
+        underscore, and egress is the first: there is nothing to replace,
+        so the dotted name is the wire name unchanged. Stated rather than
+        left to be derived, because "replace the first underscore" has no
+        answer here and a transcriber would otherwise have to invent one.
+        The spelling is
         fixed here so a second implementation transcribing this enum has
         no name to invent.
 
         BIT VALUES ARE ALLOCATED ONCE, REPO-WIDE, AND ARE IMMUTABLE. The
-        gap between 32 and 512 is deliberate: 64, 128 and 256 are reserved
+        gap between 32 and 512 is deliberate: 64 and 256 are reserved
         by allocation to verbs that have not landed yet, and reusing one
         later would be a permanent wire collision rather than a rename.
         A bit is not free merely because this document does not define it.
+        128 was one of those reserved bits until egress landed on it; it
+        was taken from the allocation registry rather than chosen as the
+        next unused-looking power of two, which is the whole point of
+        allocating repo-wide.
 
         DEFINED BUT UNSERVED. A verb may be defined here and refused
         "unsupported" by a deployment that does not serve it, exactly as
         the durable persistence rungs are. observe_cursor is refused by
         every deployment at version 2, because per-principal cursor
-        delivery does not exist. layout_arrange, layout_focus and
+        delivery does not exist. egress is refused by every deployment
+        too, and for a reason that is about mechanism rather than about
+        policy: the mediating proxy a connection would be made through
+        does not exist yet, so no deployment can enforce what the verb
+        names. layout_arrange, layout_focus and
         realm_launch were in that same position when they were allocated
         and are now SERVABLE - each has a facet interface, a chokepoint arm
         and prompt copy - so whether a petition for one is answered
@@ -852,13 +873,78 @@
 
         Not every verb has a facet interface. observe_cursor has none by
         construction - it widens what capture_frame composites rather than
-        adding a request. Every other verb does: layout_arrange has
+        adding a request. layout_arrange has
         vitrin_layout_arrange, layout_focus has vitrin_layout_focus, and
         realm_launch has vitrin_launcher, each a since-gated mint on
         vitrin_grant because request_grant's five new_id arguments are
         frozen forever. The layout verbs take TWO facets rather than one
         because a facet interface declares exactly one verb; see
         get_layout_arrange.
+
+        egress has no facet interface IN THIS DOCUMENT YET, and that is a
+        gap rather than a design: the verb is defined here so a petition
+        naming it is answered rather than killed, and the facet through
+        which a connection would be asked for arrives with the powerbox
+        (docs/plan/02-phase-2-semantic-epochs.md artifact C5). Until it
+        does, egress is a verb no request exercises, which is precisely
+        why every deployment refuses it "unsupported" - a granted verb
+        with nothing to exercise it would be authority nobody checks.
+
+        THE net: RESOURCE PREFIX, and why it has no wildcard. egress is
+        the one verb whose authority is not fully named by the realm: a
+        grant that said only "this realm may reach the network" would be
+        the blanket authority this design exists to refuse. The resource
+        selector carries the rest, in request_grant's type-prefixed
+        vocabulary, as "net:HOST:PORT". The grammar is WILDCARD-FREE BY
+        CONSTRUCTION, and that is the point rather than a restriction
+        waiting to be lifted:
+
+          - exactly one HOST - a DNS name or a literal IP address. No "*",
+            no leading dot, no CIDR suffix, no comma-separated list.
+          - exactly one PORT - a single decimal integer in 1-65535, in its
+            canonical spelling. No ranges, no lists, no sign, no leading
+            zero: one endpoint must have exactly one selector string,
+            because covers is byte-exact and two spellings of one port
+            would be two selectors a consent card renders identically.
+            Port 0 is not a port a connection can be made to and is
+            refused.
+          - comparison is BYTE-EXACT, case included. DNS is
+            case-insensitive, so net:Example.com:443 and
+            net:example.com:443 name the same endpoint and are still two
+            different selectors; holding one does not cover the other.
+            That errs narrow - the wrong answer is a refusal, never an
+            unapproved connection - which is the only direction this
+            comparison is permitted to be wrong in.
+          - an IPv6 literal is bracketed ("net:[2001:db8::1]:443") so the
+            final colon that separates host from port is unambiguous.
+            Without the brackets the selector has no parse, and no parse
+            means the petition resolves "unsupported" rather than being
+            guessed at.
+          - the whole selector obeys resource's 256-byte bound like every
+            other prefix.
+
+        A blanket egress grant is therefore not refused by policy; it is
+        INEXPRESSIBLE. There is no syntax to abuse, which is what lets an
+        ergonomics answer be an enumerated template rather than an
+        allowlist language.
+
+        Because the grammar admits no wildcard, one net: selector covers
+        exactly one other: itself. net:example.com:443 does not cover
+        net:example.com:80 and does not cover net:sub.example.com:443.
+        There is no subsumption to express, and a server that invented one
+        would be widening authority a human never approved.
+
+        A NAME IS NOT THE AUTHORITY; THE ADDRESSES BEHIND IT AT GRANT TIME
+        ARE. Where the selector names a DNS name, the addresses it
+        resolved to when the human approved are pinned into the grant row,
+        and resolution happens only in the out-of-core mediating proxy -
+        there is no resolver inside a realm to route around. The proxy
+        asks the enforcement chokepoint per connection and holds no grant
+        of its own, so it decides nothing; a connection to an address the
+        pin does not contain is outside what was approved and is refused
+        "not_granted", including a literal-IP connection under a
+        name-scoped grant. That is what makes a DNS rebind lose rather
+        than win by outlasting a process.
 
         COMPOSITION. observe_cursor is meaningful only alongside observe.
         It widens what a capture contains, so a petition naming it
@@ -868,10 +954,13 @@
         deployment does not enforce. It is not an independent authority
         and is never inert-but-held. No other verb pair carries a
         dependency: observe, actuate_pointer, actuate_text,
-        layout_arrange, layout_focus and realm_launch are each
+        layout_arrange, layout_focus, realm_launch and egress are each
         independently petitionable. realm_launch in particular does NOT
         imply observe: authority to start an app is not authority to watch
-        it, and an agent that wants both petitions for both.
+        it, and an agent that wants both petitions for both. egress
+        likewise implies nothing and is implied by nothing: reaching one
+        host:port is not authority over the realm's pixels, and holding
+        every other verb buys no packet.
       </description>
       <entry name="observe" value="1" summary="capture frames of the granted resource"/>
       <entry name="actuate_pointer" value="2" summary="inject pointer motion, buttons, and scroll"/>
@@ -879,7 +968,8 @@
       <entry name="observe_cursor" value="8" summary="capture frames that include the human principal's cursor - reading the human's attention, hence a verb and not a display preference; meaningful only alongside observe, and a petition naming it without observe resolves unsupported; another agent principal's cursor is not purchasable by this or any verb; refused unsupported in version 1"/>
       <entry name="layout_arrange" value="16" summary="arrange the granted realm's view, subject to the ordering invariants no grant can purchase; exercised through vitrin_layout_arrange, which defines set_fullscreen and no other request - place, resize, raise and stacking are absent rather than refused, because a scene showing one unstacked realm cannot honour them; at most one holder per output, counting a live grant that carries this verb AND a petition still pending for it, so a second petition while either exists resolves layout_held"/>
       <entry name="layout_focus" value="32" summary="bind the output to a view of the granted realm and direct input there - one act, because routing keys to a realm the human cannot see is focus theft in its sharpest form; exercised through vitrin_layout_focus; separate from layout_arrange because focus theft is at once the sharpest attack and the most legitimate need, so it must be attenuable alone"/>
-      <entry name="realm_launch" value="512" summary="launch the realm template this grant addresses into a new realm instance, through the vitrin_launcher facet; the template names the program and no command ever crosses the wire, so this is authority over an operator-written template rather than over an arbitrary command; bits 64, 128 and 256 are allocated to verbs not yet defined here and were skipped rather than reused; refused unsupported in version 1, which cannot mint the facet at all, and by any deployment that does not serve it"/>
+      <entry name="realm_launch" value="512" summary="launch the realm template this grant addresses into a new realm instance, through the vitrin_launcher facet; the template names the program and no command ever crosses the wire, so this is authority over an operator-written template rather than over an arbitrary command; bits 64 and 256 are allocated to verbs not yet defined here and were skipped rather than reused (128 was one of them until egress landed on it); refused unsupported in version 1, which cannot mint the facet at all, and by any deployment that does not serve it"/>
+      <entry name="egress" value="128" summary="open one outbound connection to the single host:port named by this grant's net: resource selector, through an out-of-core mediating proxy that asks the enforcement chokepoint per connection and holds no grant of its own; the selector's grammar is wildcard-free, so a blanket egress grant is inexpressible rather than refused, and one selector covers exactly itself; a DNS name resolves only in the proxy and the addresses it resolved to at grant time are pinned into the grant row, so a connection to an unpinned address is refused not_granted even under a name-scoped grant; the dotted SDK name is egress unchanged, the wire name carrying no underscore to replace; refused unsupported in version 1 and by every deployment at version 2, because the facet the connection would be asked for through is not in this document yet"/>
     </enum>
 
     <enum name="persistence">

@@ -1021,11 +1021,13 @@ The dialect adds exactly two attributes beyond the Wayland shape:
 <!-- vitrin-verb-set: facet-verbs = observe, actuate_pointer, actuate_text, layout_arrange, layout_focus, realm_launch -->
 <!-- vitrin-verb-set: facet-interfaces = vitrin_view, vitrin_actuator_pointer, vitrin_actuator_text, vitrin_launcher, vitrin_layout_focus, vitrin_layout_arrange -->
 
-Both halves of that row were stale for two workstreams — it read four values
-and four interfaces from WS-E.1.4 (which added the layout pair) until issue
-#196's third review — so neither is transcribed by hand any more: `cargo xtask
-verb-sets --check` derives both from `interface/@verb` and fails when this row
-falls behind.
+Both halves of that row went stale at WS-E.1.4 — which added
+`vitrin_layout_focus` and `vitrin_layout_arrange` and left the row reading four
+values and four interfaces — and stayed that way until issue #196's third
+review, fifteen lines above a paragraph on the same page that contradicted it.
+So neither half is transcribed by hand any more: `cargo xtask verb-sets
+--check` derives both from `interface/@verb` and fails when this row falls
+behind.
 
 `@verb` is the codegen chokepoint: one attribute per capability interface
 generates the single-site authority check, so there is no second enforcement
@@ -1037,7 +1039,7 @@ IDL, and `xmllint --relaxng` gates the pair. The set tracks the
 *facet-bearing* verbs, not the whole `verb` bitfield, so it is **shorter than
 the bitfield by two**, for two different reasons:
 
-<!-- vitrin-verb-set: facetless-verbs = observe_cursor, egress -->
+<!-- vitrin-verb-set: facetless-verbs = observe_cursor, egress | count: two -->
 
 - **`observe_cursor` has no interface to annotate, by construction.** It
   widens what `capture_frame` composites rather than adding a request, so

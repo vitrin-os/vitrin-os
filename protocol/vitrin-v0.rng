@@ -32,10 +32,15 @@
   Those two names are also what protocol/test-mutations.sh's
   verb-without-facet case draws on: it mutates a legal @verb into a real
   grant verb the set does not admit, and only a facetless verb can play that
-  part. The two marker lines above are read by `cargo xtask verb-sets`,
-  which derives both sets from protocol/vitrin-v0.xml, holds the value set
-  below to the first of them, and fails when this comment (or any other
-  surface enumerating either set) falls behind.
+  part.
+
+  The marker line above, and its sibling on the attribute itself further
+  down, are read by `cargo xtask verb-sets`. That tool derives both sets from
+  protocol/vitrin-v0.xml, holds the value set below to the facet-bearing one,
+  and fails when this comment (or any other surface enumerating either set)
+  falls behind. xmllint sees only one direction of that pairing - an IDL
+  using a name this schema omits - and can never see a schema admitting a
+  name no interface declares.
 
   layout_arrange and layout_focus were in that no-facet list until they
   gained one each (vitrin_layout_arrange, vitrin_layout_focus). They are two

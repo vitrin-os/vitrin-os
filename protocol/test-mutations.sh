@@ -96,7 +96,7 @@ check_rejected bad-verb-value \
 # re-pinned it claimed the case "cannot go stale the same way again" and then
 # went stale the same way again -- not the CASE, which still works, but the
 # claim above it, which said `observe_cursor` was the only facetless verb
-# left three months before `egress` became the second one.
+# left and was falsified by the very next verb the IDL gained.
 #
 # So the claim is now a marker rather than a sentence: `cargo xtask
 # verb-sets` derives the facetless set from the IDL and fails if the line

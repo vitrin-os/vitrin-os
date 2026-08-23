@@ -515,10 +515,10 @@ impl NetSelector {
 /// the served set is a property of *this build*, and it did not widen
 /// when the wire went from 1 to 2.
 ///
-/// The wire bitfield ([`Verb::VALID_MASK`]) is deliberately wider, and has
-/// been widened on the same terms five times: D-017 and D-018 define
-/// `observe_cursor`, `layout_arrange` and `layout_focus` from day one so the
-/// decided cursor and layout models are expressible before v0 freezes,
+/// The wire bitfield ([`Verb::VALID_MASK`]) is deliberately wider, and five
+/// bits have been put on it ahead of anyone serving them: D-017 and D-018
+/// define `observe_cursor`, `layout_arrange` and `layout_focus` from day one
+/// so the decided cursor and layout models are expressible before v0 freezes,
 /// version 2 added `realm_launch`, and P2.7.2 added `egress` -- so a
 /// petition for any of them is a *recoverable* `unsupported` rather than an
 /// out-of-range bit that kills the connection.

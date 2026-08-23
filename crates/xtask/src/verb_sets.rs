@@ -185,6 +185,10 @@ const CARRIERS: &[(&str, SetKind)] = &[
     // -- the book, which is where round 1's stale copies were --------------
     ("docs/book/src/02-your-first-agent.md", SetKind::AllVerbs),
     (
+        "docs/book/src/02-your-first-agent.md",
+        SetKind::UnservedVerbs,
+    ),
+    (
         "docs/book/src/03-grants-consent-revocation.md",
         SetKind::UnservedVerbs,
     ),

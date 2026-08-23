@@ -277,12 +277,19 @@ This enum is the type of `request_grant`'s `verbs` argument, of
 facet interface and to that interface's `@verb` annotation, which drives the
 scanner-generated chokepoint table; `observe_cursor` is the one that does not,
 by construction, and `egress` is the one whose facet has not landed yet — see
-[below](#the-net-resource-prefix). That six is checked rather than remembered:
+[below](#the-net-resource-prefix). That six is **derived rather than
+remembered**, and the first attempt at saying so overstated it.
 `crates/vitrin-protocol/tests/decode_errors.rs`'s
-`every_verb_is_classified_as_facet_bearing_or_not` counts the generated `VERB`
-constants against `Verb::VALID_MASK`, so a verb appended without being put on
-one side of that line is a red test rather than a stale sentence — this
-sentence and [its restatement further down](#defined-but-unserved). Later
+`every_verb_is_classified_as_facet_bearing_or_not` used to count a
+hand-maintained list of per-interface `VERB` constants, which meant a
+*seventh* facet on an existing verb — exactly what lands with the egress facet
+— left it green while this sentence became false. Both sides now come from the
+generator: `generated::FACET_VERBS` is emitted from `interface/@verb`, and the
+facetless remainder is a set difference over `Verb::ENTRIES`. So a verb
+appended without being classified, or a facet added to a verb that had none,
+is a red test rather than a stale sentence — this sentence and [its
+restatement further down](#defined-but-unserved) — and `cargo xtask verb-sets
+--check` holds every other page that states either set. Later
 phases append entries (for example
 key actuation, credential presentation, subtree reads) without touching
 existing bits; values are immutable.
@@ -405,8 +412,9 @@ Consequences worth stating rather than deriving:
 **What has not landed, stated so it is findable.** The verb bit and this
 grammar are P2.7.2's; the facet through which a connection is *asked for* —
 `request_connect` and its connected-socket delivery event — is not in the IDL
-yet. It is **an interface of its own**, not a request on
-[`vitrin_powerbox`](13-vitrin_powerbox.md), and the dialect settles that
+yet. It is **an interface of its own**, not a request on the filesystem
+powerbox `vitrin_powerbox` (page 13, which P2.6.5 creates and which does not
+exist on this branch either), and the dialect settles that
 rather than taste: `interface/@verb` is one value per interface, so the
 interface that declares `verb="designate_file"` cannot also declare
 `verb="egress"` (see [Growth](#growth) for the full argument, and

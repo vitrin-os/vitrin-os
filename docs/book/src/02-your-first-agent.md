@@ -96,13 +96,18 @@ verbs = Verb.OBSERVE | Verb.ACTUATE_POINTER
 
 <!-- vitrin-verb-set: all-verbs = observe, actuate_pointer, actuate_text, observe_cursor, layout_arrange, layout_focus, realm_launch, egress | count: eight -->
 
-The enum has **eight** members, and the two above are the ones this page has
-used so far. Of the rest, `LAYOUT_ARRANGE`, `LAYOUT_FOCUS` and `REALM_LAUNCH`
-are **served** by this core — a grant can carry them, and `grant.focus()`,
-`grant.set_fullscreen()` and `grant.launch()` exercise them. `OBSERVE_CURSOR`
-and `EGRESS` are defined and resolve `unsupported`, the first because
-per-principal cursor delivery does not exist yet and the second because the
-facet a connection would be asked for through is not in the protocol at all.
+The enum has **eight** members, and the petition above asked for three of
+them: `OBSERVE`, `ACTUATE_POINTER` and `ACTUATE_TEXT`. Three more are
+**served** by this core on the same terms — `LAYOUT_ARRANGE`, `LAYOUT_FOCUS`
+and `REALM_LAUNCH`, exercised by `grant.set_fullscreen()`, `grant.focus()` and
+`grant.launch()`.
+
+<!-- vitrin-verb-set: unserved-verbs = observe_cursor, egress -->
+
+The remaining two — `OBSERVE_CURSOR` and `EGRESS` — are defined and resolve
+`unsupported`: the first because per-principal cursor delivery does not exist
+yet, the second because the facet a connection would be asked for through is
+not in the protocol at all.
 
 Whether a verb is served is a property of the *deployment*, not of the
 protocol — a deployment that will not host process creation refuses

@@ -1851,11 +1851,11 @@ mod tests {
     ///
     /// It is now held from both directions:
     ///
-    /// - **against the tests**, by [`RungsEntered`]: each test below records
-    ///   every rung it hands to `landlock::create_ruleset` and asserts, before
-    ///   it returns, that the set it recorded is exactly this table's row for
-    ///   it. Retarget a measurement at another rung and the test goes red at
-    ///   the assertion rather than quietly measuring something else.
+    /// - **against the tests**, by [`landlock::RungsEntered`]: minting the
+    ///   token `landlock::restrict_self` demands records the rung, and the
+    ///   ledger compares what it recorded against this table's row for the
+    ///   test when it drops. Retarget a measurement at another rung and the
+    ///   test goes red rather than quietly measuring something else.
     /// - **against the published page**, by the generator: it parses this
     ///   table out of this file and refuses to emit unless every
     ///   `Rung::behavioural_tests` entry names a test this table says enters a
@@ -1864,6 +1864,19 @@ mod tests {
     ///
     /// So a rung number here is wrong in exactly one way -- by being wrong in
     /// both places at once, which is a deliberate edit and not a drift.
+    ///
+    /// # And a test missing from this table cannot enter a domain at all
+    ///
+    /// That is the newer half, and it is the one that holds
+    /// `docs/book/src/limits.md`'s absolute about rungs 4 and 5. Recording
+    /// used to be **opt-in**: a test that called `create_ruleset(4)` and then
+    /// `restrict_self` without touching the ledger entered a domain nothing
+    /// counted, and the three cross-checks above -- name to `fn`, rung to row,
+    /// row to rung -- all pass over a declaration nobody wrote. The token now
+    /// makes the ledger the only route to the syscall, and
+    /// [`landlock::RungsEntered::for_test`] refuses a name this table does not
+    /// carry, so an undeclared domain is a compile error or a panic and never
+    /// a green run.
     pub(crate) const BEHAVIOURAL_RUNGS: &[(&str, &[u32])] = &[
         (
             "a_realm_can_write_where_it_was_granted_and_nowhere_else",
@@ -1882,52 +1895,6 @@ mod tests {
             &[7],
         ),
     ];
-
-    /// Every rung a test actually entered a Landlock domain at, recorded as it
-    /// happens and checked against [`BEHAVIOURAL_RUNGS`] before the test ends.
-    ///
-    /// The recording has to be the *same value* the ruleset is built from --
-    /// hence [`RungsEntered::at`] returns its argument, so a call site reads
-    /// `let rung = entered.at(rung);` and there is no second literal to keep in
-    /// step.
-    #[derive(Default)]
-    struct RungsEntered(std::cell::RefCell<Vec<u32>>);
-
-    impl RungsEntered {
-        /// Record `rung` and hand it straight back.
-        fn at(&self, rung: u32) -> u32 {
-            self.0.borrow_mut().push(rung);
-            rung
-        }
-
-        /// The set recorded must be exactly what [`BEHAVIOURAL_RUNGS`]
-        /// declares for `test`.
-        fn matches_declaration(&self, test: &str) {
-            let mut seen = self.0.borrow().clone();
-            seen.sort_unstable();
-            seen.dedup();
-            let declared = BEHAVIOURAL_RUNGS
-                .iter()
-                .find(|(name, _)| *name == test)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "{test} enters Landlock domains and BEHAVIOURAL_RUNGS does not declare \
-                         it. Add a row: the matrix page publishes which rungs are exercised, \
-                         and a test missing from that table is a rung published as measured by \
-                         nothing"
-                    )
-                })
-                .1;
-            assert_eq!(
-                seen, declared,
-                "{test} entered Landlock domains at {seen:?} and BEHAVIOURAL_RUNGS declares \
-                 {declared:?}. The declaration is what `cargo xtask isolation-matrix` publishes \
-                 as this test's rungs, so the two have to move together -- update the table if \
-                 the retarget was intended, and expect the matrix page and \
-                 `docs/book/src/limits.md` to change with it"
-            );
-        }
-    }
 
     /// Every name in [`BEHAVIOURAL_RUNGS`] is a test in this file, and every
     /// rung it names is one this build can ask for.
@@ -1959,6 +1926,34 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// **Non-vacuity for the ledger's drop check**, which is what holds
+    /// `docs/book/src/limits.md`'s *"No test in this repository enters a
+    /// Landlock domain at rung 4 or rung 5"*.
+    ///
+    /// Mints a token at a rung the named row does not carry and lets the
+    /// ledger drop. It enters **no** domain -- `landlock::restrict_self` is
+    /// never called, so the sentence above stays true while this test proves
+    /// the mechanism that holds it fires.
+    #[test]
+    #[should_panic(expected = "BEHAVIOURAL_RUNGS declares")]
+    fn a_ledger_that_recorded_a_rung_its_row_does_not_name_fails_on_drop() {
+        let entered = landlock::RungsEntered::for_test(
+            "a_realm_can_write_where_it_was_granted_and_nowhere_else",
+        );
+        // Rung 4 is precisely the rung the published absolute is about; the
+        // row for this name says `&[1]`.
+        let _minted = entered.entering(4);
+    }
+
+    /// And the other end: a test the table does not declare cannot open a
+    /// ledger at all, so it cannot mint the token
+    /// `landlock::restrict_self` demands, so it cannot enter a domain.
+    #[test]
+    #[should_panic(expected = "BEHAVIOURAL_RUNGS does not declare it")]
+    fn a_ledger_for_a_test_the_table_does_not_declare_refuses_to_open() {
+        let _ = landlock::RungsEntered::for_test("a_test_no_row_of_that_table_names");
     }
 
     #[test]
@@ -2073,9 +2068,15 @@ mod tests {
             | (1 << 13)
             | (1 << 14);
 
-        let entered = RungsEntered::default();
+        let entered = landlock::RungsEntered::for_test(
+            "rung_one_forbids_reparenting_that_the_rung_above_permits",
+        );
         let measure = |rung: u32, rights: u64, to: &CString| -> i32 {
-            let rung = entered.at(rung);
+            // Minted in the PARENT, so the recording survives the fork the
+            // measurement body runs in; `rung()` hands the same number back so
+            // the ruleset and the ledger cannot disagree.
+            let entering = entered.entering(rung);
+            let rung = entering.rung();
             let _ = std::fs::remove_file(from_dir.join("f"));
             let _ = std::fs::remove_file(to_dir.join("f"));
             let _ = std::fs::remove_file(from_dir.join("g"));
@@ -2099,7 +2100,7 @@ mod tests {
                 if landlock::add_path_rule(ruleset, &dir_c, rights).is_err() {
                     return SETUP_FAILED + 3;
                 }
-                if landlock::restrict_self(ruleset, 0).is_err() {
+                if landlock::restrict_self(ruleset, entering, 0).is_err() {
                     return SETUP_FAILED + 4;
                 }
                 if unsafe { libc::rename(source.as_ptr(), to.as_ptr()) } < 0 {
@@ -2146,7 +2147,8 @@ mod tests {
             "rung 2 with REFER withheld from the hierarchy must still deny; if it does not, \
              rung 2's permission above came from the RUNG rather than from the grant"
         );
-        entered.matches_declaration("rung_one_forbids_reparenting_that_the_rung_above_permits");
+        // No closing call: `entered` compares what it recorded against
+        // `BEHAVIOURAL_RUNGS` when it drops, so the check cannot be forgotten.
     }
 
     #[test]
@@ -2454,9 +2456,12 @@ mod tests {
         // test enters a domain at and the number `BEHAVIOURAL_RUNGS` publishes
         // for it are one value.
         const AUDIT_RUNG: u32 = 7;
-        let entered = RungsEntered::default();
+        let entered = landlock::RungsEntered::for_test(
+            "the_audit_log_flag_is_off_unless_asked_for_and_the_kernel_takes_it",
+        );
         let measure = |flags: libc::c_uint| -> i32 {
-            let rung = entered.at(AUDIT_RUNG);
+            let entering = entered.entering(AUDIT_RUNG);
+            let rung = entering.rung();
             fork_and_measure(move || {
                 if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } < 0 {
                     return SETUP_FAILED;
@@ -2467,7 +2472,7 @@ mod tests {
                 if got != rung {
                     return SETUP_FAILED + 2;
                 }
-                match landlock::restrict_self(ruleset, flags) {
+                match landlock::restrict_self(ruleset, entering, flags) {
                     Ok(()) => 0,
                     Err(fail) => fail.errno,
                 }
@@ -2485,9 +2490,7 @@ mod tests {
             "the kernel accepted a flags bit that does not exist, so the acceptance above \
              says nothing about the bit this build passes"
         );
-        entered.matches_declaration(
-            "the_audit_log_flag_is_off_unless_asked_for_and_the_kernel_takes_it",
-        );
+        // The ledger checks itself against `BEHAVIOURAL_RUNGS` on drop.
     }
 
     #[test]
@@ -2538,13 +2541,16 @@ mod tests {
         // The rung, named once and recorded, so the number this test enters a
         // domain at is the number `BEHAVIOURAL_RUNGS` publishes for it.
         const WRITE_SET_RUNG: u32 = 1;
-        let entered = RungsEntered::default();
+        let entered = landlock::RungsEntered::for_test(
+            "a_realm_can_write_where_it_was_granted_and_nowhere_else",
+        );
 
         for (target, expected, what) in [
             (&inside, 0, "a write inside the granted hierarchy"),
             (&outside, libc::EACCES, "a write outside every granted rule"),
         ] {
-            let rung = entered.at(WRITE_SET_RUNG);
+            let entering = entered.entering(WRITE_SET_RUNG);
+            let rung = entering.rung();
             let code = fork_and_measure(|| {
                 // Landlock's precondition, which K10 has already set in the
                 // real sequence and which a test binary has not.
@@ -2560,7 +2566,7 @@ mod tests {
                 if landlock::add_path_rule(ruleset, &granted_c, WRITE_AT_RUNG_1).is_err() {
                     return SETUP_FAILED + 2;
                 }
-                if landlock::restrict_self(ruleset, 0).is_err() {
+                if landlock::restrict_self(ruleset, entering, 0).is_err() {
                     return SETUP_FAILED + 3;
                 }
                 let fd = unsafe {
@@ -2582,7 +2588,7 @@ mod tests {
                  is only evidence because the grant in the same run succeeded"
             );
         }
-        entered.matches_declaration("a_realm_can_write_where_it_was_granted_and_nowhere_else");
+        // The ledger checks itself against `BEHAVIOURAL_RUNGS` on drop.
     }
 
     /// **Sub-floor, and kept for a stated reason (D-043).** Rungs 2 and 3 are
@@ -2614,9 +2620,12 @@ mod tests {
         const READ_ONLY: u64 = (1 << 2) | (1 << 3);
         const WRITE_WITH_TRUNCATE: u64 = (1 << 1) | (1 << 2) | (1 << 3) | (1 << 14);
 
-        let entered = RungsEntered::default();
+        let entered = landlock::RungsEntered::for_test(
+            "the_truncate_rung_is_measured_and_its_absence_is_measured_with_it",
+        );
         let measure = |rung: u32, rights: u64| -> (i32, u64) {
-            let rung = entered.at(rung);
+            let entering = entered.entering(rung);
+            let rung = entering.rung();
             std::fs::write(&victim, vec![b'x'; 100]).expect("re-fill the victim");
             let code = fork_and_measure(|| {
                 if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } < 0 {
@@ -2633,7 +2642,7 @@ mod tests {
                 if landlock::add_path_rule(ruleset, &dir_c, rights).is_err() {
                     return SETUP_FAILED + 3;
                 }
-                if landlock::restrict_self(ruleset, 0).is_err() {
+                if landlock::restrict_self(ruleset, entering, 0).is_err() {
                     return SETUP_FAILED + 4;
                 }
                 if unsafe { libc::truncate(victim_c.as_ptr(), 0) } < 0 {
@@ -2673,9 +2682,7 @@ mod tests {
              the denial above proves only that Landlock was switched on"
         );
         assert_eq!(size, 0);
-        entered.matches_declaration(
-            "the_truncate_rung_is_measured_and_its_absence_is_measured_with_it",
-        );
+        // The ledger checks itself against `BEHAVIOURAL_RUNGS` on drop.
     }
 
     /// The cumulative `handled_access_fs` table, pinned.

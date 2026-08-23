@@ -565,10 +565,176 @@ pub fn add_path_rule(ruleset: RawFd, path: &CStr, rights: u64) -> Result<(), Fai
     Ok(())
 }
 
+/// The rung a caller has committed to **entering** a Landlock domain at, and
+/// the only thing [`restrict_self`] accepts in that position.
+///
+/// # The published absolute this exists to hold
+///
+/// `docs/book/src/limits.md` publishes *"No test in this repository enters a
+/// Landlock domain at rung 4 or rung 5"*, and the matrix page publishes a
+/// per-rung list of the tests that enter one. Until this token existed, the
+/// binding between a test and the rungs it enters was `RungsEntered`, which
+/// every measurement in `main.rs` **opted into**. An opt-in cannot hold an
+/// absolute about tests nobody has written yet: a new test that called
+/// `create_ruleset(4)`, then `restrict_self`, and never touched the ledger
+/// left that sentence false with `cargo xtask isolation-matrix --check`,
+/// `limits-check` and the whole suite green. The generator held
+/// declared-name -> real fn, declared-rung -> row and row -> declared rung,
+/// and none of those three can see a domain nobody declared.
+///
+/// So the opt-in is gone. `landlock_restrict_self` is the only syscall that
+/// enters a domain, [`restrict_self`] is the only place in this workspace that
+/// issues it, and it now demands this token -- which, in a test build, only
+/// [`RungsEntered::entering`] can mint, and which records the rung as it
+/// mints. The production mint is compiled **out** of test builds
+/// ([`Entering::production`]), so [`apply_with`]'s own path to a domain is not
+/// a way around the ledger either; see [`enter_domain`].
+///
+/// What it does **not** cover is said where the claim is published rather than
+/// only here: a test that asks the *shipped* helper for a rung never links
+/// this module at all. That route is held at `crates/vitrin-core`'s realm
+/// spawn instead (`RUNGS_NO_TEST_ENTERS`).
+#[derive(Clone, Copy)]
+pub struct Entering(u32);
+
+impl Entering {
+    /// The rung recorded, handed back so a call site spells the number once.
+    #[cfg(test)]
+    pub fn rung(self) -> u32 {
+        self.0
+    }
+
+    /// The production mint, and its `cfg` is the load-bearing half.
+    ///
+    /// In a test build this function does not exist, so nothing outside
+    /// [`RungsEntered`] can produce an [`Entering`] -- which is what makes the
+    /// ledger mandatory rather than conventional.
+    #[cfg(not(test))]
+    fn production(rung: u32) -> Entering {
+        Entering(rung)
+    }
+}
+
+/// Every rung a test actually entered a Landlock domain at, recorded as the
+/// token is minted and checked against `BEHAVIOURAL_RUNGS` when the ledger
+/// drops.
+///
+/// # Why the check is in `Drop` and not in a method the test calls last
+///
+/// Because a method a test calls last is a method a test can forget to call.
+/// The previous shape had exactly that: `matches_declaration` at the bottom of
+/// four tests, invisible to every gate if a fifth omitted it. `Drop` runs
+/// whether the test remembers or not, so the only way to enter a domain in
+/// this crate's suite and not be checked against the declaration is to not
+/// enter one.
+///
+/// The ledger is constructed with the test's own name and looks its row up at
+/// once, so a typo is a failure at construction rather than a comparison
+/// against nothing. Construct it **after** any `skip_unless!`: a skipped test
+/// returns before it enters anything, and a ledger dropped with an empty set
+/// is a test that declared rungs it did not enter -- which is what this is
+/// for.
+///
+/// The forked measurement bodies do not disturb it: a child reaches `_exit`,
+/// which runs no destructor, and the parent's recording happened before the
+/// `fork` because the token is minted there.
+#[cfg(test)]
+pub struct RungsEntered {
+    /// The `#[test] fn`'s own name, as `BEHAVIOURAL_RUNGS` spells it.
+    test: &'static str,
+    /// Every rung handed to [`RungsEntered::entering`], in mint order.
+    entered: std::cell::RefCell<Vec<u32>>,
+}
+
+#[cfg(test)]
+impl RungsEntered {
+    /// A ledger for `test`, which `BEHAVIOURAL_RUNGS` must already declare.
+    pub fn for_test(test: &'static str) -> RungsEntered {
+        assert!(
+            crate::tests::BEHAVIOURAL_RUNGS
+                .iter()
+                .any(|(name, _)| *name == test),
+            "{test} opened a Landlock domain ledger and BEHAVIOURAL_RUNGS does not declare it. \
+             Add a row: `cargo xtask isolation-matrix` publishes which rungs are exercised, and \
+             a test missing from that table is a rung published as measured by nothing"
+        );
+        RungsEntered {
+            test,
+            entered: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Record `rung` and mint the token [`restrict_self`] demands.
+    pub fn entering(&self, rung: u32) -> Entering {
+        self.entered.borrow_mut().push(rung);
+        Entering(rung)
+    }
+}
+
+#[cfg(test)]
+impl Drop for RungsEntered {
+    fn drop(&mut self) {
+        // A failing assertion inside the test has already said what is wrong,
+        // and a second panic while unwinding aborts the process without
+        // printing it.
+        if std::thread::panicking() {
+            return;
+        }
+        let mut seen = self.entered.borrow().clone();
+        seen.sort_unstable();
+        seen.dedup();
+        let declared = crate::tests::BEHAVIOURAL_RUNGS
+            .iter()
+            .find(|(name, _)| *name == self.test)
+            .expect("checked in `for_test`")
+            .1;
+        assert_eq!(
+            seen, declared,
+            "{} entered Landlock domains at {seen:?} and BEHAVIOURAL_RUNGS declares \
+             {declared:?}. The declaration is what `cargo xtask isolation-matrix` publishes as \
+             this test's rungs, so the two have to move together -- update the table if the \
+             retarget was intended, and expect the matrix page and `docs/book/src/limits.md` to \
+             change with it",
+            self.test
+        );
+    }
+}
+
+/// Enter the domain from the **production** path, and refuse to from a test.
+///
+/// Two bodies. The shipped one mints an [`Entering`] and calls
+/// [`restrict_self`]; the `cfg(test)` one panics, because a test that reached
+/// this line would have entered a Landlock domain at whatever rung
+/// [`apply_with`] planned without passing through [`RungsEntered`] -- the one
+/// remaining way around the ledger, and the reason this function exists rather
+/// than a bare call. No test drives `apply_with` that far today: the two that
+/// call it stop at `--landlock=off` and at a probe answering `ENOSYS`.
+#[cfg(not(test))]
+fn enter_domain(ruleset: RawFd, rung: u32, flags: libc::c_uint) -> Result<(), Fail> {
+    restrict_self(ruleset, Entering::production(rung), flags)
+}
+
+#[cfg(test)]
+fn enter_domain(_ruleset: RawFd, rung: u32, _flags: libc::c_uint) -> Result<(), Fail> {
+    panic!(
+        "landlock::apply_with reached `landlock_restrict_self` at rung {rung} under `cargo \
+         test`. The production path may not enter a Landlock domain in a test build: the rungs \
+         a test enters are published per rung on docs/book/src/isolation-matrix.md and as an \
+         absolute on docs/book/src/limits.md, and only `RungsEntered` records them. Drive the \
+         rung through a forked measurement body with a ledger, or change what those two pages \
+         say first."
+    )
+}
+
 /// Enforce the ruleset on this process and every descendant.
 ///
 /// Requires `PR_SET_NO_NEW_PRIVS`, which K10 has already set. Irreversible by
 /// construction: there is no call that removes a Landlock domain.
+///
+/// `entering` is a witness rather than an argument -- the kernel is told the
+/// ruleset and the flags, and the rung is already baked into the ruleset. It
+/// is named here so that no caller can reach this syscall without having gone
+/// through a mint that records the rung; see [`Entering`].
 ///
 /// `flags` is [`restrict_self_flags`]' answer -- zero for every shipped
 /// session. It is a parameter rather than a constant read in here so that the
@@ -576,7 +742,15 @@ pub fn add_path_rule(ruleset: RawFd, path: &CStr, rights: u64) -> Result<(), Fai
 /// directly, name the flags word they are measuring instead of inheriting one.
 ///
 /// Allocation-free.
-pub fn restrict_self(ruleset: RawFd, flags: libc::c_uint) -> Result<(), Fail> {
+pub fn restrict_self(ruleset: RawFd, entering: Entering, flags: libc::c_uint) -> Result<(), Fail> {
+    // The token's rung is not sent to the kernel -- it is already baked into
+    // `ruleset` -- so this reads it for the one invariant it can state, rather
+    // than discarding it and leaving the field unread in a shipped build.
+    debug_assert!(
+        entering.0 >= 1,
+        "a Landlock domain cannot be entered at rung 0: rung 0 is `--landlock=off`, which builds \
+         no ruleset at all"
+    );
     // SAFETY: an integer descriptor and a flags word.
     let rc = unsafe { libc::syscall(SYS_LANDLOCK_RESTRICT_SELF, ruleset, flags) };
     if rc < 0 {
@@ -1008,7 +1182,7 @@ pub(crate) fn apply_with(
                 Err(fail) => return Err(fail),
             }
         }
-        restrict_self(ruleset, flags)
+        enter_domain(ruleset, rung, flags)
     })();
     // SAFETY: `ruleset` is this function's own descriptor. Closed on both
     // paths: after `restrict_self` the domain is enforced and the descriptor

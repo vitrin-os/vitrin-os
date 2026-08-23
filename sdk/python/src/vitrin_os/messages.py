@@ -62,7 +62,9 @@ OP_MOVE = 0
 OP_BUTTON = 1
 OP_SCROLL = 2
 OP_TYPE = 0
-# vitrin_grant's three since="2" structural mints, in document order.
+# Three of vitrin_grant's four since="2" structural mints, in document order.
+# The fourth is `get_egress` (opcode 3), listed in the table above and
+# deliberately not encoded here -- see the note under it.
 OP_GET_LAUNCHER = 0
 OP_GET_LAYOUT_FOCUS = 1
 OP_GET_LAYOUT_ARRANGE = 2

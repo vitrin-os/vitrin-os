@@ -164,9 +164,9 @@
     bitfield="true" enum argument is checked as a bitmask: any bit set
     outside the union of defined entry values is out-of-range and fatal
     "invalid_argument", while any combination of defined bits is legal.
-    Thus request_grant's verbs accepts any combination of the seven defined
-    verb bits (value 575) but a bit reserved for a future verb (for example
-    value 64) is fatal. A verb bit is NOT version-gated: the bitfield is one
+    Thus request_grant's verbs accepts any combination of the eight defined
+    verb bits (value 639) but a bit reserved for a future verb (for example
+    value 128) is fatal. A verb bit is NOT version-gated: the bitfield is one
     mask, checked identically on every negotiated version, so a version-1
     connection may name realm_launch and is answered "unsupported" rather
     than killed - which is the whole point of defining a bit before it is

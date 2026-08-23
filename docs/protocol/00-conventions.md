@@ -1016,9 +1016,12 @@ is refused.
   interface's own counter — every seam in Appendix A is a `since="2"` message
   on an interface whose own `version` was 1 when the seam was written.
 - **A verb bit's value is allocated once, repo-wide, and is immutable.** The
-  gap between 32 and 512 in the `verb` bitfield is reserved allocation, not
-  free space: a bit absent from the IDL may still be spoken for. The registry
-  is `docs/plan/02-phase-2-semantic-epochs.md` §5, and anything adding a verb
+  bits between 64 and 512 that the `verb` bitfield leaves undefined — 128 and
+  256 — are reserved allocation, not free space: a bit absent from the IDL may
+  still be spoken for. This read "the gap between 32 and 512" until P2.6.5
+  defined 64 as `designate_file`, taken from that registry rather than from the
+  next unused-looking power of two. The registry is
+  `docs/plan/02-phase-2-semantic-epochs.md` §5, and anything adding a verb
   allocates there first, whatever document schedules the work.
 
 ---

@@ -2963,12 +2963,19 @@ pub const MIRRORS: &[Derived] = &[
                recoverable `unsupported` and a fatal `invalid_argument`. It moves whenever \
                an epic allocates a verb bit, and the renderings below restate it as a \
                literal, on purpose: re-pinning each is what forces a human to classify \
-               the new bit rather than let it widen the mask silently.",
+               the new bit rather than let it widen the mask silently. The last two \
+               renderings read the IDL's normative paragraph, which states the mask in \
+               two further registers -- how many bits it defines, and the lowest bit it \
+               leaves out as its example of one that is still fatal. Both are pure \
+               functions of the same constant, so neither is a second value to keep.",
         issue: "Refs #189: the plan's re-pin registry named three sites, and measured \
                 against the tree it was wrong in both directions -- attention.rs holds a \
                 literal pin and was not named, and test_verb_parity.py holds no literal at \
                 all. Following that list on the next verb would have left attention.rs red. \
-                The list is now checked here rather than remembered.",
+                The list is now checked here rather than remembered. The same review then \
+                found protocol/vitrin-v0.xml -- the file CLAUDE.md makes normative over \
+                every prose page -- stating the count, the mask and the reserved-bit \
+                example all three wrong, behind a fully green build.",
         // The generated constant, not either test's copy of it: a row whose
         // source is one of the surfaces it holds would agree with its own
         // drift.
@@ -3004,6 +3011,30 @@ pub const MIRRORS: &[Derived] = &[
                 path: "docs/plan/20-decision-log.md",
                 render: verb_mask_log_sentence,
                 context: "`Verb::VALID_MASK == ",
+            },
+            // The IDL's protocol-level `<description>`, which CLAUDE.md makes
+            // normative over every prose page restating it. It states the mask
+            // twice over -- as a count of defined bits and as the decimal --
+            // and neither was in any table until P2.6.5's review read the
+            // paragraph by hand and found both wrong. Two renderings rather
+            // than one because the paragraph carries two registers, which is
+            // the shape `Rendering`'s own doc comment prescribes.
+            Rendering {
+                path: "protocol/vitrin-v0.xml",
+                render: verb_mask_idl_defined_count,
+                context: " defined verb bits (value ",
+            },
+            // ...and the third number in the same sentence: the example it
+            // gives of a bit that is still fatal. This one is what made the
+            // stale paragraph a self-contradiction rather than a stale
+            // decimal -- it named 64, which this very branch had just defined
+            // as `designate_file`, so the normative file said a petition for
+            // 64 was fatal on the same day the core began answering it
+            // `unsupported`.
+            Rendering {
+                path: "protocol/vitrin-v0.xml",
+                render: verb_mask_lowest_undefined_bit,
+                context: "(for example value ",
             },
         ],
     },
@@ -3346,6 +3377,43 @@ fn verb_mask_page_sentence(v: &[String]) -> String {
 
 fn verb_mask_log_sentence(v: &[String]) -> String {
     format!("`Verb::VALID_MASK == {}`", verb_mask_decimal(v))
+}
+
+/// The IDL's own register for the mask: *"any combination of the eight defined
+/// verb bits (value 639)"*. The count is the mask's population count rather
+/// than a second number to keep in step -- a verb entry is one bit by
+/// construction, and the enum's values are immutable, so the two can only
+/// disagree by the mask being wrong.
+fn verb_mask_idl_defined_count(v: &[String]) -> String {
+    let count = match verb_mask_bits(v) {
+        Some(mask) => number_word(&mask.count_ones().to_string()),
+        // Deliberately a form no surface can contain, for the same reason
+        // `verb_mask_decimal` has one: a value that failed to parse must not
+        // render as something a page might legitimately say.
+        None => "<not-an-or-of-decimals>".to_string(),
+    };
+    format!("{count} defined verb bits (value {})", verb_mask_decimal(v))
+}
+
+/// The same sentence's example of a bit that is still **fatal**: the lowest
+/// power of two the mask leaves out.
+///
+/// This is the number the paragraph got wrong, and the derivation is the point.
+/// Written by hand it names whichever bit was unallocated when the sentence was
+/// written; derived, it moves the day that bit is defined -- which is the day
+/// the sentence stops being true, because a defined bit is answered
+/// `unsupported` rather than killing the connection.
+fn verb_mask_lowest_undefined_bit(v: &[String]) -> String {
+    match verb_mask_bits(v) {
+        Some(mask) => {
+            let bit = (0..32)
+                .map(|shift| 1u32 << shift)
+                .find(|bit| mask & bit == 0)
+                .expect("a u32 mask cannot contain all 32 bits and still be a verb set");
+            format!("(for example value {bit})")
+        }
+        None => format!("(for example value {})", verb_mask_decimal(v)),
+    }
 }
 
 /// `15` -> `15 interfaces at wire version`, README's one sentence stating the

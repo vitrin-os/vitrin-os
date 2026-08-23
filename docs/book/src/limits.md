@@ -121,9 +121,11 @@ was collected with the app running from a build tree, and five of its rows were
 that tree's own ancestors — minted on the realm's root tmpfs solely to hold the
 app-directory and shim-library bind targets beneath them. With the app
 relocated, `/home` and every component under it answer **`ENOENT` at both
-settings**: they do not exist inside the realm at all. The same 40 paths were
-also run again in the same session with the app left in the build tree, which
-still denies `/`, `/run`, `/vitrin`, `/home`, `/home/<user>` and **every**
+settings**: they do not exist inside the realm at all. The same batches were
+run again in the same session with the app left in the build tree (39 distinct
+paths there rather than 40, because two slots name the app's own directory and
+collide with the build tree's own), and that run still denies `/`, `/run`,
+`/vitrin`, `/home`, `/home/<user>` and **every**
 further ancestor of the app's own directory — a count that is a function of how
 deep the checkout is and of nothing else, which is why the relocated run is the
 one published above and why the old table's "eight" was a fact about a

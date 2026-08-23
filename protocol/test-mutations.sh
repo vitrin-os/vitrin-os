@@ -145,6 +145,16 @@ check_rejected clipboard-status-without-description \
 # Each case is pinned on a message this issue ADDED, for the reason the
 # clipboard block above states: the corpus should exercise the schema against
 # the newest surface, not only against the oldest.
+#
+# ONE OF #189's ACCEPTANCE CRITERIA IS DELIBERATELY NOT HERE. It asked for an
+# `fd_count` mismatch case dying fatal `fd_violation`. `fd_count` is a byte of
+# the frame header, not a construct of the IDL dialect, so no mutation of this
+# document could be rejected for it and a case named for it would be
+# exercising something else. It lives in
+# `crates/vitrin-protocol/tests/decode_errors.rs` instead, against the real
+# decoder and asserting the real wire code; the relocation is recorded as
+# D-043 in `docs/plan/20-decision-log.md` so the criterion reads as moved
+# rather than dropped.
 
 # The @verb set is closed even though this issue WIDENED it. `designate_file`
 # joining the choice list is a dialect change, and the risk a dialect change

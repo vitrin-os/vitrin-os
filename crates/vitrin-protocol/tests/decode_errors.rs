@@ -128,6 +128,14 @@ fn invalid_bitfield_value_is_rejected() {
 /// invariant `00-conventions.md` §2.4 makes framing-level rather than
 /// signature-level.
 ///
+/// **This test and the one below it carry issue #189's acceptance criterion
+/// 5, which asked for the case in `protocol/test-mutations.sh`.** That script
+/// mutates the IDL and asserts the RELAX NG schema rejects it; `fd_count` is
+/// a header byte the dialect cannot express, so no mutation there could prove
+/// anything about it. The relocation is D-043 in
+/// `docs/plan/20-decision-log.md`, including what it does NOT cover: these
+/// are codec unit tests, not a hostile peer driven through a live `vitrind`.
+///
 /// Both directions are covered, because the cheap check (`fd.is_some()` vs
 /// `HAS_FD`) passes one of them: a header claiming **one** fd for a message
 /// that carries one, decoded with none supplied, and a header claiming

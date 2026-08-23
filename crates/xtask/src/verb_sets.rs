@@ -106,6 +106,8 @@ use anyhow::{anyhow, bail, Context, Result};
 
 use vitrin_scanner::ir::Protocol;
 
+use crate::build_output::BuildOutput;
+
 /// The IDL, relative to the workspace root.
 const XML_PATH: &str = "protocol/vitrin-v0.xml";
 /// The RELAX NG schema for the IDL dialect, relative to the workspace root.
@@ -674,13 +676,51 @@ pub fn check(root: &Path) -> Result<String> {
     ))
 }
 
-/// Every file under `root` that carries a marker, skipping the directories a
-/// source scan must never walk (`target/`, `.git/`) and this module itself
-/// (whose doc comment quotes the marker syntax).
+/// Every file under `root` that carries a marker, skipping build output and
+/// VCS metadata and this module itself (whose doc comment quotes the marker
+/// syntax).
+///
+/// # Why git decides what is build output, and not a name
+///
+/// This scan first carried a hand-written list of directory names to skip --
+/// `target`, `.git`, `node_modules`, `build`, `dist`, `*.egg-info` -- and the
+/// list was wrong the day it landed. `mdbook build docs/book` writes into
+/// `docs/book/book/`, whose name is `book`, so a tree where one of this
+/// branch's own claimed gates had been run reported four unregisterable
+/// carriers (`docs/book/book/{02,03,06}-*.html` and `print.html`) and turned
+/// both `cargo xtask verb-sets --check` and `cargo test --workspace` red.
+/// Every one of those paths is in `.gitignore`; none of them exists on a
+/// fresh clone.
+///
+/// The list was already the second attempt at the same shape -- `build`,
+/// `dist` and `*.egg-info` were added because `pip install ./sdk/python`
+/// drops a copy of every SDK source, markers and all, under
+/// `sdk/python/build/lib/`. Adding `book` would have been the third, and the
+/// next generated directory would be the fourth. So the name-shaped answer is
+/// gone: [`BuildOutput`] asks git which paths are ignored, which is the same
+/// answer `.gitignore` gives the developer and the same tree CI checks out,
+/// and it is already how [`crate::limits`], [`crate::skip_census`] and
+/// [`crate::test_census`] tell source from output (issue #295).
+///
+/// `.git` stays a literal name because it is the one directory git does not
+/// report as ignored -- it is not in the working tree at all.
+///
+/// What this deliberately does **not** skip is a file that is untracked and
+/// *not* ignored: a new carrier a developer has written but not yet committed
+/// is exactly the file this check must speak about.
 fn files_with_markers(root: &Path) -> Result<Vec<PathBuf>> {
+    let built = BuildOutput::of_tree(root).with_context(|| {
+        format!(
+            "asking git which paths under {} are build output. This scan reports every file \
+             carrying a `{MARKER}` marker that no CARRIERS row covers, and a generated copy of \
+             a carrier is not a surface anyone can register -- see \
+             crates/xtask/src/build_output.rs (issue #295).",
+            root.display()
+        )
+    })?;
     let mut out = Vec::new();
     let this_file = root.join("crates/xtask/src/verb_sets.rs");
-    walk(root, &mut |path| {
+    walk(root, &built, &mut |path| {
         if path == this_file {
             return Ok(());
         }
@@ -700,37 +740,19 @@ fn files_with_markers(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-fn walk(dir: &Path, f: &mut impl FnMut(&Path) -> Result<()>) -> Result<()> {
+fn walk(dir: &Path, built: &BuildOutput, f: &mut impl FnMut(&Path) -> Result<()>) -> Result<()> {
     for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
         let entry = entry?;
         let path = entry.path();
         let name = entry.file_name();
         let name = name.to_string_lossy();
+        // `.git` is not part of the working tree, so git never reports it as
+        // ignored; everything else that is output says so through git.
+        if name == ".git" || built.covers(&path) {
+            continue;
+        }
         if entry.file_type()?.is_dir() {
-            // Build output and VCS metadata. `build`, `dist` and `*.egg-info`
-            // join the list because `pip install ./sdk/python` drops a COPY of
-            // every SDK source under `sdk/python/build/lib/`, markers and all,
-            // and this scan then reports two carriers nobody can register --
-            // the same file twice, under a path that is gitignored and does
-            // not exist on a fresh clone. A local pip install is a normal
-            // thing to do before running the SDK's own tests, so the gate was
-            // red for a reason that had nothing to do with a verb set.
-            //
-            // The residual, stated rather than left to be met: a REAL carrier
-            // living in a directory named `build` or `dist` is now invisible
-            // to this scan. That is the same closed-world hole this module's
-            // header already owns for unregistered carriers generally, and it
-            // is accepted on the same terms.
-            if name == "target"
-                || name == ".git"
-                || name == "node_modules"
-                || name == "build"
-                || name == "dist"
-                || name.ends_with(".egg-info")
-            {
-                continue;
-            }
-            walk(&path, f)?;
+            walk(&path, built, f)?;
         } else if entry.file_type()?.is_file() {
             f(&path)?;
         }
@@ -741,6 +763,7 @@ fn walk(dir: &Path, f: &mut impl FnMut(&Path) -> Result<()>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testtree::TestTree;
 
     fn root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -888,6 +911,47 @@ mod tests {
         assert!(parse_served_bits("const SERVED_VERB_BITS: u32 = OTHER | 2;").is_err());
         assert!(parse_served_bits("nothing here").is_err());
         assert!(parse_served_bits("const SERVED_VERB_BITS: u32 = 0;").is_err());
+    }
+
+    /// The regression for the defect that replaced the hand-written skip
+    /// list: a marker inside a **gitignored** directory is not a carrier, and
+    /// the directory that proved it is `docs/book/book/` -- mdBook's output,
+    /// named `book`, which no entry of that list covered.
+    ///
+    /// Deterministic, in a tree this test builds, for the reason
+    /// [`crate::testtree`] exists: held against the real repository the
+    /// assertion would pass on a clean checkout whether or not the fix was
+    /// there. The second half is the one that keeps the filter honest -- an
+    /// untracked file git does *not* ignore is still reported, so this cannot
+    /// be satisfied by a scan that has silently switched itself off.
+    #[test]
+    fn a_marker_in_build_output_is_not_a_carrier_whatever_the_directory_is_called() {
+        let tree = TestTree::new("verb-sets-build-output");
+        tree.write(".gitignore", "docs/book/book/\nsdk/python/build/\n");
+        let marker = "<!-- vitrin-verb-set: facetless-verbs = observe_cursor, egress -->\n";
+        // What `mdbook build docs/book` writes, and what `pip install
+        // ./sdk/python` copies: the same marker text, at a generated path.
+        tree.write("docs/book/book/03-grants-consent-revocation.html", marker);
+        tree.write("sdk/python/build/lib/vitrin/grants.py", marker);
+        // The repository's own text, and a carrier a developer has written
+        // but not yet committed.
+        tree.write("docs/book/src/03-grants-consent-revocation.md", marker);
+        tree.write("docs/protocol/99-vitrin_new.md", marker);
+        tree.git_init();
+
+        let found: Vec<PathBuf> = files_with_markers(tree.path())
+            .expect("a git work tree")
+            .into_iter()
+            .map(|p| p.strip_prefix(tree.path()).expect("under the tree").into())
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                PathBuf::from("docs/book/src/03-grants-consent-revocation.md"),
+                PathBuf::from("docs/protocol/99-vitrin_new.md"),
+            ],
+            "generated copies are not surfaces anyone can register; uncommitted source is"
+        );
     }
 
     #[test]

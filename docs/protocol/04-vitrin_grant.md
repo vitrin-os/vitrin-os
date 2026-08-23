@@ -812,14 +812,16 @@ rules](00-conventions.md) guarantee.
   [`vitrin_powerbox`](13-vitrin_powerbox.md), through which
   [`designate_file`](#verb) (64) is exercised. It follows the launcher's shape
   exactly and adds two things to the pattern that the earlier rows did not
-  need. First, **two served resource prefixes** — `file:` and `dir:` in
-  [`request_grant`](03-vitrin_realm.md#request_grant)'s type-prefixed
-  vocabulary — which break no existing client because an unserved prefix
-  already resolves `unsupported` recoverably. Second, a **limitation that does
-  not go away when the verb is served**: a delivered file descriptor is kernel
-  authority the core cannot recall, so revocation stops future designations
-  and kills the grant row while every descriptor already handed over keeps
-  working until its realm dies. Stated here as well as on the facet page
+  need. First, **two newly *defined* resource prefixes** — `file:` and `dir:`
+  in [`request_grant`](03-vitrin_realm.md#request_grant)'s type-prefixed
+  vocabulary, defined and **not** served: they resolve `unsupported` in every
+  deployment today, exactly as the verb they select for does. That is why they
+  break no existing client — an unserved prefix already resolves `unsupported`
+  recoverably. Second, a **limitation that does not go away when the verb is
+  served**: a delivered file descriptor is kernel authority the core cannot
+  recall, so revocation stops future designations and kills the grant row
+  while every descriptor already handed over keeps working until its realm
+  dies. Stated here as well as on the facet page
   because this list is where a later seam looks for what a shape costs.
 
 ## Version history

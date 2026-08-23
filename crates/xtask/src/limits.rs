@@ -436,6 +436,19 @@ pub enum Source {
         dir: &'static str,
         suffix: &'static str,
     },
+    /// Count the occurrences of `needle` in a single file.
+    ///
+    /// The value is that count in decimal. Same shape and same justification
+    /// as [`Source::FileCount`] -- a published number that is the size of a
+    /// set whose honest canonical source is the set itself -- for the case
+    /// where the set lives inside one file rather than one per file. The
+    /// interface count in `protocol/vitrin-v0.xml` is exactly that: the IDL
+    /// carries no total, and writing one into it so this table could read it
+    /// would be inventing the second copy the row exists to remove.
+    Occurrences {
+        path: &'static str,
+        needle: &'static str,
+    },
 }
 
 /// One value to read out of a [`Source::File`].
@@ -597,6 +610,10 @@ const PROFILE: &str = "packaging/apparmor/vitrind";
 /// The decision log. A `**Status:**` line is a status word, not a register --
 /// see the warning above.
 const DECISIONS: &str = "docs/plan/20-decision-log.md";
+/// The wire protocol IDL -- CLAUDE.md's "source of truth for every interface",
+/// and therefore the canonical set behind every published interface count and
+/// every published interface table.
+const IDL_PATH: &str = "protocol/vitrin-v0.xml";
 
 /// Directories whose contents are third-party and must never satisfy or break
 /// an [`Evidence::AbsentFrom`] check. `shim/subprojects/` is vendored wlroots,
@@ -2760,6 +2777,38 @@ pub const DERIVED: &[Derived] = &[
             },
         ],
     },
+    Derived {
+        id: "protocol-interface-count",
+        says: "how many interfaces protocol/vitrin-v0.xml defines. The IDL is the only place \
+               that set exists; README.md states its size in one sentence and then lists the \
+               members one per table row, which is two derived renderings of one fact and \
+               historically drifts as a pair.",
+        issue: "Refs #189: adding vitrin_powerbox took the IDL to fifteen interfaces and \
+                docs/book/src/05-the-wire-protocol.md's table to fifteen rows, while README.md \
+                kept saying fourteen above a fourteen-row table. Nothing in CI was red, because \
+                nothing read either number.",
+        // Counted out of the IDL rather than read from a total written beside
+        // it: the IDL carries no total, and adding one so this row could read
+        // it would create the second copy the row exists to remove. The
+        // newline anchor keeps a `<interface` inside a `<description>` from
+        // counting.
+        source: Source::Occurrences {
+            path: IDL_PATH,
+            needle: "\n  <interface name=\"",
+        },
+        // One rendering, because README.md is the only surface that states the
+        // COUNT in words. The other half of the pair -- that the tables list
+        // exactly these interfaces, by name and in the IDL's order -- is a SET
+        // and not a string, so it is held by
+        // `the_published_interface_tables_are_the_idls_interface_list` below
+        // rather than here. Splitting them is the same division the
+        // `verb-valid-mask` row and its set-half test already use.
+        renderings: &[Rendering {
+            path: README,
+            render: interfaces_at_wire_version,
+            context: " interfaces at wire version",
+        }],
+    },
 ];
 
 /// Code-to-code mirrors: a value duplicated in a second file, with a comment
@@ -3054,6 +3103,10 @@ pub const COVERED_DERIVED: &[&str] = &[
     // the filter adds on a real kernel. It was spelled as an English word on
     // three surfaces and existed as a literal nowhere.
     "seccomp-rows-demonstrated",
+    // #189's. The first row whose canonical source is the IDL rather than a
+    // Rust constant or a measurement, and the first whose set-half is held by
+    // a test rather than by a second rendering.
+    "protocol-interface-count",
 ];
 
 /// Every code-to-code mirror this gate covers. Same contract as
@@ -3293,6 +3346,12 @@ fn verb_mask_page_sentence(v: &[String]) -> String {
 
 fn verb_mask_log_sentence(v: &[String]) -> String {
     format!("`Verb::VALID_MASK == {}`", verb_mask_decimal(v))
+}
+
+/// `15` -> `15 interfaces at wire version`, README's one sentence stating the
+/// size of the IDL's interface set.
+fn interfaces_at_wire_version(v: &[String]) -> String {
+    format!("{} interfaces at wire version", v[0])
 }
 
 fn py_demo_identity(v: &[String]) -> String {
@@ -4110,6 +4169,21 @@ fn read_source(root: &Path, source: &Source) -> Result<Vec<String>, String> {
             }
             Ok(vec![count.to_string()])
         }
+        Source::Occurrences { path, needle } => {
+            let text = fs::read_to_string(root.join(path))
+                .map_err(|err| format!("cannot read the canonical source {path}: {err}"))?;
+            let count = text.matches(needle).count();
+            if count == 0 {
+                return Err(format!(
+                    "{path} does not contain {needle:?} even once. The published sentences \
+                     derive their number from that set, and a set that has become empty would \
+                     render as `0` on every surface rather than failing -- which is the vacuity \
+                     this refuses. Either the definition was reworded or the row is aimed at \
+                     the wrong file."
+                ));
+            }
+            Ok(vec![count.to_string()])
+        }
     }
 }
 
@@ -4169,6 +4243,7 @@ fn source_path(source: &Source) -> &'static str {
     match source {
         Source::File { path, .. } => path,
         Source::FileCount { dir, .. } => dir,
+        Source::Occurrences { path, .. } => path,
     }
 }
 
@@ -4957,6 +5032,150 @@ mod tests {
                 "{REGISTRY} does not name {path} among the sites to re-pin. That list is                  followed by whoever lands the next verb bit; a site missing from it is a                  red test they will meet without having been told why."
             );
         }
+    }
+
+    /// The book's wire-protocol chapter. It carries the second published table
+    /// of the IDL's interfaces; `README.md` carries the first. Declared here
+    /// rather than beside the other surface paths because only the test below
+    /// reads it -- a surface constant no shipping table names is dead code in
+    /// the binary, and silencing that with an `allow` would hide the next one
+    /// that really is orphaned.
+    const BOOK_WIRE: &str = "docs/book/src/05-the-wire-protocol.md";
+
+    /// **The half the `protocol-interface-count` row cannot hold: the SET of
+    /// interfaces, not its size.**
+    ///
+    /// `README.md` and `docs/book/src/05-the-wire-protocol.md` each publish a
+    /// table with one row per interface in `protocol/vitrin-v0.xml`. A
+    /// `Derived` row can hold README's *sentence* stating how many there are;
+    /// no string comparison can hold fifteen table rows to fifteen IDL
+    /// elements.
+    ///
+    /// It is not hypothetical. P2.6.5 (#189) added `vitrin_powerbox` to the
+    /// IDL and to the book's table and left README at fourteen rows saying
+    /// "14 interfaces", and every gate in this repo stayed green: the count
+    /// was in nobody's table and the two published tables were compared to
+    /// nothing, not even to each other.
+    ///
+    /// So this reads the IDL and both tables and requires all three to be the
+    /// same list **in the same order** -- the order matters because both
+    /// tables are read as an index into the IDL, and a reader who finds them
+    /// permuted has to check every row to learn that nothing is missing.
+    ///
+    /// **Its honest bound**: it matches the one shape both tables have ever
+    /// taken -- a leading table cell whose first backticked token is the
+    /// interface name. A table rewritten into prose, or into a definition
+    /// list, becomes invisible to it, which is why the emptiness assertions
+    /// below are separate from the equality ones.
+    #[test]
+    fn the_published_interface_tables_are_the_idls_interface_list() {
+        let root = root();
+        let idl = idl_interfaces(&root);
+        // Non-vacuity: an IDL scan that matched nothing would make every
+        // comparison below trivially true against two empty tables.
+        assert!(
+            idl.len() >= 15,
+            "protocol/vitrin-v0.xml scanned to {} interface(s). It has defined at \
+             least fifteen since P2.6.5, so this scan is broken rather than the IDL.",
+            idl.len()
+        );
+
+        for (path, heading) in [
+            (README, "## Protocol v0 interfaces"),
+            (BOOK_WIRE, "## The interfaces"),
+        ] {
+            let text = fs::read_to_string(root.join(path)).expect("the surface exists");
+            let published = table_interfaces(&text, heading);
+            assert!(
+                !published.is_empty(),
+                "{path}: no interface row found under {heading:?}. Either the section \
+                 was renamed or the table was rewritten into a shape this scan cannot \
+                 read -- and an empty list would otherwise be compared to the IDL and \
+                 simply reported as fifteen missing rows."
+            );
+            assert_eq!(
+                published, idl,
+                "{path}: the interface table under {heading:?} is not \
+                 protocol/vitrin-v0.xml's interface list. The IDL is the source of \
+                 truth (CLAUDE.md); a table row missing from it, extra in it, or out \
+                 of its order is drift on a published surface, and the count sentence \
+                 the `protocol-interface-count` row holds cannot see it."
+            );
+        }
+
+        // README links each row to its prose page, and CLAUDE.md's protocol
+        // authoring rule makes that page mandatory. A row pointing at a page
+        // that does not exist is a dead link this test can refuse for free.
+        let readme = fs::read_to_string(root.join(README)).expect("README.md");
+        let links = table_links(&readme, "## Protocol v0 interfaces");
+        assert_eq!(
+            links.len(),
+            idl.len(),
+            "README.md's interface table has {} linked rows for {} interfaces.",
+            links.len(),
+            idl.len()
+        );
+        for link in links {
+            assert!(
+                root.join(&link).is_file(),
+                "README.md's interface table links to {link}, which does not exist. \
+                 Every interface has a prose page (CLAUDE.md's protocol authoring \
+                 rule); a wrong page number here is a broken link on the front page."
+            );
+        }
+    }
+
+    /// Every `<interface name="...">` in the IDL, in declaration order.
+    fn idl_interfaces(root: &Path) -> Vec<String> {
+        let xml = fs::read_to_string(root.join(IDL_PATH)).expect("the IDL");
+        xml.lines()
+            .filter_map(|line| line.trim().strip_prefix("<interface name=\""))
+            .filter_map(|rest| rest.split('"').next().map(str::to_string))
+            .collect()
+    }
+
+    /// The first backticked token of each row of the first Markdown table
+    /// under `heading`, keeping only the ones that name an interface.
+    fn table_interfaces(text: &str, heading: &str) -> Vec<String> {
+        table_rows(text, heading)
+            .filter_map(|cell| cell.split('`').nth(1).map(str::to_string))
+            .filter(|name| name.starts_with("vitrin_"))
+            .collect()
+    }
+
+    /// The Markdown link target of each row of that same table.
+    fn table_links(text: &str, heading: &str) -> Vec<String> {
+        table_rows(text, heading)
+            .filter_map(|cell| cell.split_once("](").map(|(_, rest)| rest))
+            .filter_map(|rest| rest.split(')').next().map(str::to_string))
+            .collect()
+    }
+
+    /// The first cell of every row of the first Markdown table under
+    /// `heading`. Header and separator rows carry no backticks and no link, so
+    /// the two callers above drop them without a special case.
+    fn table_rows<'a>(text: &'a str, heading: &str) -> impl Iterator<Item = &'a str> {
+        let start = text
+            .find(heading)
+            .unwrap_or_else(|| panic!("no {heading:?} section"));
+        let mut in_table = false;
+        text[start..]
+            .lines()
+            .skip(1)
+            .take_while(move |line| {
+                if line.starts_with("## ") {
+                    return false;
+                }
+                if line.starts_with('|') {
+                    in_table = true;
+                    return true;
+                }
+                // Prose before the table is skipped; the first non-row line
+                // after it ends the table.
+                !in_table
+            })
+            .filter(|line| line.starts_with('|'))
+            .map(|line| line.trim_start_matches('|').split('|').next().unwrap_or(""))
     }
 
     /// Recursive `*.rs` walk collecting workspace-relative paths whose text

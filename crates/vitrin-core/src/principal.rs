@@ -5273,23 +5273,32 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_consent_defines_no_requests_and_a_grant_defines_only_its_three_mints() {
+    fn a_consent_defines_no_requests_and_a_grant_defines_only_its_four_mints() {
         let _fd = crate::capture::tests::fd_lock();
         // vitrin_consent defines no requests at any version, and
-        // vitrin_grant defines exactly three, all since=2 structural mints:
+        // vitrin_grant defines exactly four, all since=2 structural mints:
         // opcode 0 `get_launcher`, 1 `get_layout_focus`, 2
-        // `get_layout_arrange`. Everything else on either object is grammar
-        // (invalid_opcode), never an authority judgement -- including
-        // opcode 0 on the consent object, which is `get_launcher`'s
-        // opcode on the *other* interface and must not be routed by
-        // number alone.
+        // `get_layout_arrange`, 3 `get_egress`. Everything else on either
+        // object is grammar (invalid_opcode), never an authority judgement
+        // -- including opcode 0 on the consent object, which is
+        // `get_launcher`'s opcode on the *other* interface and must not be
+        // routed by number alone.
         //
-        // The grant's probes are 3 and 9, one past the last defined mint
+        // The grant's probes are 4 and 9, one past the last defined mint
         // and well past it: 1 and 2 stopped being invalid when WS-E.1.4
-        // appended the layout mints, and this test going red on that append
+        // appended the layout mints, 3 stopped being invalid when P2.7.2
+        // appended `get_egress`, and this test going red on such an append
         // is exactly what an append-only opcode space should do.
+        //
+        // 3 IS NOT PROBED HERE ANY MORE, and dropping it is the point: this
+        // core does answer opcode 3 invalid_opcode, but that is a divergence
+        // from the IDL rather than the grammar this test is about. Asserting
+        // it here would have left a green test claiming opcode 3 is
+        // undefined, which the IDL stopped saying. The divergence is asserted
+        // on its own, under its own name, in
+        // `get_egress_is_defined_by_the_idl_and_still_refused_by_this_core`.
         let verifier = demo_verifier();
-        for (object_id, opcode) in [(4u32, 3u8), (4, 9), (5, 0), (5, 1)] {
+        for (object_id, opcode) in [(4u32, 4u8), (4, 9), (5, 0), (5, 1)] {
             let (mut server, mut core, mut client, mut shared) = setup();
             bind_with_realm(&mut server, &mut core, &mut client, &verifier, &mut shared);
             client
@@ -5313,6 +5322,51 @@ pub(crate) mod tests {
             );
             expect_error(&mut client, WireError::InvalidOpcode);
         }
+    }
+
+    #[test]
+    fn get_egress_is_defined_by_the_idl_and_still_refused_by_this_core() {
+        let _fd = crate::capture::tests::fd_lock();
+        // THIS TEST PINS A DIVERGENCE, NOT A CONFORMANCE.
+        //
+        // `vitrin_grant.get_egress` is opcode 3, `since="2"`, and the IDL says
+        // a structural mint is always legal on a live grant and refuses at
+        // USE. This binary has no dispatch arm for it (see the comment on the
+        // `ObjectKind::Grant` match), so a well-formed get_egress is answered
+        // fatal `invalid_opcode` and the connection dies -- which is not what
+        // the IDL says the server does. P2.7.3 closes it, together with the
+        // out-of-core proxy and the `vitrin_egress` object kind.
+        //
+        // The frame below is fully encoded rather than a bare header, so the
+        // refusal cannot be blamed on a malformed payload: the opcode is the
+        // whole reason.
+        //
+        // Nothing reachable is lost by the gap today -- `egress` is outside
+        // `SERVED_VERB_BITS`, so no petition naming it resolves `granted` and
+        // a minted facet would confer nothing -- but "harmless" is not
+        // "correct", and this assertion is what makes the divergence go red
+        // the moment P2.7.3 serves the mint, instead of leaving it to be
+        // noticed.
+        let verifier = demo_verifier();
+        let (mut server, mut core, mut client, mut shared) = setup();
+        bind_with_realm(&mut server, &mut core, &mut client, &verifier, &mut shared);
+        client
+            .send_message(&petition_frame().encode(3), None)
+            .unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        expect_consent_state(&mut client, 5, ConsentState::Queued);
+        client
+            .send_message(&grant::requests::GetEgress { egress: 9 }.encode(4), None)
+            .unwrap();
+        expect_violation(
+            process_n(&mut server, &mut core, &verifier, &mut shared, 1),
+            "invalid_opcode",
+        );
+        expect_error(&mut client, WireError::InvalidOpcode);
+        assert!(
+            !server.objects.contains_key(&9),
+            "the refused mint allocates nothing"
+        );
     }
 
     // -- acceptance: the version-2 launch facet (WS-E.1.1, issue #207) -----

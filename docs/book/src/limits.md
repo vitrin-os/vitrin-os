@@ -129,9 +129,13 @@ predictions as measurements.** The table above is exactly what was probed on
 the table is the measurement and the paragraph is an expectation about a run
 nobody has done. Re-collecting it means `solid-client --probe` over all 31
 paths in batches of eight, twice per batch, which is a measurement session
-rather than an edit — it is owed, it is not scheduled here, and until it
+rather than an edit. It is owed under
+[#187](https://github.com/vitrin-os/vitrin-os/issues/187), the issue this
+ruleset and this table belong to, and no document schedules it; until it
 happens this page reports **eight** because eight is the number that was
-observed.
+observed. Nothing in CI re-collects it or will notice that it has aged — a
+reader checks this against a session someone has to sit through, and that is
+the whole of the mechanism behind it.
 
 So what the enumeration buys over the realm-root grant #187 declined is, on this
 host, that the realm cannot **list its own root** and cannot list the handful of

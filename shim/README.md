@@ -334,14 +334,29 @@ the published site is fetched with no checksum at all
 meson setup build            # uses system wlroots-0.19 if available
 ninja -C build
 meson test -C build          # header-compiles, loader-independence, idle-inhibit,
-                             # xdg-conformance, focus-succession
+                             # xdg-conformance, focus-succession, inventories
 
 # Build the vendored wlroots from source (e.g. CI, or no system wlroots-0.19),
 # taking wlroots' own dependencies from the system:
 meson setup build --force-fallback-for=wlroots-0.19,wlroots
+
+# Everything from source, including wlroots' own nested wraps. Needs
+# -Dwerror=false: see below.
+meson setup build --wrap-mode=forcefallback -Dwerror=false
 ```
 
 The build needs no Rust toolchain — only the checked-in generated header.
+
+**`--wrap-mode=forcefallback` needs `-Dwerror=false`, and that is a defect of
+this build file rather than of the wraps.** `project()` sets
+`warning_level=2, werror=true` and subprojects inherit both, so `libdrm` and
+`pixman` fail to compile on a modern GCC over warnings in *their* code
+(`-Werror=packed` in `i915_drm.h`, `-Werror=calloc-transposed-args`,
+`-Wmissing-field-initializers`). Neither the default build nor CI meets this —
+CI forces only wlroots and its nested wayland wrap, which do build clean — so
+it is loud only for whoever needs every dependency from source. Measured
+2026-08-19; the run is what [D-043](../docs/plan/20-decision-log.md) cites for
+the static-link claim reaching every nested wrap.
 
 **Anything vendored is linked in, never loaded beside the shim** — `project()`
 defaults `default_library=static`, which subprojects inherit. That is not a
@@ -359,10 +374,13 @@ function of a build flag. See issue
 `meson test loader-independence` is what holds it: it copies the built shim to
 an empty directory, runs it there with an emptied environment, and fails if the
 binary carries any `RPATH`/`RUNPATH`, or if its program interpreter or any
-library it needs falls outside the prefixes a realm mirrors (that script's
-`REALM_LIB_PREFIXES`, currently `/usr`, `/lib`, `/lib64`, `/lib32`,
-`/libx32`). Passing `-Ddefault_library=shared` is therefore loud rather than
-silent.
+library it needs falls outside the prefixes a realm mirrors — that script's
+`REALM_LIB_PREFIXES`, which is where the current list is read and the only
+place it is written down: `vitrin-realm-init`'s
+`the_shims_realm_lib_prefixes_are_the_library_bearing_compat_names` derives it
+from the realm's own `COMPAT_NAMES` and goes red if the two drift, so no prose
+here restates it. Passing `-Ddefault_library=shared` is therefore loud rather
+than silent.
 
 ## Running
 
@@ -406,13 +424,19 @@ that provoked it are annotated in
 [`tests/acceptance/focus_succession.sh`](tests/acceptance/focus_succession.sh),
 [`tests/acceptance/idle_inhibit.sh`](tests/acceptance/idle_inhibit.sh) and
 [`tests/acceptance/loader_independence.sh`](tests/acceptance/loader_independence.sh)
-are the four scripts here wired into `meson test`, because they are the ones
-that need nothing but this tree's own binaries — `idle_inhibit.sh` only where
+are the four scripts in `tests/acceptance/` wired into `meson test`, because
+they are the ones that need nothing but this tree's own binaries —
+`idle_inhibit.sh` only where
 `wayland-protocols` ships the idle-inhibit XML `idle-probe` is generated from
 (`meson.build` gates it on its own `fs.exists`, so a moved XML costs the test
 rather than the shim), and only against
 [`tests/mock_core.c`](tests/mock_core.c), which makes it a **component** test of
 what the shim sends upstream and never milestone acceptance.
+That number and that list are the only ones stated anywhere in this file, and
+neither is typed twice: `meson test inventories`
+([`tests/inventories.sh`](tests/inventories.sh)) derives both from
+`meson.build`, checks the test names in the `meson test -C build` recipe above
+against the same source, and fails if a second paragraph starts counting.
 
 Each of the three xdg-shell facts was measured failing before the
 code that makes it pass:
@@ -445,8 +469,8 @@ wlroots defers every focus change to an active keyboard grab and a menu is
 one, so that is the input that makes the whole mechanism silently do nothing.
 Every assertion's reasoning is in the client's header comment.
 
-This is another of the three scripts here wired into `meson test`, on the same
-grounds as `xdg_conformance.sh`: headless, GPU-free, no seat device and no core
+This is another of the `tests/acceptance/` scripts wired into `meson test`, on
+the same grounds as `xdg_conformance.sh`: headless, GPU-free, no seat device and no core
 (`--no-upstream`), because `vitrin_seat_init` runs unconditionally at bring-up
 so the virtual keyboard exists and real `wl_keyboard.enter`/`leave` events can
 be observed. It is a **component** test of the shim, not milestone evidence:
@@ -553,8 +577,8 @@ the wire's one-bit-per-realm shape requires, with a second `held` failed by the
 mock core so "the shim relays levels instead of edges" is red rather than
 invisible; and (B) an app killed while still holding one must still leave the
 shim releasing, which is the leak that pins a human's panel awake forever. It
-is wired into `meson test` alongside `xdg_conformance.sh` and
-`focus_succession.sh`, and is built only where `wayland-protocols` ships the
+is among the `tests/acceptance/` scripts wired into `meson test` listed at the
+top of this section, and is built only where `wayland-protocols` ships the
 idle-inhibit XML. **It runs under the mock core, so it is a component test and
 never milestone evidence**; the bare-metal half — that a panel actually stayed
 lit — is [`../docs/drm-bringup.md`](../docs/drm-bringup.md) step 17, written

@@ -75,9 +75,18 @@ SHIM_BIN="$(cd "$(dirname "$SHIM_BIN")" && pwd)/$(basename "$SHIM_BIN")"
 # message below says "not under a prefix a realm mirrors for libraries" and
 # not "outside the realm's mount table" -- the second would be false.
 #
-# Keep this in step with `COMPAT_NAMES` and `open_sources` in
-# crates/vitrin-realm-init/src/main.rs; a Rust-side change that drops a
-# library prefix from the mount table has to drop it here too.
+# This array is the ONLY place the list is written down, and it is HELD IN
+# STEP rather than asked to be: the Rust side owns the mount table, so the
+# check lives there, where both files are certain to exist and this tree stays
+# toolchain-free.
+# `crates/vitrin-realm-init/src/main.rs`'s
+# `the_shims_realm_lib_prefixes_are_the_library_bearing_compat_names` reads
+# this line and requires it to equal `/usr` plus every `COMPAT_NAMES` entry
+# beginning `lib` -- so a Rust-side change that adds or drops a library mirror
+# goes red HERE instead of leaving this script quietly describing a realm that
+# no longer exists. shim/README.md and D-043 point at this line for the
+# current list rather than restating it, and `meson test inventories`
+# fails if either starts restating it again.
 REALM_LIB_PREFIXES=(/usr/ /lib/ /lib64/ /lib32/ /libx32/)
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/vitrin-loader.XXXXXX")"

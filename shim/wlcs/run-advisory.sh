@@ -62,10 +62,19 @@ mkdir -p "$OUT_DIR"
 # `shim/meson.build`'s `project()` defaults now carry `default_library=static`
 # (D-043), which subprojects inherit, so a vendored build produces
 # `libwlroots-0.19.a` and no `.so` at all: the `find` below yields nothing and
-# LD_LIBRARY_PATH is never exported. Measured 2026-08-19 on both build shapes
-# this repo has -- the plain vendored build and a nested build configured with
+# LD_LIBRARY_PATH is never exported. Measured 2026-08-19 on all three build
+# shapes this repo has: the plain vendored build and a nested build configured
 # `--force-fallback-for=wayland-server,wayland-client,wayland-scanner,wayland`
-# -- zero `.so*` files under the build tree in each.
+# each leave ZERO `.so*` files under the build tree; a
+# `--wrap-mode=forcefallback` build leaves four, and every one of them is
+# inside `subprojects/libliftoff/test/`, where libliftoff builds a FAKE
+# `libdrm.so.2` for its own test suite to intercept ioctls with.
+#
+# That third shape is why the `find` below excludes `test`/`tests` paths.
+# Without the exclusion this script would put a stub libdrm ahead of the real
+# one on the module's library path and announce that it had found a shared
+# vendored build -- a mitigation doing active harm on a shape nobody had
+# measured, which is worse than the leak it exists to prevent.
 #
 # It is KEPT rather than deleted because it is still the mitigation for the
 # shape that produces it: `-Ddefault_library=shared` on the command line, or a
@@ -107,15 +116,18 @@ mkdir -p "$OUT_DIR"
 # the usual case) they were compiled static: the `find` below then yields
 # nothing to add, and the line after it does nothing.
 MODULE_DIR="$(cd "$(dirname "$MODULE")" && pwd)"
-EXTRA_LIBDIRS="$(find "$MODULE_DIR" -name '*.so*' -exec dirname {} \; 2>/dev/null | sort -u | paste -sd: -)"
+EXTRA_LIBDIRS="$(find "$MODULE_DIR" -type f -name '*.so*' \
+	-not -path '*/test/*' -not -path '*/tests/*' \
+	-exec dirname {} \; 2>/dev/null | sort -u | paste -sd: -)"
 if [ -n "$EXTRA_LIBDIRS" ]; then
 	export LD_LIBRARY_PATH="$EXTRA_LIBDIRS${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 	echo "note: exporting LD_LIBRARY_PATH=$EXTRA_LIBDIRS -- a SHARED vendored build was found" >&2
 	echo "      under $MODULE_DIR. Since #283 the shim links vendored libraries statically," >&2
 	echo "      so this is a non-default build shape; see the comment above." >&2
 else
-	echo "note: no shared objects under $MODULE_DIR, so LD_LIBRARY_PATH is untouched." >&2
-	echo "      That is the expected shape since #283 (static vendored libraries)." >&2
+	echo "note: no shared objects under $MODULE_DIR outside a subproject's own test" >&2
+	echo "      scaffolding, so LD_LIBRARY_PATH is untouched. That is the expected shape" >&2
+	echo "      since #283 (static vendored libraries)." >&2
 fi
 
 # THE SCOPE (issue #47: "xdg-shell+seat groups"). Chosen empirically by

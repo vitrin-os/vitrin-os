@@ -518,6 +518,32 @@ header_test = executable(
 )
 test('header-compiles', header_test)
 
+# --- The lists this tree writes down twice ------------------------------
+# Issue #283 added a fourth acceptance script to `meson test` and updated one
+# of the TWO places README.md states how many there are, so the file shipped
+# contradicting itself in the same commit whose subject was a test that stops
+# a fact coming undone silently. Issue #306 put a global into the v0 contract
+# and updated one of the TWO acceptance scripts that state it. Both lists had
+# a machine-readable source and no owner; this gives them one.
+#
+# The script derives the test names and the wired-script list from THIS FILE,
+# and the v0 global set from src/ledger.c's `vitrin_v0_contract[]`, so a
+# `test()` added or removed below is what moves the README and the C array is
+# what moves the two scripts. It builds nothing, runs nothing and needs no
+# shim -- no browser either, which is the point: the drift it caught in
+# firefox_bringup.sh was invisible to a CI job that declares that gate
+# skipped.
+test(
+  'inventories',
+  find_program('bash'),
+  args: [
+    files('tests/inventories.sh'),
+    files('meson.build'),
+    files('README.md'),
+  ],
+  timeout: 30,
+)
+
 # --- P1.6.2 acceptance harness -----------------------------------------
 # The core side of the shim wire, in C. It deliberately links NOTHING but
 # libc and the generated header: the shim's CI job must not pull a Rust

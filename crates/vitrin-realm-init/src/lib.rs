@@ -1493,14 +1493,22 @@ mod tests {
         const MAIN_RS: &str = include_str!("main.rs");
         const TARGET: &str = "strip_leading_slash(IN_REALM_SHIM)";
 
-        let sites: Vec<usize> = MAIN_RS.match_indices(TARGET).map(|(at, _)| at).collect();
+        // Comments removed FIRST. What this test counts is bind sites, and
+        // the most natural place to explain a bind site is a comment beside
+        // it -- so counting raw text would turn "somebody documented this
+        // line" into a red build complaining about binds. That was raised as
+        // brittleness in #283's third review round, and it was right.
+        let code = code_without_comments(MAIN_RS);
+
+        let sites: Vec<usize> = code.match_indices(TARGET).map(|(at, _)| at).collect();
         assert_eq!(
             sites.len(),
             1,
-            "main.rs mentions `{TARGET}` {} times, not once. This test reads \
-             the single bind that creates the shim's in-realm path; with more \
-             than one it is reading an arbitrary one of them, and with none \
-             the path is created somewhere this check cannot see.",
+            "main.rs's CODE mentions `{TARGET}` {} times, not once (comments \
+             are stripped before counting, so prose naming this call is free). \
+             This test reads the single bind that creates the shim's in-realm \
+             path; with more than one it is reading an arbitrary one of them, \
+             and with none the path is created somewhere this check cannot see.",
             sites.len()
         );
 
@@ -1509,10 +1517,10 @@ mod tests {
         // rather than about the bind this test is here to check.
         let at = sites[0];
         let mut from = at.saturating_sub(120);
-        while from < at && !MAIN_RS.is_char_boundary(from) {
+        while from < at && !code.is_char_boundary(from) {
             from += 1;
         }
-        let call = &MAIN_RS[from..at];
+        let call = &code[from..at];
         assert!(
             call.contains("sources.shim"),
             "the bind that creates `{IN_REALM_SHIM}` no longer takes \
@@ -1521,5 +1529,82 @@ mod tests {
              tests/integration/README.md and D-043 all reason from that and \
              have to be re-checked. What precedes the target is: {call:?}"
         );
+    }
+
+    /// Rust source with its `//` comments removed, for the test above.
+    ///
+    /// Deliberately **not** a lexer, and it refuses rather than guesses. It
+    /// tracks double-quoted strings — backslash escapes included, and across
+    /// newlines, because `main.rs` really does continue a string onto the next
+    /// line — and it panics if the file ever grows a raw string or a `/* */`
+    /// comment outside a string, the two constructs a scanner this size would
+    /// silently get wrong. A parser that quietly mis-reads its input is the
+    /// exact failure the test above exists to prevent, so it may not be one.
+    fn code_without_comments(src: &str) -> String {
+        // Byte-wise is safe here: every byte of a multi-byte UTF-8 sequence is
+        // >= 0x80, so none can equal `/`, `"`, `\`, `r` or `\n`, and nothing
+        // below can split a character.
+        let bytes = src.as_bytes();
+        let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+        let mut i = 0usize;
+        let mut in_string = false;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if in_string {
+                if b == b'\\' {
+                    out.push(b);
+                    if i + 1 < bytes.len() {
+                        out.push(bytes[i + 1]);
+                    }
+                    i += 2;
+                    continue;
+                }
+                if b == b'"' {
+                    in_string = false;
+                }
+                out.push(b);
+                i += 1;
+                continue;
+            }
+            let next = bytes.get(i + 1).copied();
+            if b == b'"' {
+                in_string = true;
+                out.push(b);
+                i += 1;
+                continue;
+            }
+            if b == b'/' && next == Some(b'/') {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue; // the `\n` itself is kept, so line structure survives
+            }
+            assert!(
+                !(b == b'/' && next == Some(b'*')),
+                "main.rs has grown a `/* */` block comment outside a string, \
+                 which this stripper does not handle -- it would leave the \
+                 comment's text in the code it hands to the bind-site count. \
+                 Teach it block comments, or use `//` here."
+            );
+            let prev_is_ident = out
+                .last()
+                .is_some_and(|p| p.is_ascii_alphanumeric() || *p == b'_');
+            assert!(
+                !(b == b'r' && !prev_is_ident && matches!(next, Some(b'"') | Some(b'#'))),
+                "main.rs has grown a raw string literal, whose `\"` this \
+                 stripper would treat as an ordinary quote and so lose track \
+                 of where strings end. Teach it raw strings, or keep the \
+                 literal ordinary."
+            );
+            out.push(b);
+            i += 1;
+        }
+        assert!(
+            !in_string,
+            "main.rs ended inside a string literal, so this stripper lost \
+             track of quoting somewhere and its output cannot be trusted to \
+             be code."
+        );
+        String::from_utf8(out).expect("stripping whole `//` runs cannot split a UTF-8 character")
     }
 }

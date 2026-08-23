@@ -929,6 +929,7 @@ nothing until the grant resolves. Where prose and IDL disagree, **the IDL's
 | [`vitrin_launcher`](docs/protocol/16-vitrin_launcher.md) | Realm-launch facet (since wire version 2) — fork a new realm instance from an operator-written template, under a core-minted id; `launch` carries no arguments, so the command never crosses the wire |
 | [`vitrin_layout_focus`](docs/protocol/17-vitrin_layout_focus.md) | Focus facet (since wire version 2) — bind the output to the granted realm and send the human's own input there, one act |
 | [`vitrin_layout_arrange`](docs/protocol/18-vitrin_layout_arrange.md) | Arrangement facet (since wire version 2) — fill the output, or compose at the app's own size; `place`, `resize`, `raise` and stacking are absent rather than refused |
+| [`vitrin_egress`](docs/protocol/19-vitrin_egress.md) | Egress facet (since wire version 2) — one outbound connection to the single `host:port` the grant names, delivered as a socket fd. **No deployment serves the `egress` verb** and this core implements none of the interface's messages: the out-of-core mediating proxy does not exist |
 
 ## Roadmap
 

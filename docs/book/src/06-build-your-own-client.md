@@ -57,7 +57,8 @@ writing a Go, TypeScript or C++ SDK forks it.
   layout verbs and `realm.launch`, and refuses `observe.cursor` and
   `egress`
   <!-- vitrin-verb-set: unserved-verbs = observe_cursor, egress -->
-  — so never
+  (the second because no mediating proxy exists, *not* because its facet is
+  missing — `vitrin_egress` is on the wire) — so never
   bake the served set into a
   client. Transcribe the *values* from the IDL rather than assuming
   consecutive bits — `realm.launch` is 512, because 64 and 256 are allocated

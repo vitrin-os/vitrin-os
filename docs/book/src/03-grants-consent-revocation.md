@@ -34,7 +34,8 @@ A row in the core's grant table:
 - **verbs** — which actions. `observe`, `actuate.pointer`, `actuate.text`, the
   two `layout.*` verbs and `realm.launch` (added at wire version 2) today; two
   more are defined and refuse `unsupported` — `observe.cursor`, and `egress`
-  (added at P2.7.2, whose facet has not landed). Defining a
+  (added at P2.7.2, whose facet has landed and whose mediating proxy has
+  not). Defining a
   verb before serving it is deliberate: it makes asking for one a recoverable
   refusal instead of a fatal out-of-range bit. Which of the defined verbs a
   deployment actually serves is that deployment's property, not the wire's — a

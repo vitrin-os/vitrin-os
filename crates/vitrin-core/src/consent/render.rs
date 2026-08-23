@@ -808,14 +808,21 @@ mod tests {
         // this tripwire firing exactly as designed: the IDL gained a bit and
         // this line went red until a human classified it. It is classified
         // **unserved**, and there is no catalogue line above for it, because
-        // the mechanism the verb names does not exist — the out-of-core
-        // mediating proxy is P2.7.3's, and so is the facet a connection
-        // would be asked for through, which is an interface of its own
-        // rather than a request on P2.6.5's filesystem powerbox (one
-        // `interface/@verb` per interface). Prompt copy for authority no
-        // code enforces would be the exact lie the catalogue exists to
-        // prevent. It leaves this pin when P2.7.3 lands the proxy and
-        // P2.6.8's Q13 copy review clears its line, not before.
+        // the mechanism the verb names does not exist: the out-of-core
+        // mediating proxy is P2.7.3's. Prompt copy for authority no code
+        // enforces would be the exact lie the catalogue exists to prevent.
+        //
+        // **Its facet landed and this pin did not move**, which is the
+        // distinction worth having in writing here. P2.7.2's second half
+        // added `vitrin_egress` — an interface of its own rather than a
+        // request on P2.6.5's filesystem powerbox, since `interface/@verb` is
+        // one value per interface — so the verb now has a request to be
+        // exercised through and still has nothing to answer with. A facet
+        // changes what the wire can express; only a mechanism changes what
+        // this core can enforce, and only the second moves a bit out of
+        // `UNSERVED_VERB_BITS`. `egress` leaves this pin when P2.7.3 lands
+        // the proxy and P2.6.8's Q13 copy review clears its line, not
+        // before.
         assert_eq!(
             crate::grants::UNSERVED_VERB_BITS,
             (Verb::OBSERVE_CURSOR | Verb::EGRESS).bits(),

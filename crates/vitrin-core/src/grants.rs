@@ -535,8 +535,11 @@ impl NetSelector {
 /// `observe_cursor` (8) because per-principal cursor *delivery* is M2's, so
 /// serving the verb would promise a capture widened with a cursor this core
 /// does not have; `egress` (128) because the out-of-core mediating proxy a
-/// connection would be made through does not exist, and neither does the
-/// facet it would be asked for through. Neither name is transcribed: the set
+/// connection would be made through does not exist. `egress`'s facet does
+/// exist as of P2.7.2's second half (`vitrin_egress`), and this doc named the
+/// missing facet as half its reason until then -- a facet is a request to ask
+/// through, and only a mechanism to answer with moves a bit out of this set.
+/// Neither name is transcribed: the set
 /// is [`UNSERVED_VERB_BITS`], derived below, and `cargo xtask verb-sets
 /// --check` holds every surface that spells it out to this constant.
 ///

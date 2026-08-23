@@ -104,8 +104,13 @@ def test_the_unserved_marker_is_actually_a_phrase_the_idl_uses() -> None:
     rather than the deployment (a version-1 connection cannot mint
     `vitrin_launcher` at all), and the IDL's own summary says so, which is why
     deriving from the IDL rather than from a second list is the point.
-    `egress` (P2.7.2) carries the same marker for a stronger reason: its facet
-    is not in the IDL yet at all, so no deployment at any version serves it.
+    `egress` (P2.7.2) carries the same marker for a stronger reason: the
+    out-of-core proxy a connection would be made through does not exist, so no
+    deployment at any version serves it. Its FACET does exist as of that
+    task's second half (`vitrin_egress`), and the distinction matters here
+    because "no facet" was the reason this docstring gave when the bit landed
+    — a facet is a request to ask through, not a mechanism to answer with, and
+    only the second one moves a verb into the served set.
     """
     summaries = [(e.get("summary") or "") for e in _verb_entries()]
     marked = [s for s in summaries if UNSERVED_MARKER in s]

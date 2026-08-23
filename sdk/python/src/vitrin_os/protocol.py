@@ -122,11 +122,14 @@ VERB_MASK = int(
 #
 # `egress` (128, P2.7.2 / issue #196) is also out, and its IDL summary carries
 # the same marker phrase for a reason that goes further than the version: the
-# facet a connection would be asked for through is not in the IDL at all yet
-# (a separate interface of its own, not a request on the filesystem powerbox:
-# `interface/@verb` is one value per interface), and the mediating proxy that
-# would carry it is P2.7.3's. So the
-# bit is refused by **every** deployment at version 2, not merely by a
+# out-of-core mediating proxy a connection would be made through does not
+# exist, and that is P2.7.3's. Its FACET does exist — `vitrin_egress`, minted
+# by `vitrin_grant.get_egress`, a separate interface of its own rather than a
+# request on the filesystem powerbox, because `interface/@verb` is one value
+# per interface. This comment said "no facet at all" until that landed, and
+# the correction is worth keeping in this shape: a facet is a request to ask
+# through, not a mechanism to answer with, so gaining one moved nothing here.
+# The bit stays refused by **every** deployment at version 2, not merely by a
 # version-1 connection — which is why this constant does not move when it is
 # eventually served on some deployments and not others.
 # Those are refused "unsupported", and a petition mixing served and unserved

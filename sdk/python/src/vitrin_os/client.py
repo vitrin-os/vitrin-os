@@ -93,11 +93,17 @@ def _parse_verbs(verbs: int | Verb | Iterable[str | Verb]) -> int:
     # vitrin-verb-set: unserved-verbs = observe_cursor, egress
     #
     # Two of them -- observe.cursor and egress -- are refused by EVERY
-    # deployment today (no cursor delivery; no facet at all), and realm.launch
-    # and the layout.* pair by any deployment that declines them. The first
-    # list is derived from the reference core by `cargo xtask verb-sets
-    # --check`, so it cannot fall behind the way it did when `egress` landed;
-    # the second is a deployment property and cannot be listed at all.
+    # deployment today (no cursor delivery; no mediating proxy), and
+    # realm.launch and the layout.* pair by any deployment that declines them.
+    # The first list is derived from the reference core by `cargo xtask
+    # verb-sets --check`, so it cannot fall behind the way it did when
+    # `egress` landed; the second is a deployment property and cannot be
+    # listed at all.
+    #
+    # `egress` gained a facet (`vitrin_egress`) without becoming servable, and
+    # this comment said "no facet at all" until it did. A facet is a request
+    # to ask through; the proxy behind it is what a deployment would need to
+    # answer with, and only that moves a verb off this list.
     return bits
 
 

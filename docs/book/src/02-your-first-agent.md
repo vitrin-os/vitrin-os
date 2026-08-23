@@ -106,8 +106,11 @@ and `REALM_LAUNCH`, exercised by `grant.set_fullscreen()`, `grant.focus()` and
 
 The remaining two — `OBSERVE_CURSOR` and `EGRESS` — are defined and resolve
 `unsupported`: the first because per-principal cursor delivery does not exist
-yet, the second because the facet a connection would be asked for through is
-not in the protocol at all.
+yet, the second because the out-of-core proxy an outbound connection would be
+made through does not exist. `EGRESS` does have a facet on the wire
+(`vitrin_egress`), which is worth knowing only so it is not mistaken for
+evidence the verb works: a facet is the request you would ask through, and
+there is nothing behind it to answer.
 
 Whether a verb is served is a property of the *deployment*, not of the
 protocol — a deployment that will not host process creation refuses

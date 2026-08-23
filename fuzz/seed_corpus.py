@@ -101,8 +101,9 @@ def frame(object_id: int, opcode: int, payload: bytes, *, size_override: int | N
 # ---------------------------------------------------------------------------
 
 SEL_HELLO = 0
-SEL_FRAME_READY = 15
-SEL_ATTACH = 29
+SEL_FRAME_READY = 16
+SEL_ATTACH = 30
+SEL_CONNECTED = 50
 
 
 def protocol_decode_seeds() -> dict[str, bytes]:
@@ -157,6 +158,27 @@ def protocol_decode_seeds() -> dict[str, bytes]:
             + u32(4)  # width
             + u32(4)  # height
             + u32(16),  # stride
+            fd_count=1,
+        ),
+        # `vitrin_egress.connected`, correctly supplied an fd. The second
+        # fd-bearing successful decode in this corpus, and it is not a
+        # duplicate of `attach_with_fd`: `connected` is the only message on
+        # this wire that carries an fd AND a length-prefixed string, so it is
+        # the only one where the out-of-band fd path and `read_string`'s
+        # bounds arithmetic run in the same `decode`. `attach` is fd plus
+        # fixed-width scalars only, and could never reach that combination.
+        #
+        # `fd_count=1` in the header is load-bearing for the same reason it is
+        # in `attach_with_fd`: the generated `decode` checks the header byte
+        # independently of the out-of-band fd (conventions 2.4's two
+        # disjuncts), so a seed built with the default would die at that gate
+        # and seed nothing.
+        "connected_with_fd": bytes([SEL_CONNECTED, 1])
+        + frame(
+            1,
+            0,
+            wire_string("api.example.com")  # host
+            + u32(443),  # port
             fd_count=1,
         ),
         # An embedded NUL inside a string argument's declared byte range --
@@ -298,6 +320,7 @@ PROTOCOL_DECODE_CLAIMS: dict[str, tuple[int, str, str]] = {
         "fd_count_mismatch",
     ),
     "attach_with_fd": (SEL_ATTACH, "vitrin_shim_surface.attach", "decodes"),
+    "connected_with_fd": (SEL_CONNECTED, "vitrin_egress.connected", "decodes"),
     "embedded_nul_in_string": (SEL_HELLO, "vitrin_handshake.hello", "embedded_nul"),
 }
 

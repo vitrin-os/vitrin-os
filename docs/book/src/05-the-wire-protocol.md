@@ -181,14 +181,18 @@ Version 0 is frozen for Phase 1 — **not forever**. The wire integer is now
 
 - the `realm_launch` verb, and `vitrin_principal`'s `attention` event;
 - the `egress` verb (128, at P2.7.2) and the `net:HOST:PORT` value its
-  authority is named with — **a verb bit and a `resource` grammar, and no
-  message at all**: the facet a connection would be asked for through has
-  not landed, so every deployment refuses the verb `unsupported`;
-- three structural mints on `vitrin_grant` — `get_launcher`,
-  `get_layout_focus`, `get_layout_arrange`;
-- the three interfaces they mint — `vitrin_launcher` (`launch`/`launched`),
+  authority is named with. That half landed as **a verb bit and a `resource`
+  grammar, and no message at all**; its facet followed separately. Every
+  deployment still refuses the verb `unsupported`, because the out-of-core
+  proxy a connection would be made through does not exist — a facet is a
+  request to ask through, not a mechanism to answer with;
+- four structural mints on `vitrin_grant` — `get_launcher`,
+  `get_layout_focus`, `get_layout_arrange`, `get_egress`;
+- the four interfaces they mint — `vitrin_launcher` (`launch`/`launched`),
   `vitrin_layout_focus` (`focus`), `vitrin_layout_arrange`
-  (`set_fullscreen`) — and the `vitrin_layout_arrange.mode` enum;
+  (`set_fullscreen`), `vitrin_egress` (`request_connect`, `connected`,
+  `connect_failed`) — and the `vitrin_layout_arrange.mode` and
+  `vitrin_egress.failure` enums;
 - the `capacity` refusal code and the `layout_held` outcome;
 - on `vitrin_shim_session`, the cross-realm clipboard, the pointer
   constraints and the idle inhibit (`request_selection`, `offer_selection`,

@@ -315,7 +315,7 @@ static inline vitrin_decode_status_t vitrin_frame_header_decode(
 /* test_header_compiles.c) checks its own list length against this with */
 /* _Static_assert, so a message added to the IDL cannot ship without a */
 /* compile-time proof that its marshal functions type-check. */
-#define VITRIN_MESSAGE_COUNT 48
+#define VITRIN_MESSAGE_COUNT 52
 
 /* ==================================================================== */
 /* Section 1: per-interface metadata and enums.                          */
@@ -427,7 +427,7 @@ typedef uint32_t vitrin_grant_verb_t;
 #define VITRIN_GRANT_VERB_LAYOUT_FOCUS ((vitrin_grant_verb_t)32)
 /* launch the realm template this grant addresses into a new realm instance, through the vitrin_launcher facet; the template names the program and no command ever crosses the wire, so this is authority over an operator-written template rather than over an arbitrary command; bits 64 and 256 are allocated to verbs not yet defined here and were skipped rather than reused (128 was one of them until egress landed on it); refused unsupported in version 1, which cannot mint the facet at all, and by any deployment that does not serve it */
 #define VITRIN_GRANT_VERB_REALM_LAUNCH ((vitrin_grant_verb_t)512)
-/* open one outbound connection to the single host:port named by this grant's net: resource selector, through an out-of-core mediating proxy that asks the enforcement chokepoint per connection and holds no grant of its own; the selector's grammar is wildcard-free, so a blanket egress grant is inexpressible rather than refused, and one selector covers exactly itself - though not every spelling of one endpoint is one selector, since the host is compared byte-exactly and kept as presented; SPECIFIED BUT NOT IMPLEMENTED ANYWHERE YET: a DNS name is to resolve only in the proxy and the addresses it resolved to at grant time are to be pinned into the grant row, so that a connection to an unpinned address is refused not_granted even under a name-scoped grant - no proxy, no resolver and no pinned column with a value exist today; the dotted SDK name is egress unchanged, the wire name carrying no underscore to replace; refused unsupported in version 1 and by every deployment at version 2, because the facet the connection would be asked for through is not in this document yet, and it will be a separate interface of its own rather than a request on the filesystem powerbox, since interface/@verb is one value per interface */
+/* open one outbound connection to the single host:port named by this grant's net: resource selector, through an out-of-core mediating proxy that asks the enforcement chokepoint per connection and holds no grant of its own; exercised through the vitrin_egress facet, which is a separate interface of its own rather than a request on the filesystem powerbox, since interface/@verb is one value per interface; the selector's grammar is wildcard-free, so a blanket egress grant is inexpressible rather than refused, and one selector covers exactly itself - though not every spelling of one endpoint is one selector, since the host is compared byte-exactly and kept as presented; SPECIFIED BUT NOT IMPLEMENTED ANYWHERE YET: a DNS name is to resolve only in the proxy and the addresses it resolved to at grant time are to be pinned into the grant row, so that a connection to an unpinned address is refused not_granted even under a name-scoped grant - no proxy, no resolver and no pinned column with a value exist today; the dotted SDK name is egress unchanged, the wire name carrying no underscore to replace; refused unsupported in version 1 and by every deployment at version 2 - the facet exists now, so what is missing is the proxy behind it rather than a request to ask through */
 #define VITRIN_GRANT_VERB_EGRESS ((vitrin_grant_verb_t)128)
 /* Union of every defined entry's bits; a wire value with any other bit
    set is invalid. */
@@ -1056,6 +1056,44 @@ static inline bool vitrin_layout_arrange_mode_is_valid(uint32_t v) {
     switch (v) {
         case VITRIN_LAYOUT_ARRANGE_MODE_WINDOWED:
         case VITRIN_LAYOUT_ARRANGE_MODE_FULLSCREEN:
+            return true;
+        default:
+            return false;
+    }
+}
+
+/* ==== vitrin_egress (version 1) ==== */
+/* egress facet */
+
+#define VITRIN_EGRESS_INTERFACE_NAME "vitrin_egress"
+#define VITRIN_EGRESS_INTERFACE_VERSION 1u
+/* Every request on this interface exercises the grant verb `egress`. */
+#define VITRIN_EGRESS_VERB "egress"
+
+/* Enum `failure` on `vitrin_egress`.
+ *
+ * why an admitted connection did not complete
+ *
+ * Plain enum: a wire value MUST exactly equal one defined entry. */
+typedef enum {
+    /* the far end actively refused the connection (nothing listening on that port) */
+    VITRIN_EGRESS_FAILURE_REFUSED = 0,
+    /* no route to the host or the network; the packet had nowhere to go */
+    VITRIN_EGRESS_FAILURE_UNREACHABLE = 1,
+    /* the connection attempt exceeded the proxy's deadline with no answer either way */
+    VITRIN_EGRESS_FAILURE_TIMED_OUT = 2,
+    /* the selector named a DNS name and resolution - which happens only in the proxy, never inside the realm - did not yield an address */
+    VITRIN_EGRESS_FAILURE_RESOLUTION_FAILED = 3,
+} vitrin_egress_failure_t;
+
+/* Whole-value membership check for `vitrin_egress_failure_t` (decode a wire value by
+   whether it equals one of the defined entries above). */
+static inline bool vitrin_egress_failure_is_valid(uint32_t v) {
+    switch (v) {
+        case VITRIN_EGRESS_FAILURE_REFUSED:
+        case VITRIN_EGRESS_FAILURE_UNREACHABLE:
+        case VITRIN_EGRESS_FAILURE_TIMED_OUT:
+        case VITRIN_EGRESS_FAILURE_RESOLUTION_FAILED:
             return true;
         default:
             return false;
@@ -2204,6 +2242,98 @@ static inline vitrin_decode_status_t vitrin_grant_req_get_layout_arrange_decode(
     size_t pos = VITRIN_HEADER_LEN;
     vitrin_decode_status_t st_layout_arrange = vitrin_raw_read_u32(in, in_len, &pos, &out->layout_arrange);
     if (st_layout_arrange != VITRIN_DECODE_OK) { return st_layout_arrange; }
+    if (pos != in_len) {
+        return VITRIN_DECODE_ERR_TRAILING_BYTES;
+    }
+    *out_object_id = hdr.object_id;
+    return VITRIN_DECODE_OK;
+}
+
+/* Request `get_egress` (opcode 3) on `vitrin_grant`.
+ *
+ * mint the egress facet for this grant
+ */
+typedef struct {
+    /* the egress facet, born inert (confers nothing until this grant is granted with egress, which no deployment does yet) (new_id: vitrin_egress) */
+    uint32_t egress;
+} vitrin_grant_req_get_egress_t;
+
+#define VITRIN_GRANT_REQ_GET_EGRESS_OPCODE ((uint8_t)3)
+#define VITRIN_GRANT_REQ_GET_EGRESS_HAS_FD 0
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_GRANT_REQ_GET_EGRESS_SINCE 2u
+
+/* Encodes into a complete frame (header + argument payload). Returns the
+   number of bytes written (fits in an int32_t: the wire format's own u16
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
+static inline int32_t vitrin_grant_req_get_egress_encode(const vitrin_grant_req_get_egress_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN + 4;
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
+        return VITRIN_ENCODE_ERR_OVERFLOW;
+    }
+    vitrin_frame_header_t hdr;
+    hdr.object_id = object_id;
+    hdr.size = (uint16_t)size;
+    hdr.opcode = VITRIN_GRANT_REQ_GET_EGRESS_OPCODE;
+    hdr.fd_count = (uint8_t)VITRIN_GRANT_REQ_GET_EGRESS_HAS_FD;
+    vitrin_frame_header_encode(&hdr, out);
+    size_t pos = VITRIN_HEADER_LEN;
+    vitrin_raw_write_u32(out + pos, msg->egress);
+    pos += 4u;
+    return (int32_t)size;
+}
+
+/* Decodes one complete frame's bytes (in/in_len -- exactly one frame, e.g.
+   already delimited by a transport layer using the header's own size field,
+   out of scope here) plus, iff HAS_FD below, the fd received alongside it
+   out-of-band (fd = -1 if none). On success writes the frame's object_id to
+   *out_object_id and the decoded message to *out and returns
+   VITRIN_DECODE_OK; otherwise returns a negative vitrin_decode_status_t and
+   leaves *out_object_id and *out unspecified.
+
+   docs/protocol/00-conventions.md 2.4/5.2 define fd_violation as two
+   independent disjuncts, both checked here: the header's own fd_count byte
+   disagreeing with this message's signature, and the out-of-band fd
+   parameter disagreeing with it. A hostile or buggy peer can make either
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
+static inline vitrin_decode_status_t vitrin_grant_req_get_egress_decode(
+    const uint8_t *in, size_t in_len, int fd,
+    uint32_t *out_object_id, vitrin_grant_req_get_egress_t *out) {
+    int fd_present = (fd >= 0) ? 1 : 0;
+    if (fd_present != VITRIN_GRANT_REQ_GET_EGRESS_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    vitrin_frame_header_t hdr;
+    vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
+    if (hdr_st != VITRIN_DECODE_OK) {
+        return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_GRANT_REQ_GET_EGRESS_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
+    }
+    if (hdr.fd_count != (uint8_t)VITRIN_GRANT_REQ_GET_EGRESS_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    size_t pos = VITRIN_HEADER_LEN;
+    vitrin_decode_status_t st_egress = vitrin_raw_read_u32(in, in_len, &pos, &out->egress);
+    if (st_egress != VITRIN_DECODE_OK) { return st_egress; }
     if (pos != in_len) {
         return VITRIN_DECODE_ERR_TRAILING_BYTES;
     }
@@ -6143,6 +6273,307 @@ static inline vitrin_decode_status_t vitrin_layout_arrange_req_set_fullscreen_de
     if (st_mode != VITRIN_DECODE_OK) { return st_mode; }
     if (!vitrin_layout_arrange_mode_is_valid(mode_raw)) { return VITRIN_DECODE_ERR_INVALID_ENUM; }
     out->mode = (vitrin_layout_arrange_mode_t)mode_raw;
+    if (pos != in_len) {
+        return VITRIN_DECODE_ERR_TRAILING_BYTES;
+    }
+    *out_object_id = hdr.object_id;
+    return VITRIN_DECODE_OK;
+}
+
+/* ==== vitrin_egress messages ==== */
+
+/* Request `request_connect` (opcode 0) on `vitrin_egress`.
+ *
+ * open one outbound connection to a granted endpoint
+ */
+typedef struct {
+    /* the host half of the grant's net: selector, byte-exact, IPv6 literals WITHOUT brackets (max 253 bytes) */
+    vitrin_string_t host;
+    /* the port half of the grant's net: selector; outside 1-65535 is fatal invalid_argument */
+    uint32_t port;
+} vitrin_egress_req_request_connect_t;
+
+#define VITRIN_EGRESS_REQ_REQUEST_CONNECT_OPCODE ((uint8_t)0)
+#define VITRIN_EGRESS_REQ_REQUEST_CONNECT_HAS_FD 0
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_EGRESS_REQ_REQUEST_CONNECT_SINCE 2u
+
+/* Encodes into a complete frame (header + argument payload). Returns the
+   number of bytes written (fits in an int32_t: the wire format's own u16
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
+static inline int32_t vitrin_egress_req_request_connect_encode(const vitrin_egress_req_request_connect_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
+    if (msg->host.len > 253u) {
+        return VITRIN_ENCODE_ERR_STRING_TOO_LONG;
+    }
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN + vitrin_raw_string_wire_len(msg->host.len) + 4;
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
+        return VITRIN_ENCODE_ERR_OVERFLOW;
+    }
+    vitrin_frame_header_t hdr;
+    hdr.object_id = object_id;
+    hdr.size = (uint16_t)size;
+    hdr.opcode = VITRIN_EGRESS_REQ_REQUEST_CONNECT_OPCODE;
+    hdr.fd_count = (uint8_t)VITRIN_EGRESS_REQ_REQUEST_CONNECT_HAS_FD;
+    vitrin_frame_header_encode(&hdr, out);
+    size_t pos = VITRIN_HEADER_LEN;
+    pos += vitrin_raw_write_string(out + pos, msg->host);
+    vitrin_raw_write_u32(out + pos, msg->port);
+    pos += 4u;
+    return (int32_t)size;
+}
+
+/* Decodes one complete frame's bytes (in/in_len -- exactly one frame, e.g.
+   already delimited by a transport layer using the header's own size field,
+   out of scope here) plus, iff HAS_FD below, the fd received alongside it
+   out-of-band (fd = -1 if none). On success writes the frame's object_id to
+   *out_object_id and the decoded message to *out and returns
+   VITRIN_DECODE_OK; otherwise returns a negative vitrin_decode_status_t and
+   leaves *out_object_id and *out unspecified.
+
+   docs/protocol/00-conventions.md 2.4/5.2 define fd_violation as two
+   independent disjuncts, both checked here: the header's own fd_count byte
+   disagreeing with this message's signature, and the out-of-band fd
+   parameter disagreeing with it. A hostile or buggy peer can make either
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
+static inline vitrin_decode_status_t vitrin_egress_req_request_connect_decode(
+    const uint8_t *in, size_t in_len, int fd,
+    uint32_t *out_object_id, vitrin_egress_req_request_connect_t *out) {
+    int fd_present = (fd >= 0) ? 1 : 0;
+    if (fd_present != VITRIN_EGRESS_REQ_REQUEST_CONNECT_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    vitrin_frame_header_t hdr;
+    vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
+    if (hdr_st != VITRIN_DECODE_OK) {
+        return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_EGRESS_REQ_REQUEST_CONNECT_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
+    }
+    if (hdr.fd_count != (uint8_t)VITRIN_EGRESS_REQ_REQUEST_CONNECT_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    size_t pos = VITRIN_HEADER_LEN;
+    vitrin_decode_status_t st_host = vitrin_raw_read_string(in, in_len, &pos, 253u, &out->host);
+    if (st_host != VITRIN_DECODE_OK) { return st_host; }
+    vitrin_decode_status_t st_port = vitrin_raw_read_u32(in, in_len, &pos, &out->port);
+    if (st_port != VITRIN_DECODE_OK) { return st_port; }
+    if (pos != in_len) {
+        return VITRIN_DECODE_ERR_TRAILING_BYTES;
+    }
+    *out_object_id = hdr.object_id;
+    return VITRIN_DECODE_OK;
+}
+
+/* Event `connected` (opcode 0) on `vitrin_egress`.
+ *
+ * the connected socket for one admitted request_connect
+ */
+typedef struct {
+    /* the connected stream socket, owned by the receiving principal (not present in the byte buffer; carried out-of-band via SCM_RIGHTS) */
+    int fd;
+    /* echo of the host this socket is connected to, byte-identical to the request's (max 253 bytes) */
+    vitrin_string_t host;
+    /* echo of the port this socket is connected to */
+    uint32_t port;
+} vitrin_egress_evt_connected_t;
+
+#define VITRIN_EGRESS_EVT_CONNECTED_OPCODE ((uint8_t)0)
+#define VITRIN_EGRESS_EVT_CONNECTED_HAS_FD 1
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_EGRESS_EVT_CONNECTED_SINCE 2u
+
+/* Encodes into a complete frame (header + argument payload). Returns the
+   number of bytes written (fits in an int32_t: the wire format's own u16
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
+static inline int32_t vitrin_egress_evt_connected_encode(const vitrin_egress_evt_connected_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
+    if (msg->host.len > 253u) {
+        return VITRIN_ENCODE_ERR_STRING_TOO_LONG;
+    }
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN + vitrin_raw_string_wire_len(msg->host.len) + 4;
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
+        return VITRIN_ENCODE_ERR_OVERFLOW;
+    }
+    vitrin_frame_header_t hdr;
+    hdr.object_id = object_id;
+    hdr.size = (uint16_t)size;
+    hdr.opcode = VITRIN_EGRESS_EVT_CONNECTED_OPCODE;
+    hdr.fd_count = (uint8_t)VITRIN_EGRESS_EVT_CONNECTED_HAS_FD;
+    vitrin_frame_header_encode(&hdr, out);
+    size_t pos = VITRIN_HEADER_LEN;
+    /* fd: fd argument, never written to the byte buffer */
+    pos += vitrin_raw_write_string(out + pos, msg->host);
+    vitrin_raw_write_u32(out + pos, msg->port);
+    pos += 4u;
+    return (int32_t)size;
+}
+
+/* Decodes one complete frame's bytes (in/in_len -- exactly one frame, e.g.
+   already delimited by a transport layer using the header's own size field,
+   out of scope here) plus, iff HAS_FD below, the fd received alongside it
+   out-of-band (fd = -1 if none). On success writes the frame's object_id to
+   *out_object_id and the decoded message to *out and returns
+   VITRIN_DECODE_OK; otherwise returns a negative vitrin_decode_status_t and
+   leaves *out_object_id and *out unspecified.
+
+   docs/protocol/00-conventions.md 2.4/5.2 define fd_violation as two
+   independent disjuncts, both checked here: the header's own fd_count byte
+   disagreeing with this message's signature, and the out-of-band fd
+   parameter disagreeing with it. A hostile or buggy peer can make either
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
+static inline vitrin_decode_status_t vitrin_egress_evt_connected_decode(
+    const uint8_t *in, size_t in_len, int fd,
+    uint32_t *out_object_id, vitrin_egress_evt_connected_t *out) {
+    int fd_present = (fd >= 0) ? 1 : 0;
+    if (fd_present != VITRIN_EGRESS_EVT_CONNECTED_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    vitrin_frame_header_t hdr;
+    vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
+    if (hdr_st != VITRIN_DECODE_OK) {
+        return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_EGRESS_EVT_CONNECTED_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
+    }
+    if (hdr.fd_count != (uint8_t)VITRIN_EGRESS_EVT_CONNECTED_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    size_t pos = VITRIN_HEADER_LEN;
+    out->fd = fd;
+    vitrin_decode_status_t st_host = vitrin_raw_read_string(in, in_len, &pos, 253u, &out->host);
+    if (st_host != VITRIN_DECODE_OK) { return st_host; }
+    vitrin_decode_status_t st_port = vitrin_raw_read_u32(in, in_len, &pos, &out->port);
+    if (st_port != VITRIN_DECODE_OK) { return st_port; }
+    if (pos != in_len) {
+        return VITRIN_DECODE_ERR_TRAILING_BYTES;
+    }
+    *out_object_id = hdr.object_id;
+    return VITRIN_DECODE_OK;
+}
+
+/* Event `connect_failed` (opcode 1) on `vitrin_egress`.
+ *
+ * an admitted request_connect that the far end did not answer
+ */
+typedef struct {
+    /* what the far end did instead of answering */
+    vitrin_egress_failure_t reason;
+} vitrin_egress_evt_connect_failed_t;
+
+#define VITRIN_EGRESS_EVT_CONNECT_FAILED_OPCODE ((uint8_t)1)
+#define VITRIN_EGRESS_EVT_CONNECT_FAILED_HAS_FD 0
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_EGRESS_EVT_CONNECT_FAILED_SINCE 2u
+
+/* Encodes into a complete frame (header + argument payload). Returns the
+   number of bytes written (fits in an int32_t: the wire format's own u16
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
+static inline int32_t vitrin_egress_evt_connect_failed_encode(const vitrin_egress_evt_connect_failed_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN + 4;
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
+        return VITRIN_ENCODE_ERR_OVERFLOW;
+    }
+    vitrin_frame_header_t hdr;
+    hdr.object_id = object_id;
+    hdr.size = (uint16_t)size;
+    hdr.opcode = VITRIN_EGRESS_EVT_CONNECT_FAILED_OPCODE;
+    hdr.fd_count = (uint8_t)VITRIN_EGRESS_EVT_CONNECT_FAILED_HAS_FD;
+    vitrin_frame_header_encode(&hdr, out);
+    size_t pos = VITRIN_HEADER_LEN;
+    vitrin_raw_write_u32(out + pos, (uint32_t)msg->reason);
+    pos += 4u;
+    return (int32_t)size;
+}
+
+/* Decodes one complete frame's bytes (in/in_len -- exactly one frame, e.g.
+   already delimited by a transport layer using the header's own size field,
+   out of scope here) plus, iff HAS_FD below, the fd received alongside it
+   out-of-band (fd = -1 if none). On success writes the frame's object_id to
+   *out_object_id and the decoded message to *out and returns
+   VITRIN_DECODE_OK; otherwise returns a negative vitrin_decode_status_t and
+   leaves *out_object_id and *out unspecified.
+
+   docs/protocol/00-conventions.md 2.4/5.2 define fd_violation as two
+   independent disjuncts, both checked here: the header's own fd_count byte
+   disagreeing with this message's signature, and the out-of-band fd
+   parameter disagreeing with it. A hostile or buggy peer can make either
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
+static inline vitrin_decode_status_t vitrin_egress_evt_connect_failed_decode(
+    const uint8_t *in, size_t in_len, int fd,
+    uint32_t *out_object_id, vitrin_egress_evt_connect_failed_t *out) {
+    int fd_present = (fd >= 0) ? 1 : 0;
+    if (fd_present != VITRIN_EGRESS_EVT_CONNECT_FAILED_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    vitrin_frame_header_t hdr;
+    vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
+    if (hdr_st != VITRIN_DECODE_OK) {
+        return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_EGRESS_EVT_CONNECT_FAILED_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
+    }
+    if (hdr.fd_count != (uint8_t)VITRIN_EGRESS_EVT_CONNECT_FAILED_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    size_t pos = VITRIN_HEADER_LEN;
+    uint32_t reason_raw;
+    vitrin_decode_status_t st_reason = vitrin_raw_read_u32(in, in_len, &pos, &reason_raw);
+    if (st_reason != VITRIN_DECODE_OK) { return st_reason; }
+    if (!vitrin_egress_failure_is_valid(reason_raw)) { return VITRIN_DECODE_ERR_INVALID_ENUM; }
+    out->reason = (vitrin_egress_failure_t)reason_raw;
     if (pos != in_len) {
         return VITRIN_DECODE_ERR_TRAILING_BYTES;
     }

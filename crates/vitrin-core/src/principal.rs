@@ -1133,9 +1133,23 @@ impl PrincipalServer {
                                 Err(PrincipalViolation::UnknownOpcode { object_id, opcode }.into())
                             }
                         },
-                        // vitrin_grant carries exactly three requests, all
-                        // since="2" structural mints; every
-                        // other opcode on it, and every opcode at all on
+                        // vitrin_grant carries four requests as of P2.7.2,
+                        // all since="2" structural mints, and THIS CORE
+                        // SERVES THREE OF THEM. `get_egress` (the egress
+                        // facet's mint) has no arm below deliberately: the
+                        // IDL says a mint is always legal and refuses at
+                        // use, and this core instead answers it
+                        // invalid_opcode and kills the connection. That is a
+                        // gap between the spec and this binary, named here
+                        // rather than left for a reader to infer from the
+                        // absence, and P2.7.3 closes it together with the
+                        // out-of-core proxy and the `vitrin_egress` object
+                        // kind. Nothing today can reach it usefully anyway:
+                        // `egress` is outside `SERVED_VERB_BITS`, so no
+                        // grant resolves granted carrying it.
+                        //
+                        // Every other opcode on vitrin_grant, and every
+                        // opcode at all on
                         // vitrin_consent (which defines no requests at any
                         // version), is grammar (invalid_opcode), never an
                         // authority judgement.

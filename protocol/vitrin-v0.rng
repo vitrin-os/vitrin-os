@@ -14,25 +14,32 @@
   chokepoint entry. The set below tracks the facet-bearing verbs of
   vitrin_grant.verb, and is therefore SHORTER than that bitfield.
 
-  vitrin-verb-set: facetless-verbs = observe_cursor, egress
+  vitrin-verb-set: facetless-verbs = observe_cursor
 
-  TWO verbs are missing from it, for two different reasons, and both belong
-  here because a reader meeting a list shorter than the bitfield will ask
-  why:
+  ONE verb is missing from it, and it belongs here because a reader meeting
+  a list shorter than the bitfield will ask why: observe_cursor has no facet
+  interface BY CONSTRUCTION. It widens what capture_frame composites rather
+  than adding a request, so there is no interface for the attribute to sit
+  on and there never will be.
 
-    - observe_cursor has no facet interface BY CONSTRUCTION. It widens what
-      capture_frame composites rather than adding a request, so there is no
-      interface for the attribute to sit on and there never will be.
-    - egress has none YET (P2.7.2 landed the verb bit and no message at
-      all). When its facet lands it is an interface of its own, since @verb
-      is one value per interface and it therefore cannot be a request on the
-      filesystem powerbox, and this value set gains "egress" in that same
-      commit.
+  It was TWO until P2.7.2's second half. egress had no facet YET - the task
+  landed the verb bit with no message at all, and this comment said that its
+  facet, when it landed, would be an interface of its own rather than a
+  request on the filesystem powerbox, and that this value set would gain
+  "egress" in that same commit. Both happened: vitrin_egress is that
+  interface and "egress" is below. The prediction is kept here rather than
+  deleted, because the rule it turned on - @verb is one value per interface,
+  so an interface declaring verb="designate_file" cannot also declare
+  verb="egress" - is the same rule that split the layout facet, and it will
+  be the same rule the next time.
 
-  Those two names are also what protocol/test-mutations.sh's
+  observe_cursor is also what protocol/test-mutations.sh's
   verb-without-facet case draws on: it mutates a legal @verb into a real
   grant verb the set does not admit, and only a facetless verb can play that
-  part.
+  part. Pinning the case on the BY-CONSTRUCTION one is deliberate - the case
+  was pinned on layout_arrange until that verb gained an interface, at which
+  point the mutated document became legal and the case reported the schema
+  as broken, and egress would have done the same thing here.
 
   The marker line above, and its sibling on the attribute itself further
   down, are read by `cargo xtask verb-sets`. That tool derives both sets from
@@ -42,15 +49,23 @@
   using a name this schema omits - and can never see a schema admitting a
   name no interface declares.
 
-  layout_arrange and layout_focus were in that no-facet list until they
-  gained one each (vitrin_layout_arrange, vitrin_layout_focus). They are two
-  interfaces rather than one, and that is forced by this attribute rather
-  than chosen: @verb is one value per interface, so a single combined layout
-  facet could name only one verb and the other would reach the chokepoint
-  with no entry. D-018(3) requires the two to be independently attenuable,
-  and one attribute per interface is how the dialect makes that structural.
-  The same rule split the powerbox: egress cannot be a second verb on the
-  interface that already declares designate_file.
+  layout_arrange, layout_focus and egress were in that no-facet list until
+  they gained one each (vitrin_layout_arrange, vitrin_layout_focus,
+  vitrin_egress). The layout pair are two interfaces rather than one, and
+  that is forced by this attribute rather than chosen: @verb is one value
+  per interface, so a single combined layout facet could name only one verb
+  and the other would reach the chokepoint with no entry. D-018(3) requires
+  the two to be independently attenuable, and one attribute per interface is
+  how the dialect makes that structural. The same rule split the powerbox:
+  egress cannot be a second verb on the interface that already declares
+  designate_file, so vitrin_egress is its own interface and vitrin_powerbox
+  will carry the filesystem half alone.
+
+  A verb having a facet does not make it SERVED. egress has an interface
+  here and no deployment serves the verb, because the mediating proxy a
+  connection would be made through does not exist. This schema's value set
+  is about which verbs have a request to be exercised through, never about
+  which deployments answer.
 
   Structural rules this schema enforces beyond wayland.dtd:
     - argument types are a closed set of seven (no array);
@@ -161,7 +176,7 @@
     </attribute>
     <optional>
       <attribute name="verb">
-        <!-- vitrin-verb-set: facet-verbs = observe, actuate_pointer, actuate_text, layout_arrange, layout_focus, realm_launch -->
+        <!-- vitrin-verb-set: facet-verbs = observe, actuate_pointer, actuate_text, layout_arrange, layout_focus, realm_launch, egress -->
         <choice>
           <value>observe</value>
           <value>actuate_pointer</value>
@@ -169,6 +184,7 @@
           <value>realm_launch</value>
           <value>layout_arrange</value>
           <value>layout_focus</value>
+          <value>egress</value>
         </choice>
       </attribute>
     </optional>

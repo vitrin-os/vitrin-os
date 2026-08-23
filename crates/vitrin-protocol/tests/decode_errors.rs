@@ -136,11 +136,13 @@ fn every_verb_is_classified_as_facet_bearing_or_not() {
     // revision.** The first cut held `FACET_VERBS` as an array of six
     // per-interface `VERB` constants and the facetless pair as a literal.
     // Both halves were transcriptions: adding a *seventh* `interface/@verb`
-    // to the IDL -- which is exactly what P2.7.3 does when it lands the
-    // egress facet -- left this test green while the two doc sentences it
-    // exists to hold became false. Issue #196's round-2 review levered that
+    // to the IDL -- which is exactly what the egress facet did, in this same
+    // issue's second half -- left this test green while the two doc sentences
+    // it exists to hold became false. Issue #196's round-2 review levered that
     // by adding `verb="egress"` to `vitrin_consent` and watching the test
-    // pass. Both sides now come out of the generator:
+    // pass. The seventh then landed for real, and the derived form is what
+    // made the two literals below go red so a human re-read the prose. Both
+    // sides come out of the generator:
     //
     //   * `gen::FACET_VERBS` is emitted from `interface/@verb`, so a seventh
     //     facet moves its length;
@@ -171,19 +173,25 @@ fn every_verb_is_classified_as_facet_bearing_or_not() {
     // partition itself, which is derived above.
     assert_eq!(
         facet.len(),
-        6,
-        "the IDL no longer declares six `interface/@verb` facets ({facet:?}); \
+        7,
+        "the IDL no longer declares seven `interface/@verb` facets ({facet:?}); \
          docs/protocol/04-vitrin_grant.md states this count twice, and \
          `cargo xtask verb-sets --check` holds every surface that enumerates it"
     );
-    // vitrin-verb-set: facetless-verbs = observe_cursor, egress
+    // vitrin-verb-set: facetless-verbs = observe_cursor
     assert_eq!(
         facetless,
-        ["observe_cursor", "egress"],
+        ["observe_cursor"],
         "the facetless verb set moved. It is enumerated in prose on six \
          surfaces; `cargo xtask verb-sets --check` names them and fails on \
          each one that still lists the old set"
     );
+    // A facet is not service. `egress` left the facetless set at P2.7.2's
+    // second half and is still refused `unsupported` by every deployment,
+    // because the proxy behind the facet does not exist. The unserved set is
+    // pinned in `crates/vitrin-core/src/consent/render.rs`, not here: this
+    // file is `vitrin-protocol`'s, and which verbs a deployment serves is not
+    // a property of the wire.
 
     // ...and the partition really is a partition of the wire bitfield.
     assert_eq!(
@@ -197,6 +205,7 @@ fn every_verb_is_classified_as_facet_bearing_or_not() {
     // still pass if the generator emitted an empty slice for either.
     assert!(facet.contains(&gen::vitrin_view::VERB));
     assert!(facet.contains(&gen::vitrin_launcher::VERB));
+    assert!(facet.contains(&gen::vitrin_egress::VERB));
     assert!(!facetless.is_empty());
 }
 

@@ -172,6 +172,7 @@ const PROTOCOL_DECODE_CLAIMS: &[(&str, &str, Decode)] = &[
         Decode::FdCountMismatch,
     ),
     ("attach_with_fd", "Attach", Decode::Ok),
+    ("connected_with_fd", "Connected", Decode::Ok),
     ("embedded_nul_in_string", "Hello", Decode::EmbeddedNul),
 ];
 
@@ -207,6 +208,7 @@ fn run_decoder(type_name: &str, bytes: &[u8], fd: Option<OwnedFd>) -> Decode {
         "Attach" => outcome(gen::vitrin_shim_surface::requests::Attach::decode(
             bytes, fd,
         )),
+        "Connected" => outcome(gen::vitrin_egress::events::Connected::decode(bytes, fd)),
         other => panic!(
             "a seed selects the `{other}` decoder, which this reachability test does not \
              know how to run. Add an arm above -- a seed nobody can check is the exact \

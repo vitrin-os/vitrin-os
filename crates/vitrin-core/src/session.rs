@@ -10676,9 +10676,25 @@ mod tests {
         // so an app cannot suppress a blank in a realm nobody is looking at.
         // Being derived from no grant, it adds no verb whose requests the
         // server could fail to enforce. That is D-042, not this invariant.
+        // Re-pinned 48 -> 52 by P2.7.2's second half (issue #196), and the
+        // decision was taken rather than waved through because this addition
+        // does include a verb. The four added messages are
+        // `vitrin_grant.get_egress` (a structural mint) and the three on the
+        // new `vitrin_egress` facet -- `request_connect`, `connected` and
+        // `connect_failed`. None is a request on either layout interface, and
+        // none adds an arrangement this scene cannot honour.
+        // Invariant 2's first half needs the closer look. The addition puts a
+        // FACET on the `egress` verb bit, but it allocates no bit
+        // (`Verb::VALID_MASK` was already 703; P2.7.2's first half appended
+        // 128) and it does not make the verb served: `SERVED_VERB_BITS` still
+        // excludes `egress`, so no petition naming it resolves `granted`, so
+        // this core never grants a verb whose requests it cannot carry out.
+        // That is exactly what invariant 2 forbids and exactly what staying
+        // unserved avoids. The proxy that would make the verb servable, and
+        // the core dispatch for these four opcodes, are P2.7.3's.
         assert_eq!(
             vitrin_protocol::generated::MESSAGE_COUNT,
-            48,
+            52,
             "a message was added to the IDL. If it is a request on \
              vitrin_layout_arrange or vitrin_layout_focus, D-018(2) invariant 2 is at \
              stake: this scene shows one realm, unstacked and unoverlapped, so it cannot \

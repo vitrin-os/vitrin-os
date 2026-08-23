@@ -575,7 +575,12 @@ as a wire code):
 ### 5.3 Recoverable errors
 
 Recoverable failures are delivered as ordinary events and never close the
-connection. There are two petition/use moments plus the shim fallback path.
+connection. There are **four** classes, and what separates them is *who
+decided*: two are this server's own answers about a grant (at petition time and
+at use time), the third is the **far end's** non-answer to a use this server had
+already admitted, and the fourth is the shim's buffer-import fallback. The third
+is the newest and is the one a reader is most likely to fold into the second;
+the paragraph on it says why that folding is the expensive mistake.
 
 **Petition outcomes** — `vitrin_grant.resolved(outcome, verbs, persistence,
 expiry_ms)`, sent **exactly once per grant, ever**. On `granted` the trailing
@@ -600,6 +605,27 @@ version 2) is live for that principal — so an agent cannot reconstruct from it
 own journal why one layout request landed and an identical one did not (see
 [`vitrin_grant.refusal`](04-vitrin_grant.md#refusal)).
 
+**Transport non-answers** — `vitrin_egress.connect_failed(reason)` *(since 2)*,
+delivered on the [egress facet](19-vitrin_egress.md#connect_failed) and
+deliberately **neither** an outcome nor a refusal. It is reached only after the
+chokepoint **admitted** the use — the grant is live, the verb is in its
+effective set, and the endpoint is covered — and the far end then did not
+answer. What distinguishes it from a refusal is not severity but authorship:
+every code in [`refusal`](04-vitrin_grant.md#refusal) names something *this
+server decided* about a grant, and a host that is down decided nothing, so
+there is no honest code for it — `not_granted` would be the worst available
+rounding, because an agent that hears it correctly stops asking. Keeping the two
+apart is wrong in both directions when blurred: an agent that reads a transport
+failure as a lost authority abandons work it is permitted to do, and one that
+reads a refusal as a transient failure retries forever against a wall. It
+carries **no `retry_after_ms`** — a token bucket has a known refill time and a
+down host has none. The ordering is normative (the chokepoint answers first), so
+this class is unreachable for a principal whose grant does not cover the
+endpoint; [§6.1](#61-reply-bearing-requests) states the same argument as a
+question about terminal sets. **Nothing serves it today**: `egress` is refused
+`unsupported` by every deployment, and the reference core dispatches
+`vitrin_egress` not at all.
+
 **Shim fallback** — `vitrin_shim_surface.buffer_done(buffer_id, status)` with a
 non-`released` status is the recoverable dmabuf-import-fallback path
 (shim-side).
@@ -608,6 +634,18 @@ non-`released` status is the recoverable dmabuf-import-fallback path
 
 Each recoverable code maps to exactly one distinct typed SDK exception (or
 success), so a blocking SDK can translate the wire directly.
+
+**Two of the four classes are mapped here, and the other two are not — say so
+rather than let the tables imply a completeness they do not have.** `outcome`
+and `refusal` are below. The **shim fallback**'s `buffer_done` status is on a
+shim connection, which no agent SDK speaks. `connect_failed`'s
+[`failure`](19-vitrin_egress.md#failure) enum has **no mapping at all yet**, and
+that is a gap rather than a decision: the Python SDK implements no part of the
+egress facet ([`vitrin_os.protocol`](../../sdk/python/src/vitrin_os/protocol.py)
+names it as absent), so there is nothing to map it onto. When it is mapped, the
+one thing this section already fixes is that it must **not** land in the
+`refusal` table — the whole point of the third class is that it is not an
+authority answer.
 
 | `outcome` | SDK result |
 |---|---|

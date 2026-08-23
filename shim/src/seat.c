@@ -104,8 +104,16 @@ _Static_assert(VITRIN_SHIM_SEAT_EVT_GESTURE_END_OPCODE < VITRIN_SEAT_EVENT_SLOTS
  * `vitrin_shim_session.idle_inhibit`, a REQUEST on the session bootstrap object.
  * It is not a `vitrin_shim_seat` event, so `VITRIN_SEAT_EVENT_SLOTS` is
  * unchanged, `gesture_end` is still that interface's last event, and
+ * `delivered[]` is untouched.
+ *
+ * Re-pinned 48 -> 52 by P2.7.2 (issue #196), with the same check made against
+ * all four added messages: `vitrin_grant.get_egress` is a REQUEST on the grant
+ * object, and `vitrin_egress` contributes one request (`request_connect`) and
+ * two events (`connected`, `connect_failed`) on ITS OWN interface. None of the
+ * four is a `vitrin_shim_seat` event -- that interface's event list still ends
+ * at `gesture_end` (opcode 9), so `VITRIN_SEAT_EVENT_SLOTS` is still 10 and
  * `delivered[]` is untouched. */
-_Static_assert(VITRIN_MESSAGE_COUNT == 48,
+_Static_assert(VITRIN_MESSAGE_COUNT == 52,
 	"a message was appended to the IDL -- read the paragraph above before touching "
 	"delivered[]");
 

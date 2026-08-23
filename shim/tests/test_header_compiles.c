@@ -20,7 +20,7 @@
  *   - the frame-header and raw little-endian helpers are checked directly;
  *   - a handful of representative messages (a plain zero-argument request,
  *     a string-and-scalar-heavy request, a bitfield-and-enum-heavy event,
- *     and both of the two fd-bearing messages) are actually *called* with
+ *     and all three fd-bearing messages) are actually *called* with
  *     dummy buffers, end to end (encode then decode), to prove the API is
  *     genuinely callable from an external C translation unit, not merely
  *     syntactically present.
@@ -33,7 +33,9 @@
  * exactly what happened when version 2 added get_launcher, launch and
  * launched: the file kept compiling while type-checking 29 of 32 messages.
  * (It fired as designed when version 2 later added the two layout mints and
- * their two facet requests -- 32 to 36.)
+ * their two facet requests -- 32 to 36 -- and again for P2.7.2's egress
+ * facet: `vitrin_grant.get_egress` plus vitrin_egress's three messages,
+ * 48 to 52.)
  * It mirrors crates/vitrin-protocol/tests/roundtrip.rs's
  * `every_idl_message_is_in_the_roundtrip_table`, which gates the Rust
  * round-trip table on the same generated constant.
@@ -74,6 +76,7 @@ static int sink = 0;
     X(vitrin_grant_req_get_launcher)                                         \
     X(vitrin_grant_req_get_layout_focus)                                     \
     X(vitrin_grant_req_get_layout_arrange)                                   \
+    X(vitrin_grant_req_get_egress)                                           \
     X(vitrin_grant_evt_resolved)                                             \
     X(vitrin_grant_evt_refused)                                              \
     X(vitrin_consent_evt_state)                                              \
@@ -110,7 +113,10 @@ static int sink = 0;
     X(vitrin_launcher_req_launch)                                            \
     X(vitrin_launcher_evt_launched)                                          \
     X(vitrin_layout_focus_req_focus)                                         \
-    X(vitrin_layout_arrange_req_set_fullscreen)
+    X(vitrin_layout_arrange_req_set_fullscreen)                              \
+    X(vitrin_egress_req_request_connect)                                     \
+    X(vitrin_egress_evt_connected)                                           \
+    X(vitrin_egress_evt_connect_failed)
 
 /* The exhaustiveness gate. VITRIN_MESSAGE_COUNT is generated from the IDL,
  * so an appended message makes this a compile error here rather than a
@@ -213,6 +219,7 @@ static void check_every_symbol_type_checks(void) {
     CHECK_IS_VALID(vitrin_shim_seat_gesture_kind_is_valid);
     CHECK_IS_VALID(vitrin_shim_seat_gesture_state_is_valid);
     CHECK_IS_VALID(vitrin_layout_arrange_mode_is_valid);
+    CHECK_IS_VALID(vitrin_egress_failure_is_valid);
 
     /* ---- every message's encode + decode, in header (document) order ---- */
     VITRIN_EVERY_MESSAGE(CHECK_MESSAGE)
@@ -307,8 +314,8 @@ static void call_enum_and_bitfield_message(void) {
     sink += (decoded.outcome == msg.outcome) ? 1 : 0;
 }
 
-/* Encodes then decodes vitrin_view.frame_ready: one of the two fd-bearing
- * messages, exercising the plain `int fd` field, a cross-interface plain
+/* Encodes then decodes vitrin_view.frame_ready: the first of the three
+ * fd-bearing messages, exercising the plain `int fd` field, a cross-interface plain
  * enum (vitrin_view_format_t, defined on this same interface here but
  * referenced from vitrin_shim_surface.attach too -- see
  * call_other_fd_bearing_message below), and a bitfield in the same struct. */
@@ -343,7 +350,7 @@ static void call_fd_bearing_message(void) {
     sink += (decoded.format == msg.format) ? 1 : 0;
 }
 
-/* Encodes then decodes vitrin_shim_surface.attach: the other fd-bearing
+/* Encodes then decodes vitrin_shim_surface.attach: the second fd-bearing
  * message, and the one that references vitrin_view.format from a *different*
  * interface (vitrin_shim_surface is defined after vitrin_view in
  * protocol/vitrin-v0.xml, so this is a backward reference; request_grant's
@@ -378,6 +385,45 @@ static void call_other_fd_bearing_message(void) {
     sink += (decoded.kind == msg.kind) ? 1 : 0;
 }
 
+/* Encodes then decodes vitrin_egress.connected: the third fd-bearing message,
+ * and the only one that carries an fd and a variable-length string in the
+ * same struct. That combination is why it is called here rather than left to
+ * the type-check above: the fd is out-of-band, so the generator must emit no
+ * bytes for it while still placing `host` at the offset immediately after the
+ * frame header, and a decode that mis-accounted for the fd would read `host`'s
+ * length prefix from the wrong offset -- which encode-then-decode catches and
+ * a function-pointer assignment does not. */
+static void call_fd_and_string_message(void) {
+    static const uint8_t host_bytes[] = "example.invalid";
+    vitrin_egress_evt_connected_t msg;
+    uint8_t buf[128];
+    int32_t written;
+    uint32_t object_id_out;
+    vitrin_egress_evt_connected_t decoded;
+    vitrin_decode_status_t st;
+    int dummy_fd = 5;
+
+    msg.fd = dummy_fd;
+    msg.host.len = (uint32_t)(sizeof(host_bytes) - 1);
+    msg.host.data = host_bytes;
+    msg.port = 443;
+
+    written = vitrin_egress_evt_connected_encode(&msg, 11, buf, sizeof(buf));
+    sink += (written > 0) ? 1 : 0;
+
+    /* HAS_FD is true for this message: fd < 0 (absent) must be rejected. */
+    st = vitrin_egress_evt_connected_decode(buf, (size_t)written, -1,
+                                             &object_id_out, &decoded);
+    sink += (st == VITRIN_DECODE_ERR_FD_MISMATCH) ? 1 : 0;
+
+    st = vitrin_egress_evt_connected_decode(buf, (size_t)written, dummy_fd,
+                                             &object_id_out, &decoded);
+    sink += (st == VITRIN_DECODE_OK) ? 1 : 0;
+    sink += (decoded.fd == dummy_fd) ? 1 : 0;
+    sink += (decoded.host.len == msg.host.len) ? 1 : 0;
+    sink += (decoded.port == msg.port) ? 1 : 0;
+}
+
 int main(void) {
     check_every_symbol_type_checks();
     call_zero_arg_message();
@@ -385,5 +431,6 @@ int main(void) {
     call_enum_and_bitfield_message();
     call_fd_bearing_message();
     call_other_fd_bearing_message();
+    call_fd_and_string_message();
     return sink >= 0 ? 0 : 1;
 }

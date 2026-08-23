@@ -2968,8 +2968,12 @@
         it is permitted to do, and an agent that reads a refusal as a
         transient failure retries forever against a wall. The cost is
         named rather than hidden: clients now have three terminals to
-        handle here and two everywhere else, and the asymmetry is bought
-        deliberately.
+        handle here and AT MOST TWO anywhere else - two on capture_frame
+        and launch, one apiece on sync and request_grant - and the
+        asymmetry is bought deliberately. What does NOT move is the rule
+        itself: every reply-bearing request still receives exactly one
+        terminal. Three is the size of the set this request's one terminal
+        is drawn from, not a number of events it receives.
 
         AUTHORITY IS DECIDED BEFORE ANYTHING TOUCHES THE NETWORK, and the
         order is normative rather than an implementation preference. The

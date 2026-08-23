@@ -158,10 +158,19 @@ failure as a lost authority abandons work it is permitted to do, and an agent
 that reads a refusal as a transient failure retries forever against a wall.
 
 **The cost, named rather than hidden.** Clients now handle three terminals
-here and two everywhere else. That asymmetry is bought deliberately, and the
-seam it opens is general: a later reply-bearing request whose failure is not
-the server's decision adds *its own* terminal on *its own* facet, never a code
-in `refusal`.
+here and **at most two** anywhere else — two on
+[`capture_frame`](06-vitrin_view.md) and [`launch`](16-vitrin_launcher.md#launch),
+one apiece on [`sync`](01-vitrin_handshake.md) and
+[`request_grant`](03-vitrin_realm.md#request_grant). That asymmetry is bought
+deliberately, and the seam it opens is general: a later reply-bearing request
+whose failure is not the server's decision adds *its own* terminal on *its own*
+facet, never a code in `refusal`.
+
+**What does not move is the rule.** [Conventions
+§6.1](00-conventions.md#61-reply-bearing-requests) says every reply-bearing
+request receives *exactly one* terminal, in request order, never coalesced, and
+`request_connect` obeys it unchanged. Three is the size of the set this
+request's one terminal is **drawn from** — never a count of events it receives.
 
 ### Authority is decided before anything touches the network
 

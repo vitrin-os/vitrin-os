@@ -1,6 +1,6 @@
 # vitrin_grant — capability handle and enforcement voice
 
-**Interface version:** 2 · **Connection class:** principal · **Messages:** 3 requests *(all since 2)* + 2 events
+**Interface version:** 2 · **Connection class:** principal · **Messages:** 4 requests *(all since 2)* + 2 events
 
 ## Purpose
 
@@ -35,8 +35,10 @@ handle is not something the agent commands; it is something the agent observes.
 Authority is exercised through the facets, and the grant merely reports how the
 petition resolved and, thereafter, why any use was refused.
 
-Version 2 adds exactly one request, and it is not a command either:
-[`get_launcher`](#get_launcher) is a **structural mint** that hands back a
+Version 2 adds four requests, and none is a command either:
+[`get_launcher`](#get_launcher), [`get_layout_focus`](#get_layout_focus),
+[`get_layout_arrange`](#get_layout_arrange) and
+[`get_powerbox`](#get_powerbox) are **structural mints** that hand back a
 facet. The grant still answers no authority question itself. This is where
 *every* facet added after version 1 must be minted, for one mechanical reason:
 `request_grant`'s five `new_id` arguments are frozen forever, so a sixth
@@ -156,6 +158,41 @@ shell granted arrangement but not focus holds a live
 forever, which is exactly the shape that separation is for. A combined
 `get_layout` could not express it.
 
+### get_powerbox
+
+`get_powerbox(powerbox: new_id)` — **since version 2**
+
+| arg | type | description |
+|---|---|---|
+| `powerbox` | `new_id` → [`vitrin_powerbox`](13-vitrin_powerbox.md) | the powerbox facet, born **inert** |
+
+A **structural mint**, on exactly [`get_launcher`](#get_launcher)'s terms:
+neither reply-bearing nor refusable, always legal whatever verbs the grant
+holds and whether or not it has resolved, born inert, duplicates permitted and
+conferring nothing extra, bounded by the per-connection live-object cap whose
+breach is fatal `resource_exhausted`, and `since="2"` so the opcode does not
+exist on a version-1 connection.
+
+**The mint is not an oracle, and today that is doing visible work.** No
+deployment serves [`designate_file`](#defined-but-unserved), so no grant
+carries the bit and no petition naming it resolves `granted`. A server that
+implements this request therefore mints successfully *everywhere* and refuses
+every use of the facet *everywhere* — the defined-but-unserved staging
+behaving exactly as designed, not a defect. Refusing at mint time would leak
+what a grant holds; that is why the mint never answers an authority question.
+
+**The reference core does not implement this request yet.** `vitrind`
+negotiates exactly version 2 and has no dispatch arm for this opcode, so
+`get_powerbox` sent to it is answered with fatal `invalid_opcode` and the
+connection dies — not the mint-then-refuse above, and not the
+`resource_exhausted` cap either, since no cap is reached by a request nothing
+handles. It is the first mint this IDL has declared without a core arm, it is a
+conformance gap in that implementation rather than a property of the request,
+and it closes in **P2.6.6** with the picker. `crates/vitrin-core/src/principal.rs`
+pins it with a test that asserts the fatal answer, so the arm cannot land
+without this paragraph and its two siblings (the IDL's, and
+[page 13's](13-vitrin_powerbox.md#served-status)) going with it.
+
 ## Events
 
 ### resolved
@@ -246,7 +283,8 @@ it never escalates to a fatal error.
 Bitfield. The grantable verbs. Every entry has one SDK-level dotted name,
 formed by replacing the first underscore of the wire name with a dot:
 `observe`, `actuate.pointer`, `actuate.text`, `observe.cursor`,
-`layout.arrange`, `layout.focus`, `realm.launch`. The spelling is fixed by the
+`layout.arrange`, `layout.focus`, `designate.file`, `realm.launch`. The
+spelling is fixed by the
 IDL so a second implementation transcribing this enum has no name to invent.
 
 | entry | value | served | meaning |
@@ -257,29 +295,33 @@ IDL so a second implementation transcribing this enum has no name to invent.
 | `observe_cursor` | 0x8 | **no** — resolves `unsupported` | capture frames that include the human principal's cursor; meaningful only alongside `observe` |
 | `layout_arrange` | 0x10 | yes | arrange the granted realm's view, through the [`vitrin_layout_arrange`](18-vitrin_layout_arrange.md) facet; **one holder per output** — a live grant carrying it, or a petition still pending for it — so a second petition while either exists resolves `layout_held` |
 | `layout_focus` | 0x20 | yes | bind the output to the granted realm and direct the human's input there, through the [`vitrin_layout_focus`](17-vitrin_layout_focus.md) facet |
+| `designate_file` | 0x40 | **no** — resolves `unsupported` everywhere | designate one file or one directory subtree to the granted realm, through the [`vitrin_powerbox`](13-vitrin_powerbox.md) facet; the human picks and what crosses is a **descriptor, never a path**. **A delivered fd cannot be recalled** — see [that page](13-vitrin_powerbox.md#revocation-cannot-recall-a-delivered-descriptor) |
 | `realm_launch` | 0x200 | yes | launch the realm template this grant addresses into a new realm instance, through the [`vitrin_launcher`](16-vitrin_launcher.md) facet |
 
 The **served** column describes the reference core. Whether a defined verb is
 served is a property of a *deployment*, so a client reads `unsupported` as
 "not here, not now", never as "not in this protocol".
 
-`VALID_MASK` is therefore `0x23f` (575), not `0x7f`.
+`VALID_MASK` is therefore **639** (`0x27f`), not `0xff`. It was 575 until P2.6.5 added bit 64. The plan's registry re-pins it **once per epic**, never once per task, and [names every site that holds it](../plan/02-phase-2-semantic-epochs.md) rather than leaving them to be found — a list `cargo xtask limits-check` holds to the tree in both directions, so a pin the registry does not name is a red build. The same gate holds this sentence's own number against the generated constant, which is why no count of sites is repeated here.
 
 This enum is the type of `request_grant`'s `verbs` argument, of
-`resolved.verbs`, and of `refused.verb`. Six verbs map one-to-one to a facet
+`resolved.verbs`, and of `refused.verb`. Seven verbs map one-to-one to a facet
 interface and to that interface's `@verb` annotation, which drives the
 scanner-generated chokepoint table; `observe_cursor` is the one that does not,
 by construction. Later phases append entries (for example
 key actuation, credential presentation, subtree reads) without touching
 existing bits; values are immutable.
 
-#### The gap between 0x20 and 0x200 is allocation, not free space
+#### The gap between 0x40 and 0x200 is allocation, not free space
 
-`realm_launch` is 512 rather than 64 because **64, 128 and 256 are already
+`realm_launch` is 512 rather than 64 because **64, 128 and 256 were already
 spoken for** — allocated to verbs (`designate_file`, `egress`,
-`publish_tree`) that have not landed in the IDL yet. Bits are allocated once,
+`publish_tree`) that had not landed in the IDL yet. Bits are allocated once,
 repo-wide, in `docs/plan/02-phase-2-semantic-epochs.md` §5, and anything
 adding a verb allocates there first, whatever document schedules the work.
+**64 has since landed as `designate_file`** (P2.6.5), taken from that registry
+rather than from the next unused-looking power of two; 128 (`egress`) and 256
+(`publish_tree`) are still spoken for and still absent.
 
 This matters because a verb value is **immutable once landed**: a collision is
 not a rename, it is two authorities permanently sharing one bit. Reading the
@@ -288,7 +330,10 @@ happens — and it nearly did here, which is why the rule is written down rather
 than assumed.
 
 A reserved-but-undefined bit is still **out of range on the wire**, so
-petitioning for 64 today is fatal `invalid_argument`, not `unsupported`.
+petitioning for 128 or 256 today is fatal `invalid_argument`, not
+`unsupported`. Petitioning for 64 is now `unsupported` instead — that flip,
+from a killed connection to an answer, is the whole of what "defining a bit
+before serving it" buys.
 
 #### Defined but unserved
 
@@ -296,18 +341,30 @@ A verb may be defined on the wire ahead of being served and **refused
 `unsupported`** by a deployment that does not serve it — the same posture the
 [`persistence`](#persistence) ladder takes toward its durable rungs.
 
-Four verbs were defined this way. `observe_cursor`, `layout_arrange` and
-`layout_focus` were defined from day one and `realm_launch` arrived with
+Five verbs were defined this way. `observe_cursor`, `layout_arrange` and
+`layout_focus` were defined from day one; `realm_launch` and `designate_file`
+arrived with
 version 2; of those, **three are now served** by the reference core — each has
 a facet interface, an enforcement arm and consent copy naming its consequence
 in plain language. `layout_arrange` and `layout_focus` joined at WS-E.1.4, and
 `realm_launch` at WS-E.1.1, when the core gained the spawn path, the realm cap
 and the prompt line its refusal had stood for.
 
-**`observe_cursor` is the one that remains**, and its reason has not moved: the
+**Two remain.** `observe_cursor`'s reason has not moved: the
 per-principal cursor *delivery* it would widen a capture with does not exist
 (D-017, D-019), so serving the verb would promise something no capture
 carries.
+
+**`designate_file` is the other**, and unlike `observe_cursor` its refusal has
+a scheduled end. It landed at P2.6.5 with its facet interface and nothing
+else: no picker mints a descriptor (P2.6.6) and no consent copy names what
+approving it costs (P2.6.8 — Q13's rule that no verb is served before a human
+can be told what it means). Both must land before any deployment may answer a
+petition naming it anything but `unsupported`. In the reference core that is
+structural rather than a promise: `SERVED_VERB_BITS` does not list the bit,
+the unserved set is *derived* from the wire mask, and admission refuses the
+petition **whole** — so forgetting the rest of E2.6 produces a refusal, never
+a grant nothing enforces.
 
 Serving a verb is a **deployment** property, not a version property. A
 deployment that will not host process creation must refuse `realm_launch`
@@ -348,11 +405,12 @@ Two rules hold for every verb a deployment does not serve:
 Not every verb has a facet interface. `observe_cursor` has none by
 construction: it widens what
 [`vitrin_view.capture_frame`](06-vitrin_view.md) composites rather than adding
-a request. Every other verb does, and the three added at version 2 all arrive
+a request. Every other verb does, and the four added at version 2 all arrive
 as `since`-gated mints on *this* interface, because `request_grant`'s five
 `new_id` arguments are frozen forever (see [Growth](#growth)):
-[`get_launcher`](#get_launcher), [`get_layout_focus`](#get_layout_focus) and
-[`get_layout_arrange`](#get_layout_arrange).
+[`get_launcher`](#get_launcher), [`get_layout_focus`](#get_layout_focus),
+[`get_layout_arrange`](#get_layout_arrange) and
+[`get_powerbox`](#get_powerbox).
 
 **The layout verbs take two facets, not one, and that is forced rather than
 chosen.** A facet interface declares exactly one grant verb — that is what
@@ -376,7 +434,8 @@ the rule directly above — a deployment MUST NOT grant a verb it does not
 enforce — and it settles the case the wire would otherwise leave open:
 `observe_cursor` is **not** an independent authority and is never
 inert-but-held. Every other verb (`observe`, `actuate_pointer`, `actuate_text`,
-`layout_arrange`, `layout_focus`, `realm_launch`) is independently
+`layout_arrange`, `layout_focus`, `designate_file`, `realm_launch`) is
+independently
 petitionable — including the two layout verbs, which is the whole point of
 `layout_focus` being its own bit. A deployment that
 refuses `observe_cursor` in any combination cannot distinguish this rule from
@@ -727,8 +786,8 @@ rules](00-conventions.md) guarantee.
 - **New verbs.** Appended [`verb`](#verb) bits (for example key actuation,
   credential presentation, subtree reads) extend the bitfield without touching
   existing bits. Bit *values* come from the repo-wide allocation registry, not
-  from the next unused-looking power of two — see [the gap between 0x20 and
-  0x200](#the-gap-between-0x20-and-0x200-is-allocation-not-free-space).
+  from the next unused-looking power of two — see [the gap between 0x40 and
+  0x200](#the-gap-between-0x40-and-0x200-is-allocation-not-free-space).
 - **Layout facet mints — landed at version 2.**
   [`get_layout_focus`](#get_layout_focus) and
   [`get_layout_arrange`](#get_layout_arrange), minting
@@ -748,12 +807,28 @@ rules](00-conventions.md) guarantee.
   rather than killing the connection, which is the whole of what defining a bit
   ahead of serving it buys. The row stays here because *how it arrived* is what
   the next seam copies.
+- **Powerbox facet mint — landed at version 2.**
+  [`get_powerbox`](#get_powerbox), minting
+  [`vitrin_powerbox`](13-vitrin_powerbox.md), through which
+  [`designate_file`](#verb) (64) is exercised. It follows the launcher's shape
+  exactly and adds two things to the pattern that the earlier rows did not
+  need. First, **two newly *defined* resource prefixes** — `file:` and `dir:`
+  in [`request_grant`](03-vitrin_realm.md#request_grant)'s type-prefixed
+  vocabulary, defined and **not** served: they resolve `unsupported` in every
+  deployment today, exactly as the verb they select for does. That is why they
+  break no existing client — an unserved prefix already resolves `unsupported`
+  recoverably. Second, a **limitation that does not go away when the verb is
+  served**: a delivered file descriptor is kernel authority the core cannot
+  recall, so revocation stops future designations and kills the grant row
+  while every descriptor already handed over keeps working until its realm
+  dies. Stated here as well as on the facet page
+  because this list is where a later seam looks for what a shape costs.
 
 ## Version history
 
 | Version | Change |
 |---|---|
 | 1 | `resolved`, `refused`; no requests |
-| 2 | `get_launcher` (structural mint, request opcode 0), `get_layout_focus` (opcode 1) and `get_layout_arrange` (opcode 2); `verb` gains `realm_launch` = 512; `outcome` gains `layout_held` = 6; `refusal` gains `capacity` = 8 |
+| 2 | `get_launcher` (structural mint, request opcode 0), `get_layout_focus` (opcode 1), `get_layout_arrange` (opcode 2) and `get_powerbox` (opcode 3); `verb` gains `realm_launch` = 512 and `designate_file` = 64; `outcome` gains `layout_held` = 6; `refusal` gains `capacity` = 8 |
 
 Neither version-1 event's signature changed, and no existing enum value moved.

@@ -24,6 +24,15 @@
   with no entry. D-018(3) requires the two to be independently attenuable,
   and one attribute per interface is how the dialect makes that structural.
 
+  designate_file joined the set with vitrin_powerbox (P2.6.5). The same
+  one-value-per-interface rule that split the layout pair decided the NEXT
+  verb through that facet before it was written:
+  docs/plan/02-phase-2-semantic-epochs.md E2.7/P2.7.2 was drafted as
+  request_connect on vitrin_powerbox exercising egress, which this attribute
+  cannot express on an interface already declaring designate_file. Egress
+  therefore takes a second interface, as the layout pair did; this closed
+  set grows by one value when it lands, and no interface ever carries two.
+
   Structural rules this schema enforces beyond wayland.dtd:
     - argument types are a closed set of seven (no array);
     - new_id and object arguments MUST name their interface (no untyped
@@ -140,6 +149,7 @@
           <value>realm_launch</value>
           <value>layout_arrange</value>
           <value>layout_focus</value>
+          <value>designate_file</value>
         </choice>
       </attribute>
     </optional>

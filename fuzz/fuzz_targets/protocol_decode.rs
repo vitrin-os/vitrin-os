@@ -71,6 +71,7 @@ type RequestGrant = gen::vitrin_realm::requests::RequestGrant;
 type GetLauncher = gen::vitrin_grant::requests::GetLauncher;
 type GetLayoutFocus = gen::vitrin_grant::requests::GetLayoutFocus;
 type GetLayoutArrange = gen::vitrin_grant::requests::GetLayoutArrange;
+type GetPowerbox = gen::vitrin_grant::requests::GetPowerbox;
 type Resolved = gen::vitrin_grant::events::Resolved;
 type Refused = gen::vitrin_grant::events::Refused;
 type Launch = gen::vitrin_launcher::requests::Launch;
@@ -93,6 +94,7 @@ type OfferSelection = gen::vitrin_shim_session::events::OfferSelection;
 type SessionPointerConstraint = gen::vitrin_shim_session::requests::PointerConstraint;
 type SessionPointerConstraintState = gen::vitrin_shim_session::events::PointerConstraintState;
 type SessionIdleInhibit = gen::vitrin_shim_session::requests::IdleInhibit;
+type SessionDesignation = gen::vitrin_shim_session::events::Designation;
 type Attach = gen::vitrin_shim_surface::requests::Attach;
 type Damage = gen::vitrin_shim_surface::requests::Damage;
 type Commit = gen::vitrin_shim_surface::requests::Commit;
@@ -108,6 +110,10 @@ type SeatGestureBegin = gen::vitrin_shim_seat::events::GestureBegin;
 type SeatGestureSwipeUpdate = gen::vitrin_shim_seat::events::GestureSwipeUpdate;
 type SeatGesturePinchUpdate = gen::vitrin_shim_seat::events::GesturePinchUpdate;
 type SeatGestureEnd = gen::vitrin_shim_seat::events::GestureEnd;
+type PowerboxRequestFile = gen::vitrin_powerbox::requests::RequestFile;
+type PowerboxRequestDir = gen::vitrin_powerbox::requests::RequestDir;
+type PowerboxDesignated = gen::vitrin_powerbox::events::Designated;
+type PowerboxRefused = gen::vitrin_powerbox::events::Refused;
 
 /// One fresh, close-on-exec fd -- `decode` takes ownership of it, so every
 /// call site that wants to hand one over needs its own.
@@ -121,12 +127,13 @@ fn devnull_fd() -> OwnedFd {
 /// panic-freedom and round-trip checks in one place so the decoder table
 /// below is pure data, not one copy of this logic per type. For the fd-less
 /// majority of message types the round-trip is a full equality check
-/// ([`DecodeMsg::decoded_eq`]); the two fd-bearing types
-/// (`vitrin_view.frame_ready`, `vitrin_shim_surface.attach`) only derive
-/// `Debug` in the generated code (an `OwnedFd` field has no `PartialEq`),
-/// so their impl of [`DecodeMsg::decoded_eq`] is vacuously `true` -- the
-/// panic-freedom and "must decode again" checks below still run for them
-/// in full, only the field-level equality is skipped.
+/// ([`DecodeMsg::decoded_eq`]); the fd-bearing types
+/// (`vitrin_view.frame_ready`, `vitrin_shim_surface.attach`,
+/// `vitrin_shim_session.designation`, `vitrin_powerbox.designated`) only
+/// derive `Debug` in the generated code (an `OwnedFd` field has no
+/// `PartialEq`), so their impl of [`DecodeMsg::decoded_eq`] is vacuously
+/// `true` -- the panic-freedom and "must decode again" checks below still
+/// run for them in full, only the field-level equality is skipped.
 fn try_decode<T>(bytes: &[u8], fd: Option<OwnedFd>)
 where
     T: Debug + DecodeMsg,
@@ -154,11 +161,11 @@ where
 /// Bridges every generated message struct's identical
 /// `encode(&self, u32) -> Vec<u8>` / `decode(&[u8], Option<OwnedFd>) -> ...`
 /// shape (same pattern `tests/roundtrip.rs` uses) plus two extra hooks:
-/// [`fd_for_reencode`], because the two fd-bearing message types need a
+/// [`fd_for_reencode`], because the fd-bearing message types need a
 /// *fresh* fd supplied for their re-decode half of the round-trip check
 /// (their own `fd` field was already consumed by the first `decode`)
 /// while every fd-less type needs `None`; and [`decoded_eq`], because
-/// those same two types have no `PartialEq` (see `try_decode`'s doc
+/// those same types have no `PartialEq` (see `try_decode`'s doc
 /// comment) so the round-trip comparison needs a per-type answer instead
 /// of a blanket trait bound.
 trait DecodeMsg: Sized {
@@ -262,10 +269,19 @@ impl_decode_msg_no_fd!(
     SessionPointerConstraint,
     SessionPointerConstraintState,
     SessionIdleInhibit,
+    GetPowerbox,
+    PowerboxRequestFile,
+    PowerboxRequestDir,
+    PowerboxRefused,
 );
-// The two fd-bearing messages in v0.xml (grep for an `fd`-typed arg),
-// matching tests/roundtrip.rs's dedicated-block split.
-impl_decode_msg_with_fd!(FrameReady, Attach);
+// The four fd-bearing messages in v0.xml (grep for an `fd`-typed arg),
+// matching tests/roundtrip.rs's dedicated-block split. P2.6.5 (#189) took
+// this set from two to four; `roundtrip.rs`'s equivalent split was updated
+// with the IDL and this one was not, which is how a message can be listed
+// as fd-less here while its generated `decode` demands an fd -- every call
+// to it dying at `FdCountMismatch` before reaching a single argument read,
+// with the fuzzer reporting no crash.
+impl_decode_msg_with_fd!(FrameReady, Attach, SessionDesignation, PowerboxDesignated);
 
 /// One panic-free-and-round-trips-if-it-decodes wrapper per message type,
 /// unified behind this shape so the fuzz target body is a single indexed
@@ -287,16 +303,24 @@ macro_rules! decoder_table {
 /// that assumption, so a table written in any other order silently points every
 /// checked-in seed at a decoder it does not claim.
 ///
-/// It really had drifted. `vitrin_principal.attention` and the two layout mints
-/// were appended to the END of this table instead of inserted where the IDL puts
-/// them, which moved every later index and left the `attach_with_fd` seed
-/// feeding an fd to `get_seat` -- an immediate `FdCountMismatch`, so the one
-/// seed that exercises the fd path exercised nothing. Nothing caught it because
+/// It really had drifted, twice. `vitrin_principal.attention` and the two layout
+/// mints were appended to the END of this table instead of inserted where the IDL
+/// puts them, which moved every later index and left the `attach_with_fd` seed
+/// feeding an fd to `get_seat` -- an immediate `FdCountMismatch`, so the one seed
+/// that exercises the fd path exercised nothing. Nothing caught it because
 /// `fuzz/` is its own cargo workspace and no CI job ran `cargo test` inside it.
-/// WS-E.2.1 reorders the table and adds that job step in the same commit.
+/// WS-E.2.1 reordered the table and added that job step in the same commit -- and
+/// left `vitrin_shim_session`'s five requests and four events interleaved in the
+/// wrong order anyway, undetected for the same reason the first drift was: the
+/// only checks that read this order read it at the three indices a seed happens
+/// to name. P2.6.5 (#189) puts the six `vitrin_shim_session` rows back where the
+/// IDL has them and adds `verify_decoder_table_order` to `fuzz/seed_corpus.py`,
+/// which compares this table against the IDL entry by entry rather than at three
+/// sampled points.
 ///
 /// Nothing may be written between the macro's parentheses but bare type names:
-/// `seed_corpus_reachability.rs` parses this invocation out of the source.
+/// `seed_corpus_reachability.rs` and `seed_corpus.py` both parse this invocation
+/// out of the source.
 static DECODERS: &[Decoder] = decoder_table!(
     Hello,
     HandshakeSync,
@@ -309,6 +333,7 @@ static DECODERS: &[Decoder] = decoder_table!(
     GetLauncher,
     GetLayoutFocus,
     GetLayoutArrange,
+    GetPowerbox,
     Resolved,
     Refused,
     ConsentStateEvent,
@@ -321,12 +346,13 @@ static DECODERS: &[Decoder] = decoder_table!(
     CreateSurface,
     GetSeat,
     SessionSelection,
+    SessionPointerConstraint,
+    SessionIdleInhibit,
     Configure,
     RequestSelection,
     OfferSelection,
-    SessionPointerConstraint,
     SessionPointerConstraintState,
-    SessionIdleInhibit,
+    SessionDesignation,
     Attach,
     Damage,
     Commit,
@@ -346,6 +372,10 @@ static DECODERS: &[Decoder] = decoder_table!(
     Launched,
     LayoutFocus,
     LayoutSetFullscreen,
+    PowerboxRequestFile,
+    PowerboxRequestDir,
+    PowerboxDesignated,
+    PowerboxRefused,
 );
 
 fuzz_target!(|data: &[u8]| {

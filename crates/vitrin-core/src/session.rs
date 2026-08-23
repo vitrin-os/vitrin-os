@@ -10675,9 +10675,30 @@ mod tests {
         // so an app cannot suppress a blank in a realm nobody is looking at.
         // Being derived from no grant, it adds no verb whose requests the
         // server could fail to enforce. That is D-042, not this invariant.
+        // Re-pinned 48 -> 54 by P2.6.5 (issue #189), decision taken rather
+        // than skipped, and this is the largest single addition the pin has
+        // taken. The six added messages are `vitrin_grant.get_powerbox` (a
+        // structural mint), `vitrin_shim_session.designation` (an event on the
+        // shim bootstrap object, on the shim connection class no principal can
+        // address), and the four messages of the new `vitrin_powerbox` facet:
+        // `request_file`, `request_dir`, `designated`, `refused`. None is a
+        // request on either layout interface, and none adds an arrangement
+        // this scene cannot honour -- the powerbox draws a picker on the
+        // consent stack, which composites at the OUTPUT stage above every
+        // principal's content and is therefore not something an arrangement
+        // can reach in the first place (invariant 3).
+        // This addition DOES allocate a verb bit -- `designate_file` (64), so
+        // `Verb::VALID_MASK` moves 575 -> 639, the first time this comment has
+        // had to write that. Invariant 2 survives it for a reason that is
+        // stated rather than assumed: the verb adds no request that arranges,
+        // stacks, or routes anything. It hands out file descriptors. It is
+        // also refused `unsupported` by every deployment until P2.6.6's picker
+        // and P2.6.8's consent copy exist, so no grant can carry it today --
+        // and `SERVED_VERB_BITS` deliberately does not list it, which is what
+        // makes that fail closed rather than by promise.
         assert_eq!(
             vitrin_protocol::generated::MESSAGE_COUNT,
-            48,
+            54,
             "a message was added to the IDL. If it is a request on \
              vitrin_layout_arrange or vitrin_layout_focus, D-018(2) invariant 2 is at \
              stake: this scene shows one realm, unstacked and unoverlapped, so it cannot \

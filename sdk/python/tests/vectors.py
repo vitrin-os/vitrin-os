@@ -102,8 +102,8 @@ GOLDEN_FRAME_READY = bytes(
 # independent implementation (decision D8), and a vector transcribed from the
 # transcription it is supposed to check would agree with it by construction.
 #
-# The object ids are chosen so the three structural mints and the three uses
-# form one coherent trace: grant 4 mints launcher 11, layout_focus 12 and
+# The object ids are chosen so the three pinned structural mints and the three
+# uses form one coherent trace: grant 4 mints launcher 11, layout_focus 12 and
 # layout_arrange 13, and the three use-vectors are addressed to those ids.
 # ---------------------------------------------------------------------------
 
@@ -111,9 +111,19 @@ GOLDEN_FRAME_READY = bytes(
 GOLDEN_GET_LAUNCHER = bytes([4, 0, 0, 0, 12, 0, 0, 0, 11, 0, 0, 0])
 
 # vitrin_grant.get_layout_focus{layout_focus: 12} on grant object 4 -- request
-# 1. The three mints differ ONLY in the opcode byte and the minted id, which
-# is why all three are pinned: a reordering of the requests in the IDL would
-# leave each frame individually well-formed and silently mint the wrong facet.
+# 1. The mints differ ONLY in the opcode byte and the minted id, which is why
+# each one here is pinned: a reordering of the requests in the IDL would leave
+# each frame individually well-formed and silently mint the wrong facet.
+#
+# THREE OF FOUR, since P2.6.5 (#189). `vitrin_grant` now carries a fourth
+# structural mint, `get_powerbox` at request opcode 3, and it has no vector
+# here -- not an oversight and not a claim that it needs none. These vectors
+# are asserted against an SDK encoder (`messages.encode_get_layout_focus` and
+# its siblings), the SDK has no `encode_get_powerbox` because nothing serves
+# `designate_file` yet, and a vector with no encoder to compare against would
+# pin the transcription rather than the implementation. So the reordering
+# guard described above covers requests 0-2 and not request 3; whoever gives
+# the SDK a powerbox encoder adds the fourth vector in the same change.
 GOLDEN_GET_LAYOUT_FOCUS = bytes([4, 0, 0, 0, 12, 0, 1, 0, 12, 0, 0, 0])
 
 # vitrin_grant.get_layout_arrange{layout_arrange: 13} on grant object 4 --

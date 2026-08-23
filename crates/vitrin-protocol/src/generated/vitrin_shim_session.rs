@@ -962,6 +962,128 @@ pub mod events {
             Ok((header.object_id, PointerConstraintState { serial, state }))
         }
     }
+
+    /// Event `designation` (opcode 4) on `vitrin_shim_session`.
+    ///
+    /// hand this realm one designated file descriptor
+    #[derive(Debug)]
+    pub struct Designation {
+        /// the designated file or directory descriptor; ownership transfers to the receiver, which MUST close it (not present in the byte buffer; carried out-of-band via SCM_RIGHTS)
+        pub fd: std::os::fd::OwnedFd,
+        /// the core's opaque id for this designation, matching the journal record and the asking agent's designated event
+        pub designation_id: u32,
+        /// whether the descriptor is a file or a directory subtree
+        pub kind: crate::generated::vitrin_powerbox::Kind,
+        /// the EFFECTIVE access the human approved, which may be narrower than what was asked
+        pub mode: crate::generated::vitrin_powerbox::Mode,
+        /// basename of what the human chose, for display only - never a path (max 255 bytes)
+        pub name: String,
+    }
+
+    impl Designation {
+        pub const OPCODE: u8 = 4;
+        pub const HAS_FD: bool = true;
+        /// First protocol version at which this message is defined (`message/@since`);
+        /// this opcode is not defined on a connection whose negotiated version is
+        /// lower, where using it is fatal `invalid_opcode`.
+        pub const SINCE: u32 = 2;
+
+        /// Encode into a complete frame (header + argument payload). The fd
+        /// argument, if this message has one, is not written here -- send it
+        /// out-of-band via `SCM_RIGHTS` alongside these bytes.
+        pub fn encode(&self, object_id: u32) -> Vec<u8> {
+            let mut out = Vec::new();
+            crate::wire::FrameHeader {
+                object_id,
+                size: 0,
+                opcode: Self::OPCODE,
+                fd_count: Self::HAS_FD as u8,
+            }
+            .encode_with_placeholder_size(&mut out);
+            crate::wire::write_uint(&mut out, self.designation_id);
+            crate::wire::write_uint(&mut out, self.kind.to_wire());
+            crate::wire::write_uint(&mut out, self.mode.to_wire());
+            crate::wire::write_string(&mut out, &self.name, 255);
+            crate::wire::patch_size(&mut out);
+            out
+        }
+
+        /// Decode a complete frame (header + argument payload) plus, iff
+        /// `Self::HAS_FD`, the fd received alongside it out-of-band. Returns the
+        /// frame's `object_id` (routing data the caller's dispatcher needs)
+        /// alongside the decoded message.
+        ///
+        /// `docs/protocol/00-conventions.md` 2.4/5.2 define `fd_violation` as two
+        /// independent disjuncts, both checked here: the header's own `fd_count`
+        /// byte disagreeing with this message's signature, and the out-of-band
+        /// `fd` parameter disagreeing with it. A hostile or buggy peer can make
+        /// either one lie without the other, so neither check substitutes for
+        /// the other.
+        ///
+        /// The header's `opcode` and `size` fields are validated in the same
+        /// defense-in-depth spirit: the dispatcher already selected this message
+        /// type by opcode and delimited the frame by size, but a dispatcher bug
+        /// (or a header whose size field lies about the delivered byte count,
+        /// fatal `oversized` per conventions 2.1) must surface as an error here,
+        /// not as a silently mis-decoded message.
+        pub fn decode(
+            bytes: &[u8],
+            fd: Option<std::os::fd::OwnedFd>,
+        ) -> Result<(u32, Self), crate::error::DecodeError> {
+            if fd.is_some() != Self::HAS_FD {
+                return Err(crate::error::DecodeError::FdCountMismatch {
+                    expected: Self::HAS_FD as u8,
+                    actual: fd.is_some() as u8,
+                });
+            }
+            let header = crate::wire::FrameHeader::decode(bytes)?;
+            if header.opcode != Self::OPCODE {
+                return Err(crate::error::DecodeError::OpcodeMismatch {
+                    expected: Self::OPCODE,
+                    actual: header.opcode,
+                });
+            }
+            if header.size as usize != bytes.len() {
+                return Err(crate::error::DecodeError::SizeMismatch {
+                    declared: header.size,
+                    actual: bytes.len(),
+                });
+            }
+            if header.fd_count != Self::HAS_FD as u8 {
+                return Err(crate::error::DecodeError::FdCountMismatch {
+                    expected: Self::HAS_FD as u8,
+                    actual: header.fd_count,
+                });
+            }
+            #[allow(unused_mut)]
+            let mut pos = crate::wire::HEADER_LEN;
+            let fd = fd.expect("fd presence already validated above");
+            let designation_id = crate::wire::read_uint(bytes, &mut pos)?;
+            let kind = crate::generated::vitrin_powerbox::Kind::from_wire(crate::wire::read_uint(
+                bytes, &mut pos,
+            )?)?;
+            let mode = crate::generated::vitrin_powerbox::Mode::from_wire(crate::wire::read_uint(
+                bytes, &mut pos,
+            )?)?;
+            let name = crate::wire::read_string(bytes, &mut pos, 255)?;
+            if pos != bytes.len() {
+                return Err(crate::error::DecodeError::TrailingBytes {
+                    consumed: pos,
+                    total: bytes.len(),
+                });
+            }
+            Ok((
+                header.object_id,
+                Designation {
+                    fd,
+                    designation_id,
+                    kind,
+                    mode,
+                    name,
+                },
+            ))
+        }
+    }
 }
 
 /// Enum `selection_status` on `vitrin_shim_session`.

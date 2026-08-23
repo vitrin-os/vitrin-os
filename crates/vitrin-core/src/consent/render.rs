@@ -179,9 +179,13 @@ const EXPIRY_UNBOUNDED: &str = "no time limit - bounded only by the choice below
 /// actually grant fails a test here rather than silently rendering as nothing
 /// on a consent prompt. It is deliberately pinned to the *served* set, not to
 /// [`Verb::VALID_MASK`]: the wire defines verbs this core refuses
-/// `unsupported` at admission (D-017/D-018, and `realm_launch`, whose facet
-/// this core does not yet serve), and a verb that can never reach a prompt
-/// must not get prompt copy that implies it can.
+/// `unsupported` at admission (D-017/D-018 — `realm_launch` was in that list
+/// until WS-E.1.1 gave it a facet, a chokepoint arm and prompt copy, and it
+/// is served now), and a verb that can never reach a prompt
+/// must not get prompt copy that implies it can. `designate_file` (P2.6.5) is
+/// the standing example alongside `observe_cursor`: the bit is on the wire and
+/// this table names it nowhere, because writing its copy is P2.6.8's whole
+/// deliverable and a verb is not served until that copy exists.
 ///
 /// A served-set pin alone would let a newly appended IDL verb slip past this
 /// module in silence — [`crate::grants::UNSERVED_VERB_BITS`] is *derived* from
@@ -798,9 +802,20 @@ mod tests {
         // that has not moved: per-principal cursor *delivery* is still M2's
         // (D-017/D-019 both say so in as many words), so serving the verb
         // would widen a capture with a cursor the core does not have.
+        //
+        // **Re-pinned by P2.6.5 (issue #189) in the other direction** — the
+        // first time this pin has *grown*. `designate_file` (64) is appended
+        // to the IDL and is classified **unserved**, deliberately and not for
+        // lack of time: Q13's rule is that no verb is served before its
+        // human-readable consent copy exists (P2.6.8), and there is no picker
+        // to mint a descriptor either (P2.6.6). So it gets **no catalogue
+        // line above** — a line here would be prompt copy for a verb no
+        // petition can ever carry to a prompt, which is the exact failure the
+        // second assertion in this test forbids. When P2.6.8 writes the copy,
+        // this pin shrinks again and a line goes in above, in one change.
         assert_eq!(
             crate::grants::UNSERVED_VERB_BITS,
-            Verb::OBSERVE_CURSOR.bits(),
+            (Verb::OBSERVE_CURSOR | Verb::DESIGNATE_FILE).bits(),
             "the IDL defines a verb this module has not classified as served \
              or unserved (D-017/D-018)"
         );

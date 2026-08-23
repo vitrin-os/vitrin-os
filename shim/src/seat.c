@@ -104,8 +104,22 @@ _Static_assert(VITRIN_SHIM_SEAT_EVT_GESTURE_END_OPCODE < VITRIN_SEAT_EVENT_SLOTS
  * `vitrin_shim_session.idle_inhibit`, a REQUEST on the session bootstrap object.
  * It is not a `vitrin_shim_seat` event, so `VITRIN_SEAT_EVENT_SLOTS` is
  * unchanged, `gesture_end` is still that interface's last event, and
- * `delivered[]` is untouched. */
-_Static_assert(VITRIN_MESSAGE_COUNT == 48,
+ * `delivered[]` is untouched.
+ *
+ * Re-pinned 48 -> 54 by P2.6.5 (issue #189), same check made rather than
+ * waved through, and this is the largest single append the pin has taken.
+ * The six added messages are `vitrin_grant.get_powerbox`,
+ * `vitrin_shim_session.designation`, and the four messages of the new
+ * `vitrin_powerbox` interface. NONE is a `vitrin_shim_seat` event:
+ * `gesture_end` is still that interface's last event, so
+ * `VITRIN_SEAT_EVENT_SLOTS` is unchanged, no new `_Static_assert` belongs
+ * above, and `delivered[]` is untouched.
+ *
+ * One of the six IS a core -> shim event carrying an fd -- `designation`, the
+ * first in this protocol. It does not reach this file (it is addressed to
+ * VITRIN_SESSION_ID, not to the seat), and this transport does not implement
+ * receiving an fd at all; see `wire.h` for what P2.6.7 owes there. */
+_Static_assert(VITRIN_MESSAGE_COUNT == 54,
 	"a message was appended to the IDL -- read the paragraph above before touching "
 	"delivered[]");
 

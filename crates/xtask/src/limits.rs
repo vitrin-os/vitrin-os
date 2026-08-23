@@ -436,6 +436,19 @@ pub enum Source {
         dir: &'static str,
         suffix: &'static str,
     },
+    /// Count the occurrences of `needle` in a single file.
+    ///
+    /// The value is that count in decimal. Same shape and same justification
+    /// as [`Source::FileCount`] -- a published number that is the size of a
+    /// set whose honest canonical source is the set itself -- for the case
+    /// where the set lives inside one file rather than one per file. The
+    /// interface count in `protocol/vitrin-v0.xml` is exactly that: the IDL
+    /// carries no total, and writing one into it so this table could read it
+    /// would be inventing the second copy the row exists to remove.
+    Occurrences {
+        path: &'static str,
+        needle: &'static str,
+    },
 }
 
 /// One value to read out of a [`Source::File`].
@@ -597,6 +610,10 @@ const PROFILE: &str = "packaging/apparmor/vitrind";
 /// The decision log. A `**Status:**` line is a status word, not a register --
 /// see the warning above.
 const DECISIONS: &str = "docs/plan/20-decision-log.md";
+/// The wire protocol IDL -- CLAUDE.md's "source of truth for every interface",
+/// and therefore the canonical set behind every published interface count and
+/// every published interface table.
+const IDL_PATH: &str = "protocol/vitrin-v0.xml";
 
 /// Directories whose contents are third-party and must never satisfy or break
 /// an [`Evidence::AbsentFrom`] check. `shim/subprojects/` is vendored wlroots,
@@ -2764,6 +2781,38 @@ pub const DERIVED: &[Derived] = &[
             },
         ],
     },
+    Derived {
+        id: "protocol-interface-count",
+        says: "how many interfaces protocol/vitrin-v0.xml defines. The IDL is the only place \
+               that set exists; README.md states its size in one sentence and then lists the \
+               members one per table row, which is two derived renderings of one fact and \
+               historically drifts as a pair.",
+        issue: "Refs #189: adding vitrin_powerbox took the IDL to fifteen interfaces and \
+                docs/book/src/05-the-wire-protocol.md's table to fifteen rows, while README.md \
+                kept saying fourteen above a fourteen-row table. Nothing in CI was red, because \
+                nothing read either number.",
+        // Counted out of the IDL rather than read from a total written beside
+        // it: the IDL carries no total, and adding one so this row could read
+        // it would create the second copy the row exists to remove. The
+        // newline anchor keeps a `<interface` inside a `<description>` from
+        // counting.
+        source: Source::Occurrences {
+            path: IDL_PATH,
+            needle: "\n  <interface name=\"",
+        },
+        // One rendering, because README.md is the only surface that states the
+        // COUNT in words. The other half of the pair -- that the tables list
+        // exactly these interfaces, by name and in the IDL's order -- is a SET
+        // and not a string, so it is held by
+        // `the_published_interface_tables_are_the_idls_interface_list` below
+        // rather than here. Splitting them is the same division the
+        // `verb-valid-mask` row and its set-half test already use.
+        renderings: &[Rendering {
+            path: README,
+            render: interfaces_at_wire_version,
+            context: " interfaces at wire version",
+        }],
+    },
 ];
 
 /// Code-to-code mirrors: a value duplicated in a second file, with a comment
@@ -2912,6 +2961,87 @@ pub const MIRRORS: &[Derived] = &[
             context: "pub(crate) const MAX_LIVE_REALMS: usize = ",
         }],
     },
+    Derived {
+        id: "verb-valid-mask",
+        says: "the `vitrin_grant.verb` bitfield's VALID_MASK -- the boundary between a \
+               recoverable `unsupported` and a fatal `invalid_argument`. It moves whenever \
+               an epic allocates a verb bit, and the renderings below restate it as a \
+               literal, on purpose: re-pinning each is what forces a human to classify \
+               the new bit rather than let it widen the mask silently. The last two \
+               renderings read the IDL's normative paragraph, which states the mask in \
+               two further registers -- how many bits it defines, and the lowest bit it \
+               leaves out as its example of one that is still fatal. Both are pure \
+               functions of the same constant, so neither is a second value to keep.",
+        issue: "Refs #189: the plan's re-pin registry named three sites, and measured \
+                against the tree it was wrong in both directions -- attention.rs holds a \
+                literal pin and was not named, and test_verb_parity.py holds no literal at \
+                all. Following that list on the next verb would have left attention.rs red. \
+                The list is now checked here rather than remembered. The same review then \
+                found protocol/vitrin-v0.xml -- the file CLAUDE.md makes normative over \
+                every prose page -- stating the count, the mask and the reserved-bit \
+                example all three wrong, behind a fully green build.",
+        // The generated constant, not either test's copy of it: a row whose
+        // source is one of the surfaces it holds would agree with its own
+        // drift.
+        source: Source::File {
+            path: "crates/vitrin-protocol/src/generated/vitrin_grant.rs",
+            reads: &[Read {
+                after: "pub const VALID_MASK: u32 = ",
+                shape: Shape::UpTo(";"),
+            }],
+        },
+        renderings: &[
+            Rendering {
+                path: "crates/vitrin-protocol/tests/decode_errors.rs",
+                render: verb_mask_assert,
+                context: "Verb::VALID_MASK, ",
+            },
+            Rendering {
+                path: "crates/vitrin-core/src/attention.rs",
+                render: verb_mask_assert,
+                context: "Verb::VALID_MASK, ",
+            },
+            Rendering {
+                path: "docs/plan/02-phase-2-semantic-epochs.md",
+                render: verb_mask_plan_sentence,
+                context: "`Verb::VALID_MASK` is **",
+            },
+            Rendering {
+                path: "docs/protocol/04-vitrin_grant.md",
+                render: verb_mask_page_sentence,
+                context: "`VALID_MASK` is therefore **",
+            },
+            Rendering {
+                path: "docs/plan/20-decision-log.md",
+                render: verb_mask_log_sentence,
+                context: "`Verb::VALID_MASK == ",
+            },
+            // The IDL's protocol-level `<description>`, which CLAUDE.md makes
+            // normative over every prose page restating it. It states the mask
+            // twice over -- as a count of defined bits and as the decimal --
+            // and neither was in any table until P2.6.5's review read the
+            // paragraph by hand and found both wrong. Two renderings rather
+            // than one because the paragraph carries two registers, which is
+            // the shape `Rendering`'s own doc comment prescribes.
+            Rendering {
+                path: "protocol/vitrin-v0.xml",
+                render: verb_mask_idl_defined_count,
+                context: " defined verb bits (value ",
+            },
+            // ...and the third number in the same sentence: the example it
+            // gives of a bit that is still fatal. This one is what made the
+            // stale paragraph a self-contradiction rather than a stale
+            // decimal -- it named 64, which this very branch had just defined
+            // as `designate_file`, so the normative file said a petition for
+            // 64 was fatal on the same day the core began answering it
+            // `unsupported`.
+            Rendering {
+                path: "protocol/vitrin-v0.xml",
+                render: verb_mask_lowest_undefined_bit,
+                context: "(for example value ",
+            },
+        ],
+    },
 ];
 
 // ---------------------------------------------------------------------------
@@ -3008,6 +3138,10 @@ pub const COVERED_DERIVED: &[&str] = &[
     // the filter adds on a real kernel. It was spelled as an English word on
     // three surfaces and existed as a literal nowhere.
     "seccomp-rows-demonstrated",
+    // #189's. The first row whose canonical source is the IDL rather than a
+    // Rust constant or a measurement, and the first whose set-half is held by
+    // a test rather than by a second rendering.
+    "protocol-interface-count",
 ];
 
 /// Every code-to-code mirror this gate covers. Same contract as
@@ -3017,6 +3151,7 @@ pub const COVERED_MIRRORS: &[&str] = &[
     "demo-identity",
     "demo-token",
     "max-live-realms-mirrors-the-surface-cap",
+    "verb-valid-mask",
 ];
 
 /// Hold a table to its coverage roll: same ids, no duplicates, order free.
@@ -3199,6 +3334,96 @@ fn kernels_on_n_of_them(v: &[String]) -> String {
 
 fn core_fd_define(v: &[String]) -> String {
     format!("#define VITRIN_CORE_FD {}", v[0])
+}
+
+/// `1 | 2 | 4 | 8 | 16 | 32 | 64 | 512` -> `639`.
+///
+/// The generated constant is an OR of the IDL's entry values, and every
+/// surface below states the decimal. Summing here rather than reading a second
+/// decimal from somewhere is the whole point of the row: there is one
+/// definition, and the renderings are renderings.
+///
+/// `None` rather than a panic when a term does not parse, so that
+/// `changing_the_canonical_value_alone_fails_every_rendering` -- which
+/// perturbs the read value by appending a marker to it -- exercises this row
+/// like every other instead of aborting the whole test.
+fn verb_mask_bits(v: &[String]) -> Option<u32> {
+    let mut mask = 0u32;
+    for term in v[0].split('|') {
+        mask |= term.trim().parse::<u32>().ok()?;
+    }
+    Some(mask)
+}
+
+/// The decimal, or a form no surface can contain when the source is not an OR
+/// of decimals -- never a value that might accidentally match.
+fn verb_mask_decimal(v: &[String]) -> String {
+    match verb_mask_bits(v) {
+        Some(mask) => mask.to_string(),
+        None => format!("<not-an-or-of-decimals:{}>", v[0].trim()),
+    }
+}
+
+fn verb_mask_assert(v: &[String]) -> String {
+    format!("Verb::VALID_MASK, {})", verb_mask_decimal(v))
+}
+
+fn verb_mask_plan_sentence(v: &[String]) -> String {
+    format!("`Verb::VALID_MASK` is **{}** today", verb_mask_decimal(v))
+}
+
+fn verb_mask_page_sentence(v: &[String]) -> String {
+    match verb_mask_bits(v) {
+        Some(mask) => format!("`VALID_MASK` is therefore **{mask}** (`{mask:#x}`)"),
+        None => format!("`VALID_MASK` is therefore **{}**", verb_mask_decimal(v)),
+    }
+}
+
+fn verb_mask_log_sentence(v: &[String]) -> String {
+    format!("`Verb::VALID_MASK == {}`", verb_mask_decimal(v))
+}
+
+/// The IDL's own register for the mask: *"any combination of the eight defined
+/// verb bits (value 639)"*. The count is the mask's population count rather
+/// than a second number to keep in step -- a verb entry is one bit by
+/// construction, and the enum's values are immutable, so the two can only
+/// disagree by the mask being wrong.
+fn verb_mask_idl_defined_count(v: &[String]) -> String {
+    let count = match verb_mask_bits(v) {
+        Some(mask) => number_word(&mask.count_ones().to_string()),
+        // Deliberately a form no surface can contain, for the same reason
+        // `verb_mask_decimal` has one: a value that failed to parse must not
+        // render as something a page might legitimately say.
+        None => "<not-an-or-of-decimals>".to_string(),
+    };
+    format!("{count} defined verb bits (value {})", verb_mask_decimal(v))
+}
+
+/// The same sentence's example of a bit that is still **fatal**: the lowest
+/// power of two the mask leaves out.
+///
+/// This is the number the paragraph got wrong, and the derivation is the point.
+/// Written by hand it names whichever bit was unallocated when the sentence was
+/// written; derived, it moves the day that bit is defined -- which is the day
+/// the sentence stops being true, because a defined bit is answered
+/// `unsupported` rather than killing the connection.
+fn verb_mask_lowest_undefined_bit(v: &[String]) -> String {
+    match verb_mask_bits(v) {
+        Some(mask) => {
+            let bit = (0..32)
+                .map(|shift| 1u32 << shift)
+                .find(|bit| mask & bit == 0)
+                .expect("a u32 mask cannot contain all 32 bits and still be a verb set");
+            format!("(for example value {bit})")
+        }
+        None => format!("(for example value {})", verb_mask_decimal(v)),
+    }
+}
+
+/// `15` -> `15 interfaces at wire version`, README's one sentence stating the
+/// size of the IDL's interface set.
+fn interfaces_at_wire_version(v: &[String]) -> String {
+    format!("{} interfaces at wire version", v[0])
 }
 
 fn py_demo_identity(v: &[String]) -> String {
@@ -4016,6 +4241,21 @@ fn read_source(root: &Path, source: &Source) -> Result<Vec<String>, String> {
             }
             Ok(vec![count.to_string()])
         }
+        Source::Occurrences { path, needle } => {
+            let text = fs::read_to_string(root.join(path))
+                .map_err(|err| format!("cannot read the canonical source {path}: {err}"))?;
+            let count = text.matches(needle).count();
+            if count == 0 {
+                return Err(format!(
+                    "{path} does not contain {needle:?} even once. The published sentences \
+                     derive their number from that set, and a set that has become empty would \
+                     render as `0` on every surface rather than failing -- which is the vacuity \
+                     this refuses. Either the definition was reworded or the row is aimed at \
+                     the wrong file."
+                ));
+            }
+            Ok(vec![count.to_string()])
+        }
     }
 }
 
@@ -4075,6 +4315,7 @@ fn source_path(source: &Source) -> &'static str {
     match source {
         Source::File { path, .. } => path,
         Source::FileCount { dir, .. } => dir,
+        Source::Occurrences { path, .. } => path,
     }
 }
 
@@ -4796,6 +5037,247 @@ mod tests {
             .and_then(Path::parent)
             .expect("crates/xtask -> crates -> workspace root")
             .to_path_buf()
+    }
+
+    /// **The half a `Derived` row cannot hold: the SET of literal
+    /// `Verb::VALID_MASK` pins, not their values.**
+    ///
+    /// The `verb-valid-mask` row above holds every rendering it names in
+    /// agreement with the generated constant. It is blind to a pin it does
+    /// *not* name -- which is precisely how the re-pin registry in
+    /// `docs/plan/02-phase-2-semantic-epochs.md` §5 came to list three sites
+    /// of which one held no literal and one that did was missing
+    /// (`crates/vitrin-core/src/attention.rs`, added by WS-E.4.2 and never
+    /// registered). Following that list on the next verb bit would have left
+    /// `attention.rs` red for a reason its author had already written down.
+    ///
+    /// So this scans the tree for the literal and asserts two things: the set
+    /// of files holding one is exactly the set the row renders into, and the
+    /// registry paragraph names each of them by path.
+    ///
+    /// **Its honest bound**: it matches the one spelling a pin has ever taken,
+    /// `Verb::VALID_MASK, <decimal>`. A pin written against a hex literal, or
+    /// through a re-export under another name, is invisible to it. That is
+    /// narrower than "every pin" and is said here rather than implied.
+    #[test]
+    fn the_verb_mask_literal_pins_are_exactly_the_sites_the_registry_names() {
+        const REGISTRY: &str = "docs/plan/02-phase-2-semantic-epochs.md";
+        let root = root();
+        let row = MIRRORS
+            .iter()
+            .find(|d| d.id == "verb-valid-mask")
+            .expect("the row this test is the set-half of");
+        let values = read_source(&root, &row.source).expect("the generated constant");
+        let mask = verb_mask_decimal(&values);
+        let needle = format!("Verb::VALID_MASK, {mask}");
+
+        let mut found: Vec<String> = Vec::new();
+        collect_rust_sources_with(&root.join("crates"), &root, &needle, &mut found);
+        found.sort();
+
+        // Every rendering of the row that is a Rust source is a pin site; the
+        // documents are not. Derived from the row so the two cannot disagree.
+        let mut expected: Vec<String> = row
+            .renderings
+            .iter()
+            .map(|r| r.path.to_string())
+            .filter(|p| p.ends_with(".rs"))
+            .collect();
+        expected.sort();
+
+        // Non-vacuity first: a scan that found nothing would make the
+        // equality below trivially true if the row ever lost its Rust
+        // renderings too.
+        assert!(
+            !found.is_empty(),
+            "no file holds {needle:?}. Either the pins were deleted -- which is a              decision, not a cleanup -- or this scan stopped matching the spelling              a pin takes."
+        );
+        assert_eq!(
+            found, expected,
+            "the set of files pinning `Verb::VALID_MASK` at its literal value is not              the set `verb-valid-mask` renders into. A pin the row does not name is a              pin nothing holds to the generated constant, and it is what the re-pin              registry in {REGISTRY} will send the next author past."
+        );
+
+        let registry = fs::read_to_string(root.join(REGISTRY)).expect("the plan document");
+        for path in &expected {
+            assert!(
+                registry.contains(path.as_str()),
+                "{REGISTRY} does not name {path} among the sites to re-pin. That list is                  followed by whoever lands the next verb bit; a site missing from it is a                  red test they will meet without having been told why."
+            );
+        }
+    }
+
+    /// The book's wire-protocol chapter. It carries the second published table
+    /// of the IDL's interfaces; `README.md` carries the first. Declared here
+    /// rather than beside the other surface paths because only the test below
+    /// reads it -- a surface constant no shipping table names is dead code in
+    /// the binary, and silencing that with an `allow` would hide the next one
+    /// that really is orphaned.
+    const BOOK_WIRE: &str = "docs/book/src/05-the-wire-protocol.md";
+
+    /// **The half the `protocol-interface-count` row cannot hold: the SET of
+    /// interfaces, not its size.**
+    ///
+    /// `README.md` and `docs/book/src/05-the-wire-protocol.md` each publish a
+    /// table with one row per interface in `protocol/vitrin-v0.xml`. A
+    /// `Derived` row can hold README's *sentence* stating how many there are;
+    /// no string comparison can hold fifteen table rows to fifteen IDL
+    /// elements.
+    ///
+    /// It is not hypothetical. P2.6.5 (#189) added `vitrin_powerbox` to the
+    /// IDL and to the book's table and left README at fourteen rows saying
+    /// "14 interfaces", and every gate in this repo stayed green: the count
+    /// was in nobody's table and the two published tables were compared to
+    /// nothing, not even to each other.
+    ///
+    /// So this reads the IDL and both tables and requires all three to be the
+    /// same list **in the same order** -- the order matters because both
+    /// tables are read as an index into the IDL, and a reader who finds them
+    /// permuted has to check every row to learn that nothing is missing.
+    ///
+    /// **Its honest bound**: it matches the one shape both tables have ever
+    /// taken -- a leading table cell whose first backticked token is the
+    /// interface name. A table rewritten into prose, or into a definition
+    /// list, becomes invisible to it, which is why the emptiness assertions
+    /// below are separate from the equality ones.
+    #[test]
+    fn the_published_interface_tables_are_the_idls_interface_list() {
+        let root = root();
+        let idl = idl_interfaces(&root);
+        // Non-vacuity: an IDL scan that matched nothing would make every
+        // comparison below trivially true against two empty tables.
+        assert!(
+            idl.len() >= 15,
+            "protocol/vitrin-v0.xml scanned to {} interface(s). It has defined at \
+             least fifteen since P2.6.5, so this scan is broken rather than the IDL.",
+            idl.len()
+        );
+
+        for (path, heading) in [
+            (README, "## Protocol v0 interfaces"),
+            (BOOK_WIRE, "## The interfaces"),
+        ] {
+            let text = fs::read_to_string(root.join(path)).expect("the surface exists");
+            let published = table_interfaces(&text, heading);
+            assert!(
+                !published.is_empty(),
+                "{path}: no interface row found under {heading:?}. Either the section \
+                 was renamed or the table was rewritten into a shape this scan cannot \
+                 read -- and an empty list would otherwise be compared to the IDL and \
+                 simply reported as fifteen missing rows."
+            );
+            assert_eq!(
+                published, idl,
+                "{path}: the interface table under {heading:?} is not \
+                 protocol/vitrin-v0.xml's interface list. The IDL is the source of \
+                 truth (CLAUDE.md); a table row missing from it, extra in it, or out \
+                 of its order is drift on a published surface, and the count sentence \
+                 the `protocol-interface-count` row holds cannot see it."
+            );
+        }
+
+        // README links each row to its prose page, and CLAUDE.md's protocol
+        // authoring rule makes that page mandatory. A row pointing at a page
+        // that does not exist is a dead link this test can refuse for free.
+        let readme = fs::read_to_string(root.join(README)).expect("README.md");
+        let links = table_links(&readme, "## Protocol v0 interfaces");
+        assert_eq!(
+            links.len(),
+            idl.len(),
+            "README.md's interface table has {} linked rows for {} interfaces.",
+            links.len(),
+            idl.len()
+        );
+        for link in links {
+            assert!(
+                root.join(&link).is_file(),
+                "README.md's interface table links to {link}, which does not exist. \
+                 Every interface has a prose page (CLAUDE.md's protocol authoring \
+                 rule); a wrong page number here is a broken link on the front page."
+            );
+        }
+    }
+
+    /// Every `<interface name="...">` in the IDL, in declaration order.
+    fn idl_interfaces(root: &Path) -> Vec<String> {
+        let xml = fs::read_to_string(root.join(IDL_PATH)).expect("the IDL");
+        xml.lines()
+            .filter_map(|line| line.trim().strip_prefix("<interface name=\""))
+            .filter_map(|rest| rest.split('"').next().map(str::to_string))
+            .collect()
+    }
+
+    /// The first backticked token of each row of the first Markdown table
+    /// under `heading`, keeping only the ones that name an interface.
+    fn table_interfaces(text: &str, heading: &str) -> Vec<String> {
+        table_rows(text, heading)
+            .filter_map(|cell| cell.split('`').nth(1).map(str::to_string))
+            .filter(|name| name.starts_with("vitrin_"))
+            .collect()
+    }
+
+    /// The Markdown link target of each row of that same table.
+    fn table_links(text: &str, heading: &str) -> Vec<String> {
+        table_rows(text, heading)
+            .filter_map(|cell| cell.split_once("](").map(|(_, rest)| rest))
+            .filter_map(|rest| rest.split(')').next().map(str::to_string))
+            .collect()
+    }
+
+    /// The first cell of every row of the first Markdown table under
+    /// `heading`. Header and separator rows carry no backticks and no link, so
+    /// the two callers above drop them without a special case.
+    fn table_rows<'a>(text: &'a str, heading: &str) -> impl Iterator<Item = &'a str> {
+        let start = text
+            .find(heading)
+            .unwrap_or_else(|| panic!("no {heading:?} section"));
+        let mut in_table = false;
+        text[start..]
+            .lines()
+            .skip(1)
+            .take_while(move |line| {
+                if line.starts_with("## ") {
+                    return false;
+                }
+                if line.starts_with('|') {
+                    in_table = true;
+                    return true;
+                }
+                // Prose before the table is skipped; the first non-row line
+                // after it ends the table.
+                !in_table
+            })
+            .filter(|line| line.starts_with('|'))
+            .map(|line| line.trim_start_matches('|').split('|').next().unwrap_or(""))
+    }
+
+    /// Recursive `*.rs` walk collecting workspace-relative paths whose text
+    /// contains `needle`. Skips `src/generated` (regenerated from the IDL, so
+    /// nothing there is a hand-maintained pin) and anything vendored.
+    fn collect_rust_sources_with(dir: &Path, root: &Path, needle: &str, out: &mut Vec<String>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if is_vendored(root, &path) {
+                continue;
+            }
+            if path.is_dir() {
+                if path.file_name().is_some_and(|n| n == "generated") {
+                    continue;
+                }
+                collect_rust_sources_with(&path, root, needle, out);
+            } else if path.extension().is_some_and(|e| e == "rs")
+                && fs::read_to_string(&path).is_ok_and(|t| t.contains(needle))
+            {
+                out.push(
+                    path.strip_prefix(root)
+                        .unwrap_or(&path)
+                        .display()
+                        .to_string(),
+                );
+            }
+        }
     }
 
     /// The shipping table passes against the tree it ships with. If this fails,

@@ -19,7 +19,7 @@ pub const PROTOCOL_VERSION: u32 = 2;
 /// enumerating every message (e.g. the round-trip table) checks its own
 /// length against this, so a message added to the IDL cannot ship silently
 /// untested.
-pub const MESSAGE_COUNT: usize = 48;
+pub const MESSAGE_COUNT: usize = 54;
 
 pub mod vitrin_handshake;
 pub mod vitrin_principal;
@@ -35,3 +35,4 @@ pub mod vitrin_shim_seat;
 pub mod vitrin_launcher;
 pub mod vitrin_layout_focus;
 pub mod vitrin_layout_arrange;
+pub mod vitrin_powerbox;

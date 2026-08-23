@@ -195,6 +195,19 @@ fn header_contents(protocol: &Protocol) -> Result<String> {
     buf.line(format!("#define VITRIN_MESSAGE_COUNT {message_count}"));
 
     buf.blank();
+    let enum_count: usize = protocol.interfaces.iter().map(|i| i.enums.len()).sum();
+    buf.line("/* Total number of enums (plain and bitfield) across every interface. */");
+    buf.line("/* The same gate VITRIN_MESSAGE_COUNT gives the message list, for the */");
+    buf.line("/* enum list beside it. It exists because that list had NO gate and went */");
+    buf.line("/* stale repeatedly: shim/tests/test_header_compiles.c was silently short */");
+    buf.line("/* four enums (vitrin_shim_session's three pointer-constraint enums and */");
+    buf.line("/* its idle_inhibit_state) when P2.6.5 came to append to it, having */");
+    buf.line("/* already recorded two earlier misses in its own comment. An */");
+    buf.line("/* untype-checked validity predicate is exactly the class of check that */");
+    buf.line("/* stops checking while still compiling green. */");
+    buf.line(format!("#define VITRIN_ENUM_COUNT {enum_count}"));
+
+    buf.blank();
     buf.line("/* ==================================================================== */");
     buf.line("/* Section 1: per-interface metadata and enums.                          */");
     buf.line("/*                                                                        */");

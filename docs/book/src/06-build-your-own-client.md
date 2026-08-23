@@ -48,18 +48,18 @@ writing a Go, TypeScript or C++ SDK forks it.
 **Three things to get right, because they are what a naïve port breaks:**
 
 - **Carry every defined verb, whether or not this core serves it**
-  (`observe.cursor`, `layout.arrange`, `layout.focus`, `realm.launch`). An
+  (`observe`, `actuate.pointer`, `actuate.text`, `observe.cursor`,
+  `layout.arrange`, `layout.focus`, `designate.file`, `realm.launch`). An
   out-of-range verb bit is fatal `invalid_argument` and kills the connection.
   Omitting one turns a recoverable `unsupported` refusal into a dead socket
   for any user who petitions it. Which of them a deployment *serves* is that
-  deployment's business and can change under you — this core serves the two
-  layout verbs and `realm.launch`, and refuses `observe.cursor` — so never
-  bake the served set into a
-  client. Transcribe the *values* from the IDL rather than assuming
-  consecutive bits — `realm.launch` is 512, because 64/128/256 are allocated
-  to verbs the IDL does not define yet and are still out of range. The Python
-  SDK's `test_verb_parity.py` pins this against the IDL; write the
-  equivalent.
+  deployment's business and can change under you — this core refuses
+  `observe.cursor` and `designate.file`, and serves the other six — so never
+  bake the served set into a client. Transcribe the *values* from the IDL
+  rather than assuming consecutive bits — `realm.launch` is 512, because 128
+  and 256 are allocated to verbs the IDL does not define yet and are still out
+  of range; 64 was one of them until `designate.file` landed on it. The Python
+  SDK's `test_verb_parity.py` pins this against the IDL; write the equivalent.
 - **Model fatal versus recoverable in your type system.** If your users can
   catch a fatal error and retry, your API is lying to them. The Python SDK
   makes them separate hierarchies for this reason.

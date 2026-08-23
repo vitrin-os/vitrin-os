@@ -295,6 +295,100 @@ pub mod requests {
             Ok((header.object_id, GetLayoutArrange { layout_arrange }))
         }
     }
+
+    /// Request `get_powerbox` (opcode 3) on `vitrin_grant`.
+    ///
+    /// mint the powerbox facet for this grant
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct GetPowerbox {
+        /// the powerbox facet, born inert (confers nothing until this grant is granted with designate_file) (new_id: vitrin_powerbox)
+        pub powerbox: u32,
+    }
+
+    impl GetPowerbox {
+        pub const OPCODE: u8 = 3;
+        pub const HAS_FD: bool = false;
+        /// First protocol version at which this message is defined (`message/@since`);
+        /// this opcode is not defined on a connection whose negotiated version is
+        /// lower, where using it is fatal `invalid_opcode`.
+        pub const SINCE: u32 = 2;
+
+        /// Encode into a complete frame (header + argument payload). The fd
+        /// argument, if this message has one, is not written here -- send it
+        /// out-of-band via `SCM_RIGHTS` alongside these bytes.
+        pub fn encode(&self, object_id: u32) -> Vec<u8> {
+            let mut out = Vec::new();
+            crate::wire::FrameHeader {
+                object_id,
+                size: 0,
+                opcode: Self::OPCODE,
+                fd_count: Self::HAS_FD as u8,
+            }
+            .encode_with_placeholder_size(&mut out);
+            crate::wire::write_uint(&mut out, self.powerbox);
+            crate::wire::patch_size(&mut out);
+            out
+        }
+
+        /// Decode a complete frame (header + argument payload) plus, iff
+        /// `Self::HAS_FD`, the fd received alongside it out-of-band. Returns the
+        /// frame's `object_id` (routing data the caller's dispatcher needs)
+        /// alongside the decoded message.
+        ///
+        /// `docs/protocol/00-conventions.md` 2.4/5.2 define `fd_violation` as two
+        /// independent disjuncts, both checked here: the header's own `fd_count`
+        /// byte disagreeing with this message's signature, and the out-of-band
+        /// `fd` parameter disagreeing with it. A hostile or buggy peer can make
+        /// either one lie without the other, so neither check substitutes for
+        /// the other.
+        ///
+        /// The header's `opcode` and `size` fields are validated in the same
+        /// defense-in-depth spirit: the dispatcher already selected this message
+        /// type by opcode and delimited the frame by size, but a dispatcher bug
+        /// (or a header whose size field lies about the delivered byte count,
+        /// fatal `oversized` per conventions 2.1) must surface as an error here,
+        /// not as a silently mis-decoded message.
+        pub fn decode(
+            bytes: &[u8],
+            fd: Option<std::os::fd::OwnedFd>,
+        ) -> Result<(u32, Self), crate::error::DecodeError> {
+            if fd.is_some() != Self::HAS_FD {
+                return Err(crate::error::DecodeError::FdCountMismatch {
+                    expected: Self::HAS_FD as u8,
+                    actual: fd.is_some() as u8,
+                });
+            }
+            let header = crate::wire::FrameHeader::decode(bytes)?;
+            if header.opcode != Self::OPCODE {
+                return Err(crate::error::DecodeError::OpcodeMismatch {
+                    expected: Self::OPCODE,
+                    actual: header.opcode,
+                });
+            }
+            if header.size as usize != bytes.len() {
+                return Err(crate::error::DecodeError::SizeMismatch {
+                    declared: header.size,
+                    actual: bytes.len(),
+                });
+            }
+            if header.fd_count != Self::HAS_FD as u8 {
+                return Err(crate::error::DecodeError::FdCountMismatch {
+                    expected: Self::HAS_FD as u8,
+                    actual: header.fd_count,
+                });
+            }
+            #[allow(unused_mut)]
+            let mut pos = crate::wire::HEADER_LEN;
+            let powerbox = crate::wire::read_uint(bytes, &mut pos)?;
+            if pos != bytes.len() {
+                return Err(crate::error::DecodeError::TrailingBytes {
+                    consumed: pos,
+                    total: bytes.len(),
+                });
+            }
+            Ok((header.object_id, GetPowerbox { powerbox }))
+        }
+    }
 }
 
 pub mod events {
@@ -555,12 +649,14 @@ impl Verb {
     pub const LAYOUT_ARRANGE: Verb = Verb(16);
     /// bind the output to a view of the granted realm and direct input there - one act, because routing keys to a realm the human cannot see is focus theft in its sharpest form; exercised through vitrin_layout_focus; separate from layout_arrange because focus theft is at once the sharpest attack and the most legitimate need, so it must be attenuable alone
     pub const LAYOUT_FOCUS: Verb = Verb(32);
-    /// launch the realm template this grant addresses into a new realm instance, through the vitrin_launcher facet; the template names the program and no command ever crosses the wire, so this is authority over an operator-written template rather than over an arbitrary command; bits 64, 128 and 256 are allocated to verbs not yet defined here and were skipped rather than reused; refused unsupported in version 1, which cannot mint the facet at all, and by any deployment that does not serve it
+    /// designate one file or one directory subtree to the granted realm, through the vitrin_powerbox facet; the human picks in a core-drawn picker and what crosses the wire is a file descriptor, never a path, so this is authority to ASK for a designation rather than authority over any named file; a delivered fd is kernel authority the core cannot recall, so revocation stops future designations and kills the grant row while the payload keeps every fd already handed over until its realm dies - PRD P2's revocation is immediate and transitive is FALSE for designations already made; refused unsupported in version 1, which cannot mint the facet at all, and by every deployment until the picker (P2.6.6) and its consent copy (P2.6.8) exist
+    pub const DESIGNATE_FILE: Verb = Verb(64);
+    /// launch the realm template this grant addresses into a new realm instance, through the vitrin_launcher facet; the template names the program and no command ever crosses the wire, so this is authority over an operator-written template rather than over an arbitrary command; bits 128 and 256 are allocated to verbs not yet defined here and were skipped rather than reused, as 64 was until designate_file landed on it; refused unsupported in version 1, which cannot mint the facet at all, and by any deployment that does not serve it
     pub const REALM_LAUNCH: Verb = Verb(512);
 
     /// Union of every defined entry's bits; a wire value with any other
     /// bit set is invalid.
-    pub const VALID_MASK: u32 = 1 | 2 | 4 | 8 | 16 | 32 | 512;
+    pub const VALID_MASK: u32 = 1 | 2 | 4 | 8 | 16 | 32 | 64 | 512;
 
     /// Decode a wire value, rejecting any bit outside `VALID_MASK`.
     pub fn from_bits(value: u32) -> Result<Self, crate::error::DecodeError> {

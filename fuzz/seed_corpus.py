@@ -62,6 +62,7 @@ Two checks now stop that class of rot from returning silently:
 from __future__ import annotations
 
 import pathlib
+import re
 import struct
 import sys
 import xml.etree.ElementTree as ET
@@ -73,6 +74,10 @@ ROOT = pathlib.Path(__file__).resolve().parent
 #: below read it rather than restating it, so an IDL change that renumbers
 #: a message cannot leave a stale selector byte in a seed.
 IDL = ROOT.parent / "protocol" / "vitrin-v0.xml"
+#: The fuzz target whose `DECODERS` table the selector constants above index
+#: into. :func:`verify_decoder_table_order` reads it, so the two files cannot
+#: disagree silently.
+PROTOCOL_DECODE_RS = ROOT / "fuzz_targets" / "protocol_decode.rs"
 
 
 def u32(v: int) -> bytes:
@@ -101,8 +106,8 @@ def frame(object_id: int, opcode: int, payload: bytes, *, size_override: int | N
 # ---------------------------------------------------------------------------
 
 SEL_HELLO = 0
-SEL_FRAME_READY = 15
-SEL_ATTACH = 29
+SEL_FRAME_READY = 16
+SEL_ATTACH = 31
 
 
 def protocol_decode_seeds() -> dict[str, bytes]:
@@ -279,6 +284,95 @@ def idl_messages() -> list[Message]:
     return out
 
 
+def pascal(name: str) -> str:
+    """snake_case -> PascalCase, exactly `vitrin-scanner`'s `to_pascal_case`.
+
+    That function is what names every generated message struct, so
+    reproducing it here is what lets an IDL message name be matched against
+    the Rust type the decoder table lists.
+    """
+    return "".join(part[:1].upper() + part[1:] for part in name.split("_") if part)
+
+
+def decoder_table_entries() -> list[str]:
+    """The type names inside `protocol_decode.rs`'s `decoder_table!(...)`.
+
+    Line comments are stripped before the closing `)` is searched for, for the
+    same reason `fuzz/tests/seed_corpus_reachability.rs` strips them: a `)` or
+    `,` inside a comment would truncate or corrupt the parse, and a silently
+    short table is exactly the failure this check exists to see.
+    """
+    src = PROTOCOL_DECODE_RS.read_text()
+    start = src.index("static DECODERS")
+    open_at = src.index("decoder_table!(", start) + len("decoder_table!(")
+    body = "\n".join(line.split("//")[0] for line in src[open_at:].splitlines())
+    close = body.index(")")
+    return [t.strip() for t in body[:close].split(",") if t.strip()]
+
+
+def decoder_type_aliases() -> dict[str, tuple[str, str, str]]:
+    """`type Hello = gen::vitrin_handshake::requests::Hello;` -> the message.
+
+    The alias list is the only thing that ties a bare type name in the table
+    to an IDL message; parsing it means this check needs no second mapping to
+    go stale.
+    """
+    pattern = re.compile(
+        r"^type\s+(\w+)\s*=\s*gen::(\w+)::(requests|events)::(\w+)\s*;",
+        re.MULTILINE,
+    )
+    return {
+        m.group(1): (m.group(2), m.group(3), m.group(4))
+        for m in pattern.finditer(PROTOCOL_DECODE_RS.read_text())
+    }
+
+
+def verify_decoder_table_order() -> None:
+    """The decoder table must be the IDL's message list, entry for entry.
+
+    Every selector constant in this file is an index into that table, and the
+    table's own doc comment calls its order load-bearing -- but until P2.6.5
+    nothing compared the two. `fuzz/tests/seed_corpus_reachability.rs` asserts
+    the table's LENGTH against `MESSAGE_COUNT` and then checks the order only
+    at the two or three indices a seed happens to name, so six
+    `vitrin_shim_session` rows sat in the wrong order on `main` with every
+    check green: the events had been written before two of the requests, which
+    is not how the scanner assigns opcodes.
+
+    That is survivable only while no seed selects one of the misplaced rows.
+    It is also the precise shape of the 2026-07-25 rot the rest of this file
+    exists to stop, so it is checked here rather than remembered.
+    """
+    entries = decoder_table_entries()
+    aliases = decoder_type_aliases()
+    messages = idl_messages()
+    if len(entries) != len(messages):
+        raise SeedRotError(
+            f"protocol_decode.rs's decoder table has {len(entries)} entries and "
+            f"protocol/vitrin-v0.xml defines {len(messages)} messages. Every selector "
+            "constant in this file is an index into that table."
+        )
+    for index, (entry, msg) in enumerate(zip(entries, messages)):
+        if entry not in aliases:
+            raise SeedRotError(
+                f"protocol_decode.rs's decoder table lists {entry!r} at index {index}, "
+                "which is not one of its `type X = gen::...;` aliases -- so nothing can "
+                "say which IDL message it is"
+            )
+        interface, kind, struct = aliases[entry]
+        want = (msg.interface, msg.kind + "s", pascal(msg.name))
+        if (interface, kind, struct) != want:
+            raise SeedRotError(
+                f"protocol_decode.rs's decoder table has {entry} "
+                f"(gen::{interface}::{kind}::{struct}) at index {index}, where "
+                f"protocol/vitrin-v0.xml has {msg} "
+                f"(gen::{want[0]}::{want[1]}::{want[2]}). The table is documented as "
+                "being in IDL declaration order and every seed's selector byte is an "
+                "index into it, so an entry out of place points a seed at a decoder it "
+                "does not claim."
+            )
+
+
 #: What each `protocol_decode` seed claims, as `(selector, message, outcome)`.
 #: `outcome` is the first gate the seed is meant to reach in the generated
 #: `decode`'s fixed check order (fd presence, header, opcode, size, header
@@ -434,6 +528,13 @@ def verify_ipc_framing_seeds(seeds: dict[str, bytes]) -> None:
 def verify_seeds(all_seeds: dict[str, dict[str, bytes]]) -> int:
     """Structurally verify the seeds this script *generates*; return the count.
 
+    Plus one check that is not about a seed at all:
+    :func:`verify_decoder_table_order`, which holds the fuzz target's decoder
+    table to the IDL. It runs here because every selector byte below is an
+    index into that table, so a table out of order makes every claim in this
+    file false at once -- the check would be worthless in a place a seed
+    regeneration could skip.
+
     Raises :class:`SeedRotError` on a seed whose bytes no longer reach the
     path its name claims. Deliberately silent on success: it verifies the
     generator's output, and in ``--check`` mode that is only half the
@@ -443,6 +544,7 @@ def verify_seeds(all_seeds: dict[str, dict[str, bytes]]) -> int:
     in ``--check`` mode put a reassuring line on stdout even when the on-disk
     corpus had been altered and the FAIL lines had gone to stderr.)
     """
+    verify_decoder_table_order()
     verify_protocol_decode_seeds(all_seeds["protocol_decode"])
     verify_ipc_framing_seeds(all_seeds["ipc_framing"])
     return sum(len(s) for s in all_seeds.values())

@@ -17,8 +17,11 @@
 //! Two prior issues are the same failure class -- a green count standing in
 //! for absent evidence. #229: `tests/integration/run.sh` exited 0 while
 //! silently skipping the entire real-app ladder. #186: nine gates checked
-//! mock-freeness with a `comm` prefix test that would have gone green for the
-//! mock.
+//! mock-freeness with a `comm` prefix test that confinement had already
+//! stopped -- confined, both the real shim and the mock answered to the bind
+//! target's basename, so the test identified neither (#283 corrected the
+//! earlier telling of this, which said it "would have gone green for the
+//! mock"; it went red for the real shim and green for nothing).
 //!
 //! # The three parts, and why no two of them suffice
 //!

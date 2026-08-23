@@ -159,6 +159,18 @@ THIRD-PARTY — not ours to license
     seatd, libliftoff, libdisplay-info, v4l-utils). Only the .wrap files
     are tracked here; the fetched trees carry their own MIT/HPND/GPL/BSD
     headers and keep them.
+
+    SINCE ISSUE #283 THIS TRAVELS INTO THE BINARY. `shim/meson.build`
+    defaults to `default_library=static` (D-043), so a build that takes
+    the vendored fallback links wlroots — and, where the nested wrap is
+    used, wayland — INTO the `vitrin-shim` executable rather than beside
+    it as a `.so`. Anyone DISTRIBUTING that executable is distributing
+    those MIT/HPND works in object form and must carry their copyright
+    and permission notices with it, which the separate `.so` used to do
+    by simply being a separate file. It changes nothing about this
+    repository's own licensing, and nothing about a build that resolves
+    a SYSTEM wlroots-0.19 (still preferred by the system-first
+    `dependency()`), which embeds none of it.
   - shim/build/ and target/ are build output, not source, and are not
     tracked.
 

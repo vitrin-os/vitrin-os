@@ -16,7 +16,7 @@
 //!   is a descriptor the app inherits;
 //! - **before** the `chdir` (K14), the argv assembly and the `execve`, each of
 //!   which must therefore fall inside the granted set. A ruleset that forgets
-//!   `/vitrin/shim` does not fail here; it fails at `execve` with `EACCES`,
+//!   `/vitrin/vitrin-shim` does not fail here; it fails at `execve` with `EACCES`,
 //!   which is a realm that will not start.
 //!
 //! Ordinary Rust is allowed (this binary is single-threaded by design -- see

@@ -153,7 +153,7 @@ check_rejected clipboard-status-without-description \
 # exercising something else. It lives in
 # `crates/vitrin-protocol/tests/decode_errors.rs` instead, against the real
 # decoder and asserting the real wire code; the relocation is recorded as
-# D-043 in `docs/plan/20-decision-log.md` so the criterion reads as moved
+# D-045 in `docs/plan/20-decision-log.md` so the criterion reads as moved
 # rather than dropped.
 
 # The @verb set is closed even though this issue WIDENED it. `designate_file`

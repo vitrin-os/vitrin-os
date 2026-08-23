@@ -16,6 +16,35 @@ project(
     'c_std=c11',
     'warning_level=2',
     'werror=true',
+    # ISSUE #283: anything this build VENDORS is linked INTO the shim, never
+    # loaded from beside it. Subprojects inherit this value, so it covers the
+    # pinned wlroots fallback below and every nested wrap wlroots itself might
+    # resolve.
+    #
+    # The defect it removes is not a build-tree nicety. A confined realm
+    # (`--isolation=default`) binds the shim as a single file at a fixed
+    # in-realm path, and Meson gives an executable that links a vendored
+    # SHARED library the RUNPATH `$ORIGIN/subprojects/<name>`. `$ORIGIN` is
+    # the directory the binary is EXECUTED from, so inside the realm it is
+    # the bind target's directory -- a path the realm's mount table never
+    # creates. The dynamic loader then kills the shim before `main`, and the
+    # core sees only the config channel's EOF and reports `Broken pipe`. CI
+    # always hits this, because Ubuntu ships wlroots 0.17.1 and D11 pins
+    # 0.19, so the vendored fallback is the CI configuration.
+    #
+    # Chosen over the alternative -- have the realm's mount table follow the
+    # shim's own `ldd` closure and forward `LD_LIBRARY_PATH` -- because that
+    # makes the width of a confinement boundary a function of a build flag.
+    # This keeps the mount table fixed and auditable, which is the property
+    # D-037(3) rests on. See docs/plan/20-decision-log.md D-043.
+    #
+    # HELD BY A TEST, not by this comment: `meson test loader-independence`
+    # copies the built shim to an empty directory, runs it there with a
+    # scrubbed environment, and fails if its interpreter or anything it needs
+    # falls outside the prefixes a realm mirrors (that script's
+    # REALM_LIB_PREFIXES). Overriding this option on the command line
+    # (`-Ddefault_library=shared`) is therefore loud, not silent.
+    'default_library=static',
   ],
 )
 
@@ -393,6 +422,28 @@ shim_exe = executable(
   install: true,
 )
 
+# --- The shim must load from a directory holding nothing but itself -------
+# Issue #283. A confined realm binds the shim as a lone file at a fixed
+# in-realm path, so anything the loader has to find NEXT TO the binary, or
+# anywhere else in the build tree, is a shim that dies before `main` inside
+# every realm while working perfectly on the developer's box. This test moves
+# the binary to an empty directory, empties the environment, and runs it --
+# which is the realm's condition without needing a realm.
+#
+# It is a `meson test` on the xdg-conformance precedent: it needs nothing but
+# the shim built here, no wayland-info, no weston, no GTK, no GPU, and it
+# finishes in milliseconds.
+test(
+  'loader-independence',
+  find_program('bash'),
+  args: [
+    files('tests/acceptance/loader_independence.sh'),
+    shim_exe,
+  ],
+  depends: [shim_exe],
+  timeout: 30,
+)
+
 # --- P1.9.4 advisory WLCS integration (issue #47) -----------------------
 # Builds shim/wlcs/integration.c -- together with every phase file the real
 # `vitrin-shim` executable above uses, except main.c (argv parsing, app
@@ -466,6 +517,32 @@ header_test = executable(
   include_directories: inc,
 )
 test('header-compiles', header_test)
+
+# --- The lists this tree writes down twice ------------------------------
+# Issue #283 added a fourth acceptance script to `meson test` and updated one
+# of the TWO places README.md states how many there are, so the file shipped
+# contradicting itself in the same commit whose subject was a test that stops
+# a fact coming undone silently. Issue #306 put a global into the v0 contract
+# and updated one of the TWO acceptance scripts that state it. Both lists had
+# a machine-readable source and no owner; this gives them one.
+#
+# The script derives the test names and the wired-script list from THIS FILE,
+# and the v0 global set from src/ledger.c's `vitrin_v0_contract[]`, so a
+# `test()` added or removed below is what moves the README and the C array is
+# what moves the two scripts. It builds nothing, runs nothing and needs no
+# shim -- no browser either, which is the point: the drift it caught in
+# firefox_bringup.sh was invisible to a CI job that declares that gate
+# skipped.
+test(
+  'inventories',
+  find_program('bash'),
+  args: [
+    files('tests/inventories.sh'),
+    files('meson.build'),
+    files('README.md'),
+  ],
+  timeout: 30,
+)
 
 # --- P1.6.2 acceptance harness -----------------------------------------
 # The core side of the shim wire, in C. It deliberately links NOTHING but

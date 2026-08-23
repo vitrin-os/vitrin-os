@@ -277,7 +277,7 @@ DEV_INPUT = "/dev/input"
 
 #: **The one path on this page that separates the mount table from the
 #: ruleset.** `/vitrin` is created by `vitrin-realm-init` because it has to
-#: hold `/vitrin/shim` (the shim binary) and `/vitrin/home` (the realm's
+#: hold `/vitrin/vitrin-shim` (the shim binary) and `/vitrin/home` (the realm's
 #: private storage), and both of *those* are Landlock grants. The parent
 #: directory is not, because the read set is enumerated rather than granted at
 #: a root. So it is reachable by the mount table and denied by the ruleset --
@@ -951,7 +951,7 @@ class RealConfinementJournal(_RealChain):
             file_identity(self.shim_bin),
             "the confined realm's PID 1 is not the C shim this gate named -- matched by the "
             "executing file's inode, because a confined shim runs from the bind target "
-            "/vitrin/shim and its comm is `shim` whichever binary it is",
+            "/vitrin/vitrin-shim and its comm is that basename whichever binary it is",
         )
         core.terminate()
 

@@ -132,7 +132,7 @@ fn invalid_bitfield_value_is_rejected() {
 /// 5, which asked for the case in `protocol/test-mutations.sh`.** That script
 /// mutates the IDL and asserts the RELAX NG schema rejects it; `fd_count` is
 /// a header byte the dialect cannot express, so no mutation there could prove
-/// anything about it. The relocation is D-043 in
+/// anything about it. The relocation is D-045 in
 /// `docs/plan/20-decision-log.md`, including what it does NOT cover: these
 /// are codec unit tests, not a hostile peer driven through a live `vitrind`.
 ///

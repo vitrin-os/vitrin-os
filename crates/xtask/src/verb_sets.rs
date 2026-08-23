@@ -705,7 +705,27 @@ fn walk(dir: &Path, f: &mut impl FnMut(&Path) -> Result<()>) -> Result<()> {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if entry.file_type()?.is_dir() {
-            if name == "target" || name == ".git" || name == "node_modules" {
+            // Build output and VCS metadata. `build`, `dist` and `*.egg-info`
+            // join the list because `pip install ./sdk/python` drops a COPY of
+            // every SDK source under `sdk/python/build/lib/`, markers and all,
+            // and this scan then reports two carriers nobody can register --
+            // the same file twice, under a path that is gitignored and does
+            // not exist on a fresh clone. A local pip install is a normal
+            // thing to do before running the SDK's own tests, so the gate was
+            // red for a reason that had nothing to do with a verb set.
+            //
+            // The residual, stated rather than left to be met: a REAL carrier
+            // living in a directory named `build` or `dist` is now invisible
+            // to this scan. That is the same closed-world hole this module's
+            // header already owns for unregistered carriers generally, and it
+            // is accepted on the same terms.
+            if name == "target"
+                || name == ".git"
+                || name == "node_modules"
+                || name == "build"
+                || name == "dist"
+                || name.ends_with(".egg-info")
+            {
                 continue;
             }
             walk(&path, f)?;

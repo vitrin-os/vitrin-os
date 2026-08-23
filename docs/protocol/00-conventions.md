@@ -926,10 +926,11 @@ to is recorded here or nowhere.
 > appended `vitrin_shim_session.idle_inhibit` and its `idle_inhibit_state` enum,
 > and both rows above were extended in that same edit — the first addition since
 > the rule below was written down that had the warning above already in front of
-> it. The enum count in the paragraph *above* is stated as a number ("eight")
-> *and* as a list on purpose: the number is what a reader checks the list
-> against, and a disagreement between the two is the cheapest possible way to
-> notice a drop.
+> it. The enum count in the paragraph *above* is stated as a number *and* as a
+> list on purpose: the number is what a reader checks the list against, and a
+> disagreement between the two is the cheapest possible way to notice a drop.
+> The number itself is deliberately not quoted here — a record that restates a
+> live value becomes a second copy of it, which is the drift this block records.
 >
 > **It went stale a third time by omission of an enum, and the check fired with
 > nobody acting on it.** The enum list has been short by one since the edit that
@@ -942,10 +943,12 @@ to is recorded here or nowhere.
 > count read "seven" over a list that should have held eight for the whole of
 > its life, and the number-versus-list disagreement advertised one paragraph up
 > as "the cheapest possible way to notice a drop" was sitting there to be
-> noticed the entire time. It reads "eight" now, and the enum is listed. Cheap
-> to notice is not the same as noticed: a check nobody re-runs has stopped being
-> a check, which is the failure mode this whole block exists to document rather
-> than the one it was written to prevent.
+> noticed the entire time. That sweep corrected it to eight and listed the enum;
+> the count has moved since, with each enum that landed, and the paragraph above
+> carries the current value rather than this record restating it. Cheap to notice
+> is not the same as noticed: a check nobody re-runs has stopped being a check,
+> which is the failure mode this whole block exists to document rather than the
+> one it was written to prevent.
 
 A version-1
 connection is served exactly as before: it never sees a `since="2"` event, and

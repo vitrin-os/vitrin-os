@@ -9,10 +9,10 @@ protocol spec is published early, versioned `0.x`, and explicitly tracks
 the reference implementation; every crate is `0.1.0`, the Python SDK is
 `0.1.0a0`, and Phase 1 is complete while Phase 2 has only begun: its
 confinement track has landed through the seccomp deny-list of P2.6.4 — P2.6.3
-closed on 2026-08-19 on *corrected* criteria rather than the ones its plan row
-first wrote, and the Landlock paragraph further down says what that closure
-does and does not mean — and nothing of the powerbox, the egress path or the
-semantic work exists. The other work since has been the maintainer
+was accepted on 2026-08-19 on *corrected* criteria rather than the ones its
+plan row first wrote, and the Landlock paragraph further down says what that
+acceptance does and does not mean — and nothing of the powerbox, the egress
+path or the semantic work exists. The other work since has been the maintainer
 session-mode workstream WS-E, which **D-021** scopes as dogfooding rather than
 as a phase. There has been no
 release, no external audit, and no third-party security review.
@@ -181,8 +181,9 @@ does not spend a weekend on something the project already says out loud:
   beneath them, and **no path carrying data**. The rung is journaled per realm and is
   **child-asserted**: no `/proc` file names a process's Landlock domain, so the
   core cannot corroborate it the way it corroborates the namespace inodes. Note
-  also what P2.6.3 closing on 2026-08-19 does **not** mean, since it closed on
-  its corrected criteria rather than the ones first written: the ruleset landed,
+  also what P2.6.3's acceptance on 2026-08-19 does **not** mean, since it was
+  accepted on its corrected criteria rather than the ones first written: the
+  ruleset landed,
   and so did a generated ladder table with a CI staleness gate — the
   [Landlock ABI matrix](docs/book/src/isolation-matrix.md), which states what
   this build requires of a kernel — but it measures **no** kernel. The

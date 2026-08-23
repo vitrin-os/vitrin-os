@@ -54,8 +54,8 @@
 //!    The one-rung-at-a-time descent still exists in [`create_ruleset`] and now
 //!    bottoms out at the floor; what comes back is still what the kernel
 //!    granted, never what was asked for, and the core still warns when the two
-//!    differ. **The floor narrowed #187 rather than completing it**; #187
-//!    closed on 2026-08-19 (Correction 7, D-043), and PRD §20's "coverage is
+//!    differ. **The floor narrowed #187 rather than completing it**; P2.6.3 was
+//!    accepted on 2026-08-19 (Correction 7, D-043), and PRD §20's "coverage is
 //!    kernel-dependent" caveat is answered for the five kernels #281 booted
 //!    (`docs/book/src/isolation-kernels.md`) and for no others. The multi-rung table
 //!    that *did* get built (`docs/book/src/isolation-matrix.md`, `cargo xtask

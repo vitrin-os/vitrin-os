@@ -607,11 +607,12 @@ the bullet below states in full.
   [the kernel page](docs/book/src/isolation-kernels.md): five distribution
   kernels booted under QEMU with the shipped binary, held by
   `cargo xtask kernel-matrix --check` against the boot rows checked in under
-  `tests/kernel-matrix/rows/`. P2.6.3 closed on 2026-08-19 on its *corrected*
-  criteria — one clause of the original, "one row per ABI actually reported on
-  each kernel in the CI matrix", cannot be satisfied by any byte-stable
-  checked-in page and was replaced rather than met — so do not read the closure
-  as more than it is: every one of those rows is a kernel reading in a bare
+  `tests/kernel-matrix/rows/`. P2.6.3 was **accepted** on 2026-08-19 on its
+  *corrected* criteria — one clause of the original, "one row per ABI actually
+  reported on each kernel in the CI matrix", cannot be satisfied by any
+  byte-stable checked-in page and was replaced rather than met — so do not read
+  the acceptance as more than it is: every one of those rows is a kernel
+  reading in a bare
   initramfs rather than a distribution, the *values* in the per-rung
   behavioural statements were recorded on one box on one date — the tests that
   take them run here and on the CI runner, whose job declares

@@ -113,10 +113,10 @@
 //! This citation used to read #187, and that was a mis-route rather than a
 //! stale number. #187 applied the **realm's** ruleset inside
 //! `vitrin-realm-init`, after the helper has `pivot_root`ed away from the
-//! tree this file writes to; it closed on 2026-08-19 without ever owning a
-//! rule about `vitrind`'s own process, and would have left this obligation
-//! pointing at a closed issue. D-041 recorded the wrong destination and is
-//! corrected in place at the log rather than rewritten.
+//! tree this file writes to; it never owned a rule about `vitrind`'s own
+//! process at any point in its life, and would have left this obligation
+//! pointing at an issue that could not discharge it. D-041 recorded the wrong
+//! destination and is corrected in place at the log rather than rewritten.
 //!
 //! It also depends on a permission this repository does not own: on a stock
 //! install the write is reachable through a `video`-group membership or a

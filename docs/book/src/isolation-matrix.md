@@ -236,14 +236,17 @@ published sentence cannot be deleted or reworded while this table still cites it
   booting the runner's own `6.17.0-1020-azure` in a bare initramfs answers ABI 7
   too, which is a fact about that kernel and not about that runner.
 - **Any statement that P2.6.3's criteria were all met as written.** The task
-  (issue #187) closed on 2026-08-19, on its *corrected* criteria and on decision
-  D-043 — not on the row the plan first wrote. What landed with this page is a
+  (issue #187) was ACCEPTED on 2026-08-19, on its *corrected* criteria and on
+  decision D-043 — not on the row the plan first wrote. That date is the plan's
+  acceptance record and the owner's decision; the issue's own closure timestamp is
+  whatever GitHub writes when the merge lands, and this page asserts no value for
+  it. What landed with this page is a
   generated ladder of what this build requires, held by CI. A per-kernel row set
   landed separately on 2026-08-16 — five kernels, on [the kernel
   page](isolation-kernels.md) — and it is a row per *kernel*, not the "one row per
   ABI actually reported" the criteria ask for, a clause no byte-stable checked-in
   page can satisfy (the plan carries that as Correction 5). Four things did not
-  become true when the task closed: five kernels answered five ABIs, and four of
+  become true on acceptance: five kernels answered five ABIs, and four of
   the nine rungs are reported by none of them; every row on that page is a
   **kernel** reading taken in a bare initramfs rather than a distribution; the
   behavioural per-rung tests this page's numbers rest on still live in

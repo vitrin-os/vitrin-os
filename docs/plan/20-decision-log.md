@@ -1245,9 +1245,10 @@ D-033 already examined writing `/sys/class/backlight` and refused it. The bullet
 > this entry records is a rule the **core** grants *itself*, and no line of
 > #187 was ever going to write it.
 >
-> So the debt was routed to an issue that could not discharge it, and #187
-> closed on 2026-08-19 having discharged everything it *did* own. Four
-> surfaces then pointed a still-open obligation at a closed issue: this
+> So the debt was routed to an issue that could not discharge it: #187
+> discharged everything it *did* own and never owned this rule at any point in
+> its life. Four surfaces then pointed a still-open obligation at an issue that
+> could not carry it: this
 > paragraph, the `status-strip-reads-sysfs` bullet of
 > `docs/book/src/limits.md`, `crates/vitrin-core/src/backlight.rs`'s module
 > docs, and `docs/plan/14-workstream-session-mode.md`. **The successor is

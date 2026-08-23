@@ -56,7 +56,7 @@ table it cannot reshape — verified by the core from outside, and the spawn
 refused when it cannot be. Since P2.6.3 it also gets a **Landlock ruleset**
 with an enumerated read set, enforced before the shim's `execve`, and a
 generated [ABI matrix](isolation-matrix.md) of what that ruleset requires of a
-kernel. P2.6.3 closed on 2026-08-19, and it closed on **corrected** criteria
+kernel. P2.6.3 was accepted on 2026-08-19, and on **corrected** criteria
 rather than the ones it was written with, which is worth reading narrowly: that
 matrix probes nothing, so it is a table about the build rather than about
 kernels; the per-kernel one its criteria ask for exists separately, and is

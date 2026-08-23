@@ -2103,14 +2103,17 @@ fn render_not_here(p: &mut String, c: &Constants) {
          booting the runner's own `6.17.0-1020-azure` in a bare initramfs answers ABI {ci}\n  \
          too, which is a fact about that kernel and not about that runner.\n\
          - **Any statement that P2.6.3's criteria were all met as written.** The task\n  \
-         (issue #187) closed on 2026-08-19, on its *corrected* criteria and on decision\n  \
-         D-043 — not on the row the plan first wrote. What landed with this page is a\n  \
+         (issue #187) was ACCEPTED on 2026-08-19, on its *corrected* criteria and on\n  \
+         decision D-043 — not on the row the plan first wrote. That date is the plan's\n  \
+         acceptance record and the owner's decision; the issue's own closure timestamp is\n  \
+         whatever GitHub writes when the merge lands, and this page asserts no value for\n  \
+         it. What landed with this page is a\n  \
          generated ladder of what this build requires, held by CI. A per-kernel row set\n  \
          landed separately on 2026-08-16 — five kernels, on [the kernel\n  \
          page](isolation-kernels.md) — and it is a row per *kernel*, not the \"one row per\n  \
          ABI actually reported\" the criteria ask for, a clause no byte-stable checked-in\n  \
          page can satisfy (the plan carries that as Correction 5). Four things did not\n  \
-         become true when the task closed: five kernels answered five ABIs, and four of\n  \
+         become true on acceptance: five kernels answered five ABIs, and four of\n  \
          the nine rungs are reported by none of them; every row on that page is a\n  \
          **kernel** reading taken in a bare initramfs rather than a distribution; the\n  \
          behavioural per-rung tests this page's numbers rest on still live in\n  \

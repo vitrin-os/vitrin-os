@@ -316,9 +316,10 @@ command = "/usr/bin/foot"
 # inside a nested sandbox (GTK -> glycin -> bwrap) cannot have one and decodes
 # UNSANDBOXED instead.
 #
-# P2.6.3 CLOSED on 2026-08-19, on its CORRECTED criteria rather than the ones
-# its plan row first wrote, so read the closure narrowly. The ruleset landed,
-# and so did the generated ladder table and its CI staleness gate -- `cargo
+# P2.6.3 was ACCEPTED on 2026-08-19, on its CORRECTED criteria rather than the
+# ones its plan row first wrote, so read the acceptance narrowly. The ruleset
+# landed, and so did the generated ladder table and its CI staleness gate --
+# `cargo
 # xtask isolation-matrix` emits docs/book/src/isolation-matrix.md and `--check`
 # turns CI red on a stale copy. That table probes no kernel: it states what
 # THIS BUILD requires. The PER-KERNEL half landed separately on 2026-08-16 as

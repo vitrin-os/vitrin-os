@@ -2307,10 +2307,10 @@ The limit set follows.
   > [#314](https://github.com/vitrin-os/vitrin-os/issues/314).
   > This sentence named `#187` until 2026-08-23 and that was wrong, not merely
   > out of date: #187 wrote the **realm's** ruleset in `vitrin-realm-init`,
-  > which runs after a `pivot_root` away from `/sys`, and it closed on
-  > 2026-08-19 having never owned a rule about `vitrind`'s own process. D-041
-  > routed the debt there; the correction is appended to that entry rather than
-  > written over it.
+  > which runs after a `pivot_root` away from `/sys`, and it never owned a rule
+  > about `vitrind`'s own process at any point in its life. D-041 routed the
+  > debt there; the correction is appended to that entry rather than written
+  > over it.
 
 - <!-- limit: no-key-repeat-on-drm -->
   **A held key does not repeat on `--drm`** (pre-existing since WS-E.3.1 and

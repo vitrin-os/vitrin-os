@@ -127,8 +127,8 @@ without spawning anything.
 > `/dev/pts` and each render node — eight with one render node bound, one more
 > for each additional one). What that ruleset requires of a kernel is published
 > as a generated, CI-held table — [the Landlock ABI matrix](isolation-matrix.md)
-> — and P2.6.3 closed on 2026-08-19 on **corrected** criteria rather than the
-> ones it was written with, so read the closure narrowly: that table measures no
+> — and P2.6.3 was accepted on 2026-08-19 on **corrected** criteria rather than
+> the ones it was written with, so read that narrowly: that table measures no
 > kernel, the
 > per-kernel one its criteria ask for exists on a page of its own —
 > [which kernels this build starts on](isolation-kernels.md), five distribution

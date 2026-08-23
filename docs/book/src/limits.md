@@ -557,9 +557,9 @@ inferred from the word "Landlock":
   `test_real_confinement.py`'s own probe a write verb was considered here and
   deliberately left to it rather than done in a review-fix branch.
 - **There is a ladder table now, and it is a table about this build — not
-  about kernels. P2.6.3 closed on 2026-08-19, on its *corrected* criteria and
-  not on the ones its plan row first wrote, and this page will not round that
-  up.** The task's own acceptance criteria
+  about kernels. P2.6.3 was accepted on 2026-08-19, on its *corrected* criteria
+  and not on the ones its plan row first wrote, and this page will not round
+  that up.** The task's own acceptance criteria
   (`docs/plan/02-phase-2-semantic-epochs.md`, P2.6.3) ask for two deliverables:
   the ruleset, which landed, **and** a per-ABI ladder table *generated* on each
   kernel in the CI matrix with CI going red when the checked-in copy is stale.
@@ -607,21 +607,22 @@ inferred from the word "Landlock":
   and not a quiet pass — and on no third machine; the *values* they pin were
   recorded on one box on one date. Everything else about a rung is now generated
   and gated,
-  which is a narrower promise than "measured". **What "P2.6.3 closed" does and
-  does not mean.** It closed on the corrected criteria plus decision D-043 (the
-  sub-floor rung tests, above), and two of the criteria written in the plan were
+  which is a narrower promise than "measured". **What P2.6.3's acceptance does
+  and does not mean.** It was accepted on the corrected criteria plus decision
+  D-043 (the sub-floor rung tests, above), and two of the criteria written in
+  the plan were
   **wrong on the kernel's own terms** while a third — "one row per ABI actually
   reported, on each kernel in the CI matrix" — cannot be satisfied by any
   byte-stable checked-in page and was replaced rather than met; the plan
   document restates all three with the correction visible rather than deleting
-  them. Four things did not become true when it closed, and each is stated
+  them. Four things did not become true on acceptance, and each is stated
   above in its own words: five kernels answered five ABIs and four of the nine
   rungs are reported by none of them; every one of those rows is a **kernel**
   reading in a bare initramfs, so the number of *distributions* measured is
   still one; the suite itself has still only ever run on two machines and
   nobody but the collector's author has re-run its levers; and the per-rung
-  behavioural statements are one box, on one date. Read a closed issue as a
-  closed issue and this page for what is actually measured.
+  behavioural statements are one box, on one date. Read an accepted task as an
+  accepted task and this page for what is actually measured.
 
 ### The six enforced domains, stated once so a generated table can be compared
 
@@ -1601,8 +1602,8 @@ enumerated under `principal-has-no-hotkey` below). Four further limits belong wi
   document schedules it. This bullet named #187 until 2026-08-23, and that was
   wrong rather than merely stale: #187 built the **realm's** ruleset inside
   `vitrin-realm-init`, over a filesystem view that has already `pivot_root`ed
-  away from `/sys`, and it closed on 2026-08-19 having never owned a rule
-  about `vitrind`'s own process.
+  away from `/sys`, and it never owned a rule about `vitrind`'s own process at
+  any point in its life.
 
 <!-- limit: principal-has-no-hotkey -->
 **A principal cannot receive physical input either, so no client has a

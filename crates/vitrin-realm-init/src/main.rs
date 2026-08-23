@@ -1698,7 +1698,7 @@ fn drop_all_capabilities() -> Result<(), Fail> {
 /// the floor stands.
 ///
 /// They are kept on purpose — **D-043** (`docs/plan/20-decision-log.md`,
-/// 2026-08-19, the owner's decision closing issue #187) — and the reason is
+/// 2026-08-19, the owner's decision that accepted P2.6.3) — and the reason is
 /// written here rather than left to be inferred from the fact that the tests
 /// exist:
 ///

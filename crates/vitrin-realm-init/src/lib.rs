@@ -192,7 +192,7 @@ pub const LANDLOCK_BUILD_MAX_RUNG: u32 = 9;
 /// start.
 ///
 /// **The floor narrowed #187 rather than completing it**, and what completed it
-/// was other work plus a dated decision — #187 closed on 2026-08-19; see
+/// was other work plus a dated decision — P2.6.3 was accepted on 2026-08-19; see
 /// `docs/plan/02-phase-2-semantic-epochs.md` (P2.6.3, Correction 7) and D-043.
 /// PRD §20's "coverage is kernel-dependent" caveat is answered **for the five
 /// kernels #281 booted and for no others**: this build targets recent kernels

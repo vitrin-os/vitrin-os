@@ -1949,25 +1949,33 @@ mod tests {
         }
     }
 
-    /// **Non-vacuity for the ledger's drop check**, which is what holds
-    /// `docs/book/src/limits.md`'s *"No test in this repository enters a
-    /// Landlock domain at rung 4 or rung 5"*.
+    /// **Non-vacuity for the check that holds** `docs/book/src/limits.md`'s
+    /// *"No test in this repository enters a Landlock domain at rung 4 or rung
+    /// 5"* — and it is a check at the **mint**, not in a destructor.
     ///
-    /// Mints a token for a ruleset at a rung the named row does not carry and
-    /// lets the ledger drop. It enters **no** domain -- `landlock::restrict_self`
-    /// is never called, so the sentence above stays true while this test proves
-    /// the mechanism that holds it fires.
+    /// Asks the ledger for a token at a rung the named row does not carry. The
+    /// assertion fires inside `landlock::RungsEntered::entering`, before the
+    /// token that `landlock::restrict_self` demands has been produced, so it
+    /// cannot be skipped by anything done to the ledger afterwards. That
+    /// matters because `Drop` — where this comparison used to live in both
+    /// directions — is skippable in Rust by construction, and was demonstrably
+    /// skipped: `mem::forget(entered)` after a mint left a rung-4 domain
+    /// entered with every gate green.
+    ///
+    /// It enters **no** domain — `landlock::restrict_self` is never called — so
+    /// the sentence above stays true while this test proves the mechanism that
+    /// holds it fires.
     ///
     /// The ruleset is `Ruleset::unopened`, which holds no descriptor: the ledger
-    /// now reads the rung off a ruleset rather than being told one, and this
-    /// proof must still run on a machine with no Landlock at all. A
+    /// reads the rung off a ruleset rather than being told one, and this proof
+    /// must still run on a machine with no Landlock at all. A
     /// `#[should_panic]` test cannot be skipped -- `skip_unless!` returns, and a
     /// test that returns without panicking is a failure -- so asking the kernel
     /// for a rung-4 ruleset here would make the ledger's own non-vacuity proof
     /// kernel-dependent.
     #[test]
     #[should_panic(expected = "BEHAVIOURAL_RUNGS declares")]
-    fn a_ledger_that_recorded_a_rung_its_row_does_not_name_fails_on_drop() {
+    fn a_ledger_asked_for_a_rung_its_row_does_not_name_refuses_to_mint() {
         let entered = landlock::RungsEntered::for_test(
             "a_realm_can_write_where_it_was_granted_and_nowhere_else",
         );
@@ -1975,6 +1983,32 @@ mod tests {
         // row for this name says `&[1]`.
         let ruleset = landlock::Ruleset::unopened(4);
         let _minted = entered.entering(&ruleset);
+    }
+
+    /// **Non-vacuity for the half that IS in `Drop`**: a row declaring a rung
+    /// the run never entered.
+    ///
+    /// The mint check above cannot see this direction — nothing wrong is ever
+    /// asked for — so the ledger's destructor is what catches a row that has
+    /// gone stale against its test, and this is the proof it fires. The row for
+    /// this name says `&[1, 2]`; one rung is minted and the second never is.
+    ///
+    /// **This half is destructor-dependent and is published as such**
+    /// (`docs/book/src/limits.md`, "what holds the rung ledger"): `mem::forget`,
+    /// `ManuallyDrop`, `Box::leak`, `process::exit` and `panic = "abort"` each
+    /// skip `Drop`. The borrow in `entering(&'a self, ...)` stops the first of
+    /// those from being reached *while a token is alive*, which is the case
+    /// that could have entered a domain; it does not make `Drop` guaranteed,
+    /// and this repository does not publish an absolute that says it does.
+    #[test]
+    #[should_panic(expected = "BEHAVIOURAL_RUNGS declares")]
+    fn a_ledger_that_skipped_a_rung_its_row_declares_fails_on_drop() {
+        let entered = landlock::RungsEntered::for_test(
+            "rung_one_forbids_reparenting_that_the_rung_above_permits",
+        );
+        let ruleset = landlock::Ruleset::unopened(1);
+        let _minted = entered.entering(&ruleset);
+        // and rung 2, which the row also declares, is never entered.
     }
 
     /// And the other end: a test the table does not declare cannot open a

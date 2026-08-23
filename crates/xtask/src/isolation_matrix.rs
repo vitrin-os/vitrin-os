@@ -2216,12 +2216,23 @@ pub static PINS: &[CodePin] = &[
     },
     CodePin {
         path: LANDLOCK_RS,
-        needle: "pub fn entering<'a>(&self, ruleset: &'a Ruleset) -> Entering<'a> {",
+        needle: "pub fn entering<'a>(&'a self, ruleset: &'a Ruleset) -> Entering<'a> {",
         means: "the ledger still reads the rung OFF the ruleset it is handed rather than being \
-                told one. The shape before this took a `u32`: `entering(1)` beside \
-                `create_ruleset(4)` recorded rung 1, entered a rung-4 domain, and left every \
-                mechanism on this page green -- found by compiling it. Give this a rung \
-                parameter again and that hole is back.",
+                told one, AND the token still borrows the ledger. Two holes were compiled here, \
+                one per missing half. Give this a rung parameter again and `entering(1)` beside \
+                `create_ruleset(4)` records rung 1 while a rung-4 domain is entered. Narrow the \
+                receiver back to `&self` and `mem::forget(entered)` under a live token compiles \
+                again, which skips the drop check entirely.",
+    },
+    CodePin {
+        path: LANDLOCK_RS,
+        needle: "assert!( declared.contains(&rung),",
+        means: "the rung a test enters is still checked against BEHAVIOURAL_RUNGS AT THE MINT, \
+                before the token exists -- which is what holds the limits page's \"No test in \
+                this repository enters a Landlock domain at rung 4 or rung 5\" without resting \
+                on a destructor. Rust does not guarantee `Drop` runs. Delete this and that \
+                absolute is back to being held by `impl Drop for RungsEntered` alone, which \
+                `mem::forget` skips.",
     },
     CodePin {
         path: LANDLOCK_RS,
@@ -2249,9 +2260,12 @@ pub static PINS: &[CodePin] = &[
     CodePin {
         path: LANDLOCK_RS,
         needle: "impl Drop for RungsEntered {",
-        means: "the ledger still checks itself when it drops rather than when a test remembers \
-                to ask. The previous shape was a `matches_declaration` call at the bottom of \
-                four tests, which a fifth could simply not make.",
+        means: "the ledger still checks its DECLARED rungs against what the run entered when it \
+                drops, rather than when a test remembers to ask. The previous shape was a \
+                `matches_declaration` call at the bottom of four tests, which a fifth could \
+                simply not make. This half -- a row naming a rung the run never entered -- is \
+                the destructor-dependent one, and the limits page publishes it as such; the \
+                other direction moved into the mint above.",
     },
     CodePin {
         path: CORE_SPAWN_RS,

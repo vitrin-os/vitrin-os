@@ -166,6 +166,7 @@
 //! this ruleset is what confines a realm's network, and it is not.
 
 use std::ffi::{CStr, CString};
+use std::marker::PhantomData;
 use std::os::fd::RawFd;
 
 use vitrin_realm_init::{
@@ -683,18 +684,65 @@ pub fn add_path_rule(ruleset: RawFd, path: &CStr, rights: u64) -> Result<(), Fai
 /// rather than two that agree -- there is no argument left for them to disagree
 /// in, and the disagreement is now a type error rather than a green run.
 ///
-/// What it does **not** cover is said where the claim is published rather than
-/// only here: a test that asks the *shipped* helper for a rung never links this
-/// module at all (held at `crates/vitrin-core`'s realm spawn,
-/// `RUNGS_NO_TEST_ENTERS`), and a test that issues syscall 446 by hand is held
-/// by nothing in this file. `docs/book/src/limits.md` names both.
+/// # And it borrows the LEDGER, so the ledger cannot be forgotten under it
+///
+/// The second shape still left one route open, and it was again found by
+/// compiling it rather than by reading. The token borrowed the *ruleset* and
+/// nothing else, so this compiled and ran:
+///
+/// ```ignore
+/// let entered = RungsEntered::for_test("a_realm_can_write_where_it_was_granted_and_nowhere_else");
+/// let ruleset = create_ruleset(4).expect("a rung-4 ruleset");
+/// let entering = entered.entering(&ruleset);
+/// std::mem::forget(entered);      // the comparison in `Drop` never runs
+/// // ... enter a rung-4 domain with `entering`, and every gate stays green
+/// ```
+///
+/// Two changes close it, and they are load-bearing in different ways:
+///
+/// - [`RungsEntered::entering`] takes `&'a self` and this token carries a
+///   `PhantomData<`[`LedgerBorrow`]`<'a>>`, so the ledger is **borrowed for as
+///   long as the token lives**. The `mem::forget` above is now `E0505`,
+///   pasted in `docs/book/src/limits.md`.
+/// - The comparison against `BEHAVIOURAL_RUNGS` moved **into the mint**, in
+///   the direction the published absolute is about. `entering` refuses a rung
+///   the test's row does not declare *before* it returns a token, so the
+///   sentence "no test enters a domain at rung 4 or rung 5" no longer rests on
+///   a destructor at all. What is still in `Drop` is the other direction --
+///   rungs a row declares that the run never entered -- and `Drop` is
+///   skippable in Rust by construction (`mem::forget`, `ManuallyDrop`,
+///   `Box::leak`, `process::exit`, `panic = "abort"`). That residual is
+///   published rather than argued away; see `docs/book/src/limits.md`.
+///
+/// What neither covers is said in the same place: a test that asks the
+/// *shipped* helper for a rung never links this module at all (held at
+/// `crates/vitrin-core`'s realm spawn, `RUNGS_NO_TEST_ENTERS`), and a test that
+/// issues syscall 446 by hand is held by nothing in this file.
 #[derive(Clone, Copy)]
-pub struct Entering<'a>(&'a Ruleset);
+pub struct Entering<'a> {
+    ruleset: &'a Ruleset,
+    /// The ledger's borrow, carried so the type itself says what it holds.
+    ///
+    /// Zero-sized, and it changes no run. Its whole job is to keep
+    /// [`RungsEntered::entering`]'s `&'a self` from being "simplified" back to
+    /// `&self` by someone reading this struct and seeing only a ruleset in it.
+    ledger: PhantomData<LedgerBorrow<'a>>,
+}
+
+/// What [`Entering`] borrows besides the ruleset.
+///
+/// In a test build that is the ledger; in a shipped build [`RungsEntered`] does
+/// not exist, and the production mint has no ledger to borrow.
+#[cfg(test)]
+type LedgerBorrow<'a> = &'a RungsEntered;
+/// See the `cfg(test)` twin: outside a test build there is no ledger.
+#[cfg(not(test))]
+type LedgerBorrow<'a> = &'a ();
 
 impl<'a> Entering<'a> {
     /// The rung the ruleset about to be entered was **created** at.
     fn rung(self) -> u32 {
-        self.0.rung
+        self.ruleset.rung
     }
 
     /// The production mint, and its `cfg` is the load-bearing half.
@@ -705,7 +753,10 @@ impl<'a> Entering<'a> {
     /// about to enter, so there is no rung to supply here either.
     #[cfg(not(test))]
     fn production(ruleset: &'a Ruleset) -> Entering<'a> {
-        Entering(ruleset)
+        Entering {
+            ruleset,
+            ledger: PhantomData,
+        }
     }
 }
 
@@ -713,14 +764,30 @@ impl<'a> Entering<'a> {
 /// token is minted and checked against `BEHAVIOURAL_RUNGS` when the ledger
 /// drops.
 ///
-/// # Why the check is in `Drop` and not in a method the test calls last
+/// # Which half is in `Drop`, which half is not, and why the split
 ///
-/// Because a method a test calls last is a method a test can forget to call.
-/// The previous shape had exactly that: `matches_declaration` at the bottom of
-/// four tests, invisible to every gate if a fifth omitted it. `Drop` runs
-/// whether the test remembers or not, so the only way to enter a domain in
-/// this crate's suite and not be checked against the declaration is to not
-/// enter one.
+/// The comparison used to be a method a test called last -- `matches_declaration`
+/// at the bottom of four tests, invisible to every gate if a fifth omitted it.
+/// That moved into `Drop`, which runs whether a test remembers or not. But
+/// `Drop` is not *guaranteed* to run: `mem::forget`, `ManuallyDrop`,
+/// `Box::leak`, `process::exit` and `panic = "abort"` each skip it, and the
+/// first of those was demonstrated against this very type (see [`Entering`]).
+/// A published absolute may not rest on a destructor.
+///
+/// So the two directions live in two places:
+///
+/// - **entered ⊆ declared** -- the direction `docs/book/src/limits.md`'s
+///   *"No test in this repository enters a Landlock domain at rung 4 or rung 5"*
+///   is about -- is asserted in [`RungsEntered::entering`], **before the token
+///   exists**. Nothing done to the ledger afterwards can skip it.
+/// - **declared ⊆ entered** -- a row claiming a rung the run never entered --
+///   is asserted here in `Drop`, and is therefore skippable by the five
+///   constructs above. It is a *staleness* check, and the limits page names it
+///   as destructor-dependent rather than letting the absolute above cover it.
+///
+/// The ledger cannot be dropped early under a live token either:
+/// [`RungsEntered::entering`] borrows `&'a self`, so `mem::forget(entered)`
+/// between the mint and the use is a borrow-check error.
 ///
 /// The ledger is constructed with the test's own name and looks its row up at
 /// once, so a typo is a failure at construction rather than a comparison
@@ -758,17 +825,63 @@ impl RungsEntered {
         }
     }
 
-    /// Record the rung `ruleset` was **created** at, and mint the token
-    /// [`restrict_self`] demands for that ruleset.
+    /// Record the rung `ruleset` was **created** at, refuse a rung this test's
+    /// row does not declare, and mint the token [`restrict_self`] demands for
+    /// that ruleset.
     ///
     /// The rung is read off the ruleset rather than handed in beside it, and
     /// that is the whole difference from the shape this replaced. A ledger that
     /// is *told* a number records what a test said; this one records what the
     /// kernel built. `entering(1)` next to a rung-4 ruleset is no longer a
     /// sentence this API can express.
-    pub fn entering<'a>(&self, ruleset: &'a Ruleset) -> Entering<'a> {
-        self.entered.borrow_mut().push(ruleset.rung);
-        Entering(ruleset)
+    ///
+    /// # Two things this signature does that a shorter one did not
+    ///
+    /// **`&'a self`, not `&self`.** The returned token carries the ledger's
+    /// borrow ([`Entering::ledger`]), so the ledger cannot be moved -- and
+    /// therefore cannot be `mem::forget`ten -- while a token minted from it is
+    /// alive. Before that, the counterexample in [`Entering`]'s docs compiled
+    /// and ran.
+    ///
+    /// **The declaration is checked here, not only in [`Drop`].** A destructor
+    /// is skippable in Rust by construction, so an absolute that rests on one
+    /// is an absolute with a documented hole. This assertion fires *before* the
+    /// token exists, so a rung `BEHAVIOURAL_RUNGS` does not declare for this
+    /// test cannot reach `landlock_restrict_self` however the ledger is
+    /// disposed of afterwards. `Drop` keeps the converse -- a declared rung the
+    /// run never entered -- and that half is the one the limits page publishes
+    /// as destructor-dependent.
+    pub fn entering<'a>(&'a self, ruleset: &'a Ruleset) -> Entering<'a> {
+        let rung = ruleset.rung;
+        let declared = self.declared();
+        assert!(
+            declared.contains(&rung),
+            "{} is about to enter a Landlock domain at rung {rung}, and BEHAVIOURAL_RUNGS \
+             declares {declared:?} for it. That table is what `cargo xtask isolation-matrix` \
+             publishes as the rungs each test enters, and `docs/book/src/limits.md` states an \
+             absolute about the rungs no test enters at all -- so a rung reached here and \
+             missing from the row is a published sentence about to become false. Add the rung \
+             to the row if the retarget was intended, and expect the matrix page and the limits \
+             page to change with it",
+            self.test
+        );
+        self.entered.borrow_mut().push(rung);
+        Entering {
+            ruleset,
+            ledger: PhantomData,
+        }
+    }
+
+    /// This ledger's row in `BEHAVIOURAL_RUNGS`.
+    ///
+    /// [`RungsEntered::for_test`] already refused a name the table does not
+    /// carry, so the lookup cannot miss here.
+    fn declared(&self) -> &'static [u32] {
+        crate::tests::BEHAVIOURAL_RUNGS
+            .iter()
+            .find(|(name, _)| *name == self.test)
+            .expect("checked in `for_test`")
+            .1
     }
 }
 
@@ -784,11 +897,13 @@ impl Drop for RungsEntered {
         let mut seen = self.entered.borrow().clone();
         seen.sort_unstable();
         seen.dedup();
-        let declared = crate::tests::BEHAVIOURAL_RUNGS
-            .iter()
-            .find(|(name, _)| *name == self.test)
-            .expect("checked in `for_test`")
-            .1;
+        let declared = self.declared();
+        // `entering` already refused anything outside `declared`, so what is
+        // left for this comparison to catch is a rung the row declares and the
+        // run never reached. It is written as an equality anyway: the message
+        // is the useful one, and an equality that can only fail one way is
+        // cheaper to read than a subset test plus a comment saying why the
+        // other direction is impossible.
         assert_eq!(
             seen, declared,
             "{} entered Landlock domains at {seen:?} and BEHAVIOURAL_RUNGS declares \
@@ -856,7 +971,7 @@ pub fn restrict_self(entering: Entering<'_>, flags: libc::c_uint) -> Result<(), 
          no ruleset at all"
     );
     // SAFETY: an integer descriptor and a flags word.
-    let rc = unsafe { libc::syscall(SYS_LANDLOCK_RESTRICT_SELF, entering.0.fd, flags) };
+    let rc = unsafe { libc::syscall(SYS_LANDLOCK_RESTRICT_SELF, entering.ruleset.fd, flags) };
     if rc < 0 {
         return Err(Fail::at(Stage::Landlock));
     }

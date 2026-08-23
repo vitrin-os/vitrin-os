@@ -368,17 +368,54 @@ inferred from the word "Landlock":
     token whose only mint in a test build is a ledger, and the token carries the
     **ruleset**, not a rung number beside it — so what the ledger records is the
     rung the kernel *created that ruleset at*, and the ruleset it recorded is
-    the only descriptor the syscall can be given. It compares what it recorded
-    against `BEHAVIOURAL_RUNGS` when it drops, and it refuses to open at all for
-    a test name that table does not declare. Declaring is therefore not
-    something a test can forget, and the production path
-    (`landlock::apply_with`) has its own mint compiled **out** of test builds so
-    it is not a way round. (The token's first shape, the same day, carried a
-    rung *number*: a test could declare rung 1, build its ruleset at rung 4,
-    enter a rung-4 domain and leave every mechanism here green. That was found
-    by compiling the counterexample rather than by reading the code, and it is
-    closed by welding the two — `entering(4)` no longer type-checks, and a
-    ruleset the ledger never saw cannot be named to the syscall at all.)
+    the only descriptor the syscall can be given. The rung is compared against
+    `BEHAVIOURAL_RUNGS` **inside the mint, before the token exists**, and the
+    ledger refuses to open at all for a test name that table does not declare.
+    Declaring is therefore not something a test can forget, and the production
+    path (`landlock::apply_with`) has its own mint compiled **out** of test
+    builds so it is not a way round.
+
+    Two shapes of that token were found broken by *compiling* the
+    counterexample rather than by reading the code, both on 2026-08-23:
+
+    - It carried a rung *number*. A test could declare rung 1, build its
+      ruleset at rung 4, enter a rung-4 domain and leave every mechanism here
+      green. Closed by welding the two: `entering(4)` no longer type-checks,
+      and a ruleset the ledger never saw cannot be named to the syscall at all.
+    - The comparison lived **only** in the ledger's destructor, and the token
+      borrowed the ruleset without borrowing the ledger — so the ledger could
+      be moved out from under a live token. This compiled, ran, entered a
+      rung-4 domain and skipped the check, with every gate green:
+
+      ```text
+      let entered = RungsEntered::for_test("a_realm_can_write_where_it_was_granted_and_nowhere_else");
+      let ruleset = create_ruleset(4).expect("a rung-4 ruleset");
+      let entering = entered.entering(&ruleset);
+      std::mem::forget(entered);
+      // ... enters a rung-4 domain; nothing records it
+      ```
+
+      Closed twice over, because one of the two fixes would have been a fix
+      that still rested on a destructor. The mint now takes `&'a self`, so the
+      ledger cannot be moved while a token minted from it is alive. Pasted from
+      a probe compiled into the test module and then reverted, so the line
+      numbers are the probe's and not a line in the shipped tree:
+
+      ```text
+      error[E0505]: cannot move out of `entered` because it is borrowed
+          --> crates/vitrin-realm-init/src/main.rs:1995:26
+           |
+      1994 |         let entering = entered.entering(&ruleset);
+           |                        ------- borrow of `entered` occurs here
+      1995 |         std::mem::forget(entered);
+           |                          ^^^^^^^ move out of `entered` occurs here
+      1996 |         let _ = landlock::restrict_self(entering, 0);
+           |                                         -------- borrow later used here
+      ```
+
+      And the comparison the sentence in bold depends on — *this rung is one
+      the row declares* — moved out of the destructor into the mint, where no
+      disposal of the ledger afterwards can skip it.
   - **A test that asks the shipped helper for a rung**, entering the domain in
     another process where no Rust type can reach it. The core's own confinement
     suite is held at its single realm-spawn point, which refuses a spawn that
@@ -387,9 +424,16 @@ inferred from the word "Landlock":
     from the ladder corpus rather than typed, so a test added at rung 4 changes
     what the generator demands of this page instead of leaving it behind.
 
-  **What that does not cover, stated rather than implied.** The scan reads
-  literals in the suite's files, so a rung composed at runtime from pieces
-  would pass it. `VITRIN_LANDLOCK=abi:4` set in the *environment* by
+  **What that does not cover, stated rather than implied.** `Drop` is not
+  guaranteed to run in Rust — `mem::forget`, `ManuallyDrop`, `Box::leak`,
+  `std::process::exit` and a `panic = "abort"` profile each skip it — so
+  nothing on this page publishes an absolute that rests on one. The half of
+  the ledger's comparison that is *still* in its destructor is the converse of
+  the sentence in bold: a row declaring a rung the run never entered, which is
+  a **staleness** check on the table and not a claim about which rungs are
+  reachable. That half is skippable and is stated here as skippable. The scan
+  reads literals in the suite's files, so a rung composed at runtime from
+  pieces would pass it. `VITRIN_LANDLOCK=abi:4` set in the *environment* by
   whoever runs the suite is invisible to all of it — that is an operator
   pinning a session, which the bullets above describe as the instrument these
   measurements are taken with, and it is not a test in this repository. And the

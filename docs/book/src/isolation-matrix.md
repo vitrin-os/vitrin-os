@@ -124,7 +124,11 @@ file, which declares the rungs that test enters a domain at; a name listed on a 
 it does not enter refuses to render, a rung it does enter and this page omits refuses
 to render, and the tests cannot enter a domain without declaring it: the function that
 issues `landlock_restrict_self` demands a token only a recording ledger can mint, and
-that ledger compares what it recorded against the same table when it drops. The
+**the mint itself refuses a rung the test's row does not declare** — before the token
+exists, so that direction rests on no destructor. What the ledger still checks when it
+drops is the converse — a row declaring a rung the run never entered — and `Drop` is
+skippable in Rust by construction, which `docs/book/src/limits.md` publishes rather
+than argues away. The
 generator also refuses to emit when the limits page does not carry the tally above.
 
 **A test that asks the shipped helper for a rung enters a domain in another process,

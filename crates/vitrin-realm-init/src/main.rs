@@ -1863,11 +1863,14 @@ mod tests {
     /// It is now held from both directions:
     ///
     /// - **against the tests**, by [`landlock::RungsEntered`]: minting the
-    ///   token `landlock::restrict_self` demands records the rung **the
-    ///   ruleset handed to the ledger was created at**, and the ledger compares
-    ///   what it recorded against this table's row for the test when it drops.
-    ///   Retarget a measurement at another rung and the test goes red rather
-    ///   than quietly measuring something else.
+    ///   token `landlock::restrict_self` demands reads the rung **the ruleset
+    ///   handed to the ledger was created at**, and the mint **refuses** when
+    ///   this table's row for the test does not declare that rung. Retarget a
+    ///   measurement at another rung and the test panics at the mint, before a
+    ///   token exists, rather than quietly measuring something else. The
+    ///   destructor still runs the *converse* comparison -- a row naming a
+    ///   rung the run never entered -- and that half is skippable, which is
+    ///   why the absolute below is held by the mint and not by `Drop`.
     /// - **against the published page**, by the generator: it parses this
     ///   table out of this file and refuses to emit unless every
     ///   `Rung::behavioural_tests` entry names a test this table says enters a
@@ -2213,8 +2216,10 @@ mod tests {
             "rung 2 with REFER withheld from the hierarchy must still deny; if it does not, \
              rung 2's permission above came from the RUNG rather than from the grant"
         );
-        // No closing call: `entered` compares what it recorded against
-        // `BEHAVIOURAL_RUNGS` when it drops, so the check cannot be forgotten.
+        // No closing call: the rung this body entered was checked AT THE MINT
+        // against `BEHAVIOURAL_RUNGS`, before a token existed. What `entered`
+        // still compares on drop is the converse -- a declared rung this run
+        // never reached -- and that half is skippable.
     }
 
     #[test]
@@ -2564,7 +2569,10 @@ mod tests {
             "the kernel accepted a flags bit that does not exist, so the acceptance above \
              says nothing about the bit this build passes"
         );
-        // The ledger checks itself against `BEHAVIOURAL_RUNGS` on drop.
+        // No closing call: the rung this body entered was checked AT THE MINT
+        // against `BEHAVIOURAL_RUNGS`, before a token existed. What the ledger
+        // still compares on drop is the converse -- a declared rung this run
+        // never reached -- and that half is skippable.
     }
 
     #[test]
@@ -2663,7 +2671,10 @@ mod tests {
                  is only evidence because the grant in the same run succeeded"
             );
         }
-        // The ledger checks itself against `BEHAVIOURAL_RUNGS` on drop.
+        // No closing call: the rung this body entered was checked AT THE MINT
+        // against `BEHAVIOURAL_RUNGS`, before a token existed. What the ledger
+        // still compares on drop is the converse -- a declared rung this run
+        // never reached -- and that half is skippable.
     }
 
     /// **Sub-floor, and kept for a stated reason (D-044).** Rungs 2 and 3 are
@@ -2756,7 +2767,10 @@ mod tests {
              the denial above proves only that Landlock was switched on"
         );
         assert_eq!(size, 0);
-        // The ledger checks itself against `BEHAVIOURAL_RUNGS` on drop.
+        // No closing call: the rung this body entered was checked AT THE MINT
+        // against `BEHAVIOURAL_RUNGS`, before a token existed. What the ledger
+        // still compares on drop is the converse -- a declared rung this run
+        // never reached -- and that half is skippable.
     }
 
     /// The cumulative `handled_access_fs` table, pinned.

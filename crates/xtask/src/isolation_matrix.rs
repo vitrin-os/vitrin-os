@@ -1418,12 +1418,16 @@ pub fn render(corpus: &Corpus, sources: &Sources) -> Result<String> {
     //   1. `vitrin-realm-init`'s forked measurement bodies, which issue
     //      `landlock_restrict_self` themselves. Held by the type system:
     //      `landlock::restrict_self` demands an `Entering`, whose only mint in
-    //      a test build is `RungsEntered`, which records the rung the ruleset
-    //      it is handed was CREATED at -- not a number the test supplied
-    //      alongside it -- and compares what it recorded against
-    //      `BEHAVIOURAL_RUNGS` when it drops. The token carries that ruleset,
-    //      so it is the only descriptor that can be enforced. The `PINS` above
-    //      keep that shape from being deleted quietly.
+    //      a test build is `RungsEntered::entering`, which reads the rung the
+    //      ruleset it is handed was CREATED at -- not a number the test
+    //      supplied alongside it -- and REFUSES to hand back a token when
+    //      `BEHAVIOURAL_RUNGS` does not declare that rung for that test. That
+    //      refusal is at the mint, so this absolute rests on no destructor;
+    //      `Drop` still checks the converse (a row declaring a rung the run
+    //      never entered) and `Drop` is skippable, which the limits page
+    //      publishes. The token carries that ruleset, so it is the only
+    //      descriptor that can be enforced. The `PINS` above keep that shape
+    //      from being deleted quietly.
     //   2. A test that asks the *shipped helper* for a rung -- the core's own
     //      confinement suite, and the integration suite. Held at the core's
     //      realm spawn by `RUNGS_NO_TEST_ENTERS`, and in `tests/integration`
@@ -1936,7 +1940,11 @@ fn render_exercised_rungs(p: &mut String, corpus: &Corpus, c: &Constants) {
          it does not enter refuses to render, a rung it does enter and this page omits refuses\n\
          to render, and the tests cannot enter a domain without declaring it: the function that\n\
          issues `landlock_restrict_self` demands a token only a recording ledger can mint, and\n\
-         that ledger compares what it recorded against the same table when it drops. The\n\
+         **the mint itself refuses a rung the test's row does not declare** — before the token\n\
+         exists, so that direction rests on no destructor. What the ledger still checks when it\n\
+         drops is the converse — a row declaring a rung the run never entered — and `Drop` is\n\
+         skippable in Rust by construction, which `docs/book/src/limits.md` publishes rather\n\
+         than argues away. The\n\
          generator also refuses to emit when the limits page does not carry the tally above.\n\n\
          **A test that asks the shipped helper for a rung enters a domain in another process,\n\
          where no Rust type can reach it.** That route is held separately: the core's own\n\

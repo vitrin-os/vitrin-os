@@ -497,15 +497,18 @@ impl Ruleset {
         self.rung
     }
 
-    /// A rung with **no descriptor**, for the ledger's own non-vacuity proof.
+    /// A rung with **no descriptor**, for the ledger's own non-vacuity proofs.
     ///
     /// `landlock_restrict_self` on `-1` cannot enter a domain at any rung, so
     /// this is safe to hand to a [`RungsEntered`] on a machine that has no
-    /// Landlock at all -- which is what
-    /// `a_ledger_that_recorded_a_rung_its_row_does_not_name_fails_on_drop`
-    /// needs, and it is the only reason this exists. It is deliberately **not**
-    /// a way to attach a chosen rung to a real descriptor: there is no argument
-    /// here that could carry one.
+    /// Landlock at all -- which is what both of the ledger's `#[should_panic]`
+    /// proofs in `main.rs` need, one per direction:
+    /// `a_ledger_asked_for_a_rung_its_row_does_not_name_refuses_to_mint` for
+    /// the mint check, and
+    /// `a_ledger_that_skipped_a_rung_its_row_declares_fails_on_drop` for the
+    /// converse still held in `Drop`. Those two are the only reason this
+    /// exists. It is deliberately **not** a way to attach a chosen rung to a
+    /// real descriptor: there is no argument here that could carry one.
     #[cfg(test)]
     pub fn unopened(rung: u32) -> Ruleset {
         Ruleset { fd: -1, rung }

@@ -2238,9 +2238,11 @@ pub(crate) const RUNGS_NO_TEST_ENTERS: &[u32] = &[4, 5];
 
 /// Refuse a spawn that would make the published absolute above false.
 ///
-/// `vitrin-realm-init`'s own suite is held by the type system: minting the
-/// token `landlock::restrict_self` demands records the rung, and the ledger
-/// checks what it recorded against `BEHAVIOURAL_RUNGS` when it drops. That
+/// `vitrin-realm-init`'s own suite is held by the type system: the mint of the
+/// token `landlock::restrict_self` demands reads the rung off the ruleset it is
+/// handed and **refuses** when `BEHAVIOURAL_RUNGS` does not declare that rung
+/// for that test -- at the mint, not in a destructor, because `Drop` is
+/// skippable and this is a published absolute. That
 /// mechanism cannot see **this** route, because a test here enters no domain
 /// itself -- it asks the shipped helper to, in another process, over a
 /// handshake. So the rung the helper reports back is checked here, at the one

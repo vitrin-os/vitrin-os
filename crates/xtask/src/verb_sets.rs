@@ -40,11 +40,13 @@
 //! rather than of the wire, and the tool says so rather than blurring it: a
 //! deployment may decline any verb it likes. It is checkable here only because
 //! the two sets coincide today -- `observe_cursor` and `egress` are refused by
-//! *every* deployment (no cursor delivery, no facet at all), which is what the
-//! spec surfaces claim, and they are also exactly what this core leaves out of
-//! `SERVED_VERB_BITS`. Should a verb ever be unserved *here* but servable
-//! elsewhere, the spec carriers must drop the marker rather than be forced to
-//! restate a local fact.
+//! *every* deployment (no per-principal cursor delivery; and for `egress`, no
+//! out-of-core mediating proxy -- the facet landed at P2.7.2 and did not make
+//! the verb servable, so this parenthetical reads "no proxy" where it once
+//! read "no facet at all"), which is what the spec surfaces claim, and they
+//! are also exactly what this core leaves out of `SERVED_VERB_BITS`. Should a
+//! verb ever be unserved *here* but servable elsewhere, the spec carriers must
+//! drop the marker rather than be forced to restate a local fact.
 //!
 //! # The marker, and why it is not a phrase
 //!

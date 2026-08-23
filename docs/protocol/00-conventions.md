@@ -386,6 +386,18 @@ Notes:
 Every `string` argument documents a maximum byte length. A violation is fatal
 `invalid_argument`.
 
+This table is a **closed registry**, and it went stale the way closed registries
+do: the egress facet added two `string` arguments and neither reached it, so a
+section opening with the word *every* listed fifteen of seventeen. It is now
+**held to the IDL mechanically** — `cargo xtask protocol-tables --check` derives
+`(interface.message, argument, max bytes)` from every `string` argument in
+`protocol/vitrin-v0.xml` and fails naming any row this table has that the IDL
+does not, or the IDL has that this table does not. The rows are still **typed by
+hand, not generated**: the parenthetical reasoning in the third column is prose
+no tool can produce, and losing it would cost more than the typing does. What
+the gate removes is the possibility of the set disagreeing, which is the part
+that was ever wrong.
+
 | Interface.message | Argument | Max bytes |
 |---|---|---|
 | `vitrin_handshake.hello` | `identity` | 2048 (the SPIFFE-ID maximum: a 255-byte trust domain plus path) |
@@ -403,6 +415,8 @@ Every `string` argument documents a maximum byte length. A violation is fatal
 | `vitrin_shim_session.offer_selection` | `data` | 61440 |
 | `vitrin_shim_seat.text` | `text` | 4096 |
 | `vitrin_launcher.launched` | `realm` | 64 (same bound as every other realm id, so it passes back through `get_realm` unchanged) |
+| `vitrin_egress.request_connect` | `host` | 253 (the DNS name maximum, stated in its own terms rather than derived from `request_grant`'s 256-byte `resource` — and deliberately the **looser** of the two, so a 251-byte host fits here and fits in no `net:` selector, is therefore accepted by the decoder and refused `not_granted` by the chokepoint, which is the fail-closed direction) |
+| `vitrin_egress.connected` | `host` | 253 (the echo, byte-identical to the request's and bounded identically; an IPv6 literal carries **no** brackets in either, since the port is its own argument and two spellings of one endpoint under one selector is the thing that bound exists to prevent) |
 
 ### 2.4 The one-fd-per-message invariant
 

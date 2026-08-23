@@ -66,7 +66,7 @@ unknown message never desynchronises the fd stream. If the header's
 
 | Class | Reaches the core by | Interfaces |
 |---|---|---|
-| **Agent principal** | Connecting to the core's listening socket and authenticating | `vitrin_handshake`, `vitrin_principal`, `vitrin_realm`, `vitrin_grant`, `vitrin_consent`, `vitrin_view`, `vitrin_actuator_*`, `vitrin_launcher`, `vitrin_layout_*` |
+| **Agent principal** | Connecting to the core's listening socket and authenticating | `vitrin_handshake`, `vitrin_principal`, `vitrin_realm`, `vitrin_grant`, `vitrin_consent`, `vitrin_view`, `vitrin_actuator_*`, `vitrin_launcher`, `vitrin_layout_*`, `vitrin_egress` |
 | **Shim** | Inheriting a socketpair from the core across `fork`/`exec` | `vitrin_shim_session`, `vitrin_shim_surface`, `vitrin_shim_seat` |
 
 The classes are mutually unreachable. A message using the other class's
@@ -94,6 +94,7 @@ authentication, because the core created both ends itself.
 | `vitrin_launcher` | Realm-launch facet (since wire version 2) — fork a new realm instance from an operator-written template, under a core-minted id; `launch` carries no arguments, so the command never crosses the wire |
 | `vitrin_layout_focus` | Focus facet (since wire version 2) — bind the output to the granted realm and send the human's own input there, one act |
 | `vitrin_layout_arrange` | Arrangement facet (since wire version 2) — fill the output, or compose at the app's own size; `place`, `resize`, `raise` and stacking are absent rather than refused |
+| `vitrin_egress` | Egress facet (since wire version 2) — one outbound connection to the single `host:port` the grant names, handed back as a socket fd. **No deployment serves the `egress` verb**, and this core implements none of the interface's messages: the out-of-core mediating proxy does not exist |
 
 Each has a prose page under
 [`docs/protocol/`](https://github.com/vitrin-os/vitrin-os/tree/main/docs/protocol).

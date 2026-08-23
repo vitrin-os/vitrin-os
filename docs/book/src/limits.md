@@ -86,56 +86,64 @@ and that was false. Read from `crates/vitrin-realm-init/src/landlock.rs`'s
 
 **And "nothing else" is a small set — which is the honest half of that
 sentence, and it is published because the enumeration is the stronger-sounding
-claim.** Measured on this repo's box (Arch, kernel `7.1.8-arch1-3`, Landlock ABI
-9, 2026-08-14) with `solid-client --probe` over **31 distinct in-realm paths**,
-in batches of eight, each batch run twice — shipped default and
+claim.** Re-collected on this repo's box (Arch, kernel `7.1.9-arch1-2`, Landlock
+ABI 9, 2026-08-23) with `solid-client --probe` over **40 distinct in-realm
+paths**, in batches of eight, each batch run twice — shipped default and
 `--landlock=off`, byte-identical `realm.toml` asserted between the pair, and at
 least one path per batch reachable in both runs so a report from an app that
-could open nothing cannot satisfy a denial. **Eight** paths were refused
-`EACCES` at the default and opened at `--landlock=off`:
+could open nothing cannot satisfy a denial. With the app **relocated out of the
+build tree**, into a `/tmp` directory that the mount table and the ruleset both
+already carry, **three** paths were refused `EACCES` at the default and opened
+at `--landlock=off`:
 
 | denied at the default, reachable at `--landlock=off` | what it is |
 |---|---|
 | `/` | the realm root |
-| `/run`, `/vitrin` | the parents of `/run/vitrin`, `/vitrin/home` and the shim binary |
-| `/home`, `/home/<user>`, `…/projects`, `…/projects/vitrin`, `…/projects/vitrin/shim` | the parents of this development tree's app-directory and shim-library binds — the build tree's own paths, mirrored into the realm at the same spelling, and **not** the core-chosen `/vitrin/…` above |
+| `/run` | the parent of `/run/vitrin` |
+| `/vitrin` | the parent of `/vitrin/home` and of the shim binary `/vitrin/vitrin-shim` |
 
-Every one of the eight is a directory the realm's **own** mount table created on
-its root tmpfs purely to hold a bind target beneath it, and each holds nothing
-but the next component of that path. Most of the `/home` chain is an artefact of
-running from a build tree: with the app relocated to a directory already inside
-a granted hierarchy, a second run's probed denials were `/`, `/run`, `/vitrin`
-and `/home` — the deeper components stayed only because *this tree's shim*
-needed its `subprojects/wlroots` directory bound, which a packaged install would
-not. Every other probed
-path answered identically at both settings: `/usr`, `/etc`, `/proc`, `/sys`,
-`/tmp`, `/dev` and its nodes, `/dev/shm`, `/dev/pts`, `/dev/dri`,
-`/vitrin/home`, the shim binary, `/run/vitrin`, the `/bin`-class symlinks and
-files inside them all opened in both; `/dev/tty` answered `ENXIO` in both, which
-is a realm with no controlling terminal and not a ruleset denial.
+All three are directories the realm's **own** mount table created on its root
+tmpfs purely to hold a bind target beneath it, and each holds nothing but the
+next component of that path. Every other probed path answered identically at
+both settings: `/usr`, `/usr/bin`, `/usr/lib`, `/usr/lib64`, `/etc`, `/proc`,
+`/proc/self`, `/sys`, `/tmp`, `/dev` and its nodes (`/dev/null`, `/dev/zero`,
+`/dev/urandom`, `/dev/ptmx`), `/dev/shm`, `/dev/pts`, `/dev/dri`,
+`/vitrin/home`, `/vitrin/vitrin-shim`, `/run/vitrin`, the `/bin`-class names
+(`/bin`, `/sbin`, `/lib`, `/lib64`), files inside them (`/bin/sh`,
+`/usr/bin/env`), and the app's own directory and binary all opened in both;
+`/dev/tty` answered `ENXIO` in both, which is a realm with no controlling
+terminal and not a ruleset denial, and `/dev/input` answered `ENOENT` in both,
+which is the mount table and not the ruleset.
 
-**Two things this measurement predates, neither of which moves the boundary it
-reports.** Issue [#283](https://github.com/vitrin-os/vitrin-os/issues/283)
-(a) renamed the shim's bind target from `/vitrin/shim` to
-`/vitrin/vitrin-shim`, which changes a leaf's name and no grant, and (b) removed
-the shim-library bind the `/home` chain's deeper components existed for, by
-linking anything the shim vendors statically instead. So a re-run today should
-deny four paths rather than eight when the app is relocated, and should mint no
-`…/projects/vitrin/shim` chain at all.
+**The `/home` chain this page used to publish is gone, and it was never a
+denial the design produced.** The eight-row table carried here until 2026-08-23
+was collected with the app running from a build tree, and five of its rows were
+that tree's own ancestors — minted on the realm's root tmpfs solely to hold the
+app-directory and shim-library bind targets beneath them. With the app
+relocated, `/home` and every component under it answer **`ENOENT` at both
+settings**: they do not exist inside the realm at all. The same 40 paths were
+also run again in the same session with the app left in the build tree, which
+still denies `/`, `/run`, `/vitrin`, `/home`, `/home/<user>` and **every**
+further ancestor of the app's own directory — a count that is a function of how
+deep the checkout is and of nothing else, which is why the relocated run is the
+one published above and why the old table's "eight" was a fact about a
+pathname.
 
-**That last sentence is a prediction, and this page does not publish
-predictions as measurements.** The table above is exactly what was probed on
-2026-08-14 and it has **not** been re-collected since; where the two disagree,
-the table is the measurement and the paragraph is an expectation about a run
-nobody has done. Re-collecting it means `solid-client --probe` over all 31
-paths in batches of eight, twice per batch, which is a measurement session
-rather than an edit. It is owed under
-[#187](https://github.com/vitrin-os/vitrin-os/issues/187), the issue this
-ruleset and this table belong to, and no document schedules it; until it
-happens this page reports **eight** because eight is the number that was
-observed. Nothing in CI re-collects it or will notice that it has aged — a
-reader checks this against a session someone has to sit through, and that is
-the whole of the mechanism behind it.
+That also settles a prediction this page carried and labelled as one.
+[#283](https://github.com/vitrin-os/vitrin-os/issues/283) renamed the shim's
+bind target `/vitrin/shim` → `/vitrin/vitrin-shim` and removed the
+shim-library bind by linking anything the shim vendors statically, and the page
+predicted **four** denials afterwards — `/`, `/run`, `/vitrin` and `/home`. The
+measurement says **three**: `/home` is not denied, it is absent. The prediction
+was wrong, in the direction that overstated the boundary, and it is deleted
+rather than left standing beside the run that replaced it.
+
+**Nothing in CI re-collects this and nothing will notice when it has aged
+again.** It is a measurement session someone sits through — twenty core starts
+across the two app locations, two isolation settings each — not an edit, and
+what a reader is checking this page against is a run rather than a gate. It
+belongs to [#187](https://github.com/vitrin-os/vitrin-os/issues/187), the issue
+this ruleset and this table come from.
 
 So what the enumeration buys over the realm-root grant #187 declined is, on this
 host, that the realm cannot **list its own root** and cannot list the handful of

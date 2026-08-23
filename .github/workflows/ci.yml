@@ -760,6 +760,43 @@ jobs:
         # not depend on this step existing.
         run: cargo xtask verb-sets --check
 
+      - name: cargo xtask protocol-tables --check
+        # Issue #196's FOURTH review, and the same defect a fourth time: an
+        # item appended to a closed normative enumeration without the
+        # enumeration moving. The step above holds the enumerations of VERBS;
+        # this one holds the two enumerations of the IDL's own STRUCTURE that
+        # prose restates, both of which had just gone stale:
+        #
+        #   * `docs/protocol/04-vitrin_grant.md`'s header said "3 requests" of
+        #     an interface with four. Fifteen page headers had to be read by
+        #     hand against the IDL to find the one that disagreed.
+        #   * `docs/protocol/00-conventions.md` section 2.3 opens "Every
+        #     `string` argument documents a maximum byte length" and listed 15
+        #     of the 17 the IDL declares.
+        #
+        # Both are structurally derivable -- an interface's version and its
+        # request/event counts are attributes and child counts, and every
+        # string bound is already resolved into the scanner's IR from the
+        # `(max N bytes)` token it refuses to default -- so neither is a human
+        # judgement and neither should be typed from memory.
+        #
+        # The registry here is the FILE NAMES: `docs/protocol/NN-<iface>.md`
+        # pairs page to interface, and the check is a bijection, so a new
+        # interface with no prose page is red without anyone remembering to
+        # register anything.
+        #
+        # What it deliberately does NOT hold is section 6's three delivery
+        # class counts. Which class a request belongs to is a judgement about
+        # its delivery contract rather than something the IDL states; a gate
+        # that checked only the total would stay green on a request moved from
+        # one class to another, which is the drift that actually happened
+        # there. That section says so in its own words and this step does not
+        # contradict it.
+        #
+        # Reads files, writes nothing. Runs here AND as a test in `cargo test
+        # --workspace`, so the gate does not depend on this step existing.
+        run: cargo xtask protocol-tables --check
+
   deny:
     name: deny (TCB dependency budget - plan risk R7)
     runs-on: ubuntu-latest

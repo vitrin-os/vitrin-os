@@ -155,6 +155,21 @@
 //!                                prose, corrected in one place and left stale
 //!                                in another. See the module docs for what it
 //!                                deliberately does NOT catch.
+//!
+//! cargo xtask protocol-tables --check
+//!                                The same shape for the IDL's STRUCTURE
+//!                                rather than its verbs: every
+//!                                `docs/protocol/NN-<interface>.md` header's
+//!                                stated interface version and message counts,
+//!                                and every row of `00-conventions.md` section
+//!                                2.3's per-argument string-bound registry.
+//!                                Both are derivable from
+//!                                `protocol/vitrin-v0.xml` and neither was
+//!                                held: a fourth review of issue #196 found a
+//!                                page saying "3 requests" of an interface
+//!                                with four, and a section opening "Every
+//!                                `string` argument" that listed 15 of 17.
+//!                                Reads only; also runs as a test.
 //! ```
 //!
 //! Calls straight into the `vitrin_scanner` library (`parse`, `rust_gen`,
@@ -174,6 +189,7 @@ mod build_output;
 mod isolation_matrix;
 mod kernel_matrix;
 mod limits;
+mod protocol_tables;
 mod session_matrix;
 mod skip_census;
 mod test_census;
@@ -197,7 +213,7 @@ fn main() -> ExitCode {
 }
 
 fn usage() -> &'static str {
-    "usage: cargo xtask codegen [--check]\n       cargo xtask demo [--headless] [--task K=V]...\n       cargo xtask bless [--filter SUBSTR]\n       cargo xtask session-matrix [--check]\n       cargo xtask isolation-matrix [--check]\n       cargo xtask kernel-matrix [--check]\n       cargo xtask limits-check [--tracker]\n       cargo xtask verb-sets [--check]\n       cargo xtask skip-scan\n       cargo xtask skip-census --min-tests N [--expect-self-marker] -- CMD [ARG...]"
+    "usage: cargo xtask codegen [--check]\n       cargo xtask demo [--headless] [--task K=V]...\n       cargo xtask bless [--filter SUBSTR]\n       cargo xtask session-matrix [--check]\n       cargo xtask isolation-matrix [--check]\n       cargo xtask kernel-matrix [--check]\n       cargo xtask limits-check [--tracker]\n       cargo xtask verb-sets [--check]\n       cargo xtask protocol-tables [--check]\n       cargo xtask skip-scan\n       cargo xtask skip-census --min-tests N [--expect-self-marker] -- CMD [ARG...]"
 }
 
 fn run() -> Result<()> {
@@ -357,6 +373,29 @@ fn run() -> Result<()> {
                 }
             }
             let report = verb_sets::check(&workspace_root()?)?;
+            println!("{report}");
+            Ok(())
+        }
+        "protocol-tables" => {
+            // Reads the IDL and the two prose surfaces that restate its
+            // structure; writes nothing. `--check` is accepted and is the only
+            // mode, for the same reason `verb-sets` has no generator half:
+            // neither surface is generated, and this holds their numbers
+            // rather than producing their prose.
+            for arg in &args[1..] {
+                match arg.as_str() {
+                    "--check" => {}
+                    "-h" | "--help" => {
+                        println!("{}", usage());
+                        return Ok(());
+                    }
+                    other => bail!(
+                        "unknown flag '{other}' for 'protocol-tables'\n\n{}",
+                        usage()
+                    ),
+                }
+            }
+            let report = protocol_tables::check(&workspace_root()?)?;
             println!("{report}");
             Ok(())
         }

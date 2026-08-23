@@ -112,7 +112,7 @@ const INTEGRATION_DIR: &str = "tests/integration";
 /// on the ladder no Rust check could reach.
 const HARNESS_PY: &str = "tests/integration/harness.py";
 
-/// The two claims D-043 (2026-08-19) put on the rows below the floor. Exactly
+/// The two claims D-044 (2026-08-19) put on the rows below the floor. Exactly
 /// one belongs on each such row, and which one is decided by
 /// [`Rung::behavioural_tests`] rather than by whoever last edited the corpus --
 /// see step (7b) of [`render`].
@@ -230,7 +230,7 @@ pub struct Rung {
     ///
     /// Empty is a real and common answer, and it is the honest one for every
     /// rung nothing exercises. It is a field rather than a sentence because
-    /// the sentence is what went wrong: D-043's first draft published "the
+    /// the sentence is what went wrong: D-044's first draft published "the
     /// behavioural tests that exercise them" on the rows for rungs 4 and 5,
     /// which no test enters a domain at.
     ///
@@ -1244,7 +1244,7 @@ pub fn render(corpus: &Corpus, sources: &Sources) -> Result<String> {
     }
 
     // (7b) Which sub-floor rungs a behavioural test actually enters a domain
-    // at, held against the two claims that talk about it (D-043). The first
+    // at, held against the two claims that talk about it (D-044). The first
     // draft of that decision published "the behavioural tests that exercise
     // them" on the rows for rungs 4 and 5, where nothing does -- a sentence a
     // human had to remember to keep true, on the rows it was least true of.
@@ -1343,7 +1343,7 @@ pub fn render(corpus: &Corpus, sources: &Sources) -> Result<String> {
                 bail!(
                     "isolation-matrix: ABI rung {} is below the floor of {} and carries {} of \
                      {EXERCISED_CLAIM:?} / {UNEXERCISED_CLAIM:?}. Exactly one is required: \
-                     D-043 is the published answer to \"what is a test at an unreachable rung \
+                     D-044 is the published answer to \"what is a test at an unreachable rung \
                      evidence about\", and a sub-floor row that names neither, or both, either \
                      has no answer or two.",
                     rung.abi,
@@ -1852,7 +1852,7 @@ fn sub_floor_tally(corpus: &Corpus, c: &Constants) -> String {
 /// Which rungs a behavioural test enters a domain at — **counted from the
 /// corpus, never typed into a sentence.**
 ///
-/// This paragraph exists because the sentence it replaces was wrong. D-043's
+/// This paragraph exists because the sentence it replaces was wrong. D-044's
 /// first draft published "the behavioural tests that exercise them" on every
 /// row below the floor, including the two rows nothing exercises. A reader
 /// cannot tell those rows apart from the table, so the page now says which is
@@ -1862,7 +1862,7 @@ fn sub_floor_tally(corpus: &Corpus, c: &Constants) -> String {
 ///
 /// The **denominator** is the ladder's height and not the number of rows here:
 /// rows above [`Constants::max_rung`] are clamp rows, not rungs this build can
-/// ask for, and counting them published "4 of the 10 rungs" against D-043's
+/// ask for, and counting them published "4 of the 10 rungs" against D-044's
 /// "the ladder ... has nine rungs" on one branch.
 fn render_exercised_rungs(p: &mut String, corpus: &Corpus, c: &Constants) {
     let exercised: Vec<&Rung> = corpus
@@ -1893,7 +1893,7 @@ fn render_exercised_rungs(p: &mut String, corpus: &Corpus, c: &Constants) {
     // rows above this build's ceiling are clamp rows, and every other surface
     // in this repository counts the ladder as nine rungs. Counting rows here
     // published "4 of the 10 rungs" against "the ladder ... has nine rungs" in
-    // D-043, on the same branch -- exactly the count-in-two-places defect this
+    // D-044, on the same branch -- exactly the count-in-two-places defect this
     // page's tally check exists to stop.
     let above: Vec<String> = corpus
         .rungs
@@ -1930,7 +1930,7 @@ fn render_exercised_rungs(p: &mut String, corpus: &Corpus, c: &Constants) {
          > {}.\n\n\
          Every cell on an unexercised row is derived from this build's own source and\n\
          measured against nothing — keeping the sub-floor tests that exist and adding none\n\
-         for the rest is decision D-043, not an oversight. **Neither the name nor the rung is\n\
+         for the rest is decision D-044, not an oversight. **Neither the name nor the rung is\n\
          remembered.** Each name above is resolved against `BEHAVIOURAL_RUNGS` in that same\n\
          file, which declares the rungs that test enters a domain at; a name listed on a rung\n\
          it does not enter refuses to render, a rung it does enter and this page omits refuses\n\
@@ -2104,7 +2104,7 @@ fn render_not_here(p: &mut String, c: &Constants) {
          too, which is a fact about that kernel and not about that runner.\n\
          - **Any statement that P2.6.3's criteria were all met as written.** The task\n  \
          (issue #187) was ACCEPTED on 2026-08-19, on its *corrected* criteria and on\n  \
-         decision D-043 — not on the row the plan first wrote. That date is the plan's\n  \
+         decision D-044 — not on the row the plan first wrote. That date is the plan's\n  \
          acceptance record and the owner's decision; the issue's own closure timestamp is\n  \
          whatever GitHub writes when the merge lands, and this page asserts no value for\n  \
          it. What landed with this page is a\n  \
@@ -2321,7 +2321,7 @@ pub static CLAIMS: &[Claim] = &[
         ],
     },
     // The lower half of this ladder is unreachable in production, and until
-    // D-043 (2026-08-19) nothing published said what its behavioural tests
+    // D-044 (2026-08-19) nothing published said what its behavioural tests
     // were therefore evidence *about*. A reader met three tests exercising
     // rungs no shipped session can run at and had to guess. These two claims
     // are the machine-held half of that decision, and they are a PAIR because
@@ -2351,7 +2351,7 @@ pub static CLAIMS: &[Claim] = &[
                behavioural test taken at one of them holds the `--landlock=abi:N` DIAL honest \
                and not the floor. This row is a rung such a test enters a domain at: it \
                describes no state a stock session can reach, and those tests are the only \
-               evidence that this part of the table is not fiction (decision D-043, \
+               evidence that this part of the table is not fiction (decision D-044, \
                2026-08-19).",
         anchors: &[Anchor {
             surface: LIMITS,
@@ -2363,7 +2363,7 @@ pub static CLAIMS: &[Claim] = &[
         says: "This rung is below the floor AND no behavioural test enters a Landlock domain at \
                it, so every cell on this row is derived from this build's own source and \
                measured against nothing -- the sub-floor half of the ladder is exercised in \
-               part, not throughout. D-043 (2026-08-19) kept the sub-floor tests that exist and \
+               part, not throughout. D-044 (2026-08-19) kept the sub-floor tests that exist and \
                deliberately added none, so this row's status is a decision rather than an \
                oversight.",
         anchors: &[Anchor {
@@ -2940,7 +2940,7 @@ mod tests {
         );
     }
 
-    /// **D-043's own defect, as a gate.** The first draft of that decision
+    /// **D-044's own defect, as a gate.** The first draft of that decision
     /// carried one claim -- "the behavioural tests that exercise them" -- on
     /// every sub-floor row, including the two rows nothing enters a domain at,
     /// so the published matrix asserted tests existed where none did. Which
@@ -2968,7 +2968,7 @@ mod tests {
 
     /// And the other direction: a sub-floor row that carries neither claim has
     /// no answer to "what is a test at an unreachable rung evidence about",
-    /// which is the state D-043 exists to end.
+    /// which is the state D-044 exists to end.
     #[test]
     fn a_sub_floor_rung_with_no_sub_floor_claim_refuses_to_render() {
         let mut rungs: Vec<Rung> = RUNGS.iter().map(rung_clone).collect();
@@ -3247,7 +3247,7 @@ mod tests {
     /// The denominator on the emitted page is the LADDER's height, not the
     /// number of rows: the clamp row above the ceiling is not a rung this
     /// build can ask for. Counting rows published "4 of the 10 rungs" against
-    /// D-043's "the ladder ... has nine rungs" on the same branch.
+    /// D-044's "the ladder ... has nine rungs" on the same branch.
     #[test]
     fn the_exercised_count_is_out_of_the_rungs_this_build_can_ask_for() {
         let src = sources();

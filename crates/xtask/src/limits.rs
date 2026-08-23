@@ -2341,7 +2341,7 @@ pub const DERIVED: &[Derived] = &[
         says: "the Landlock ABI floor this build declares. One constant, four published \
                renderings of it, and until #172 the four were held by nothing.",
         issue: "#187 (P2.6.3) was accepted on 2026-08-19, on its corrected criteria and on \
-                D-043 -- that date is the plan's acceptance record, not a GitHub timestamp. \
+                D-044 -- that date is the plan's acceptance record, not a GitHub timestamp. \
                 What its criteria still do not cover is published on the limits page rather \
                 than owed by an open issue, and the distribution half is #281. The floor's \
                 own value is an owner's decision (2026-08-15, lowered a rung on 2026-08-16) \

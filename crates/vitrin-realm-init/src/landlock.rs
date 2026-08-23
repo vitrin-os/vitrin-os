@@ -16,7 +16,7 @@
 //!   is a descriptor the app inherits;
 //! - **before** the `chdir` (K14), the argv assembly and the `execve`, each of
 //!   which must therefore fall inside the granted set. A ruleset that forgets
-//!   `/vitrin/shim` does not fail here; it fails at `execve` with `EACCES`,
+//!   `/vitrin/vitrin-shim` does not fail here; it fails at `execve` with `EACCES`,
 //!   which is a realm that will not start.
 //!
 //! Ordinary Rust is allowed (this binary is single-threaded by design -- see
@@ -55,7 +55,7 @@
 //!    bottoms out at the floor; what comes back is still what the kernel
 //!    granted, never what was asked for, and the core still warns when the two
 //!    differ. **The floor narrowed #187 rather than completing it**; P2.6.3 was
-//!    accepted on 2026-08-19 (Correction 7, D-043), and PRD §20's "coverage is
+//!    accepted on 2026-08-19 (Correction 7, D-044), and PRD §20's "coverage is
 //!    kernel-dependent" caveat is answered for the five kernels #281 booted
 //!    (`docs/book/src/isolation-kernels.md`) and for no others. The multi-rung table
 //!    that *did* get built (`docs/book/src/isolation-matrix.md`, `cargo xtask

@@ -1413,7 +1413,7 @@ fn exec_shim(chan: &Chan, config: &Config) -> Result<std::convert::Infallible, F
     // MARKS descriptors close-on-exec -- a rule fd opened after it would
     // reach the app unmarked. And everything after it -- the `chdir`, the
     // argv assembly, the `execve` -- must fall inside the granted set, which
-    // is why `/vitrin/shim` and `/run/vitrin` are grants rather than
+    // is why `/vitrin/vitrin-shim` and `/run/vitrin` are grants rather than
     // afterthoughts.
     //
     // The frame is sent *here*, before `execve`, because after it there is no
@@ -1697,7 +1697,7 @@ fn drop_all_capabilities() -> Result<(), Fail> {
 /// no shipped session has ever run at rung 1, 2 or 3 and none ever will while
 /// the floor stands.
 ///
-/// They are kept on purpose — **D-043** (`docs/plan/20-decision-log.md`,
+/// They are kept on purpose — **D-044** (`docs/plan/20-decision-log.md`,
 /// 2026-08-19, the owner's decision that accepted P2.6.3) — and the reason is
 /// written here rather than left to be inferred from the fact that the tests
 /// exist:
@@ -2095,7 +2095,7 @@ mod tests {
     /// storage**, and a realm at rung 2 or above can. Climbing the ladder
     /// loosens the domain here; the cap is a dial, not a one-way weakening.
     ///
-    /// **Sub-floor, and kept for a stated reason (D-043).** Rungs 1 and 2 are
+    /// **Sub-floor, and kept for a stated reason (D-044).** Rungs 1 and 2 are
     /// below `LANDLOCK_MIN_ABI`, so this measures **the dial**, not the floor,
     /// and describes no state a stock session can reach. It is also the one
     /// measurement whose result cannot be read off the mask table: it is what
@@ -2575,7 +2575,7 @@ mod tests {
         // this is the primitive the whole ladder stands on -- so it runs on
         // every kernel that has Landlock at all.
         //
-        // **Sub-floor, and kept for a stated reason (D-043).** Rung 1 is below
+        // **Sub-floor, and kept for a stated reason (D-044).** Rung 1 is below
         // `LANDLOCK_MIN_ABI`; this is evidence about the DIAL and about the
         // primitive, never about the floor and never about a rung a shipped
         // session runs at.
@@ -2666,7 +2666,7 @@ mod tests {
         // The ledger checks itself against `BEHAVIOURAL_RUNGS` on drop.
     }
 
-    /// **Sub-floor, and kept for a stated reason (D-043).** Rungs 2 and 3 are
+    /// **Sub-floor, and kept for a stated reason (D-044).** Rungs 2 and 3 are
     /// below `LANDLOCK_MIN_ABI`, so a kernel that reported either would be
     /// refused at startup rather than confined here. What this measures is the
     /// `--landlock=abi:N` **dial** and the ladder table's lower half — never
@@ -2892,6 +2892,92 @@ mod tests {
              `handled_access_fs`. If it no longer does, the published sentence \"the domain is \
              identical at 6, 7 and 8, and rung 9 is a superset\" is wrong in the overclaiming \
              direction and has to be rewritten."
+        );
+    }
+
+    /// Issue #283, and the one duplication the shim-side fix left standing.
+    ///
+    /// `shim/tests/acceptance/loader_independence.sh` refuses to let the shim
+    /// resolve a library from outside the prefixes a realm's mount table
+    /// mirrors, and it names those prefixes in its own
+    /// `REALM_LIB_PREFIXES` array because it is a **shim-only** test: it must
+    /// run in a source tree with no Rust toolchain and no Cargo workspace, so
+    /// it cannot read [`COMPAT_NAMES`].
+    ///
+    /// That leaves the mount table's library-bearing width written in two
+    /// places, which is exactly the shape this issue's own review kept
+    /// finding. The direction that matters is Rust → shell: a change *here*
+    /// that adds or drops a `lib*` mirror is a change the shim's test would
+    /// keep passing through, silently, having stopped describing the realm.
+    /// So the check lives on this side, where both files are guaranteed to
+    /// exist, and the shim tree keeps needing nothing.
+    ///
+    /// The expected set is **derived, not typed**: `/usr` (bound at its own
+    /// path by `open_sources`) plus every [`COMPAT_NAMES`] entry that names a
+    /// library directory. `bin` and `sbin` are excluded by that predicate, and
+    /// deliberately: the script's own comment explains it is a strict subset
+    /// of what a realm can reach, so that a library resolved out of `/bin` is
+    /// still something this project wants to hear about.
+    #[test]
+    fn the_shims_realm_lib_prefixes_are_the_library_bearing_compat_names() {
+        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../shim/tests/acceptance/loader_independence.sh");
+        // A missing script is a FAILURE, never a skip: "skip when the file is
+        // absent" is how this check would stop checking the first time
+        // somebody moved it.
+        let text = std::fs::read_to_string(&script).unwrap_or_else(|e| {
+            panic!(
+                "cannot read {} ({e}). It is the shim-side half of this assertion; if it moved, \
+                 this test moves with it rather than quietly passing.",
+                script.display()
+            )
+        });
+
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("REALM_LIB_PREFIXES="))
+            .unwrap_or_else(|| {
+                panic!(
+                    "no `REALM_LIB_PREFIXES=` assignment in {}, so this test compared nothing.",
+                    script.display()
+                )
+            });
+        let inner = line
+            .trim_start_matches("REALM_LIB_PREFIXES=")
+            .trim()
+            .trim_start_matches('(')
+            .trim_end_matches(')');
+        let mut found: Vec<&str> = inner.split_whitespace().collect();
+
+        // Derived from COMPAT_NAMES by predicate, so a seventh compat name
+        // that happens to be `lib*` arrives here without an edit.
+        let lib_names: Vec<&&str> = COMPAT_NAMES
+            .iter()
+            .filter(|n| n.starts_with("lib"))
+            .collect();
+        assert!(
+            !lib_names.is_empty() && lib_names.len() < COMPAT_NAMES.len(),
+            "the `lib*` predicate selected {} of COMPAT_NAMES' {} entries. At 0 this test asserts \
+             nothing; at all of them it has stopped distinguishing `bin`/`sbin` from the library \
+             mirrors and the script's `strict subset` comment is no longer true.",
+            lib_names.len(),
+            COMPAT_NAMES.len()
+        );
+        let mut expected: Vec<String> = std::iter::once("/usr/".to_string())
+            .chain(lib_names.iter().map(|n| format!("/{n}/")))
+            .collect();
+
+        found.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(
+            found,
+            expected,
+            "{}'s REALM_LIB_PREFIXES no longer matches this binary's mount table. It is \
+             `/usr` plus the `lib*` entries of COMPAT_NAMES ({COMPAT_NAMES:?}); the script says \
+             {found:?}. Whichever side moved, the other has to move with it -- shim/README.md and \
+             D-044 both point at the script for the current list rather than restating it, so the \
+             script is the only place to change.",
+            script.display()
         );
     }
 }

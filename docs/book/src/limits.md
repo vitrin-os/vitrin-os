@@ -86,33 +86,66 @@ and that was false. Read from `crates/vitrin-realm-init/src/landlock.rs`'s
 
 **And "nothing else" is a small set — which is the honest half of that
 sentence, and it is published because the enumeration is the stronger-sounding
-claim.** Measured on this repo's box (Arch, kernel `7.1.8-arch1-3`, Landlock ABI
-9, 2026-08-14) with `solid-client --probe` over **31 distinct in-realm paths**,
-in batches of eight, each batch run twice — shipped default and
+claim.** Re-collected on this repo's box (Arch, kernel `7.1.9-arch1-2`, Landlock
+ABI 9, 2026-08-23) with `solid-client --probe` over **40 distinct in-realm
+paths**, in batches of eight, each batch run twice — shipped default and
 `--landlock=off`, byte-identical `realm.toml` asserted between the pair, and at
 least one path per batch reachable in both runs so a report from an app that
-could open nothing cannot satisfy a denial. **Eight** paths were refused
-`EACCES` at the default and opened at `--landlock=off`:
+could open nothing cannot satisfy a denial. With the app **relocated out of the
+build tree**, into a `/tmp` directory that the mount table and the ruleset both
+already carry, **three** paths were refused `EACCES` at the default and opened
+at `--landlock=off`:
 
 | denied at the default, reachable at `--landlock=off` | what it is |
 |---|---|
 | `/` | the realm root |
-| `/run`, `/vitrin` | the parents of `/run/vitrin`, `/vitrin/home` and `/vitrin/shim` |
-| `/home`, `/home/<user>`, `…/projects`, `…/projects/vitrin`, `…/vitrin/shim` | the parents of this development tree's app-directory and shim-library binds |
+| `/run` | the parent of `/run/vitrin` |
+| `/vitrin` | the parent of `/vitrin/home` and of the shim binary `/vitrin/vitrin-shim` |
 
-Every one of the eight is a directory the realm's **own** mount table created on
-its root tmpfs purely to hold a bind target beneath it, and each holds nothing
-but the next component of that path. Most of the `/home` chain is an artefact of
-running from a build tree: with the app relocated to a directory already inside
-a granted hierarchy, a second run's probed denials were `/`, `/run`, `/vitrin`
-and `/home` — the deeper components stay only because *this tree's shim* needs
-its `subprojects/wlroots` directory bound (`harness.shim_library_dirs`), which a
-packaged install would not. Every other probed
-path answered identically at both settings: `/usr`, `/etc`, `/proc`, `/sys`,
-`/tmp`, `/dev` and its nodes, `/dev/shm`, `/dev/pts`, `/dev/dri`,
-`/vitrin/home`, `/vitrin/shim`, `/run/vitrin`, the `/bin`-class symlinks and
-files inside them all opened in both; `/dev/tty` answered `ENXIO` in both, which
-is a realm with no controlling terminal and not a ruleset denial.
+All three are directories the realm's **own** mount table created on its root
+tmpfs purely to hold a bind target beneath it, and each holds nothing but the
+next component of that path. Every other probed path answered identically at
+both settings: `/usr`, `/usr/bin`, `/usr/lib`, `/usr/lib64`, `/etc`, `/proc`,
+`/proc/self`, `/sys`, `/tmp`, `/dev` and its nodes (`/dev/null`, `/dev/zero`,
+`/dev/urandom`, `/dev/ptmx`), `/dev/shm`, `/dev/pts`, `/dev/dri`,
+`/vitrin/home`, `/vitrin/vitrin-shim`, `/run/vitrin`, the `/bin`-class names
+(`/bin`, `/sbin`, `/lib`, `/lib64`), files inside them (`/bin/sh`,
+`/usr/bin/env`), and the app's own directory and binary all opened in both;
+`/dev/tty` answered `ENXIO` in both, which is a realm with no controlling
+terminal and not a ruleset denial, and `/dev/input` answered `ENOENT` in both,
+which is the mount table and not the ruleset.
+
+**The `/home` chain this page used to publish is gone, and it was never a
+denial the design produced.** The eight-row table carried here until 2026-08-23
+was collected with the app running from a build tree, and five of its rows were
+that tree's own ancestors — minted on the realm's root tmpfs solely to hold the
+app-directory and shim-library bind targets beneath them. With the app
+relocated, `/home` and every component under it answer **`ENOENT` at both
+settings**: they do not exist inside the realm at all. The same batches were
+run again in the same session with the app left in the build tree (39 distinct
+paths there rather than 40, because two slots name the app's own directory and
+collide with the build tree's own), and that run still denies `/`, `/run`,
+`/vitrin`, `/home`, `/home/<user>` and **every**
+further ancestor of the app's own directory — a count that is a function of how
+deep the checkout is and of nothing else, which is why the relocated run is the
+one published above and why the old table's "eight" was a fact about a
+pathname.
+
+That also settles a prediction this page carried and labelled as one.
+[#283](https://github.com/vitrin-os/vitrin-os/issues/283) renamed the shim's
+bind target `/vitrin/shim` → `/vitrin/vitrin-shim` and removed the
+shim-library bind by linking anything the shim vendors statically, and the page
+predicted **four** denials afterwards — `/`, `/run`, `/vitrin` and `/home`. The
+measurement says **three**: `/home` is not denied, it is absent. The prediction
+was wrong, in the direction that overstated the boundary, and it is deleted
+rather than left standing beside the run that replaced it.
+
+**Nothing in CI re-collects this and nothing will notice when it has aged
+again.** It is a measurement session someone sits through — twenty core starts
+across the two app locations, two isolation settings each — not an edit, and
+what a reader is checking this page against is a run rather than a gate. It
+belongs to [#187](https://github.com/vitrin-os/vitrin-os/issues/187), the issue
+this ruleset and this table come from.
 
 So what the enumeration buys over the realm-root grant #187 declined is, on this
 host, that the realm cannot **list its own root** and cannot list the handful of
@@ -312,7 +345,7 @@ inferred from the word "Landlock":
   rungs is **below `build.landlock_min_abi`**, so a kernel reporting one is
   refused at startup rather than confined weakly, and no shipped session has
   ever run at any of them. They are kept deliberately — decision
-  [**D-043**](https://github.com/vitrin-os/vitrin-os/blob/main/docs/plan/20-decision-log.md#d-043--the-sub-floor-landlock-rung-tests-are-kept-and-what-they-are-evidence-about-is-published-beside-them-the---landlockabin-dial-never-the-floor)
+  [**D-044**](https://github.com/vitrin-os/vitrin-os/blob/main/docs/plan/20-decision-log.md#d-044--the-sub-floor-landlock-rung-tests-are-kept-and-what-they-are-evidence-about-is-published-beside-them-the---landlockabin-dial-never-the-floor)
   (2026-08-19), taken as a dated decision precisely because this task's
   *previous* narrowing was settled by attrition and reached these pages as a
   deferral nobody could date. The reasons are two, and neither is "deleting
@@ -341,7 +374,7 @@ inferred from the word "Landlock":
   bullet above did pass through those rungs once and left nothing behind that
   re-takes it; a measurement nobody can re-run is not coverage.) That is a
   decision rather than an
-  oversight: D-043 was offered the option of *adding* the missing rungs and did
+  oversight: D-044 was offered the option of *adding* the missing rungs and did
   not take it, rung 4 buying `handled_access_net` which this build leaves zero.
   The tally above is **held**, not remembered — `cargo xtask isolation-matrix`
   computes it from the corpus, prints it on the matrix page, and refuses to
@@ -609,7 +642,7 @@ inferred from the word "Landlock":
   and gated,
   which is a narrower promise than "measured". **What P2.6.3's acceptance does
   and does not mean.** It was accepted on the corrected criteria plus decision
-  D-043 (the sub-floor rung tests, above), and two of the criteria written in
+  D-044 (the sub-floor rung tests, above), and two of the criteria written in
   the plan were
   **wrong on the kernel's own terms** while a third — "one row per ABI actually
   reported, on each kernel in the CI matrix" — cannot be satisfied by any

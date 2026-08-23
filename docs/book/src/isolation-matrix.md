@@ -118,7 +118,7 @@ requests — so it is not in that denominator. Below the floor the tally is the 
 
 Every cell on an unexercised row is derived from this build's own source and
 measured against nothing — keeping the sub-floor tests that exist and adding none
-for the rest is decision D-043, not an oversight. **Neither the name nor the rung is
+for the rest is decision D-044, not an oversight. **Neither the name nor the rung is
 remembered.** Each name above is resolved against `BEHAVIOURAL_RUNGS` in that same
 file, which declares the rungs that test enters a domain at; a name listed on a rung
 it does not enter refuses to render, a rung it does enter and this page omits refuses
@@ -202,8 +202,8 @@ published sentence cannot be deleted or reworded while this table still cites it
 | claim | what it says | published at |
 |---|---|---|
 | `abi-floor-refuses-below-the-number` | A kernel reporting a Landlock ABI below this build's floor is refused at startup rather than confined at a weaker rung, and the number is printed as `build.landlock_min_abi`. | `docs/book/src/limits.md` — “build.landlock_min_abi”; `README.md` — “build.landlock_min_abi”; `SECURITY.md` — “build.landlock_min_abi” |
-| `sub-floor-rungs-hold-the-dial-not-the-floor` | Rungs below this build's floor are unreachable in production -- a kernel reporting one is REFUSED at startup rather than confined weakly -- so a behavioural test taken at one of them holds the `--landlock=abi:N` DIAL honest and not the floor. This row is a rung such a test enters a domain at: it describes no state a stock session can reach, and those tests are the only evidence that this part of the table is not fiction (decision D-043, 2026-08-19). | `docs/book/src/limits.md` — “hold the dial honest, not the floor” |
-| `sub-floor-rungs-are-not-all-exercised` | This rung is below the floor AND no behavioural test enters a Landlock domain at it, so every cell on this row is derived from this build's own source and measured against nothing -- the sub-floor half of the ladder is exercised in part, not throughout. D-043 (2026-08-19) kept the sub-floor tests that exist and deliberately added none, so this row's status is a decision rather than an oversight. | `docs/book/src/limits.md` — “exercised in part, not throughout” |
+| `sub-floor-rungs-hold-the-dial-not-the-floor` | Rungs below this build's floor are unreachable in production -- a kernel reporting one is REFUSED at startup rather than confined weakly -- so a behavioural test taken at one of them holds the `--landlock=abi:N` DIAL honest and not the floor. This row is a rung such a test enters a domain at: it describes no state a stock session can reach, and those tests are the only evidence that this part of the table is not fiction (decision D-044, 2026-08-19). | `docs/book/src/limits.md` — “hold the dial honest, not the floor” |
+| `sub-floor-rungs-are-not-all-exercised` | This rung is below the floor AND no behavioural test enters a Landlock domain at it, so every cell on this row is derived from this build's own source and measured against nothing -- the sub-floor half of the ladder is exercised in part, not throughout. D-044 (2026-08-19) kept the sub-floor tests that exist and deliberately added none, so this row's status is a decision rather than an oversight. | `docs/book/src/limits.md` — “exercised in part, not throughout” |
 | `refer-makes-the-cap-a-dial` | A domain denies cross-directory `rename(2)` unless its ruleset HANDLES `REFER`, so rung 1 is stricter about reparenting than rung 2 -- the rung cap is a dial, not a one-way weakening. | `docs/book/src/limits.md` — “The cap is a dial, not a one-way weakening”; `README.md` — “dial, not a one-way tightening” |
 | `truncate-arrives-at-abi-3` | Below ABI 3 there is no `TRUNCATE` right, so a payload that cannot write a file can still empty it -- measured at rung 2 succeeding and rung 3 refusing. | `docs/book/src/limits.md` — “Below ABI 3 there is no `TRUNCATE` right” |
 | `net-scoping-is-carried-by-the-namespace` | ABI 4 buys network scoping, which this build leaves zero because the realm's own network namespace carries that claim and covers UDP and raw sockets too. | `docs/book/src/limits.md` — “ABI 4 is network scoping” |
@@ -237,7 +237,7 @@ published sentence cannot be deleted or reworded while this table still cites it
   too, which is a fact about that kernel and not about that runner.
 - **Any statement that P2.6.3's criteria were all met as written.** The task
   (issue #187) was ACCEPTED on 2026-08-19, on its *corrected* criteria and on
-  decision D-043 — not on the row the plan first wrote. That date is the plan's
+  decision D-044 — not on the row the plan first wrote. That date is the plan's
   acceptance record and the owner's decision; the issue's own closure timestamp is
   whatever GitHub writes when the merge lands, and this page asserts no value for
   it. What landed with this page is a

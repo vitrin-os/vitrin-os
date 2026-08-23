@@ -3280,7 +3280,7 @@ fn verify_shim_exe(shim_host_pid: i32) -> Result<(), SpawnError> {
             ),
         )
     })?;
-    // Measured on this kernel: the link reads back as exactly `/vitrin/shim`.
+    // Measured on this kernel: the link reads back as exactly `/vitrin/vitrin-shim`.
     // Matched as a suffix rather than for equality anyway, because `d_path`
     // is documented to prefix a path it cannot reach from the reader's root
     // with `(unreachable)`, and a hardening change that started doing so here

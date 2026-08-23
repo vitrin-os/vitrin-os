@@ -535,12 +535,16 @@ $(grep '^globals-log:' "$LEDGER" || true)"
 # inside the field they landed in.
 got_v0="$(grep -o '^globals-touched: interface=[a-z0-9_]* class=v0' "$LEDGER" \
 	| sed 's/.*interface=\([a-z0-9_]*\) .*/\1/' | sort -u | tr '\n' ' ')"
-want_v0="wl_compositor wl_data_device_manager wl_output wl_seat wl_shm wl_subcompositor xdg_wm_base zwp_pointer_constraints_v1 zwp_pointer_gestures_v1 zwp_relative_pointer_manager_v1 zxdg_decoration_manager_v1 "
+want_v0="wl_compositor wl_data_device_manager wl_output wl_seat wl_shm wl_subcompositor xdg_wm_base zwp_idle_inhibit_manager_v1 zwp_pointer_constraints_v1 zwp_pointer_gestures_v1 zwp_relative_pointer_manager_v1 zxdg_decoration_manager_v1 "
 [[ "$got_v0" == "$want_v0" ]] || fail "[d] the advertised v0 global set is not the contract
   got:  $got_v0
   want: $want_v0
 If this is a deliberate change, update shim/README.md, shim/src/globals.c and
-the want list here -- in that order, citing the globals-demand line."
+the want list here -- in that order, citing the globals-demand line. And it is
+not on you to remember all three: \`meson test inventories\` holds this list,
+shim_globals_and_client.sh's and the README's table to src/ledger.c's
+vitrin_v0_contract[], and needs no browser to do it. This line was stale from
+issue #306 until 2026-08-20 for exactly the want of that."
 ok "the advertised v0 set is exactly the contract: $got_v0"
 
 # The shim's OWN cross-check ran and agreed. ledger.c holds a second copy of

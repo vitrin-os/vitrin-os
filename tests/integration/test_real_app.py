@@ -24,9 +24,9 @@ property of the whole module, enforced by the Skip-or-fail policy below:
    `unshare(CLONE_NEWPID)` does not move the caller, so the confinement helper
    has to fork the realm's PID 1 and stay behind as its supervisor. The shim is
    matched by the **inode of the file it is executing**, not by `comm`: a
-   confined shim runs from the bind target `/vitrin/shim`, so `vitrin-shim` and
-   `vitrin-mock-shim` answer the same name and only the inode still tells them
-   apart.
+   confined shim runs from the core-chosen bind target `/vitrin/vitrin-shim`,
+   so the real shim and `vitrin-mock-shim` answer the same name and only the
+   inode still tells them apart.
 2. **A real frame.** A frame `weston-terminal` actually rendered reaches the
    agent through the enforcement/capture path and is non-uniform (it carries
    the terminal's chrome), so it is neither the mock animation nor an
@@ -204,11 +204,12 @@ class RealApp(IntegrationTest):
             shim_pid, f"the core forked no shim; children were {children_of(core.pid)}"
         )
         # The mock-freeness check, by INODE rather than by name. A confined
-        # shim is bound at `/vitrin/shim`, so its `comm` is `shim` whichever
-        # binary it is (P2.6.2, #186) and a name test stopped telling the real
-        # shim from `vitrin-mock-shim`. The running image's inode does, and
-        # more sharply: a name says what a program is called, an inode says
-        # which file is executing.
+        # shim is bound at the core-chosen `/vitrin/vitrin-shim`, so its
+        # `comm` comes from that basename whichever binary it is (P2.6.2,
+        # #186; renamed from `/vitrin/shim` by #283) and a name test stopped
+        # telling the real shim from `vitrin-mock-shim`. The running image's
+        # inode does, and more sharply: a name says what a program is called,
+        # an inode says which file is executing.
         self.assertEqual(
             exe_identity(shim_pid),
             file_identity(self.shim_bin),
@@ -280,7 +281,7 @@ class RealApp(IntegrationTest):
             ("vitrind", file_identity(self.shim_bin), APP_NAME),
             "the spine must be exactly vitrind -> the real C shim -> weston-terminal. "
             "The middle link is matched by the executing file's inode, not by name: a "
-            "confined shim runs from the bind target /vitrin/shim and its comm is "
+            "confined shim runs from the bind target /vitrin/vitrin-shim and its comm is "
             f"{comm_of(shim_pid)!r} for the real shim and the mock alike (P2.6.2, #186).",
         )
 
@@ -400,18 +401,19 @@ class RealApp(IntegrationTest):
             )
         # The environment is *only* what the core composed: the allow-listed
         # names plus the three injected confinement names. Anything else would
-        # mean the scrub is porous. `LD_LIBRARY_PATH` is in the allowlist on a
-        # machine whose C shim links a vendored wlroots -- see
-        # `harness.shim_library_dirs` for why that is a workaround for a real
-        # defect and not a fact of nature -- and absent on one whose shim links
-        # only system libraries, so the expected set is computed rather than
-        # written out.
-        allowed = set(WLR_ENV)
-        if core.shim_library_dirs:
-            allowed.add("LD_LIBRARY_PATH")
+        # mean the scrub is porous.
+        #
+        # The expected set is now written out rather than computed. Until #283
+        # it carried a machine-dependent `LD_LIBRARY_PATH` -- the harness added
+        # it whenever the C shim linked a vendored wlroots, which is to say on
+        # every CI machine -- and an assertion whose expectation moves with the
+        # host is one that cannot fail on the host where it matters. The shim
+        # is now statically linked against anything vendored, so no realm's
+        # environment carries that name and its presence here would be a
+        # regression, not a configuration.
         self.assertEqual(
             set(env),
-            allowed | {"WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "HOME"},
+            set(WLR_ENV) | {"WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "HOME"},
             f"the app's environment must hold only the allow-listed names and the three "
             f"injected confinement names; it held {sorted(env)}",
         )

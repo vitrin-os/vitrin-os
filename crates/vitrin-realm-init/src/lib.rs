@@ -150,7 +150,35 @@ pub const IN_REALM_PREFIX: &str = "/vitrin";
 /// It has to be bound at all because in a development tree the shim lives in
 /// `target/debug` under `$HOME`, which is the exact tree this task exists to
 /// hide from the realm.
-pub const IN_REALM_SHIM: &str = "/vitrin/shim";
+///
+/// # Why the basename is `vitrin-shim` and not `shim` (issue #283)
+///
+/// The kernel takes a process's `comm` from the **basename of the file it
+/// `execve`d**, and this constant is that basename for every confined shim.
+/// Binding at `/vitrin/shim` therefore made `ps` report `shim` -- a name
+/// neither binary owned. Nine integration gates read `comm` to prove a run
+/// was mock-free, spelled `comm_of(shim).startswith("vitrin-shim")`, and
+/// under confinement that assertion went **red for the real shim**, because
+/// `"shim"` does not start with `"vitrin-shim"`. It did not go green for
+/// `vitrin-mock-shim` either, confined or not: unconfined the kernel
+/// truncates that basename to `vitrin-mock-shi`, which fails the same test.
+/// The check had stopped identifying anything at all, which is why those
+/// gates now compare `(st_dev, st_ino)` of `/proc/<pid>/exe`.
+///
+/// **This rename gives `comm` no evidence value back; it takes the last of
+/// it away.** `main.rs` binds whatever host binary the core named *to this
+/// constant*, so a confined `vitrin-mock-shim` answers to `vitrin-shim` too
+/// -- measured 2026-08-19 against a `--isolation=default` core started with
+/// the mock: `comm` `vitrin-shim`, `/proc/<pid>/exe -> /vitrin/vitrin-shim`,
+/// inode the mock's. A `startswith("vitrin-shim")` check that was red for
+/// both binaries is now green for both. What the name buys is `ps`
+/// legibility for a human reading a process tree, and nothing else. The test
+/// `a_confined_comm_is_decided_by_the_bind_target_not_the_host_binary` below
+/// holds that reading to `main.rs` rather than to this paragraph.
+///
+/// The in-realm path is a **core-chosen constant**, not the host basename, so
+/// this is not a claim about what the operator called their binary.
+pub const IN_REALM_SHIM: &str = "/vitrin/vitrin-shim";
 
 /// The realm's private storage, inside the realm, and the value of its
 /// `HOME`.
@@ -1406,5 +1434,177 @@ mod tests {
     fn the_core_owned_prefix_holds_the_shim_and_the_storage() {
         assert!(IN_REALM_SHIM.starts_with(IN_REALM_PREFIX));
         assert!(IN_REALM_HOME.starts_with(IN_REALM_PREFIX));
+    }
+
+    /// `TASK_COMM_LEN - 1`: the kernel copies at most this many bytes of the
+    /// `execve`d file's basename into `comm` and NUL-terminates.
+    const COMM_MAX: usize = 15;
+
+    /// What `ps` will show for a process that `execve`d `path`: the component
+    /// after the last `/`, truncated the way `__set_task_comm` truncates it.
+    fn comm_of(path: &str) -> &str {
+        let base = path.rsplit('/').next().unwrap_or(path);
+        &base[..base.len().min(COMM_MAX)]
+    }
+
+    /// Issue #283. The kernel derives `comm` from the basename of the
+    /// `execve`d file, so this constant's LAST COMPONENT is what `ps` shows
+    /// for every confined shim.
+    ///
+    /// Two properties, and the pair is the whole of what the name is worth:
+    /// it is the shim's own name rather than the bare `shim` the old bind
+    /// target produced, and it survives `TASK_COMM_LEN` truncation whole, so
+    /// what `ps` prints is the name and not a prefix of it.
+    #[test]
+    fn the_confined_shims_comm_is_this_constants_basename() {
+        assert_eq!(
+            comm_of(IN_REALM_SHIM),
+            "vitrin-shim",
+            "the bind target's basename IS the confined shim's comm; \
+             `/vitrin/shim` made it `shim`, which is issue #283's second half"
+        );
+        assert_eq!(
+            IN_REALM_SHIM.rsplit('/').next(),
+            Some(comm_of(IN_REALM_SHIM)),
+            "the basename must survive the kernel's {COMM_MAX}-byte truncation \
+             whole, or `ps` shows a prefix and the legibility this rename \
+             bought is spent"
+        );
+    }
+
+    /// Issue #283, and the half a sentence in a doc comment kept getting
+    /// wrong. A confined process's `comm` is decided by **this constant**,
+    /// not by the binary the core was handed: `main.rs` binds whatever host
+    /// path arrived in `sources.shim` *to this target*, so a confined
+    /// `vitrin-mock-shim` answers to `vitrin-shim` exactly as the real shim
+    /// does. Measured 2026-08-19 against a `--isolation=default` core started
+    /// with the mock: `comm` `vitrin-shim`, `/proc/<pid>/exe ->
+    /// /vitrin/vitrin-shim`, and the inode the mock's.
+    ///
+    /// So `comm` is **not** a mock-freeness check and no rename can make it
+    /// one -- the integration gates compare `(st_dev, st_ino)` of
+    /// `/proc/<pid>/exe`. This test asserts the mechanism rather than
+    /// restating the conclusion, because the conclusion is the part that
+    /// rots: if the bind ever stops taking `sources.shim`, or a second bind
+    /// starts writing this target, the reasoning above is void and this goes
+    /// red instead of a comment quietly becoming false.
+    #[test]
+    fn a_confined_comm_is_decided_by_the_bind_target_not_the_host_binary() {
+        const MAIN_RS: &str = include_str!("main.rs");
+        const TARGET: &str = "strip_leading_slash(IN_REALM_SHIM)";
+
+        // Comments removed FIRST. What this test counts is bind sites, and
+        // the most natural place to explain a bind site is a comment beside
+        // it -- so counting raw text would turn "somebody documented this
+        // line" into a red build complaining about binds. That was raised as
+        // brittleness in #283's third review round, and it was right.
+        let code = code_without_comments(MAIN_RS);
+
+        let sites: Vec<usize> = code.match_indices(TARGET).map(|(at, _)| at).collect();
+        assert_eq!(
+            sites.len(),
+            1,
+            "main.rs's CODE mentions `{TARGET}` {} times, not once (comments \
+             are stripped before counting, so prose naming this call is free). \
+             This test reads the single bind that creates the shim's in-realm \
+             path; with more than one it is reading an arbitrary one of them, \
+             and with none the path is created somewhere this check cannot see.",
+            sites.len()
+        );
+
+        // Back up to a char boundary: `main.rs` is not pure ASCII, and
+        // slicing a `&str` mid-codepoint panics with a message about UTF-8
+        // rather than about the bind this test is here to check.
+        let at = sites[0];
+        let mut from = at.saturating_sub(120);
+        while from < at && !code.is_char_boundary(from) {
+            from += 1;
+        }
+        let call = &code[from..at];
+        assert!(
+            call.contains("sources.shim"),
+            "the bind that creates `{IN_REALM_SHIM}` no longer takes \
+             `sources.shim`, so `comm` may no longer be a function of the \
+             bind target alone -- the doc comment on IN_REALM_SHIM, \
+             tests/integration/README.md and D-043 all reason from that and \
+             have to be re-checked. What precedes the target is: {call:?}"
+        );
+    }
+
+    /// Rust source with its `//` comments removed, for the test above.
+    ///
+    /// Deliberately **not** a lexer, and it refuses rather than guesses. It
+    /// tracks double-quoted strings — backslash escapes included, and across
+    /// newlines, because `main.rs` really does continue a string onto the next
+    /// line — and it panics if the file ever grows a raw string or a `/* */`
+    /// comment outside a string, the two constructs a scanner this size would
+    /// silently get wrong. A parser that quietly mis-reads its input is the
+    /// exact failure the test above exists to prevent, so it may not be one.
+    fn code_without_comments(src: &str) -> String {
+        // Byte-wise is safe here: every byte of a multi-byte UTF-8 sequence is
+        // >= 0x80, so none can equal `/`, `"`, `\`, `r` or `\n`, and nothing
+        // below can split a character.
+        let bytes = src.as_bytes();
+        let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+        let mut i = 0usize;
+        let mut in_string = false;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if in_string {
+                if b == b'\\' {
+                    out.push(b);
+                    if i + 1 < bytes.len() {
+                        out.push(bytes[i + 1]);
+                    }
+                    i += 2;
+                    continue;
+                }
+                if b == b'"' {
+                    in_string = false;
+                }
+                out.push(b);
+                i += 1;
+                continue;
+            }
+            let next = bytes.get(i + 1).copied();
+            if b == b'"' {
+                in_string = true;
+                out.push(b);
+                i += 1;
+                continue;
+            }
+            if b == b'/' && next == Some(b'/') {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue; // the `\n` itself is kept, so line structure survives
+            }
+            assert!(
+                !(b == b'/' && next == Some(b'*')),
+                "main.rs has grown a `/* */` block comment outside a string, \
+                 which this stripper does not handle -- it would leave the \
+                 comment's text in the code it hands to the bind-site count. \
+                 Teach it block comments, or use `//` here."
+            );
+            let prev_is_ident = out
+                .last()
+                .is_some_and(|p| p.is_ascii_alphanumeric() || *p == b'_');
+            assert!(
+                !(b == b'r' && !prev_is_ident && matches!(next, Some(b'"') | Some(b'#'))),
+                "main.rs has grown a raw string literal, whose `\"` this \
+                 stripper would treat as an ordinary quote and so lose track \
+                 of where strings end. Teach it raw strings, or keep the \
+                 literal ordinary."
+            );
+            out.push(b);
+            i += 1;
+        }
+        assert!(
+            !in_string,
+            "main.rs ended inside a string literal, so this stripper lost \
+             track of quoting somewhere and its output cannot be trusted to \
+             be code."
+        );
+        String::from_utf8(out).expect("stripping whole `//` runs cannot split a UTF-8 character")
     }
 }

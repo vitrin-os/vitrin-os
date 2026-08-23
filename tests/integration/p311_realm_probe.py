@@ -8,15 +8,20 @@ has by construction. It writes one line-oriented report and then holds the realm
 open so the core does not tear the run down underneath the reader.
 
 **It decides nothing.** Every line here is an observation with its errno; the
-verdicts live in `test_real_principal_socket_reach.py`, which reads this report
-from the host side and compares the confined run against the `--isolation=off`
-run of the same argv. A probe that concluded on its own behalf would be a probe
-whose failure mode is a confident wrong answer.
+verdicts live in `p311_principal_socket_reach.py`, which reads this report from
+the host side and compares the confined run against the `--isolation=off` run of
+the same argv. A probe that concluded on its own behalf would be a probe whose
+failure mode is a confident wrong answer.
 
 Report grammar — one record per line, `KIND field=value ...`, every free-form
 value base64 (no whitespace, no quoting rules, no locale). `P311-END` is written
 last and is the reader's completeness marker, exactly as `PROBE-END` is for
 `test_real_confinement.py`.
+
+Every `connect` outcome in this report is **three-valued**, not two — see
+:func:`try_connect`. `1` reached, `0` the kernel refused, `-1` the kernel never
+answered. A reader that folded `-1` into `0` would be reporting confinement it
+never measured.
 """
 
 from __future__ import annotations
@@ -30,6 +35,24 @@ import sys
 import time
 
 VERSION = 1
+
+#: The three `connect` outcomes every record in this report uses.
+#: `CONNECT_INCONCLUSIVE` is **not** a negative — see :func:`try_connect`. It
+#: says the kernel gave no answer, and a reader that counted it as a denial
+#: would be reporting confinement that was never measured.
+CONNECT_OK = 1
+CONNECT_DENIED = 0
+CONNECT_INCONCLUSIVE = -1
+
+#: Errnos that mean "not now", not "no". `EAGAIN` is what an AF_UNIX stream
+#: `connect` returns against a full listen backlog; `EINTR` is a signal landing
+#: mid-call. Neither is evidence about reachability.
+RETRY_ERRNOS = (errno.EAGAIN, errno.EWOULDBLOCK, errno.EINTR)
+
+#: How long :func:`try_connect` keeps retrying a "not now" before calling the
+#: route unmeasured, and how long it sleeps between attempts.
+CONNECT_TIMEOUT = 3.0
+CONNECT_RETRY_SLEEP = 0.02
 
 #: How much of a walked filesystem is enough. A realm root is a few thousand
 #: inodes; the cap exists so a mount table that accidentally exposed a real
@@ -313,7 +336,7 @@ def observe_pids(rep: Report, core_sock: str) -> None:
             stat_errno = errno_of(exc)
         if stat_ok == 1:
             conn_ok, conn_errno = try_connect(via)
-            if conn_ok:
+            if conn_ok == CONNECT_OK:
                 reached += 1
         rep.emit(
             "P311-PID",
@@ -359,15 +382,13 @@ def observe_abstract(rep: Report) -> None:
                 names.append(name)
     rep.emit("P311-ABSTRACT-COUNT", n=len(names))
     for name in sorted(set(names)):
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(2.0)
-        try:
-            sock.connect("\0" + name[1:])
-            rep.emit("P311-ABSTRACT", name=b64(name), connect=1, errno=0)
-        except OSError as exc:
-            rep.emit("P311-ABSTRACT", name=b64(name), connect=0, errno=errno_of(exc))
-        finally:
-            sock.close()
+        # Through :func:`try_connect` like every other connect here, and not
+        # through a local `settimeout` + `except OSError`: an abstract name
+        # whose owner has a full backlog answers `EAGAIN`, and recording that
+        # as `connect=0` is exactly the unmeasured negative that function
+        # exists to keep out of this report.
+        ok, err = try_connect("\0" + name[1:])
+        rep.emit("P311-ABSTRACT", name=b64(name), connect=ok, errno=err)
 
 
 def is_skipped(path: str) -> bool:
@@ -471,16 +492,49 @@ def observe_walk(rep: Report) -> None:
 # -- the candidate paths ----------------------------------------------------
 
 
-def try_connect(path: str) -> tuple[int, int]:
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.settimeout(3.0)
-    try:
-        sock.connect(path)
-        return 1, 0
-    except OSError as exc:
-        return 0, errno_of(exc)
-    finally:
-        sock.close()
+def try_connect(path: str, timeout: float = CONNECT_TIMEOUT) -> tuple[int, int]:
+    """`(outcome, errno)` for one `connect(2)`. **Three-valued, deliberately.**
+
+    :data:`CONNECT_OK` the socket was reached, :data:`CONNECT_DENIED` the kernel
+    refused with the errno beside it, :data:`CONNECT_INCONCLUSIVE` the kernel
+    never answered within `timeout` and this route is therefore **unmeasured**.
+
+    The third value exists because a two-valued version of this function
+    reported confinement it had not measured. `settimeout()` puts the socket in
+    non-blocking mode, and CPython's timeout machinery waits only on
+    `EINPROGRESS` — which an AF_UNIX stream `connect` never returns. What it
+    returns when the listener's backlog is full is `EAGAIN`, **immediately**
+    (`unix_stream_connect`: `err = -EAGAIN; if (!timeo) goto out_unlock`), so
+    the 3s timeout was never honoured and errno 11 was being recorded as "did
+    not connect" — indistinguishable, in the report, from a realm that was
+    genuinely walled off. That is the one failure mode this whole file exists to
+    avoid, so `EAGAIN` is retried until the deadline (a fresh socket per
+    attempt: after a failed `connect` the old one's state is not worth
+    reasoning about) and, if the kernel is still saying "not now" when the
+    deadline passes, reported as its own outcome rather than as a negative.
+
+    A bare `TimeoutError` carries no errno at all; it is inconclusive for the
+    same reason and is reported as errno 0.
+    """
+    deadline = time.monotonic() + timeout
+    err = 0
+    while True:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        try:
+            sock.connect(path)
+            return CONNECT_OK, 0
+        except OSError as exc:
+            err = errno_of(exc)
+        finally:
+            sock.close()
+        if err == 0:
+            return CONNECT_INCONCLUSIVE, 0
+        if err not in RETRY_ERRNOS:
+            return CONNECT_DENIED, err
+        if time.monotonic() >= deadline:
+            return CONNECT_INCONCLUSIVE, err
+        time.sleep(CONNECT_RETRY_SLEEP)
 
 
 def candidates(core_sock: str) -> list[tuple[str, str]]:
@@ -543,7 +597,7 @@ def observe_paths(rep: Report, core_sock: str) -> list[tuple[str, str]]:
             )
         ok, err = try_connect(path)
         rep.emit("P311-CONNECT", label=label, path=b64(path), connect=ok, errno=err)
-        if ok:
+        if ok == CONNECT_OK:
             connectable.append((label, path))
     return connectable
 
@@ -566,11 +620,26 @@ def observe_handshake(rep: Report, connectable, identity: str, token: str, bad: 
         rep.emit("P311-SDK", ok=0, detail=b64(f"{type(exc).__name__}: {exc}"))
         return
     rep.emit("P311-SDK", ok=1, detail=b64(getattr(vitrin_os, "__file__", "?")))
+    # The shim's own Wayland socket, identified by where it RESOLVES rather
+    # than by a `label.startswith("wayland")` prefix. The prefix was wrong in
+    # the direction that costs evidence: `wayland-dotdot` is
+    # `dirname($WAYLAND_DISPLAY)/../core.sock`, which at `--isolation=off` is
+    # the core socket itself -- so a route that genuinely reached the core was
+    # being skipped, and the positive control was one route weaker than the
+    # run had earned.
+    try:
+        shim_socket = os.path.realpath(os.environ.get("WAYLAND_DISPLAY", ""))
+    except OSError:
+        shim_socket = ""
     for label, path in connectable:
-        if label.startswith("wayland"):
-            # The shim's own Wayland socket. Connecting to it is the control
-            # for the socket layer; speaking Vitrin at it is not a measurement
-            # of anything and would only confuse libwayland's accept loop.
+        try:
+            same = bool(shim_socket) and os.path.realpath(path) == shim_socket
+        except OSError:
+            same = False
+        if same:
+            # Connecting to it is the control for the socket layer; speaking
+            # Vitrin at it is not a measurement of anything and would only
+            # confuse libwayland's accept loop.
             rep.emit("P311-HANDSHAKE", label=label, cred="skipped", result="skipped", detail="")
             continue
         for cred_name, cred in (("good", token), ("bad", bad)):

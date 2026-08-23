@@ -85,10 +85,29 @@ closure, and not a property gate: it asserts the state of an **open** question
 rather than a property the project publishes. It carries no `test_` prefix for that reason: `run.sh`'s three-way gate
 partition (issue #288) requires every `test_*.py` on disk to be a milestone,
 property or supporting gate, and this is none of them — it is a measurement run
-explicitly, not collected by `unittest discover`. Run it with::
+explicitly, not collected by `unittest discover`. Run it from the repo root
+with::
 
-    VITRIN_C_SHIM_BIN=shim/build/vitrin-shim PYTHONPATH=sdk/python/src \
-      python3 -m unittest tests.integration.p311_principal_socket_reach -v
+    VITRIN_C_SHIM_BIN="$PWD/shim/build/vitrin-shim" PYTHONPATH=sdk/python/src \
+      VITRIN_P311_EVIDENCE_DIR=/tmp/p311 \
+      python3 -m unittest discover -s tests/integration \
+        -p 'p311_principal_socket_reach.py' -v
+
+Three details in that command line are load-bearing, and each was found by the
+run failing without it:
+
+* `discover -s` rather than a dotted module path, for the same reason `run.sh`
+  uses it: `tests/` and `tests/integration/` are not packages (no
+  `__init__.py`), so `-m unittest tests.integration.p311_principal_socket_reach`
+  cannot resolve at all, and `discover` is what puts `tests/integration` on
+  `sys.path` for `from harness import ...`.
+* `$PWD/` on the shim path, because the core refuses a relative `command`
+  outright — it "would resolve against the child's working directory, which the
+  confined app can write, so the core would audit one program and exec another".
+  `run.sh` exports `$REPO/$DEFAULT_SHIM` for the same reason.
+* `VITRIN_P311_EVIDENCE_DIR` is optional and writes each arm's raw report,
+  `realm.toml` and core log out, for a reader who wants the records rather than
+  the verdict. The verdict is one bit; #311 is decided from the records.
 
 If #311 is decided and the decision has a property, that property gets its own
 `test_*.py` gate and this file is superseded by it.
@@ -110,6 +129,11 @@ from harness import (
     IntegrationTest,
     require_binaries,
 )
+
+# The probe's own outcome vocabulary, imported rather than restated: the two
+# halves of this measurement disagreeing about what `connect=-1` means is
+# exactly how an unmeasured route would come to be read as a denial.
+from p311_realm_probe import CONNECT_INCONCLUSIVE, CONNECT_OK
 
 require_binaries()
 
@@ -147,6 +171,26 @@ WLR_ENV = {
 #: Labels whose target is the shim's own Wayland socket. They are the in-realm
 #: positive control and are never expected to be denied.
 CONTROL_LABELS = ("wayland-display",)
+
+#: The errnos that make a confined arm's negative a **measurement**. A route
+#: that did not connect proves confinement only if the kernel said so: the path
+#: does not exist in this mount namespace (`ENOENT`), a component of it is not
+#: searchable (`EACCES`), or the operation is forbidden (`EPERM`).
+#:
+#: Everything else is a different finding wearing a negative's clothes, and each
+#: is failed separately rather than counted as confinement:
+#:
+#: * `EAGAIN` — the kernel never answered (`p311_realm_probe.try_connect`
+#:   reports it as `CONNECT_INCONCLUSIVE`, not as a denial);
+#: * `ECONNREFUSED` — the path **resolved to a socket inode inside the realm**
+#:   and only the listener was absent, which is a reachability result #311 wants
+#:   to hear about rather than a wall;
+#: * `ENOTDIR`, `ELOOP`, and friends — path resolution failed for a reason that
+#:   says nothing about whether the socket is reachable by a better-formed path.
+#:
+#: Only the three are accepted, so a run that meets a fourth goes red with the
+#: errno named instead of quietly widening what "confined" means.
+DENIAL_ERRNOS = (errno.EACCES, errno.EPERM, errno.ENOENT)
 
 
 class Report:
@@ -190,6 +234,36 @@ class Report:
 
     def ns(self) -> dict[str, str]:
         return {row["kind"]: _un(row["link"]) for row in self.of("P311-NS") if row["ok"] == "1"}
+
+    #: `(kind, connect field, identifying field, is base64, errno field)` for
+    #: every record kind that carries a `connect` outcome. Kept in one place
+    #: because the interesting failure is a kind nobody checked: `P311-CONNECT`
+    #: is the one the assertions below walk label by label, and the other three
+    #: would otherwise have their `CONNECT_INCONCLUSIVE` rows read as silence.
+    CONNECT_FIELDS = (
+        ("P311-CONNECT", "connect", "label", False, "errno"),
+        ("P311-ABSTRACT", "connect", "name", True, "errno"),
+        ("P311-WALK-SOCKET", "connect", "path", True, "errno"),
+        ("P311-PID", "via_connect", "pid", False, "via_connect_errno"),
+    )
+
+    def unanswered(self) -> list[str]:
+        """Every recorded `connect` the kernel never answered.
+
+        `CONNECT_INCONCLUSIVE` is not a denial and must never be counted as one
+        — a realm whose every route came back `EAGAIN` would otherwise report
+        as perfectly confined while nothing about it had been measured.
+        """
+        out: list[str] = []
+        for kind, field, key, encoded, err_field in self.CONNECT_FIELDS:
+            for row in self.of(kind):
+                if row.get(field) != str(CONNECT_INCONCLUSIVE):
+                    continue
+                name = row.get(key, "?")
+                if encoded:
+                    name = _un(name) or name
+                out.append(f"{kind} {key}={name} errno={row.get(err_field, '?')}")
+        return out
 
     def handshakes(self) -> dict[tuple[str, str], tuple[str, str]]:
         return {
@@ -398,7 +472,7 @@ class RealmReachesPrincipalSocket(IntegrationTest):
                 self.assertIn(label, connects, f"[{arm.name}] no {label} record")
                 self.assertEqual(
                     connects[label][0],
-                    1,
+                    CONNECT_OK,
                     f"[{arm.name}] the in-realm positive control {label} did not connect "
                     f"(errno {connects[label][1]}); every negative below would be satisfied "
                     "by a probe that can open no socket at all",
@@ -410,11 +484,16 @@ class RealmReachesPrincipalSocket(IntegrationTest):
         #     candidate paths, the connect and the handshake all work when
         #     nothing is in the way, and it is the only arm in which the answer
         #     to #311's question is "yes, and it binds".
+        #     `unanswered()` is deliberately NOT asserted empty for this arm:
+        #     it walks the host's own filesystem and connects to every socket
+        #     on it, so a busy service with a full backlog can legitimately
+        #     leave an `EAGAIN` row here. What this arm has to prove is a
+        #     positive, and a positive cannot be faked by an unanswered call.
         off_connects = unconfined.report.connects()
         reached = [
             label
             for label, (ok, _) in off_connects.items()
-            if ok == 1 and label not in CONTROL_LABELS
+            if ok == CONNECT_OK and label not in CONTROL_LABELS
         ]
         self.assertTrue(
             reached,
@@ -448,17 +527,41 @@ class RealmReachesPrincipalSocket(IntegrationTest):
         #     the mount table and the ruleset are different barriers and #311's
         #     answer may be built on either.
         for arm in (confined, mount_only):
+            # (4a) Before any negative is read as confinement: every connect in
+            #      this arm got an ANSWER from the kernel. An `EAGAIN` route is
+            #      unmeasured, and a measurement that reported it as a denial
+            #      would be claiming confinement it never observed -- the one
+            #      failure mode this whole file is built against.
+            self.assertEqual(
+                arm.report.unanswered(), [],
+                f"[{arm.name}] the kernel never answered these connects, so they are "
+                "UNMEASURED routes and none of the negatives below covers them",
+            )
             for label, (ok, err) in sorted(arm.report.connects().items()):
                 if label in CONTROL_LABELS:
                     continue
-                self.assertEqual(
-                    ok, 0,
+                self.assertNotEqual(
+                    ok, CONNECT_OK,
                     f"[{arm.name}] a confined realm CONNECTED to {label} (errno {err}). That "
                     "is the finding #311 exists to establish; record it rather than deleting "
                     "this test.",
                 )
+                # ...and the negative is only a negative if the kernel refused.
+                # `connect != 0` on its own would count a route nobody measured,
+                # or a socket that was reachable and merely unattended, as a
+                # wall.
+                self.assertIn(
+                    err, DENIAL_ERRNOS,
+                    f"[{arm.name}] {label} did not connect, but errno {err} "
+                    f"({errno.errorcode.get(err, 'unnamed')}) is not one of "
+                    f"{[errno.errorcode[e] for e in DENIAL_ERRNOS]}. This route is therefore "
+                    "not evidence of confinement; read the record and say what it is.",
+                )
             self.assertEqual(
-                [row for row in arm.report.of("P311-ABSTRACT") if row["connect"] == "1"],
+                [
+                    row for row in arm.report.of("P311-ABSTRACT")
+                    if row["connect"] == str(CONNECT_OK)
+                ],
                 [],
                 f"[{arm.name}] an abstract-namespace name was reachable from inside the realm",
             )
@@ -507,7 +610,7 @@ class RealmReachesPrincipalSocket(IntegrationTest):
         strays = [
             _un(row["path"])
             for row in mount_only.report.of("P311-WALK-SOCKET")
-            if row["connect"] == "1" and _un(row["path"]) != shim_socket
+            if row["connect"] == str(CONNECT_OK) and _un(row["path"]) != shim_socket
         ]
         self.assertEqual(
             strays, [],

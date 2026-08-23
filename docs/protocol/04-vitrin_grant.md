@@ -1,6 +1,6 @@
 # vitrin_grant — capability handle and enforcement voice
 
-**Interface version:** 2 · **Connection class:** principal · **Messages:** 3 requests *(all since 2)* + 2 events
+**Interface version:** 2 · **Connection class:** principal · **Messages:** 4 requests *(all since 2)* + 2 events
 
 ## Purpose
 

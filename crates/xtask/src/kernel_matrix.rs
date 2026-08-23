@@ -102,7 +102,7 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 
-use crate::isolation_matrix::Constants;
+use crate::isolation_matrix::{join_and, normalize, Constants};
 
 /// Where the collector writes, and where this reads.
 const ROWS_DIR: &str = "tests/kernel-matrix/rows";
@@ -115,6 +115,13 @@ const REALM_INIT_LIB_RS: &str = "crates/vitrin-realm-init/src/lib.rs";
 /// Where the floor's *mechanism set* is declared, and the source of the
 /// `floor.mechanism=` and `applies.*` rows every row file carries.
 const CORE_ISOLATION_RS: &str = "crates/vitrin-core/src/spawn/isolation.rs";
+/// The plan surfaces that **enumerate** the rungs no measured kernel reports,
+/// rather than only counting them. Held to the rows by
+/// [`check_unreported_enumeration`]; see [`unreported_rungs_sentence`] for why.
+const ENUMERATING_SURFACES: &[&str] = &[
+    "docs/plan/20-decision-log.md",
+    "docs/plan/02-phase-2-semantic-epochs.md",
+];
 
 /// **The build-half staleness the checked-in rows carry, in the FLOOR.**
 ///
@@ -826,6 +833,71 @@ fn validate(rows: &[Row], constants: &Constants, manifest: &str) -> Result<()> {
     Ok(())
 }
 
+/// The rungs of this build's ladder that **no checked-in row reports**.
+///
+/// Derived from `landlock.abi` in `tests/kernel-matrix/rows/*.row` and this
+/// build's ceiling, so a sixth kernel filling one in moves the set here and
+/// everywhere the set is published.
+fn unreported_rungs(rows: &[Row], constants: &Constants) -> Vec<u32> {
+    let reported: Vec<u32> = rows.iter().filter_map(|r| r.landlock_abi().ok()).collect();
+    (1..=constants.max_rung)
+        .filter(|rung| !reported.contains(rung))
+        .collect()
+}
+
+/// The sentence the two plan surfaces that **name** those rungs must carry.
+///
+/// **This exists because the count was machine-held and the names were not.**
+/// [`render`] has computed "N of this build's 9 rungs are reported by none of
+/// these kernels" since the page was first emitted, and that number has always
+/// been right. But `docs/plan/20-decision-log.md` (D-044, Decision 3) and
+/// `docs/plan/02-phase-2-semantic-epochs.md` (Correction 7) went further and
+/// *enumerated* them by hand -- and both published **4, 7 and 8**, which is the
+/// set the `--landlock=abi:N` cap cannot simulate, not the set no measured
+/// kernel reports. The rows say `landlock.abi` 1, 2, 4, 6 and 7, so the real
+/// answer is 3, 5, 8 and 9: two of the three names published were rungs a
+/// checked-in row reports. A full green build carried that sentence for four
+/// days, which is exactly the defect class this repository's generators exist
+/// to end -- so the enumeration is now derived here and demanded there.
+///
+/// It is a **substring** requirement, matched after whitespace normalization
+/// ([`crate::isolation_matrix::normalize`]), so the surrounding paragraph can
+/// be rewritten and re-wrapped freely; only the claim is pinned.
+fn unreported_rungs_sentence(rows: &[Row], constants: &Constants) -> String {
+    let names: Vec<String> = unreported_rungs(rows, constants)
+        .iter()
+        .map(u32::to_string)
+        .collect();
+    format!(
+        "the rungs no measured kernel reports are **{}**",
+        join_and(&names)
+    )
+}
+
+/// Hold both plan surfaces to [`unreported_rungs_sentence`].
+///
+/// Runs on `--check` **and** on a regeneration, because a wrong enumeration is
+/// wrong on the day it is written and not on the day CI next runs.
+fn check_unreported_enumeration(root: &Path, rows: &[Row], constants: &Constants) -> Result<()> {
+    let required = unreported_rungs_sentence(rows, constants);
+    let needle = normalize(&required);
+    for surface in ENUMERATING_SURFACES {
+        let text = fs::read_to_string(root.join(surface))
+            .with_context(|| format!("kernel-matrix: reading {surface}"))?;
+        if !normalize(&text).contains(&needle) {
+            bail!(
+                "kernel-matrix: {surface} does not carry the enumeration the rows in {ROWS_DIR} \
+                 produce. It must say, in these words:\n  {required:?}\nThe rungs are derived \
+                 from `landlock.abi` across the checked-in rows and this build's ceiling of {}. \
+                 Do not retype the list on the page -- if it disagrees with this, the rows \
+                 changed and the prose around them has to be re-derived too.",
+                constants.max_rung
+            );
+        }
+    }
+    Ok(())
+}
+
 fn admitted(rows: &[Row]) -> Vec<&Row> {
     rows.iter().filter(|r| r.verdict == "admitted").collect()
 }
@@ -1111,10 +1183,10 @@ fn render(
 
     // The unreported rungs are COUNTED, never typed: a sixth kernel that filled
     // one in would otherwise leave a published number describing the old set.
-    let reported: Vec<u32> = rows.iter().filter_map(|r| r.landlock_abi().ok()).collect();
-    let unreported = (1..=constants.max_rung)
-        .filter(|rung| !reported.contains(rung))
-        .count();
+    // The same derivation names them for the two plan surfaces that enumerate
+    // them -- see [`unreported_rungs_sentence`], which exists because the count
+    // was held here and the names were not.
+    let unreported = unreported_rungs(rows, constants).len();
     p.push_str(&format!(
         "All {n} rows report `ns.all=available` and `mount.in_userns=available`, so the\n\
          Landlock floor is the only thing separating the two groups. **{unreported} of this\n\
@@ -1337,6 +1409,7 @@ pub fn kernel_matrix(root: &Path, check: bool) -> Result<()> {
         );
     }
     validate(&rows, &constants, &manifest)?;
+    check_unreported_enumeration(root, &rows, &constants)?;
     let stale = staleness(&rows, &build)?;
 
     let crossval = cross_validation(&rows)?;
@@ -1433,6 +1506,75 @@ mod tests {
             current, page,
             "docs/book/src/isolation-kernels.md is generated; run `cargo xtask kernel-matrix`"
         );
+    }
+
+    /// The rungs no measured kernel reports are what the rows say they are.
+    ///
+    /// Pinned rather than only derived, so a re-collection that changes the set
+    /// has to change this assertion too and cannot slide past as "the
+    /// generator agrees with itself". The values are the `landlock.abi` cells
+    /// of the five checked-in rows -- 1, 2, 4, 6, 7 -- against a ceiling of 9.
+    #[test]
+    fn the_unreported_rungs_are_derived_from_the_rows() {
+        let rows = load_rows(&root()).expect("rows must load");
+        assert_eq!(
+            unreported_rungs(&rows, &constants()),
+            vec![3, 5, 8, 9],
+            "the checked-in rows report landlock.abi 1, 2, 4, 6 and 7"
+        );
+    }
+
+    /// Both plan surfaces carry that enumeration in the generator's words.
+    ///
+    /// This is [`check_unreported_enumeration`] as a test, so a page that
+    /// enumerates a different set is red in the ordinary suite and not only in
+    /// the job that runs `cargo xtask kernel-matrix --check`.
+    #[test]
+    fn both_plan_surfaces_carry_the_enumeration() {
+        let rows = load_rows(&root()).expect("rows must load");
+        check_unreported_enumeration(&root(), &rows, &constants())
+            .expect("the plan surfaces must name the rungs the rows produce");
+    }
+
+    /// And a surface naming the wrong set is refused.
+    ///
+    /// The wrong set here is the one that was actually published -- 4, 7 and 8
+    /// -- so this test fails against the exact prose the gate was written to
+    /// catch, rather than against a synthetic mutation.
+    #[test]
+    fn a_surface_naming_the_wrong_rungs_is_refused() {
+        let rows = load_rows(&root()).expect("rows must load");
+        let required = unreported_rungs_sentence(&rows, &constants());
+        assert_eq!(
+            required, "the rungs no measured kernel reports are **3, 5, 8 and 9**",
+            "the demanded sentence is the one the plan pages carry"
+        );
+
+        let tmp = std::env::temp_dir().join(format!(
+            "vitrin-kernel-matrix-enumeration-{}",
+            std::process::id()
+        ));
+        for surface in ENUMERATING_SURFACES {
+            let dst = tmp.join(surface);
+            fs::create_dir_all(dst.parent().expect("a parent")).expect("mkdir");
+            let text = fs::read_to_string(root().join(surface)).expect("the real surface");
+            fs::write(
+                &dst,
+                text.replace(
+                    &required,
+                    "the rungs no measured kernel reports are **4, 7 and 8**",
+                ),
+            )
+            .expect("write");
+        }
+        let err = check_unreported_enumeration(&tmp, &rows, &constants())
+            .expect_err("a surface naming 4, 7 and 8 must be refused");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(ENUMERATING_SURFACES[0]) && msg.contains("3, 5, 8 and 9"),
+            "the refusal must name the surface and the set the rows produce: {msg}"
+        );
+        fs::remove_dir_all(&tmp).expect("cleanup");
     }
 
     /// Every provenance cell the page prints is a real reading, not a

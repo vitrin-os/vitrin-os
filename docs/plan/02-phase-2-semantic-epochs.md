@@ -472,8 +472,17 @@ which one is decided by that row's list of behavioural tests rather than by an
 editor, so the ladder's lower half cannot go back to having an unexplained
 status — or a *wrong* explanation — while CI is green. The option of *adding*
 tests for the four rungs no measured kernel reports was offered and **not**
-taken; two of those four are not testable by this mechanism at all, since rungs
-7 and 8 buy `landlock_restrict_self` flags rather than mask bits.
+taken. Those four are read off the five checked-in boot rows, whose
+`landlock.abi` values are 1, 2, 4, 6 and 7, so the rungs no measured kernel
+reports are **3, 5, 8 and 9** — and `cargo xtask kernel-matrix` now derives that
+sentence from the rows and refuses to run when this page or the decision log
+states a different set, because what stood here until 2026-08-23 named rungs 4,
+7 and 8, which is the set the rung cap cannot *simulate* and not the set no
+kernel *reports*. Exactly one rung is in both: **8**, which buys
+`landlock_restrict_self`'s `TSYNC` flag rather than a mask bit, so
+`--landlock=abi:N` has nothing to take away from it. Rungs 3, 5 and 9 each move
+`handled_access_fs` and the cap does reproduce their absence; rung 3 already has
+a behavioural test, which leaves **5 and 9** unreported and unentered both.
 
 **Why this is a correction and not a silent close.** This task's *previous*
 narrowing — "target recent kernels for now" — was settled by attrition and

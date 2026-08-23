@@ -510,7 +510,7 @@ fn rungs_no_test_enters(core_spawn_rs: &str) -> Result<Vec<u32>> {
 
 /// Collapse every run of whitespace to one space, so a needle may span the
 /// line wrapping of the prose it is looking for.
-fn normalize(text: &str) -> String {
+pub(crate) fn normalize(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
@@ -1740,7 +1740,7 @@ fn render_rung_table(p: &mut String, corpus: &Corpus, ladder: &Ladder, c: &Const
 }
 
 /// `1, 2 and 3`, for a list a human reads inside a sentence.
-fn join_and(items: &[String]) -> String {
+pub(crate) fn join_and(items: &[String]) -> String {
     match items {
         [] => "none".to_string(),
         [one] => one.clone(),

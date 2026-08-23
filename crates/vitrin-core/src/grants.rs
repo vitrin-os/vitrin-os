@@ -1399,6 +1399,87 @@ mod tests {
         assert_eq!(SERVED_VERB_BITS & UNSERVED_VERB_BITS, 0);
     }
 
+    // -- the published renderings of the served/unserved partition ---------
+
+    /// The published spelling of every wire verb bit, plus the assertion that
+    /// the table is complete.
+    ///
+    /// The book spells a verb with a dot where the wire spells it with an
+    /// underscore. Written out per bit rather than derived by `replace`, so a
+    /// verb whose published spelling is not its wire spelling cannot pass
+    /// silently -- and the union assertion makes appending a bit to the IDL
+    /// fail here until its spelling is added.
+    ///
+    /// Shared by the two page-reading tests below rather than copied into
+    /// each: two book chapters render this partition, and a spelling table
+    /// kept twice is the second copy that drifts.
+    fn published_verb_spellings() -> Vec<(Verb, &'static str)> {
+        let spellings = vec![
+            (Verb::OBSERVE, "observe"),
+            (Verb::ACTUATE_POINTER, "actuate.pointer"),
+            (Verb::ACTUATE_TEXT, "actuate.text"),
+            (Verb::OBSERVE_CURSOR, "observe.cursor"),
+            (Verb::LAYOUT_ARRANGE, "layout.arrange"),
+            (Verb::LAYOUT_FOCUS, "layout.focus"),
+            (Verb::DESIGNATE_FILE, "designate.file"),
+            (Verb::REALM_LAUNCH, "realm.launch"),
+        ];
+        assert_eq!(
+            spellings.iter().fold(0, |acc, (v, _)| acc | v.bits()),
+            Verb::VALID_MASK,
+            "this table must name every wire verb bit: a bit appended to the IDL has a \
+             published spelling too, and deriving one by rule would invent it"
+        );
+        spellings
+    }
+
+    /// A small count in the register the book writes it in: prose says "two",
+    /// not "2".
+    fn count_word(n: usize) -> &'static str {
+        match n {
+            1 => "one",
+            2 => "two",
+            3 => "three",
+            4 => "four",
+            5 => "five",
+            6 => "six",
+            7 => "seven",
+            8 => "eight",
+            n => panic!(
+                "{n} is beyond the range these book sentences have ever spelled. Add the \
+                 word here and to the page that now needs it, deliberately"
+            ),
+        }
+    }
+
+    /// `["a", "b"]` -> ``"`a` and `b`"``, the way both bullets list verbs.
+    fn backticked_english_list(items: &[&str]) -> String {
+        let quoted: Vec<String> = items.iter().map(|i| format!("`{i}`")).collect();
+        match quoted.split_last() {
+            None => String::new(),
+            Some((last, [])) => last.clone(),
+            Some((last, head)) => format!("{} and {last}", head.join(", ")),
+        }
+    }
+
+    /// The one bullet of `text` that starts at `marker`, whitespace-collapsed.
+    ///
+    /// Prose reflows; a Markdown line break inside a sentence is not drift.
+    /// Collapsing runs of whitespace before matching is the same choice
+    /// `crates/xtask/src/limits.rs`'s `normalize` makes for an `Anchor`.
+    fn collapsed_bullet(text: &str, marker: &str, path: &str) -> String {
+        let start = text.find(marker).unwrap_or_else(|| {
+            panic!(
+                "{path}: no {marker:?} bullet. Either the list was renamed or it was \
+                 rewritten into a shape this scan cannot read -- and an empty slice would \
+                 otherwise be reported as a missing claim"
+            )
+        });
+        let bullet = &text[start..];
+        let bullet = &bullet[..bullet[1..].find("\n- **").map_or(bullet.len(), |i| i + 1)];
+        bullet.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
     /// The book publishes this partition **in words**, and until P2.6.5 nothing
     /// read the sentence.
     ///
@@ -1445,28 +1526,7 @@ mod tests {
         /// occurrence on the page is this claim (asserted below).
         const CONTEXT: &str = " more are defined and refuse";
 
-        // The book spells a verb with a dot where the wire spells it with an
-        // underscore. Written out per bit rather than derived by `replace`, so
-        // a verb whose published spelling is not its wire spelling cannot pass
-        // silently -- and the union assertion below makes appending a bit to
-        // the IDL fail here until its spelling is added.
-        let spellings = [
-            (Verb::OBSERVE, "observe"),
-            (Verb::ACTUATE_POINTER, "actuate.pointer"),
-            (Verb::ACTUATE_TEXT, "actuate.text"),
-            (Verb::OBSERVE_CURSOR, "observe.cursor"),
-            (Verb::LAYOUT_ARRANGE, "layout.arrange"),
-            (Verb::LAYOUT_FOCUS, "layout.focus"),
-            (Verb::DESIGNATE_FILE, "designate.file"),
-            (Verb::REALM_LAUNCH, "realm.launch"),
-        ];
-        assert_eq!(
-            spellings.iter().fold(0, |acc, (v, _)| acc | v.bits()),
-            Verb::VALID_MASK,
-            "this table must name every wire verb bit: a bit appended to the IDL has a \
-             published spelling too, and deriving one by rule would invent it"
-        );
-
+        let spellings = published_verb_spellings();
         let unserved: Vec<&str> = spellings
             .iter()
             .filter(|(v, _)| v.bits() & UNSERVED_VERB_BITS != 0)
@@ -1482,27 +1542,11 @@ mod tests {
         );
 
         let text = std::fs::read_to_string(BOOK).expect("the book chapter exists");
-        let start = text
-            .find("- **verbs**")
-            .unwrap_or_else(|| panic!("{BOOK}: no `- **verbs**` bullet. Either the grant-anatomy list was renamed or it was rewritten into a shape this scan cannot read -- and an empty slice would otherwise be reported as a missing count"));
-        let bullet = &text[start..];
-        let bullet = &bullet[..bullet[1..].find("\n- **").map_or(bullet.len(), |i| i + 1)];
-        // Prose reflows; a Markdown line break inside the sentence is not
-        // drift. Collapse runs of whitespace before matching, the same choice
-        // `crates/xtask/src/limits.rs`'s `normalize` makes for an `Anchor`.
-        let bullet = bullet.split_whitespace().collect::<Vec<_>>().join(" ");
+        let bullet = collapsed_bullet(&text, "- **verbs**", BOOK);
         let page = text.split_whitespace().collect::<Vec<_>>().join(" ");
 
         // The count, in the surface's own register.
-        let word = match unserved.len() {
-            1 => "one",
-            2 => "two",
-            3 => "three",
-            4 => "four",
-            n => panic!(
-                "{n} unserved verbs, and this test has no word for it. Add it here and to {BOOK}"
-            ),
-        };
+        let word = count_word(unserved.len());
         let rendered = if unserved.len() == 1 {
             "one more is defined and refuses".to_string()
         } else {
@@ -1537,6 +1581,195 @@ mod tests {
                  \n\nbullet was:\n{bullet}"
             );
         }
+    }
+
+    /// The **other** book chapter that renders this partition -- and the one
+    /// that shows why holding chapter 3 alone was not enough.
+    ///
+    /// `docs/book/src/06-build-your-own-client.md` is chapter 6 of the mdBook
+    /// the Pages workflow deploys (`SUMMARY.md` lists it), and its "Carry every
+    /// defined verb" bullet is the instruction a third-party client author
+    /// actually follows when transcribing the verb bitfield.
+    ///
+    /// **P2.6.5 (issue #189) left three of its claims false at once, and the
+    /// diff never touched the file.** It listed the verbs to carry and omitted
+    /// `designate.file`; it said this core "refuses `observe.cursor`" and
+    /// stopped there, with the bit added on that very branch unmentioned; and
+    /// it explained `realm.launch` = 512 by *"64/128/256 are allocated to verbs
+    /// the IDL does not define yet and are still out of range"* on the branch
+    /// that defined 64 and made petitioning for it recoverable. The bullet's
+    /// own stated failure mode is that omitting a defined verb *"turns a
+    /// recoverable `unsupported` refusal into a dead socket"* -- so it was
+    /// instructing readers straight into the fault it warns about.
+    ///
+    /// **Why a sibling test rather than a widening of the one above.** The two
+    /// bullets state different things: chapter 3 gives a COUNT of unserved
+    /// verbs and names them, chapter 6 gives the whole verb LIST, the served
+    /// remainder as a count, and the reserved bits that are still fatal.
+    /// Nothing but the spelling table and the number words is common, and those
+    /// are shared as functions. Merging the assertions would produce one test
+    /// whose failure message could not say which page was wrong.
+    ///
+    /// **Its honest bounds:**
+    ///
+    /// * like its sibling, it matches the one shape this bullet has ever had.
+    ///   A rewrite that keeps every fact but changes the wording goes RED while
+    ///   being correct; each failure prints the phrase it wanted, so the fix is
+    ///   to move the string with the prose.
+    /// * the served half is checked as a **count**, not name by name. The
+    ///   bullet does not name the served verbs -- that is the point of "never
+    ///   bake the served set into a client" -- so there is nothing to compare
+    ///   per bit.
+    /// * the reserved-bit set is derived as *"every power of two below the
+    ///   highest defined bit that the mask leaves out"*, which is what makes
+    ///   the sentence go red the day one of them is allocated. It is not read
+    ///   from the allocation registry in `docs/plan/02-phase-2-semantic-epochs.md`
+    ///   §5, so a bit reserved ABOVE the highest defined one is invisible here.
+    #[test]
+    fn the_books_client_chapter_carries_every_verb_and_names_the_unserved_ones() {
+        const BOOK: &str = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../docs/book/src/06-build-your-own-client.md"
+        );
+        const MARKER: &str = "- **Carry every defined verb";
+        /// The register the refusal sits in: value-free, and every occurrence
+        /// of it on the page is this claim (asserted below).
+        const REFUSES: &str = "this core refuses ";
+        /// ...and the register the served remainder sits in.
+        const SERVES: &str = ", and serves the other ";
+
+        let spellings = published_verb_spellings();
+        let text = std::fs::read_to_string(BOOK).expect("the book chapter exists");
+        let bullet = collapsed_bullet(&text, MARKER, BOOK);
+        let page = text.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        // 1. "Carry every defined verb" -- so the parenthesised list must name
+        //    every one. This is the claim whose failure the bullet itself
+        //    describes as a dead socket.
+        //
+        //    Scoped to the LIST rather than to the bullet, and measured: with
+        //    a `bullet.contains` this assertion passed while the list was
+        //    missing `designate.file`, because the verb is named again two
+        //    sentences later. A membership test whose haystack is the whole
+        //    paragraph tests the paragraph, not the list.
+        let list = bullet
+            .split_once("** (")
+            .and_then(|(_, rest)| rest.split_once(')'))
+            .map(|(list, _)| list)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{BOOK}: the {MARKER:?} bullet carries no parenthesised verb list \
+                     directly after its bold lead-in.\n\nbullet was:\n{bullet}"
+                )
+            });
+        for (verb, name) in &spellings {
+            assert!(
+                list.contains(&format!("`{name}`")),
+                "{BOOK}: the {MARKER:?} bullet's verb list does not name `{name}` ({:#x}), \
+                 which the IDL defines. The bullet's own text says omitting one turns a \
+                 recoverable `unsupported` refusal into a dead socket.\n\nlist was:\n{list}",
+                verb.bits()
+            );
+        }
+        // ...and names nothing else. A list that grew an entry the IDL does
+        // not define would send a client author to a fatal bit, which is the
+        // same failure in the other direction.
+        assert_eq!(
+            list.matches('`').count(),
+            spellings.len() * 2,
+            "{BOOK}: the {MARKER:?} bullet's verb list holds a backticked name that is not \
+             one of the {} the IDL defines.\n\nlist was:\n{list}",
+            spellings.len()
+        );
+
+        // 2. The unserved half, named -- the same derivation chapter 3 renders
+        //    as a count.
+        let unserved: Vec<&str> = spellings
+            .iter()
+            .filter(|(v, _)| v.bits() & UNSERVED_VERB_BITS != 0)
+            .map(|(_, name)| *name)
+            .collect();
+        assert!(
+            !unserved.is_empty(),
+            "no verb is unserved any more. Rewrite this bullet on {BOOK} and this test \
+             deliberately, rather than deleting either"
+        );
+        let refusal = format!("{REFUSES}{}", backticked_english_list(&unserved));
+        assert!(
+            bullet.contains(&refusal),
+            "{BOOK}: the {MARKER:?} bullet does not say {refusal:?}. `UNSERVED_VERB_BITS` \
+             holds {} verb(s) ({}).\n\nbullet was:\n{bullet}",
+            unserved.len(),
+            unserved.join(", ")
+        );
+        assert_eq!(
+            page.matches(REFUSES).count(),
+            1,
+            "{BOOK} states what this core refuses in more than one place (or in none). A \
+             second, disagreeing statement is exactly the drift this test exists for"
+        );
+
+        // 3. The served remainder, as a count. `serves the other six` is a
+        //    claim about SERVED_VERB_BITS, and it moves when a verb is
+        //    classified either way.
+        let served = format!(
+            "{SERVES}{}",
+            count_word(SERVED_VERB_BITS.count_ones() as usize)
+        );
+        assert!(
+            bullet.contains(&served),
+            "{BOOK}: the {MARKER:?} bullet does not say {served:?}. `SERVED_VERB_BITS` holds \
+             {} verb(s).\n\nbullet was:\n{bullet}",
+            SERVED_VERB_BITS.count_ones()
+        );
+        assert_eq!(
+            page.matches(SERVES).count(),
+            1,
+            "{BOOK} states the served-verb count in more than one place (or in none)"
+        );
+
+        // 4. `realm.launch` is 512 -- the value the bullet tells a client
+        //    author to transcribe, and the reason the next assertion exists.
+        assert!(
+            bullet.contains(&format!("`realm.launch` is {}", Verb::REALM_LAUNCH.bits())),
+            "{BOOK}: the {MARKER:?} bullet does not state `realm.launch`'s value as {}.\
+             \n\nbullet was:\n{bullet}",
+            Verb::REALM_LAUNCH.bits()
+        );
+
+        // 5. ...and the bits that are still out of range, which is the claim
+        //    that went false. Every power of two below the top defined bit that
+        //    the mask leaves out: allocated in the plan's registry, absent from
+        //    the IDL, and therefore still fatal rather than `unsupported`.
+        let top = u32::BITS - 1 - Verb::VALID_MASK.leading_zeros();
+        let reserved: Vec<String> = (0..top)
+            .map(|shift| 1u32 << shift)
+            .filter(|bit| Verb::VALID_MASK & bit == 0)
+            .map(|bit| bit.to_string())
+            .collect();
+        // Non-vacuity: with no gap left, the sentence explaining the gap has to
+        // be rewritten rather than re-numbered.
+        assert!(
+            !reserved.is_empty(),
+            "the verb bitfield has no gap below {:#x} any more, so {BOOK}'s explanation of \
+             why `realm.launch` is not 64 no longer describes anything. Rewrite the bullet \
+             and this test",
+            Verb::VALID_MASK
+        );
+        let names: Vec<&str> = reserved.iter().map(String::as_str).collect();
+        let gap = format!(
+            "because {} are allocated to verbs the IDL does not define yet",
+            names.join(" and ")
+        );
+        assert!(
+            bullet.contains(&gap),
+            "{BOOK}: the {MARKER:?} bullet does not say {gap:?}. The bits still outside \
+             `VALID_MASK` ({:#x}) below its top bit are exactly {}; naming a bit the IDL \
+             now DEFINES tells a client author a recoverable petition is fatal, which is \
+             the error this assertion was added for.\n\nbullet was:\n{bullet}",
+            Verb::VALID_MASK,
+            reserved.join(", ")
+        );
     }
 
     // -- expiry (injected clock) -------------------------------------------

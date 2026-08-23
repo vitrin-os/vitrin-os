@@ -14,15 +14,30 @@ import enum
 
 # protocol/@version — the wire version integer offered in hello. The "v0"
 # in the document family's name is the spec generation; the wire integer
-# starts at 1 (the schema forbids 0) and is 2 today. Version 2 appends, in
-# full: the realm_launch verb; the three structural mints on vitrin_grant
-# (get_launcher, get_layout_focus, get_layout_arrange); the three interfaces
-# they mint (vitrin_launcher, vitrin_layout_focus, vitrin_layout_arrange)
-# with their requests launch/launched, focus and set_fullscreen; the
-# vitrin_layout_arrange.mode enum; the capacity refusal code; and the
-# layout_held outcome. Every version-1 signature is byte-identical at
-# version 2, so this SDK offering 2 changes nothing about the messages it
-# already sends — it only widens what it can send and must decode.
+# starts at 1 (the schema forbids 0) and is 2 today.
+#
+# What version 2 appends ON THE PRINCIPAL CONNECTION CLASS, which is the only
+# one this SDK speaks: the realm_launch and egress verbs;
+# vitrin_principal.attention; the four structural mints on vitrin_grant
+# (get_launcher, get_layout_focus, get_layout_arrange, get_egress); the four
+# interfaces they mint (vitrin_launcher, vitrin_layout_focus,
+# vitrin_layout_arrange, vitrin_egress) with their requests launch/launched,
+# focus, set_fullscreen and request_connect/connected/connect_failed; the
+# vitrin_layout_arrange.mode and vitrin_egress.failure enums; the capacity
+# refusal code; and the layout_held outcome. The shim connection class gains
+# version-2 messages of its own (selection, pointer constraints, idle inhibit,
+# relative motion, gestures); this SDK never speaks those and does not
+# enumerate them.
+#
+# This paragraph said "in full" and was not: it omitted
+# vitrin_principal.attention — a since="2" event on an interface this SDK does
+# decode — from the day it was written, then the egress additions on top. It
+# names its connection class now so the claim is one a reader can check
+# against `grep 'since="2"' protocol/vitrin-v0.xml` rather than believe.
+#
+# Every version-1 signature is byte-identical at version 2, so this SDK
+# offering 2 changes nothing about the messages it already sends — it only
+# widens what it can send and must decode.
 PROTOCOL_VERSION = 2
 
 # --- object-id ranges (conventions section 3) ------------------------------

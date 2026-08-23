@@ -11,13 +11,23 @@ Request opcodes (document order):
     vitrin_principal:        get_realm=0
     vitrin_realm:            request_grant=0
     vitrin_grant:            get_launcher=0, get_layout_focus=1,
-                             get_layout_arrange=2   (all since=2)
+                             get_layout_arrange=2, get_egress=3
+                                                    (all since=2)
     vitrin_view:             capture_frame=0
     vitrin_actuator_pointer: move=0, button=1, scroll=2
     vitrin_actuator_text:    type=0
     vitrin_launcher:         launch=0               (since=2)
     vitrin_layout_focus:     focus=0                (since=2)
     vitrin_layout_arrange:   set_fullscreen=0       (since=2)
+    vitrin_egress:           request_connect=0      (since=2)
+
+NOT ENCODED HERE, and named rather than left as a gap in the table above:
+`vitrin_grant.get_egress` and everything on `vitrin_egress`. The opcodes are
+listed because they are principal-facing and this module's tables claim to be
+that half of the IDL, but no codec below emits them: the verb is outside every
+deployment's served set (no mediating proxy exists — P2.7.3), so an SDK call
+that minted the facet could only ever reach a refusal. Adding the codecs is
+P2.7.3's, alongside the proxy that makes an answer possible.
 
 Event opcodes (document order):
     vitrin_handshake:        error=0, done=1
@@ -26,6 +36,8 @@ Event opcodes (document order):
     vitrin_consent:          state=0
     vitrin_view:             frame_ready=0 (fd_count=1)
     vitrin_launcher:         launched=0                  (since=2)
+    vitrin_egress:           connected=0 (fd_count=1), connect_failed=1
+                                                        (both since=2)
 """
 
 from __future__ import annotations

@@ -98,6 +98,14 @@ const LANDLOCK_RS: &str = "crates/vitrin-realm-init/src/landlock.rs";
 const REALM_INIT_LIB_RS: &str = "crates/vitrin-realm-init/src/lib.rs";
 const REALM_INIT_MAIN_RS: &str = "crates/vitrin-realm-init/src/main.rs";
 const ISOLATION_RS: &str = "crates/vitrin-core/src/spawn/isolation.rs";
+/// The core's realm spawn, which keeps the one Rust copy of "which sub-floor
+/// rungs is this repository publishing as entered by no test" -- checked
+/// against this corpus by step (7e) of [`render`].
+const CORE_SPAWN_RS: &str = "crates/vitrin-core/src/spawn.rs";
+/// The integration suite. Read as a **directory** rather than as named files,
+/// because the thing step (7e) has to be true of is every test in it,
+/// including the ones written after this line.
+const INTEGRATION_DIR: &str = "tests/integration";
 /// The integration harness, which keeps a **Python copy** of both constants
 /// so a mock-free gate can assert the rung a real realm obtained against the
 /// floor this build declares. Loaded here because that copy is the one thing
@@ -307,7 +315,11 @@ pub struct Sources {
     realm_init_lib_rs: String,
     realm_init_main_rs: String,
     isolation_rs: String,
+    core_spawn_rs: String,
     harness_py: String,
+    /// Every `.py`/`.sh` under [`INTEGRATION_DIR`], as (relative path, text),
+    /// sorted by path so a failure names the same file on every machine.
+    integration_suite: Vec<(String, String)>,
 }
 
 impl Sources {
@@ -331,7 +343,9 @@ impl Sources {
             realm_init_lib_rs: read(REALM_INIT_LIB_RS)?,
             realm_init_main_rs: read(REALM_INIT_MAIN_RS)?,
             isolation_rs: read(ISOLATION_RS)?,
+            core_spawn_rs: read(CORE_SPAWN_RS)?,
             harness_py: read(HARNESS_PY)?,
+            integration_suite: integration_suite(root)?,
         })
     }
 
@@ -354,12 +368,108 @@ impl Sources {
             REALM_INIT_LIB_RS => Ok(&self.realm_init_lib_rs),
             REALM_INIT_MAIN_RS => Ok(&self.realm_init_main_rs),
             ISOLATION_RS => Ok(&self.isolation_rs),
+            CORE_SPAWN_RS => Ok(&self.core_spawn_rs),
             other => bail!(
                 "isolation-matrix: {other} is not a source this generator loads, so a pin on it \
                  could never fail. Load it in `Sources::load` first."
             ),
         }
     }
+}
+
+/// Every executable file of the integration suite, as (relative path, text).
+///
+/// A **directory** read rather than a list of names, because step (7e) of
+/// [`render`] is an absolute about tests that do not exist yet: a named list
+/// would be a check that stops checking the moment someone adds a file.
+/// `.md` is deliberately excluded -- `tests/integration/README.md` documents
+/// the `--landlock=abi:N` dial in prose, and prose is not a request.
+fn integration_suite(root: &Path) -> Result<Vec<(String, String)>> {
+    let dir = root.join(INTEGRATION_DIR);
+    let mut out: Vec<(String, String)> = Vec::new();
+    let entries = fs::read_dir(&dir).with_context(|| {
+        format!(
+            "isolation-matrix: reading {} (step (7e) is an absolute about every test in it, so \
+             an unreadable suite is refused rather than skipped)",
+            dir.display()
+        )
+    })?;
+    for entry in entries {
+        let path = entry
+            .with_context(|| format!("isolation-matrix: listing {}", dir.display()))?
+            .path();
+        let is_test_surface = matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("py") | Some("sh")
+        );
+        if !path.is_file() || !is_test_surface {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "isolation-matrix: {} has a name this generator cannot read as UTF-8",
+                    path.display()
+                )
+            })?
+            .to_string();
+        let text = fs::read_to_string(&path)
+            .with_context(|| format!("isolation-matrix: reading {}", path.display()))?;
+        out.push((format!("{INTEGRATION_DIR}/{name}"), text));
+    }
+    if out.is_empty() {
+        bail!(
+            "isolation-matrix: {INTEGRATION_DIR} holds no .py or .sh file. An empty suite would \
+             make step (7e)'s scan vacuously true, which is the shape this repository calls a \
+             check that stopped checking."
+        );
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
+}
+
+/// The declaration step (7e) reads out of [`CORE_SPAWN_RS`].
+const RUNGS_NO_TEST_ENTERS_MARKER: &str = "pub(crate) const RUNGS_NO_TEST_ENTERS: &[u32] = &[";
+
+/// Parse `RUNGS_NO_TEST_ENTERS` -- the sub-floor rungs the core's own suite
+/// refuses to spawn a realm into, because this page publishes that no test
+/// enters a domain at them.
+fn rungs_no_test_enters(core_spawn_rs: &str) -> Result<Vec<u32>> {
+    let start = core_spawn_rs
+        .find(RUNGS_NO_TEST_ENTERS_MARKER)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "isolation-matrix: could not find `{RUNGS_NO_TEST_ENTERS_MARKER}` in \
+             {CORE_SPAWN_RS}. That constant is what stops a confinement test in the core's own \
+             suite from spawning a realm into a rung this page publishes as entered by nothing; \
+             without it the absolute on {LIMITS} is held on one of its two routes only."
+            )
+        })?;
+    let rest = &core_spawn_rs[start + RUNGS_NO_TEST_ENTERS_MARKER.len()..];
+    let end = rest.find(']').ok_or_else(|| {
+        anyhow::anyhow!(
+            "isolation-matrix: `RUNGS_NO_TEST_ENTERS` in {CORE_SPAWN_RS} is not closed by `]`, \
+             so its extent cannot be read."
+        )
+    })?;
+    let mut rungs = Vec::new();
+    for item in rest[..end].split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        rungs.push(item.parse::<u32>().with_context(|| {
+            format!(
+                "isolation-matrix: `RUNGS_NO_TEST_ENTERS` in {CORE_SPAWN_RS} lists {item:?}, \
+                 which is not a rung number"
+            )
+        })?);
+    }
+    rungs.sort_unstable();
+    rungs.dedup();
+    Ok(rungs)
 }
 
 /// Collapse every run of whitespace to one space, so a needle may span the
@@ -1261,6 +1371,61 @@ pub fn render(corpus: &Corpus, sources: &Sources) -> Result<String> {
         }
     }
 
+    // (7e) **The absolute, held on both of its routes.** (7b) and (7c) hold
+    // which rungs the page *reports* as exercised; they cannot hold
+    // `docs/book/src/limits.md`'s "No test in this repository enters a
+    // Landlock domain at rung 4 or rung 5", because a test that enters one
+    // and declares nothing appears in no corpus for them to compare against.
+    // There are exactly two ways into a domain in this tree, and each is held
+    // by a different mechanism this step only *pins*:
+    //
+    //   1. `vitrin-realm-init`'s forked measurement bodies, which issue
+    //      `landlock_restrict_self` themselves. Held by the type system:
+    //      `landlock::restrict_self` demands an `Entering`, whose only mint in
+    //      a test build is `RungsEntered`, which records the rung and compares
+    //      it against `BEHAVIOURAL_RUNGS` when it drops. The `PINS` above keep
+    //      that shape from being deleted quietly.
+    //   2. A test that asks the *shipped helper* for a rung -- the core's own
+    //      confinement suite, and the integration suite. Held at the core's
+    //      realm spawn by `RUNGS_NO_TEST_ENTERS`, and in `tests/integration`
+    //      by the scan below, because a Python test never links either crate.
+    //
+    // Both halves are computed from this corpus rather than typed, so adding
+    // a test at rung 4 changes the required constant and the required page
+    // instead of leaving them behind.
+    {
+        let unentered: Vec<u32> = corpus
+            .rungs
+            .iter()
+            .filter(|r| r.abi < constants.min_abi && r.behavioural_tests.is_empty())
+            .map(|r| r.abi)
+            .collect();
+        let declared = rungs_no_test_enters(&sources.core_spawn_rs)?;
+        if declared != unentered {
+            bail!(
+                "isolation-matrix: `RUNGS_NO_TEST_ENTERS` in {CORE_SPAWN_RS} is {declared:?} and \
+                 this corpus says the sub-floor rungs no behavioural test enters a domain at are \
+                 {unentered:?}. That constant is what refuses a confinement test in the core's \
+                 own suite that would spawn a realm into one of them, so the two have to be one \
+                 set -- a stale constant is a published absolute held by nothing on that route."
+            );
+        }
+        for rung in &unentered {
+            let needle = format!("abi:{rung}");
+            for (path, text) in &sources.integration_suite {
+                if text.contains(&needle) {
+                    bail!(
+                        "isolation-matrix: {path} names `{needle}`, and this page publishes that \
+                         no test in this repository enters a Landlock domain at rung {rung}. A \
+                         realm spawned under `--landlock={needle}` enters one, and no Rust check \
+                         can see a Python test do it. Drive a rung this corpus already accounts \
+                         for, or change what {LIMITS} and this page say first."
+                    );
+                }
+            }
+        }
+    }
+
     // (8) One tier statement per derived domain, published verbatim.
     let domains = domains(&ladder);
     if corpus.tiers.len() != domains.len() {
@@ -1730,9 +1895,15 @@ fn render_exercised_rungs(p: &mut String, corpus: &Corpus, c: &Constants) {
          remembered.** Each name above is resolved against `BEHAVIOURAL_RUNGS` in that same\n\
          file, which declares the rungs that test enters a domain at; a name listed on a rung\n\
          it does not enter refuses to render, a rung it does enter and this page omits refuses\n\
-         to render, and the tests themselves assert at runtime that the rungs they entered are\n\
-         the rungs they declared. The generator also refuses to emit when the limits page does\n\
-         not carry the tally above.\n\n",
+         to render, and the tests cannot enter a domain without declaring it: the function that\n\
+         issues `landlock_restrict_self` demands a token only a recording ledger can mint, and\n\
+         that ledger compares what it recorded against the same table when it drops. The\n\
+         generator also refuses to emit when the limits page does not carry the tally above.\n\n\
+         **A test that asks the shipped helper for a rung enters a domain in another process,\n\
+         where no Rust type can reach it.** That route is held separately: the core's own\n\
+         confinement suite refuses a spawn reporting a rung this page publishes as entered by\n\
+         nothing, and `tests/integration/` is scanned for a literal `abi:N` naming one. Both\n\
+         lists are computed from this corpus, so they move when it does rather than after it.\n\n",
         sub_floor_tally(corpus, c),
     ));
 }
@@ -1993,6 +2164,37 @@ pub static PINS: &[CodePin] = &[
         means: "a bound render node still carries IOCTL_DEV, which is why rung 5 does not close \
                 the published render-node limit. Remove it and the 'does not buy' cell for rung \
                 5 becomes wrong -- and every realm on a GPU host stops rendering.",
+    },
+    CodePin {
+        path: LANDLOCK_RS,
+        needle: "pub fn restrict_self(ruleset: RawFd, entering: Entering, flags: libc::c_uint)",
+        means: "entering a Landlock domain still demands the `Entering` token, which is what \
+                makes the rung a test enters recordable rather than optional. Take the token \
+                back out and the limits page's \"No test in this repository enters a Landlock \
+                domain at rung 4 or rung 5\" goes back to being held by an opt-in.",
+    },
+    CodePin {
+        path: LANDLOCK_RS,
+        needle: "#[cfg(not(test))] fn production(rung: u32) -> Entering {",
+        means: "the production mint is still compiled OUT of test builds, so `apply_with`'s own \
+                path to a domain is not a way around the ledger. Drop the `cfg` and a test could \
+                enter a domain at any rung by driving the shipped path.",
+    },
+    CodePin {
+        path: LANDLOCK_RS,
+        needle: "impl Drop for RungsEntered {",
+        means: "the ledger still checks itself when it drops rather than when a test remembers \
+                to ask. The previous shape was a `matches_declaration` call at the bottom of \
+                four tests, which a fifth could simply not make.",
+    },
+    CodePin {
+        path: CORE_SPAWN_RS,
+        needle: "refuse_a_rung_no_test_is_published_as_entering(handshake.landlock_rung);",
+        means: "the core's own confinement suite still checks the rung the helper reports \
+                against `RUNGS_NO_TEST_ENTERS`. This is the only thing standing between a test \
+                here spawning a realm at rung 4 and a published absolute quietly becoming false; \
+                the realm-init token cannot see this route, because the domain is entered in \
+                another process.",
     },
     CodePin {
         path: ISOLATION_RS,
@@ -3050,6 +3252,67 @@ mod tests {
         assert!(
             text.contains("tier T4") && text.contains("not published VERBATIM"),
             "got: {text}"
+        );
+    }
+
+    /// **Step (7e), route two: the core's own suite.** The constant that
+    /// refuses a confined spawn into an unentered rung is derived from this
+    /// corpus, so letting it fall behind must stop the page rather than leave
+    /// the published absolute held on one route only.
+    #[test]
+    fn a_stale_rungs_no_test_enters_constant_refuses_to_render() {
+        let mut src = sources();
+        src.core_spawn_rs = src.core_spawn_rs.replace(
+            "pub(crate) const RUNGS_NO_TEST_ENTERS: &[u32] = &[4, 5];",
+            "pub(crate) const RUNGS_NO_TEST_ENTERS: &[u32] = &[4];",
+        );
+        let err = render(&corpus(), &src)
+            .expect_err("a constant that no longer matches the corpus must not render");
+        let text = format!("{err}");
+        assert!(
+            text.contains("RUNGS_NO_TEST_ENTERS") && text.contains("[4, 5]"),
+            "the refusal must name the constant and the set the corpus computed, got: {text}"
+        );
+    }
+
+    /// And the constant has to be **found**, not merely agreed with: deleting
+    /// it would otherwise leave the scan comparing nothing.
+    #[test]
+    fn a_missing_rungs_no_test_enters_constant_refuses_to_render() {
+        let mut src = sources();
+        src.core_spawn_rs = src.core_spawn_rs.replace(
+            RUNGS_NO_TEST_ENTERS_MARKER,
+            "const SOMETHING_ELSE: &[u32] = &[",
+        );
+        let err = render(&corpus(), &src)
+            .expect_err("a vanished constant must not degrade to no check at all");
+        assert!(
+            format!("{err}").contains("RUNGS_NO_TEST_ENTERS"),
+            "got: {err:#}"
+        );
+    }
+
+    /// **Step (7e), route three: the integration suite.** A Python test links
+    /// neither Rust crate, so nothing but this scan can see it pin a realm to
+    /// a rung this page publishes as entered by nothing.
+    #[test]
+    fn an_integration_test_pinning_an_unentered_rung_refuses_to_render() {
+        let mut src = sources();
+        let (path, text) = src
+            .integration_suite
+            .first_mut()
+            .expect("the suite is non-empty");
+        assert!(
+            path.starts_with("tests/integration/"),
+            "the scan must name a real suite file, got {path}"
+        );
+        text.push_str("\nLANDLOCK = \"abi:4\"\n");
+        let err = render(&corpus(), &src)
+            .expect_err("an integration test pinning rung 4 must not render");
+        let text = format!("{err}");
+        assert!(
+            text.contains("abi:4") && text.contains("tests/integration/"),
+            "the refusal must name the rung and the file, got: {text}"
         );
     }
 

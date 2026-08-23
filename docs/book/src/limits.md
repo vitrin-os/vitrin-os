@@ -348,9 +348,44 @@ inferred from the word "Landlock":
   emit at all unless this page carries the same sentence. So is the rung each
   named test belongs to: the generator resolves every name against
   `BEHAVIOURAL_RUNGS` in `crates/vitrin-realm-init/src/main.rs`, which declares
-  the rungs that test enters a domain at and which each test asserts against the
-  rungs it actually entered, so a test cannot be published on a rung it never
-  enters and a rung it does enter cannot be left off.
+  the rungs that test enters a domain at, so a test cannot be published on a
+  rung it never enters and a rung it does enter cannot be left off.
+
+  **The absolute in bold above is a different kind of claim from the tally, and
+  it is worth saying what holds it — because until 2026-08-23 nothing did.**
+  A tally is about tests that exist; *"no test in this repository"* is about
+  tests nobody has written yet, and the three cross-checks in the paragraph
+  above — declared name to a real `fn`, declared rung to a published row, row
+  back to declared rung — are all comparisons against a **declaration**. A test
+  that entered a domain and declared nothing appeared in none of them, so
+  adding one at rung 4 would have left this sentence false on a fully green
+  build. There are exactly two ways into a Landlock domain in this tree and
+  each now has its own mechanism:
+
+  - **A test that issues the syscall itself** — `vitrin-realm-init`'s forked
+    measurement bodies, the only code in this workspace that calls
+    `landlock_restrict_self`. Held by the type system: that function demands a
+    token whose only mint in a test build is a ledger, the ledger records the
+    rung as it mints and compares what it recorded against `BEHAVIOURAL_RUNGS`
+    when it drops, and it refuses to open at all for a test name that table
+    does not declare. Declaring is therefore not something a test can forget,
+    and the production path (`landlock::apply_with`) has its own mint compiled
+    **out** of test builds so it is not a way round.
+  - **A test that asks the shipped helper for a rung**, entering the domain in
+    another process where no Rust type can reach it. The core's own confinement
+    suite is held at its single realm-spawn point, which refuses a spawn that
+    reports one of these rungs; `tests/integration/`'s Python and shell files
+    are held by a scan for `abi:N` naming one of them. Both lists are computed
+    from the ladder corpus rather than typed, so a test added at rung 4 changes
+    what the generator demands of this page instead of leaving it behind.
+
+  **What that does not cover, stated rather than implied.** The scan reads
+  literals in the suite's files, so a rung composed at runtime from pieces
+  would pass it. And `VITRIN_LANDLOCK=abi:4` set in the *environment* by
+  whoever runs the suite is invisible to all of it — that is an operator
+  pinning a session, which the bullets above describe as the instrument these
+  measurements are taken with, and it is not a test in this repository. The
+  sentence in bold is about the files, and it is now the files that hold it.
 - **This build's ladder stops at rung 9, and a newer kernel is clamped to it.**
   ABI 10 exists in mainline and this build does not request it. A kernel
   reporting more than 9 gets a rung-9 ruleset, and that is journaled per realm

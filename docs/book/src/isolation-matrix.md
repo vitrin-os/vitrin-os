@@ -122,9 +122,16 @@ for the rest is decision D-043, not an oversight. **Neither the name nor the run
 remembered.** Each name above is resolved against `BEHAVIOURAL_RUNGS` in that same
 file, which declares the rungs that test enters a domain at; a name listed on a rung
 it does not enter refuses to render, a rung it does enter and this page omits refuses
-to render, and the tests themselves assert at runtime that the rungs they entered are
-the rungs they declared. The generator also refuses to emit when the limits page does
-not carry the tally above.
+to render, and the tests cannot enter a domain without declaring it: the function that
+issues `landlock_restrict_self` demands a token only a recording ledger can mint, and
+that ledger compares what it recorded against the same table when it drops. The
+generator also refuses to emit when the limits page does not carry the tally above.
+
+**A test that asks the shipped helper for a rung enters a domain in another process,
+where no Rust type can reach it.** That route is held separately: the core's own
+confinement suite refuses a spawn reporting a rung this page publishes as entered by
+nothing, and `tests/integration/` is scanned for a literal `abi:N` naming one. Both
+lists are computed from this corpus, so they move when it does rather than after it.
 
 ## What each rung does not buy
 

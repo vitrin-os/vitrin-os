@@ -569,8 +569,11 @@ arguments carry the *effective* authority the human chose (which may be
 narrower than requested); on any other outcome they are zero.
 
 **Use-time refusals** — `vitrin_grant.refused(verb, code, retry_after_ms)` from
-the single enforcement chokepoint, covering capture, actuation and launch
-alike. `retry_after_ms` is greater than zero only for `rate_limited`.
+the single enforcement chokepoint, covering capture, actuation, launch, the
+layout verbs and egress alike — a closed list of use classes, grouped by facet
+shape rather than by verb, and whose two past lapses are recorded at
+[`vitrin_grant.refusal`](04-vitrin_grant.md#refusal).
+`retry_after_ms` is greater than zero only for `rate_limited`.
 Which codes a given use can draw is not uniform: `preempted` and
 `consent_held` are attention-shaped (actuation and the layout verbs),
 `capacity` is launch-only, and a launch is

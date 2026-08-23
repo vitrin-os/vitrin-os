@@ -748,9 +748,16 @@ outcome is the **only** thing the core says about arbitration.
 ### refusal
 
 Use-time refusal codes, emitted by the enforcement chokepoint on every refused
-*use* of a grant — capture, actuation and launch alike. Each code maps to a
-distinct typed SDK exception (NotGranted, GrantExpired, Revoked, RateLimited,
-Preempted, ConsentHeld, NoSurface, OperationFailed, AtCapacity).
+*use* of a grant — capture, actuation, launch, the layout verbs and egress
+alike. That list is a **closed enumeration** of the use classes this enum
+answers for, and the IDL records that it has gone stale twice: it read
+"capture, actuation and launch" after the layout verbs had already earned two
+paragraphs below, and still read so once egress became a fifth class. It groups
+by **facet shape**, not by verb — the two actuators are one class and the two
+layout interfaces are one — so a verb appended to this protocol either joins a
+class named here or adds one. Each code maps to a distinct typed SDK exception
+(NotGranted, GrantExpired, Revoked, RateLimited, Preempted, ConsentHeld,
+NoSurface, OperationFailed, AtCapacity).
 
 | entry | value | meaning |
 |---|---|---|

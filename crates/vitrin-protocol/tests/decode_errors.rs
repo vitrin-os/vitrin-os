@@ -126,11 +126,38 @@ fn invalid_bitfield_value_is_rejected() {
 #[test]
 fn every_verb_is_classified_as_facet_bearing_or_not() {
     // A count that documents itself. `docs/protocol/04-vitrin_grant.md`
-    // states "Six verbs map one-to-one to a facet interface" and, four
-    // hundred lines later, "the other six do" -- and the second sentence
-    // read "five" until issue #196's review caught it. Both numbers are the
-    // same number, and neither should be a sentence a human has to remember
-    // to update, so this is where it lives instead.
+    // states the facet-bearing count twice, four hundred lines apart, and the
+    // two sentences disagreed -- one said six and the other five -- until
+    // issue #196's review caught it. Both are the same number, and neither
+    // should be a sentence a human has to remember to update, so the
+    // invariant lives here instead: `|facet| + |facetless|` partitions the
+    // verb bitfield, and the size of each side is a tripwire below.
+    //
+    // **This comment used to quote those two sentences, and no longer does.**
+    // It quoted "Six" and "six" while the page -- shipped by this same branch
+    // -- says seven. The first quotation had been accurate and went stale the
+    // moment the egress facet moved the count. The second never matched
+    // anything: the page's other site read "Every other verb does", so "the
+    // other six do" was a paraphrase wearing quotation marks and was wrong
+    // before the count ever moved. A quotation of a file this test does not
+    // open is unholdable by construction -- nothing can go red when the
+    // quoted text changes -- which is the same defect class the count itself
+    // is here to close.
+    //
+    // The alternative -- have this test read the page and assert on its text
+    // -- is deliberately NOT taken, for two reasons. Reading
+    // `docs/protocol/` from a `vitrin-protocol` test would couple the wire
+    // codec's negative-path suite to prose layout, so a reword that changed
+    // no fact would go red. And that job is already done, by an instrument
+    // built for it: `cargo xtask verb-sets --check` registers
+    // `docs/protocol/04-vitrin_grant.md` as a `facet-verbs` carrier, reads
+    // the marker beside that first sentence (`| count: seven`), derives the
+    // set from the IDL, and fails with the path in it when the two disagree.
+    // A second reader here would be a second definition of one check --
+    // exactly what `crates/xtask/src/verb_sets.rs` exists to stop.
+    //
+    // So this test states the count, and the page's copy of it is held by
+    // the tool that reads the page.
     //
     // **Nothing here is hand-listed any more, and that is the point of this
     // revision.** The first cut held `FACET_VERBS` as an array of six

@@ -2206,6 +2206,14 @@ where
         seccomp_instructions: Some(handshake.seccomp_instructions),
     };
 
+    // Under `cargo test` this process **is** a test, and the realm it just
+    // spawned entered a real Landlock domain at the rung the handshake
+    // reports. That is the second of the two routes into a domain in this
+    // repository -- the first being `vitrin-realm-init`'s own forked
+    // measurement bodies -- and until this line it was the unheld one.
+    #[cfg(test)]
+    refuse_a_rung_no_test_is_published_as_entering(handshake.landlock_rung);
+
     Ok(SpawnedRealm {
         realm_id: realm.id().clone(),
         child: GuardedChild(child.0.take()),
@@ -2214,6 +2222,46 @@ where
         isolation,
         _realm_lock: guard.keep(),
     })
+}
+
+/// The sub-floor Landlock rungs this repository publishes as entered by **no**
+/// test -- `docs/book/src/limits.md`'s *"No test in this repository enters a
+/// Landlock domain at rung 4 or rung 5"* and the matching rows of
+/// `docs/book/src/isolation-matrix.md`.
+///
+/// The number is not remembered here: `cargo xtask isolation-matrix --check`
+/// computes the same set from the ladder corpus and refuses to emit the page
+/// unless this constant carries it, so widening it silently is not a thing an
+/// editor can do to one file.
+#[cfg(test)]
+pub(crate) const RUNGS_NO_TEST_ENTERS: &[u32] = &[4, 5];
+
+/// Refuse a spawn that would make the published absolute above false.
+///
+/// `vitrin-realm-init`'s own suite is held by the type system: the mint of the
+/// token `landlock::restrict_self` demands reads the rung off the ruleset it is
+/// handed and **refuses** when `BEHAVIOURAL_RUNGS` does not declare that rung
+/// for that test -- at the mint, not in a destructor, because `Drop` is
+/// skippable and this is a published absolute. That
+/// mechanism cannot see **this** route, because a test here enters no domain
+/// itself -- it asks the shipped helper to, in another process, over a
+/// handshake. So the rung the helper reports back is checked here, at the one
+/// place every confined spawn in this crate's suite goes through, and a test
+/// that pinned `--landlock=abi:4` would fail rather than quietly falsify a
+/// sentence on a page it never opened.
+///
+/// It fires exactly when a domain is entered: a host that cannot build the
+/// namespaces skips the spawn, and `--landlock=off` reports rung 0.
+#[cfg(test)]
+fn refuse_a_rung_no_test_is_published_as_entering(rung: u32) {
+    assert!(
+        !RUNGS_NO_TEST_ENTERS.contains(&rung),
+        "this test spawned a realm that entered a Landlock domain at rung {rung}, and \
+         docs/book/src/limits.md publishes that no test in this repository enters one at any of \
+         {RUNGS_NO_TEST_ENTERS:?}. Either drive a rung that page already accounts for, or change \
+         what docs/book/src/limits.md and docs/book/src/isolation-matrix.md say first -- \
+         `cargo xtask isolation-matrix` holds this constant against those pages."
+    );
 }
 
 /// The realm's `stdout`/`stderr` file, inside its own runtime directory.

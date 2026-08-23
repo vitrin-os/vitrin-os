@@ -280,10 +280,11 @@ inferred from the word "Landlock":
   numbers are now deliberately different: the *build* floor is 6 and the *CI
   require-variable* is 7, because the second is a statement about the runner's
   kernel and not about what this build needs.
-  **This narrows P2.6.3 rather than completing it**: PRD §20's
-  "coverage is kernel-dependent" caveat is *deferred*, not answered. Five
-  kernels reported five ABIs and four of this build's nine rungs are reported by
-  none of them, so the per-rung table the task asks for is still generated from
+  **The floor narrowed P2.6.3 rather than completing it**, and what completed
+  it was other work plus a decision — not this. PRD §20's "coverage is
+  kernel-dependent" caveat is answered **for those five kernels and for no
+  others**: five kernels reported five ABIs and four of this build's nine rungs
+  are reported by none of them, so the per-rung table is still generated from
   source rather than measured on machines. The plan document carries that
   correction in as many words.
 - **The rung matters, and the rung *obtained* is what is published.** A
@@ -322,9 +323,162 @@ inferred from the word "Landlock":
   storage**, and every rung above it can. Measured on this repo's box (kernel
   `7.1.8-arch1-3`, Landlock ABI 9, 2026-08-14) with the realm's whole writable
   set granted on one hierarchy: rung 1 answers `EXDEV`, rungs 2–9 succeed, and
-  a same-directory rename succeeds at every rung. Practically, `--landlock=abi:1`
+  a same-directory rename succeeds at every rung. **Two of those rungs are
+  re-taken on every run and the rest are not**, which matters because the next
+  bullet says no test in this repository enters a domain at rung 4 or rung 5.
+  `rung_one_forbids_reparenting_that_the_rung_above_permits` enters a Landlock
+  domain at rung 1 and at rung 2 and at no other — that is declared in
+  `BEHAVIOURAL_RUNGS` and asserted by the test itself against the rungs it
+  actually entered — so rungs 3–9 above, and the same-directory result anywhere
+  but rung 1, are a **hand run on that one date**: checked by a reader, and by
+  nothing in CI. Practically, `--landlock=abi:1`
   breaks every app that writes by rename-into-place (GTK, Firefox). Do not read
   the ladder as "higher is always tighter"; read it as "rung N is ABI N".
+- **Some of the rungs below the floor are exercised, on purpose: those tests
+  hold the dial honest, not the floor. The rest are exercised by nothing, and
+  this page says which is which rather than leaving it to be inferred.** Three
+  behavioural measurements in `crates/vitrin-realm-init/src/main.rs` enforce a
+  domain at rung 1, 2 or 3 —
+  `rung_one_forbids_reparenting_that_the_rung_above_permits`,
+  `the_truncate_rung_is_measured_and_its_absence_is_measured_with_it` and
+  `a_realm_can_write_where_it_was_granted_and_nowhere_else`. Every one of those
+  rungs is **below `build.landlock_min_abi`**, so a kernel reporting one is
+  refused at startup rather than confined weakly, and no shipped session has
+  ever run at any of them. They are kept deliberately — decision
+  [**D-044**](https://github.com/vitrin-os/vitrin-os/blob/main/docs/plan/20-decision-log.md#d-044--the-sub-floor-landlock-rung-tests-are-kept-and-what-they-are-evidence-about-is-published-beside-them-the---landlockabin-dial-never-the-floor)
+  (2026-08-19), taken as a dated decision precisely because this task's
+  *previous* narrowing was settled by attrition and reached these pages as a
+  deferral nobody could date. The reasons are two, and neither is "deleting
+  tests feels wrong": they are the only evidence that any part of the
+  [ABI matrix](isolation-matrix.md)'s lower half is not fiction, that page being
+  *derived* from this build's own source and observing no kernel answering
+  anything; and the `REFER` result in the bullet above — rung 1 being
+  **stricter** than rung 2 — cannot be read off the mask column at all, which
+  is why two tests asserting the opposite invariant were replaced when it was
+  measured. What they are **not** evidence about is said in the same breath:
+  not the floor, not any confinement claim this build publishes, and not any
+  state an operator running a stock build can reach. Nor are they evidence
+  about a kernel: which kernels report which ABI is [the kernel
+  page](isolation-kernels.md) and its checked-in boot rows, measured elsewhere
+  and by other means.
+
+  **And the sub-floor rungs the three do not reach are exercised by nothing at
+  all.** Counted from the same list the generator checks:
+
+  > below the floor of 6, rungs 1, 2 and 3 are exercised and rungs 4 and 5 are not.
+
+  So the sub-floor half of the ladder is exercised in part, not throughout.
+  **No test in this repository enters a Landlock domain at rung 4 or rung 5**,
+  so every cell on those two rows of the matrix is derived from this build's own
+  source and measured against nothing. (The 2026-08-14 hand run in the `REFER`
+  bullet above did pass through those rungs once and left nothing behind that
+  re-takes it; a measurement nobody can re-run is not coverage.) That is a
+  decision rather than an
+  oversight: D-044 was offered the option of *adding* the missing rungs and did
+  not take it, rung 4 buying `handled_access_net` which this build leaves zero.
+  The tally above is **held**, not remembered — `cargo xtask isolation-matrix`
+  computes it from the corpus, prints it on the matrix page, and refuses to
+  emit at all unless this page carries the same sentence. So is the rung each
+  named test belongs to: the generator resolves every name against
+  `BEHAVIOURAL_RUNGS` in `crates/vitrin-realm-init/src/main.rs`, which declares
+  the rungs that test enters a domain at, so a test cannot be published on a
+  rung it never enters and a rung it does enter cannot be left off.
+
+  **The absolute in bold above is a different kind of claim from the tally, and
+  it is worth saying what holds it — because until 2026-08-23 nothing did.**
+  A tally is about tests that exist; *"no test in this repository"* is about
+  tests nobody has written yet, and the three cross-checks in the paragraph
+  above — declared name to a real `fn`, declared rung to a published row, row
+  back to declared rung — are all comparisons against a **declaration**. A test
+  that entered a domain and declared nothing appeared in none of them, so
+  adding one at rung 4 would have left this sentence false on a fully green
+  build. There are exactly two ways into a Landlock domain in this tree and
+  each now has its own mechanism:
+
+  - **A test that issues the syscall itself** — `vitrin-realm-init`'s forked
+    measurement bodies, the only code in this workspace that calls
+    `landlock_restrict_self`. Held by the type system: that function demands a
+    token whose only mint in a test build is a ledger, and the token carries the
+    **ruleset**, not a rung number beside it — so what the ledger records is the
+    rung the kernel *created that ruleset at*, and the ruleset it recorded is
+    the only descriptor the syscall can be given. The rung is compared against
+    `BEHAVIOURAL_RUNGS` **inside the mint, before the token exists**, and the
+    ledger refuses to open at all for a test name that table does not declare.
+    Declaring is therefore not something a test can forget, and the production
+    path (`landlock::apply_with`) has its own mint compiled **out** of test
+    builds so it is not a way round.
+
+    Two shapes of that token were found broken by *compiling* the
+    counterexample rather than by reading the code, both on 2026-08-23:
+
+    - It carried a rung *number*. A test could declare rung 1, build its
+      ruleset at rung 4, enter a rung-4 domain and leave every mechanism here
+      green. Closed by welding the two: `entering(4)` no longer type-checks,
+      and a ruleset the ledger never saw cannot be named to the syscall at all.
+    - The comparison lived **only** in the ledger's destructor, and the token
+      borrowed the ruleset without borrowing the ledger — so the ledger could
+      be moved out from under a live token. This compiled, ran, entered a
+      rung-4 domain and skipped the check, with every gate green:
+
+      ```text
+      let entered = RungsEntered::for_test("a_realm_can_write_where_it_was_granted_and_nowhere_else");
+      let ruleset = create_ruleset(4).expect("a rung-4 ruleset");
+      let entering = entered.entering(&ruleset);
+      std::mem::forget(entered);
+      // ... enters a rung-4 domain; nothing records it
+      ```
+
+      Closed twice over, because one of the two fixes would have been a fix
+      that still rested on a destructor. The mint now takes `&'a self`, so the
+      ledger cannot be moved while a token minted from it is alive. Pasted from
+      a probe compiled into the test module and then reverted, so the line
+      numbers are the probe's and not a line in the shipped tree:
+
+      ```text
+      error[E0505]: cannot move out of `entered` because it is borrowed
+          --> crates/vitrin-realm-init/src/main.rs:1995:26
+           |
+      1994 |         let entering = entered.entering(&ruleset);
+           |                        ------- borrow of `entered` occurs here
+      1995 |         std::mem::forget(entered);
+           |                          ^^^^^^^ move out of `entered` occurs here
+      1996 |         let _ = landlock::restrict_self(entering, 0);
+           |                                         -------- borrow later used here
+      ```
+
+      And the comparison the sentence in bold depends on — *this rung is one
+      the row declares* — moved out of the destructor into the mint, where no
+      disposal of the ledger afterwards can skip it.
+  - **A test that asks the shipped helper for a rung**, entering the domain in
+    another process where no Rust type can reach it. The core's own confinement
+    suite is held at its single realm-spawn point, which refuses a spawn that
+    reports one of these rungs; `tests/integration/`'s Python and shell files
+    are held by a scan for `abi:N` naming one of them. Both lists are computed
+    from the ladder corpus rather than typed, so a test added at rung 4 changes
+    what the generator demands of this page instead of leaving it behind.
+
+  **What that does not cover, stated rather than implied.** `Drop` is not
+  guaranteed to run in Rust — `mem::forget`, `ManuallyDrop`, `Box::leak`,
+  `std::process::exit` and a `panic = "abort"` profile each skip it — so
+  nothing on this page publishes an absolute that rests on one. The half of
+  the ledger's comparison that is *still* in its destructor is the converse of
+  the sentence in bold: a row declaring a rung the run never entered, which is
+  a **staleness** check on the table and not a claim about which rungs are
+  reachable. That half is skippable and is stated here as skippable. The scan
+  reads literals in the suite's files, so a rung composed at runtime from
+  pieces would pass it. `VITRIN_LANDLOCK=abi:4` set in the *environment* by
+  whoever runs the suite is invisible to all of it — that is an operator
+  pinning a session, which the bullets above describe as the instrument these
+  measurements are taken with, and it is not a test in this repository. And the
+  first bullet holds one *function*, not the kernel's ABI: `landlock_restrict_self`
+  is syscall 446, a test could issue it by hand through `libc::syscall`, and
+  **nothing checks** that `landlock::restrict_self` remains its only caller —
+  that `restrict_self` is the only such call today is a fact about the tree as
+  it stands, not a mechanism. The first and the third would each make the
+  sentence in bold silently false and neither is held; the second is an
+  operator rather than a test, and is out of its scope by construction.
+  The sentence in bold is about the files, and it is the files that hold it
+  — as far as a literal can be read.
 - **This build's ladder stops at rung 9, and a newer kernel is clamped to it.**
   ABI 10 exists in mainline and this build does not request it. A kernel
   reporting more than 9 gets a rung-9 ruleset, and that is journaled per realm
@@ -422,10 +576,23 @@ inferred from the word "Landlock":
   table, same argv, it succeeds. Neither half is evidence without the other.
   What is still *not* measured that way is any particular rung's rights inside
   a real realm — those are measured in `vitrin-realm-init`'s own suite, where a
-  forked child can enforce a capped domain and try the syscall.
+  forked child can enforce a capped domain and try the syscall. **Nor is the
+  verb the same**: that gate's probe opens read-only (`O_RDONLY`), so what it
+  measures mock-free is a **read** denial. P2.6.3's criterion about a *write*
+  to a path outside the granted set — with its positive control in the same
+  run — is measured only by `a_realm_can_write_where_it_was_granted_and_nowhere_else`
+  in `vitrin-realm-init`'s own suite, at rung 1, in a forked child. That is a
+  component test and this page will not cite it as anything else. **Where the
+  write half is scheduled to be measured mock-free is
+  [#193](https://github.com/vitrin-os/vitrin-os/issues/193)** (P2.6.9, the
+  ransomware gate), whose payload reports every write it attempted with the
+  errno each got; nothing before that gate lands closes this, and giving
+  `test_real_confinement.py`'s own probe a write verb was considered here and
+  deliberately left to it rather than done in a review-fix branch.
 - **There is a ladder table now, and it is a table about this build — not
-  about kernels. P2.6.3 is still not finished and this page will not say
-  otherwise.** The task's own acceptance criteria
+  about kernels. P2.6.3 was accepted on 2026-08-19, on its *corrected* criteria
+  and not on the ones its plan row first wrote, and this page will not round
+  that up.** The task's own acceptance criteria
   (`docs/plan/02-phase-2-semantic-epochs.md`, P2.6.3) ask for two deliverables:
   the ruleset, which landed, **and** a per-ABI ladder table *generated* on each
   kernel in the CI matrix with CI going red when the checked-in copy is stale.
@@ -468,12 +635,27 @@ inferred from the word "Landlock":
   "coverage is kernel-dependent" caveat is answered for those five and for no
   others. The per-rung *behavioural* statements quoted above
   (the `TRUNCATE` pair, the `REFER` pair) are held by `vitrin-realm-init`'s own
-  tests on one box; everything else about a rung is now generated and gated,
-  which is a narrower promise than "measured". Do not read "P2.6.3" anywhere in
-  this repository as a finished task. The plan document carries the
-  corrections, and two of the criteria written there were **wrong on the
-  kernel's own terms**; they are restated with the correction visible rather
-  than deleted.
+  tests, which run on this repository's development box and on the CI runner —
+  whose job declares `VITRIN_REQUIRE_LANDLOCK_ABI=7`, so a skip there is a panic
+  and not a quiet pass — and on no third machine; the *values* they pin were
+  recorded on one box on one date. Everything else about a rung is now generated
+  and gated,
+  which is a narrower promise than "measured". **What P2.6.3's acceptance does
+  and does not mean.** It was accepted on the corrected criteria plus decision
+  D-044 (the sub-floor rung tests, above), and two of the criteria written in
+  the plan were
+  **wrong on the kernel's own terms** while a third — "one row per ABI actually
+  reported, on each kernel in the CI matrix" — cannot be satisfied by any
+  byte-stable checked-in page and was replaced rather than met; the plan
+  document restates all three with the correction visible rather than deleting
+  them. Four things did not become true on acceptance, and each is stated
+  above in its own words: five kernels answered five ABIs and four of the nine
+  rungs are reported by none of them; every one of those rows is a **kernel**
+  reading in a bare initramfs, so the number of *distributions* measured is
+  still one; the suite itself has still only ever run on two machines and
+  nobody but the collector's author has re-run its levers; and the per-rung
+  behavioural statements are one box, on one date. Read an accepted task as an
+  accepted task and this page for what is actually measured.
 
 ### The six enforced domains, stated once so a generated table can be compared
 
@@ -1436,18 +1618,25 @@ enumerated under `principal-has-no-hotkey` below). Four further limits belong wi
   the whole directory, or the flag would silently stop working on a class with
   seventeen entries in it — 24 bytes per read, every failure a no-op), which
   makes it the first rule in that future ruleset with a write bit in it.
-  Recorded here rather than left for whoever writes the ruleset
-  ([#187](https://github.com/vitrin-os/vitrin-os/issues/187)) to discover. It is
-  **not** a `--status` fact and does not need the strip; the two are listed
-  together because they are the two sysfs *class* trees the core walks, and
-  because the second is the one that turns a read-only future ruleset into a
-  read-write one. They are **not** the only sysfs paths the trusted core
+  Recorded here rather than left for whoever writes the ruleset to discover.
+  It is **not** a `--status` fact and does not need the strip; the two are
+  listed together because they are the two sysfs *class* trees the core walks,
+  and because the second is the one that turns a read-only future ruleset into
+  a read-write one. They are **not** the only sysfs paths the trusted core
   touches. There are four, and the other two are single files read once rather
   than directories walked on a timer: `/sys/class/tty/tty0/active`, which the
   bare-metal backend reads to learn which VT it is on, and
   `/sys/module/apparmor/parameters/enabled`, which the spawn path reads to
   decide whether an AppArmor label means anything on this kernel — the same
   file this page already cites in the confinement section above.
+  **Both the read and the write are owed to
+  [#314](https://github.com/vitrin-os/vitrin-os/issues/314)**,
+  which owns the core's own Landlock self-sandbox. It is unbuilt and no plan
+  document schedules it. This bullet named #187 until 2026-08-23, and that was
+  wrong rather than merely stale: #187 built the **realm's** ruleset inside
+  `vitrin-realm-init`, over a filesystem view that has already `pivot_root`ed
+  away from `/sys`, and it never owned a rule about `vitrind`'s own process at
+  any point in its life.
 
 <!-- limit: principal-has-no-hotkey -->
 **A principal cannot receive physical input either, so no client has a

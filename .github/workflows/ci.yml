@@ -212,10 +212,17 @@ jobs:
       # 2026-08-14, kernel 6.17.0-1020-azure, recorded in
       # docs/book/src/limits.md. A floor, not a flag: every rung at or below
       # 7 must run, and a measurement needing a rung above 7 is an honest
-      # kernel limit and still skips. Seven is also this build's own startup
-      # floor (`LANDLOCK_MIN_ABI` in crates/vitrin-realm-init/src/lib.rs), so
-      # a runner that dropped below it could not start vitrind at all and the
-      # integration job would be red for the same reason. **Change this
+      # kernel limit and still skips. Seven is
+      # above this build's startup floor of 6 (`LANDLOCK_MIN_ABI` in
+      # crates/vitrin-realm-init/src/lib.rs), so a
+      # runner that dropped to 6 would still start vitrind and would make this
+      # floor red on its own, while a runner below 6 could not start vitrind at
+      # all and the integration job would be red for that second reason. That
+      # relationship is CHECKED, not recalled -- this comment read "also this
+      # build's own startup floor" for three days after the floor was lowered
+      # to 6, so `the_declared_landlock_abi_states_its_real_relation_to_the_build_floor`
+      # in crates/xtask/src/skip_census.rs now reads the constant and requires
+      # the clause above here and in CI_DECLARATIONS. **Change this
       # number when the runner image changes, and only against a fresh
       # measurement** -- it is a claim about a machine, not about this code.
       VITRIN_REQUIRE_LANDLOCK_ABI: "7"

@@ -1227,10 +1227,15 @@ D-033 already examined writing `/sys/class/backlight` and refused it. The bullet
 > hardware** — and it does not improve until the owner pastes a dated result
 > into that record block.
 
-> **CORRECTED 2026-08-23: THE ROUTING OF THE SANDBOX DEBT WAS WRONG, AND THE
-> ISSUE IT NAMED HAS NOW CLOSED.** Everything above stands as written; this
-> block corrects exactly one clause of it, appended rather than edited in
-> place for the reason the amendment above gives.
+> **CORRECTED 2026-08-23: THE ROUTING OF THE SANDBOX DEBT WAS WRONG, AND
+> [#314](https://github.com/vitrin-os/vitrin-os/issues/314) OWNS IT NOW.**
+> Everything above stands as written; this block corrects exactly one clause of
+> it, appended rather than edited in place for the reason the amendment above
+> gives. It asserts nothing about #187's own state: as of this writing #187 is
+> **open**, and the branch carrying this correction is the one whose merge
+> closes it — a heading here cannot record that in advance, and the earlier
+> draft of this heading, which said the issue *had* closed, was wrong on the
+> day it was written.
 >
 > **Wrong as written: *"It lands directly in [#187] (P2.6.3, the Landlock
 > ruleset and the ABI ladder), which is where the ruleset is actually

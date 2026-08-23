@@ -106,8 +106,17 @@
 //! **write** bit, over [`SYSFS_ROOT`] and the `brightness` file of one
 //! immediate child. It is recorded here, in `docs/book/src/limits.md` and in
 //! `docs/plan/14-workstream-session-mode.md` rather than left to be
-//! rediscovered by whoever writes the ruleset
-//! ([#187](https://github.com/vitrin-os/vitrin-os/issues/187)).
+//! rediscovered by whoever writes the ruleset, and the issue that owns that
+//! ruleset is
+//! [#314](https://github.com/vitrin-os/vitrin-os/issues/314).
+//!
+//! This citation used to read #187, and that was a mis-route rather than a
+//! stale number. #187 applied the **realm's** ruleset inside
+//! `vitrin-realm-init`, after the helper has `pivot_root`ed away from the
+//! tree this file writes to; it never owned a rule about `vitrind`'s own
+//! process at any point in its life, and would have left this obligation
+//! pointing at an issue that could not discharge it. D-041 recorded the wrong
+//! destination and is corrected in place at the log rather than rewritten.
 //!
 //! It also depends on a permission this repository does not own: on a stock
 //! install the write is reachable through a `video`-group membership or a

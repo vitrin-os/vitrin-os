@@ -607,10 +607,18 @@ the bullet below states in full.
   [the kernel page](docs/book/src/isolation-kernels.md): five distribution
   kernels booted under QEMU with the shipped binary, held by
   `cargo xtask kernel-matrix --check` against the boot rows checked in under
-  `tests/kernel-matrix/rows/`. Do not read P2.6.3 as a finished task even so —
-  every one of those rows is a kernel reading in a bare initramfs rather than a
-  distribution, the per-rung *behavioural* statements are still measured on one
-  box, and nobody but the collector's author has re-run its failure levers.
+  `tests/kernel-matrix/rows/`. P2.6.3 was **accepted** on 2026-08-19 on its
+  *corrected* criteria — one clause of the original, "one row per ABI actually
+  reported on each kernel in the CI matrix", cannot be satisfied by any
+  byte-stable checked-in page and was replaced rather than met — so do not read
+  the acceptance as more than it is: every one of those rows is a kernel
+  reading in a bare
+  initramfs rather than a distribution, the *values* in the per-rung
+  behavioural statements were recorded on one box on one date — the tests that
+  take them run here and on the CI runner, whose job declares
+  `VITRIN_REQUIRE_LANDLOCK_ABI=7` so a skip is a panic there, and on no third
+  machine — and nobody but the collector's author has re-run its failure
+  levers.
   Each row records the build it was taken with as well as the kernel's answers,
   and `cargo xtask kernel-matrix --check` holds that half to this tree: it reads
   each row's own recorded mechanism set and goes **red the day the floor moves
@@ -750,9 +758,10 @@ the bullet below states in full.
   *lowest* rung at which the domain this build enforces is unchanged — rungs 7
   and 8 buy `landlock_restrict_self` flags rather than mask bits, and every
   shipped run passes flags = 0 — so lowering it refuses fewer machines and
-  weakens none. It still narrows P2.6.3 rather than
-  completing it; the [limits page](docs/book/src/limits.md) says what is not
-  built. **Which kernels the floor admits is measured**: five distribution
+  weakens none. The floor narrowed P2.6.3 rather than completing it, and what
+  completed it was other work plus a dated decision; the
+  [limits page](docs/book/src/limits.md) says what is not built. **Which
+  kernels the floor admits is measured**: five distribution
   kernels were booted with the shipped binary, and Debian 13 (ABI 6) and the
   `6.17.0-1020-azure` kernel CI runs (ABI 7) start, while Ubuntu 22.04 (ABI 1),
   Debian 12 (ABI 2) and Ubuntu 24.04's GA kernel (ABI 4) are refused — see

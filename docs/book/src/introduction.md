@@ -56,9 +56,11 @@ table it cannot reshape — verified by the core from outside, and the spawn
 refused when it cannot be. Since P2.6.3 it also gets a **Landlock ruleset**
 with an enumerated read set, enforced before the shim's `execve`, and a
 generated [ABI matrix](isolation-matrix.md) of what that ruleset requires of a
-kernel. P2.6.3 is nevertheless **not finished**: that matrix probes nothing, so
-it is a table about the build rather than about kernels; the per-kernel one its
-criteria ask for now exists separately, and is **measured** — [which kernels
+kernel. P2.6.3 was accepted on 2026-08-19, and on **corrected** criteria
+rather than the ones it was written with, which is worth reading narrowly: that
+matrix probes nothing, so it is a table about the build rather than about
+kernels; the per-kernel one its criteria ask for exists separately, and is
+**measured** — [which kernels
 this build starts on](isolation-kernels.md), five distribution kernels booted
 under QEMU with the shipped `vitrind`, three of them refused below the floor and
 two admitted — though every row there is a **kernel** reading taken in a bare

@@ -1217,8 +1217,8 @@ const CI_DECLARATIONS: &[CiDeclaration] = &[
     CiDeclaration {
         var: "VITRIN_REQUIRE_LANDLOCK_ABI",
         jobs: &[("rust", "7")],
-        why: "the ABI the runner was MEASURED at on 2026-08-14 (docs/book/src/limits.md), which \
-              is also this build's own startup floor -- change it only against a fresh \
+        why: "the ABI the runner was MEASURED at on 2026-08-14 (docs/book/src/limits.md), and \
+              it is above this build's startup floor of 6 -- change it only against a fresh \
               measurement",
     },
     CiDeclaration {
@@ -2432,6 +2432,56 @@ fn f<'a>(x: &'a str) -> String {
             problems.is_empty(),
             ".github/workflows/ci.yml disagrees with CI_DECLARATIONS:\n{}",
             problems.join("\n")
+        );
+    }
+
+    /// The runner's declared Landlock ABI and this build's startup floor are two
+    /// numbers in three files, and until this test the relation between them
+    /// was a sentence in two of them.
+    ///
+    /// It had already drifted: the floor was lowered 7 -> 6 on 2026-08-16 and
+    /// both copies went on saying the declared 7 "is also this build's own
+    /// startup floor". Nothing was red, because the declaration itself was
+    /// still true -- only the explanation of it had stopped being.
+    #[test]
+    fn the_declared_landlock_abi_states_its_real_relation_to_the_build_floor() {
+        let root = crate::workspace_root().expect("the workspace root");
+        let lib = std::fs::read_to_string(root.join("crates/vitrin-realm-init/src/lib.rs"))
+            .expect("the crate that declares the floor");
+        let floor = crate::isolation_matrix::Constants::from_source(&lib)
+            .expect("the floor and ceiling")
+            .min_abi;
+        let row = CI_DECLARATIONS
+            .iter()
+            .find(|d| d.var == "VITRIN_REQUIRE_LANDLOCK_ABI")
+            .expect("the Landlock ABI declaration");
+        let (job, value) = row.jobs.first().expect("the job that declares it");
+        let declared: u32 = value
+            .parse()
+            .unwrap_or_else(|_| panic!("job `{job}` declares {value:?}, which is not an ABI"));
+        let required = match declared.cmp(&floor) {
+            std::cmp::Ordering::Equal => {
+                format!("equal to this build's startup floor of {floor}")
+            }
+            std::cmp::Ordering::Greater => {
+                format!("above this build's startup floor of {floor}")
+            }
+            std::cmp::Ordering::Less => {
+                format!("below this build's startup floor of {floor}")
+            }
+        };
+        assert!(
+            row.why.contains(&required),
+            "CI_DECLARATIONS explains VITRIN_REQUIRE_LANDLOCK_ABI={declared} against a floor of \
+             {floor}, so its `why` must say it is {required:?}. It says: {:?}",
+            row.why
+        );
+        let workflow =
+            std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("the workflow");
+        assert!(
+            workflow.contains(&required),
+            ".github/workflows/ci.yml must carry the same clause, {required:?}, beside the \
+             variable it explains -- two copies of a relationship are two things to keep true"
         );
     }
 

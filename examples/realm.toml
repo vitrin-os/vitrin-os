@@ -316,14 +316,26 @@ command = "/usr/bin/foot"
 # inside a nested sandbox (GTK -> glycin -> bwrap) cannot have one and decodes
 # UNSANDBOXED instead.
 #
-# P2.6.3 is NOT COMPLETE, and what is missing is narrower than it was. The
-# ruleset landed, and so did the generated ladder table and its CI staleness
-# gate -- `cargo xtask isolation-matrix` emits docs/book/src/isolation-matrix.md
-# and `--check` turns CI red on a stale copy. What did NOT land, and is
-# DEFERRED to issue #281, is the PER-KERNEL half: one row per ABI actually
-# reported, on each kernel in a CI matrix. The table that exists probes no
-# kernel -- it states what THIS BUILD requires -- so treat every per-rung
-# BEHAVIOURAL claim about this ruleset as prose measured once on one box.
+# P2.6.3 was ACCEPTED on 2026-08-19, on its CORRECTED criteria rather than the
+# ones its plan row first wrote, so read the acceptance narrowly. The ruleset
+# landed, and so did the generated ladder table and its CI staleness gate --
+# `cargo
+# xtask isolation-matrix` emits docs/book/src/isolation-matrix.md and `--check`
+# turns CI red on a stale copy. That table probes no kernel: it states what
+# THIS BUILD requires. The PER-KERNEL half landed separately on 2026-08-16 as
+# docs/book/src/isolation-kernels.md (issue #281) -- five distribution kernels
+# booted under QEMU with the shipped binary, reporting ABI 1, 2, 4, 6 and 7,
+# three of them refused below the floor. It is a row per KERNEL and not the
+# "one row per ABI actually reported" the original criteria asked for: five
+# kernels answered five ABIs, and four of the nine rungs are reported by none
+# of them. Every row there is a KERNEL reading taken in a bare initramfs rather
+# than a distribution. The per-rung BEHAVIOURAL claims are NOT uniform, and
+# docs/book/src/isolation-matrix.md counts which is which rather than leaving it
+# to be inferred: rungs 1, 2, 3 and 7 are entered by tests in
+# crates/vitrin-realm-init/src/main.rs, which run here and on the CI runner;
+# every other rung's behaviour is derived from this build's own source and
+# measured against nothing. The VALUES those tests pin were recorded on one box
+# on one date.
 #
 # Since P2.6.4 there IS a seccomp filter, and it is a DENY-LIST -- which is a
 # named-class claim and never a completeness one. It closes the

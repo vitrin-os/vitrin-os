@@ -29,8 +29,9 @@
 //! - the grant table's chokepoint query `check_use_grant` is called from
 //!   exactly one non-test site in the crate -- here;
 //! - `vitrin_grant.refused` is constructed at exactly one site in the
-//!   crate -- [`Chokepoint::voice_refusal`], one refusal voice for capture
-//!   and actuation alike (IDL `vitrin_grant`);
+//!   crate -- [`Chokepoint::voice_refusal`], one refusal voice for every
+//!   use class this core serves (IDL `vitrin_grant`; that function's own
+//!   docs name the one class it does not, and why);
 //! - the capture mechanics entry [`crate::capture::render_frame`] and the
 //!   emulated-input constructor `SeatInput::emulated` each have exactly
 //!   one caller outside their home modules -- here, *after* admission.
@@ -1180,14 +1181,28 @@ impl Chokepoint {
     }
 
     /// The single site where every `vitrin_grant.refused` is built and
-    /// sent -- capture, actuation and launch alike, one refusal voice
-    /// (IDL). For coalescible (actuation) refusals it applies the
-    /// delivery classification's two MAY-bounds and returns whether the
-    /// event was actually voiced; refusals of the reply-bearing requests
-    /// (capture and launch) are always voiced, because a terminal that
-    /// coalesced away would leave the client waiting forever. Defensively
-    /// re-enforces the IDL invariant that `retry_after_ms` is nonzero
-    /// only for `rate_limited`, in release builds too.
+    /// sent -- one refusal voice (IDL). For coalescible refusals (the two
+    /// actuations and the two layout requests -- see
+    /// [`UseKind::coalescible`]) it applies the delivery classification's
+    /// two MAY-bounds and returns whether the event was actually voiced;
+    /// refusals of the reply-bearing requests (capture and launch) are
+    /// always voiced, because a terminal that coalesced away would leave
+    /// the client waiting forever. Defensively re-enforces the IDL
+    /// invariant that `retry_after_ms` is nonzero only for
+    /// `rate_limited`, in release builds too.
+    ///
+    /// **This function is one voice for four of the IDL's five use
+    /// classes, not five**, and the fifth is named here rather than left
+    /// to be inferred from a `match` with no arm. `vitrin_grant.refusal`
+    /// enumerates capture, actuation, launch, the layout verbs and
+    /// **egress**; [`UseKind`] has no egress variant, because this core
+    /// dispatches neither `vitrin_grant.get_egress` nor
+    /// `vitrin_egress.request_connect` at all -- both are answered
+    /// `invalid_opcode` today, which the IDL's own `vitrin_egress`
+    /// description records as a gap between the document and this binary.
+    /// So no egress refusal is ever built here, and the reason is an
+    /// absent dispatch arm rather than an exemption at the chokepoint.
+    /// The task that lands the out-of-core proxy owns closing it.
     fn voice_refusal<F>(
         &mut self,
         grant_wire_id: u32,

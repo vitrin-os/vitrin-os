@@ -2300,10 +2300,17 @@ The limit set follows.
   > now"; that sentence would be wrong in three directions at once.
   >
   > It also **widens the core's future self-sandbox from read to write** — the
-  > first write rule `#187`'s Landlock ruleset will owe — which is recorded here,
-  > in `crates/vitrin-core/src/backlight.rs`'s module docs and in the
-  > `status-strip-reads-sysfs` bullet of `docs/book/src/limits.md`, on
-  > `battery.rs:32-39`'s three-surface precedent.
+  > first write rule the **core's own** Landlock ruleset will owe — which is
+  > recorded here, in `crates/vitrin-core/src/backlight.rs`'s module docs and in
+  > the `status-strip-reads-sysfs` bullet of `docs/book/src/limits.md`, on
+  > `battery.rs:32-39`'s three-surface precedent. That ruleset is
+  > [#314](https://github.com/vitrin-os/vitrin-os/issues/314).
+  > This sentence named `#187` until 2026-08-23 and that was wrong, not merely
+  > out of date: #187 wrote the **realm's** ruleset in `vitrin-realm-init`,
+  > which runs after a `pivot_root` away from `/sys`, and it closed on
+  > 2026-08-19 having never owned a rule about `vitrind`'s own process. D-041
+  > routed the debt there; the correction is appended to that entry rather than
+  > written over it.
 
 - <!-- limit: no-key-repeat-on-drm -->
   **A held key does not repeat on `--drm`** (pre-existing since WS-E.3.1 and
@@ -2715,7 +2722,13 @@ The limit set follows.
   than a guess. **When E2.6/E2.7 put Landlock over the core's own process this
   becomes a rule the core must grant itself**, which is a real widening of that
   future sandbox and is recorded here so the ruleset's author does not have to
-  rediscover it.
+  rediscover it. That author has an issue as of 2026-08-23:
+  [#314](https://github.com/vitrin-os/vitrin-os/issues/314),
+  which carries this read rule together with the backlight write rule the
+  brightness bullet above describes. `battery.rs`'s own module docs are
+  deliberately left without that citation: D-041 quotes six line numbers from
+  that file and inserting a paragraph into it would move every one of them.
+  This is where a reader of the sysfs limit is pointed instead.
 
 - <!-- limit: screenshots-are-world-readable-to-realms -->
   **A file on disk that is a picture of the human's screen** (created by

@@ -1524,18 +1524,25 @@ enumerated under `principal-has-no-hotkey` below). Four further limits belong wi
   the whole directory, or the flag would silently stop working on a class with
   seventeen entries in it — 24 bytes per read, every failure a no-op), which
   makes it the first rule in that future ruleset with a write bit in it.
-  Recorded here rather than left for whoever writes the ruleset
-  ([#187](https://github.com/vitrin-os/vitrin-os/issues/187)) to discover. It is
-  **not** a `--status` fact and does not need the strip; the two are listed
-  together because they are the two sysfs *class* trees the core walks, and
-  because the second is the one that turns a read-only future ruleset into a
-  read-write one. They are **not** the only sysfs paths the trusted core
+  Recorded here rather than left for whoever writes the ruleset to discover.
+  It is **not** a `--status` fact and does not need the strip; the two are
+  listed together because they are the two sysfs *class* trees the core walks,
+  and because the second is the one that turns a read-only future ruleset into
+  a read-write one. They are **not** the only sysfs paths the trusted core
   touches. There are four, and the other two are single files read once rather
   than directories walked on a timer: `/sys/class/tty/tty0/active`, which the
   bare-metal backend reads to learn which VT it is on, and
   `/sys/module/apparmor/parameters/enabled`, which the spawn path reads to
   decide whether an AppArmor label means anything on this kernel — the same
   file this page already cites in the confinement section above.
+  **Both the read and the write are owed to
+  [#314](https://github.com/vitrin-os/vitrin-os/issues/314)**,
+  which owns the core's own Landlock self-sandbox. It is unbuilt and no plan
+  document schedules it. This bullet named #187 until 2026-08-23, and that was
+  wrong rather than merely stale: #187 built the **realm's** ruleset inside
+  `vitrin-realm-init`, over a filesystem view that has already `pivot_root`ed
+  away from `/sys`, and it closed on 2026-08-19 having never owned a rule
+  about `vitrind`'s own process.
 
 <!-- limit: principal-has-no-hotkey -->
 **A principal cannot receive physical input either, so no client has a

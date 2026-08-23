@@ -1227,6 +1227,45 @@ D-033 already examined writing `/sys/class/backlight` and refused it. The bullet
 > hardware** — and it does not improve until the owner pastes a dated result
 > into that record block.
 
+> **CORRECTED 2026-08-23: THE ROUTING OF THE SANDBOX DEBT WAS WRONG, AND THE
+> ISSUE IT NAMED HAS NOW CLOSED.** Everything above stands as written; this
+> block corrects exactly one clause of it, appended rather than edited in
+> place for the reason the amendment above gives.
+>
+> **Wrong as written: *"It lands directly in [#187] (P2.6.3, the Landlock
+> ruleset and the ABI ladder), which is where the ruleset is actually
+> written"*, and with it the cost bullet *"#187 inherits it rather than
+> discovering it"*.** Both sentences assume one ruleset. There are two, and
+> they confine different processes. #187 is *"Apply the Landlock ruleset in
+> vitrin-realm-init and publish the ABI ladder"* — the **realm's** ruleset,
+> built by the helper `vitrind` execs, immediately before it `execve`s the
+> shim, over the realm's own filesystem view. It never contained a rule about
+> `vitrind`'s own process and could not have: the helper has already
+> `pivot_root`ed away from the tree `/sys/class/backlight` lives in. The rule
+> this entry records is a rule the **core** grants *itself*, and no line of
+> #187 was ever going to write it.
+>
+> So the debt was routed to an issue that could not discharge it, and #187
+> closed on 2026-08-19 having discharged everything it *did* own. Four
+> surfaces then pointed a still-open obligation at a closed issue: this
+> paragraph, the `status-strip-reads-sysfs` bullet of
+> `docs/book/src/limits.md`, `crates/vitrin-core/src/backlight.rs`'s module
+> docs, and `docs/plan/14-workstream-session-mode.md`. **The successor is
+> [#314](https://github.com/vitrin-os/vitrin-os/issues/314)**,
+> which owns the core's own Landlock self-sandbox — the read rule
+> `crates/vitrin-core/src/status/battery.rs` records and the write rule this
+> entry adds — and the four surfaces now cite it.
+>
+> **Two things this correction does not change.** The obligation itself is
+> unaltered: a write to `/sys/class/backlight/<device>/brightness` is still
+> the first rule in that future ruleset with a write bit, and the
+> three-surface record this entry demanded was executed and still stands.
+> And nothing is scheduled by it — no plan document places the core's
+> self-sandbox in a phase, which is why #314 carries no `phase-N`
+> label. This entry's own sentence *"E2.6/E2.7 put Landlock over `vitrind`'s
+> own process"* is the closest thing to a schedule anywhere in the tree, and
+> neither epic's task list contains such a task.
+
 ### D-042 — An idle inhibit is a property of the realm the human is looking at, not an authority a grant confers; it suppresses the blank and never the lock
 
 **Status:** accepted (2026-08-17) — issue [#306](https://github.com/vitrin-os/vitrin-os/issues/306), workstream [WS-E](14-workstream-session-mode.md). **Discharges the deferral** `docs/plan/14-workstream-session-mode.md` files verbatim as *"**Idle inhibition** (`zwp_idle_inhibit_manager_v1`). Needs a new shim global **and** a shim→core wire verb, i.e. paired IDL + prose work on `track:protocol`. **Reopened by:** that paired edit"* — this is that paired edit. It settles the question #306 asks in as many words: **is holding an idle inhibit an authority that needs a grant, or a property of a focused realm's surface?** Independent of [D-039](#d-039--global-hotkeys-are-served-as-named-actions-the-core-resolves-never-as-keystrokes-it-forwards-the-attention-keys-one-bit-becomes-an-operator-configured-chord-table-and-no-verb-for-observing-the-humans-input-is-designed), [D-040](#d-040--layer-shell-and-tiling-are-one-deferral-rather-than-two-because-both-need-a-scene-that-holds-more-than-one-client-surface-x11-stays-e32s-and-multi-output-stays-behind-the-m4-gate) and [D-041](#d-041--the-core-writes-sysclassbacklight-so-the-brightness-keys-actuate-d-033-refused-that-interface-as-a-blanking-mechanism-and-half-of-its-reasoning-still-bites-here); it neither reverses nor weakens any clause of [D-033](#d-033--idle-blanks-the-screen-and-does-not-lock-it-suspend-is-detected-after-the-fact-or-not-at-all-and-the-recovery-path-is-sudo-only).

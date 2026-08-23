@@ -379,15 +379,49 @@ impl Sources {
 
 /// Every executable file of the integration suite, as (relative path, text).
 ///
-/// A **directory** read rather than a list of names, because step (7e) of
+/// A **directory walk** rather than a list of names, because step (7e) of
 /// [`render`] is an absolute about tests that do not exist yet: a named list
 /// would be a check that stops checking the moment someone adds a file.
 /// `.md` is deliberately excluded -- `tests/integration/README.md` documents
 /// the `--landlock=abi:N` dial in prose, and prose is not a request.
+///
+/// # Recursive, and it was not
+///
+/// This read `fs::read_dir` once, non-recursively, while the paragraph above
+/// claimed every test "including the ones written later". `tests/integration/`
+/// happens to be flat today, so the two agreed by accident and would have
+/// stopped agreeing the first time anyone added a subdirectory -- silently,
+/// with the gate green and the absolute unheld for every file under it. That
+/// is the shape this repository calls a check that stopped checking, so the
+/// scan was made to match the comment rather than the comment made to match
+/// the scan. Proved by putting a literal `abi:4` in a file one directory down
+/// and watching `cargo xtask isolation-matrix --check` go red.
 fn integration_suite(root: &Path) -> Result<Vec<(String, String)>> {
     let dir = root.join(INTEGRATION_DIR);
     let mut out: Vec<(String, String)> = Vec::new();
-    let entries = fs::read_dir(&dir).with_context(|| {
+    walk_integration_suite(&dir, &dir, &mut out)?;
+    if out.is_empty() {
+        bail!(
+            "isolation-matrix: {INTEGRATION_DIR} holds no .py or .sh file. An empty suite would \
+             make step (7e)'s scan vacuously true, which is the shape this repository calls a \
+             check that stopped checking."
+        );
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
+}
+
+/// One directory of [`integration_suite`]'s walk, descending into every
+/// subdirectory it finds.
+///
+/// `base` is the suite root, kept so the emitted key is the path a reader can
+/// paste into an editor rather than a bare file name -- two `test_x.py` in two
+/// subdirectories must not report as one string. Symlinked directories are not
+/// followed: `fs::metadata` resolves them and a link back up the tree would
+/// walk forever, so `symlink_metadata` decides and a symlinked *file* is still
+/// read through.
+fn walk_integration_suite(base: &Path, dir: &Path, out: &mut Vec<(String, String)>) -> Result<()> {
+    let entries = fs::read_dir(dir).with_context(|| {
         format!(
             "isolation-matrix: reading {} (step (7e) is an absolute about every test in it, so \
              an unreadable suite is refused rather than skipped)",
@@ -398,16 +432,26 @@ fn integration_suite(root: &Path) -> Result<Vec<(String, String)>> {
         let path = entry
             .with_context(|| format!("isolation-matrix: listing {}", dir.display()))?
             .path();
+        let meta = fs::symlink_metadata(&path)
+            .with_context(|| format!("isolation-matrix: stat {}", path.display()))?;
+        if meta.is_dir() {
+            walk_integration_suite(base, &path, out)?;
+            continue;
+        }
         let is_test_surface = matches!(
             path.extension().and_then(|e| e.to_str()),
             Some("py") | Some("sh")
         );
-        if !path.is_file() || !is_test_surface {
+        // `is_file` follows the link, so a symlinked test file is still read
+        // and a symlink pointing at a directory is not handed to
+        // `read_to_string`. Same guard the flat version carried.
+        if !is_test_surface || !path.is_file() {
             continue;
         }
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
+        let rel = path
+            .strip_prefix(base)
+            .expect("the walk only descends below `base`")
+            .to_str()
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "isolation-matrix: {} has a name this generator cannot read as UTF-8",
@@ -417,17 +461,9 @@ fn integration_suite(root: &Path) -> Result<Vec<(String, String)>> {
             .to_string();
         let text = fs::read_to_string(&path)
             .with_context(|| format!("isolation-matrix: reading {}", path.display()))?;
-        out.push((format!("{INTEGRATION_DIR}/{name}"), text));
+        out.push((format!("{INTEGRATION_DIR}/{rel}"), text));
     }
-    if out.is_empty() {
-        bail!(
-            "isolation-matrix: {INTEGRATION_DIR} holds no .py or .sh file. An empty suite would \
-             make step (7e)'s scan vacuously true, which is the shape this repository calls a \
-             check that stopped checking."
-        );
-    }
-    out.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(out)
+    Ok(())
 }
 
 /// The declaration step (7e) reads out of [`CORE_SPAWN_RS`].

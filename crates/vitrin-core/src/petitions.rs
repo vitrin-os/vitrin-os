@@ -1427,14 +1427,30 @@ mod tests {
         // so the requirement is findable by the verb's name rather than only
         // by the constant it happens to be in today.
         //
-        // The bit is on the wire (P2.7.2's IDL half) and this core serves
-        // nothing by it: the mediating proxy that would ask the chokepoint per
-        // connection is P2.7.3's, and so is the facet a connection would be
-        // asked for through -- an interface of its own rather than a request
-        // on P2.6.5's filesystem powerbox, since `interface/@verb` is one
-        // value per interface. Two halves, and both matter. In range, so
-        // naming it is never a killed connection; unserved, so it is never
-        // granted. A deployment MUST NOT grant a verb it does not enforce.
+        // The bit is on the wire and so is the facet a connection would be
+        // asked for through: P2.7.2 landed both halves -- `vitrin_egress`,
+        // minted by `vitrin_grant.get_egress`, an interface of its own rather
+        // than a request on P2.6.5's filesystem powerbox, since
+        // `interface/@verb` is one value per interface. This core still
+        // serves nothing by the verb, and what is missing is now exactly one
+        // thing: the out-of-core mediating proxy that would ask the
+        // chokepoint per connection, which is P2.7.3's. A facet is a request
+        // to ask through, not a mechanism to answer with.
+        //
+        // Two facts about this core that are not the same fact. This test
+        // holds the first: `egress` is outside `SERVED_VERB_BITS`, so no
+        // petition naming it resolves `granted`. The second is that this
+        // binary dispatches the facet's messages not at all -- `get_egress`
+        // is answered fatal `invalid_opcode` and the connection dies, where
+        // the IDL says a mint is always legal and refuses at use. That
+        // divergence is P2.7.3's as well, and it is pinned under its own name
+        // by `principal::tests::
+        // get_egress_is_defined_by_the_idl_and_still_refused_by_this_core`,
+        // not here.
+        //
+        // In range, so naming the verb is never a killed connection;
+        // unserved, so it is never granted. A deployment MUST NOT grant a
+        // verb it does not enforce.
         assert_eq!(
             Verb::EGRESS.bits() & crate::grants::SERVED_VERB_BITS,
             0,

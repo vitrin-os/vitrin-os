@@ -300,11 +300,12 @@ class _RealChainTest(IntegrationTest):
             shim_pid, f"the core forked no shim; children were {children_of(core.pid)}"
         )
         # The mock-freeness check, by INODE rather than by name. A confined
-        # shim is bound at `/vitrin/shim`, so its `comm` is `shim` whichever
-        # binary it is (P2.6.2, #186) and a name test stopped telling the real
-        # shim from `vitrin-mock-shim`. The running image's inode does, and
-        # more sharply: a name says what a program is called, an inode says
-        # which file is executing.
+        # shim is bound at the core-chosen `/vitrin/vitrin-shim`, so its
+        # `comm` comes from that basename whichever binary it is (P2.6.2,
+        # #186; renamed from `/vitrin/shim` by #283) and a name test stopped
+        # telling the real shim from `vitrin-mock-shim`. The running image's
+        # inode does, and more sharply: a name says what a program is called,
+        # an inode says which file is executing.
         self.assertEqual(
             exe_identity(shim_pid),
             file_identity(self.shim_bin),
@@ -358,7 +359,8 @@ class DemoHeadless(_RealChainTest):
             "the demo's process spine must be exactly vitrind -> the real C shim -> "
             f"{APP_NAME}, with vitrin-mock-shim nowhere on it (issue #110). The shim is "
             "matched by the executing file's inode: a confined shim runs from the bind "
-            "target /vitrin/shim and answers the same comm as the mock (P2.6.2, #186)",
+            "target /vitrin/vitrin-shim and answers the same comm as the mock "
+            "(P2.6.2, #186; #283)",
         )
 
         out_dir = self.work / "frames"

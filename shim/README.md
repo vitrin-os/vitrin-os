@@ -333,14 +333,54 @@ the published site is fetched with no checksum at all
 ```bash
 meson setup build            # uses system wlroots-0.19 if available
 ninja -C build
-meson test -C build          # header-compiles, idle-inhibit, xdg-conformance, focus-succession
+meson test -C build          # header-compiles, loader-independence, idle-inhibit,
+                             # xdg-conformance, focus-succession, inventories
 
 # Build the vendored wlroots from source (e.g. CI, or no system wlroots-0.19),
 # taking wlroots' own dependencies from the system:
 meson setup build --force-fallback-for=wlroots-0.19,wlroots
+
+# Everything from source, including wlroots' own nested wraps. Needs
+# -Dwerror=false: see below.
+meson setup build --wrap-mode=forcefallback -Dwerror=false
 ```
 
 The build needs no Rust toolchain — only the checked-in generated header.
+
+**`--wrap-mode=forcefallback` needs `-Dwerror=false`, and that is a defect of
+this build file rather than of the wraps.** `project()` sets
+`warning_level=2, werror=true` and subprojects inherit both, so `libdrm` and
+`pixman` fail to compile on a modern GCC over warnings in *their* code
+(`-Werror=packed` in `i915_drm.h`, `-Werror=calloc-transposed-args`,
+`-Wmissing-field-initializers`). Neither the default build nor CI meets this —
+CI forces only wlroots and its nested wayland wrap, which do build clean — so
+it is loud only for whoever needs every dependency from source. Measured
+2026-08-19; the run is what [D-043](../docs/plan/20-decision-log.md) cites for
+the static-link claim reaching every nested wrap.
+
+**Anything vendored is linked in, never loaded beside the shim** — `project()`
+defaults `default_library=static`, which subprojects inherit. That is not a
+size preference, it is what makes the shim runnable inside a confined realm:
+`vitrin-realm-init` binds it as a **single file** at a fixed in-realm path, so
+a build-tree RUNPATH (`$ORIGIN/subprojects/wlroots`, which Meson emits for a
+vendored *shared* library) resolves to a directory the realm's mount table
+never creates and the dynamic loader kills the shim before `main`. The
+alternative — widening every realm's mount table to whatever this build
+happened to link — was refused, because it makes a confinement boundary a
+function of a build flag. See issue
+[#283](https://github.com/vitrin-os/vitrin-os/issues/283) and
+[D-043](../docs/plan/20-decision-log.md).
+
+`meson test loader-independence` is what holds it: it copies the built shim to
+an empty directory, runs it there with an emptied environment, and fails if the
+binary carries any `RPATH`/`RUNPATH`, or if its program interpreter or any
+library it needs falls outside the prefixes a realm mirrors — that script's
+`REALM_LIB_PREFIXES`, which is where the current list is read and the only
+place it is written down: `vitrin-realm-init`'s
+`the_shims_realm_lib_prefixes_are_the_library_bearing_compat_names` derives it
+from the realm's own `COMPAT_NAMES` and goes red if the two drift, so no prose
+here restates it. Passing `-Ddefault_library=shared` is therefore loud rather
+than silent.
 
 ## Running
 
@@ -381,15 +421,22 @@ app that opens a menu maps it instead of being disconnected. The client is
 reasoning for each assertion is in its header comment, and the wlcs failures
 that provoked it are annotated in
 [`wlcs/README.md`](wlcs/README.md). It and
-[`tests/acceptance/focus_succession.sh`](tests/acceptance/focus_succession.sh)
-and [`tests/acceptance/idle_inhibit.sh`](tests/acceptance/idle_inhibit.sh)
-are the three scripts here wired into `meson test`, because they are the ones
-that need nothing but this tree's own binaries — the last of them only where
+[`tests/acceptance/focus_succession.sh`](tests/acceptance/focus_succession.sh),
+[`tests/acceptance/idle_inhibit.sh`](tests/acceptance/idle_inhibit.sh) and
+[`tests/acceptance/loader_independence.sh`](tests/acceptance/loader_independence.sh)
+are the four scripts in `tests/acceptance/` wired into `meson test`, because
+they are the ones that need nothing but this tree's own binaries —
+`idle_inhibit.sh` only where
 `wayland-protocols` ships the idle-inhibit XML `idle-probe` is generated from
 (`meson.build` gates it on its own `fs.exists`, so a moved XML costs the test
 rather than the shim), and only against
 [`tests/mock_core.c`](tests/mock_core.c), which makes it a **component** test of
 what the shim sends upstream and never milestone acceptance.
+That number and that list are the only ones stated anywhere in this file, and
+neither is typed twice: `meson test inventories`
+([`tests/inventories.sh`](tests/inventories.sh)) derives both from
+`meson.build`, checks the test names in the `meson test -C build` recipe above
+against the same source, and fails if a second paragraph starts counting.
 
 Each of the three xdg-shell facts was measured failing before the
 code that makes it pass:
@@ -422,8 +469,8 @@ wlroots defers every focus change to an active keyboard grab and a menu is
 one, so that is the input that makes the whole mechanism silently do nothing.
 Every assertion's reasoning is in the client's header comment.
 
-This is another of the three scripts here wired into `meson test`, on the same
-grounds as `xdg_conformance.sh`: headless, GPU-free, no seat device and no core
+This is another of the `tests/acceptance/` scripts wired into `meson test`, on
+the same grounds as `xdg_conformance.sh`: headless, GPU-free, no seat device and no core
 (`--no-upstream`), because `vitrin_seat_init` runs unconditionally at bring-up
 so the virtual keyboard exists and real `wl_keyboard.enter`/`leave` events can
 be observed. It is a **component** test of the shim, not milestone evidence:
@@ -433,6 +480,28 @@ reach.
 
 ```bash
 bash tests/acceptance/focus_succession.sh ./build/vitrin-shim ./build/focus-succession-client
+```
+
+[`tests/acceptance/loader_independence.sh`](tests/acceptance/loader_independence.sh)
+— the shim must load from a directory that holds nothing but the shim
+([#283](https://github.com/vitrin-os/vitrin-os/issues/283)). It copies the
+built binary to an empty directory, runs it there with an emptied environment
+(so `$ORIGIN` moves and no `LD_LIBRARY_PATH` can help), and requires it to
+reach `main`; separately requires no `DT_RPATH`/`DT_RUNPATH` at all, because an
+**absolute** RUNPATH into the build tree passes the first check and still
+breaks every realm; separately requires its `PT_INTERP` program interpreter to
+be under a mirrored prefix, since `ldd` prints the interpreter without a `=>`
+and the loop below would otherwise never inspect the one path the kernel
+resolves before the process exists; and separately requires every library it
+resolves to live under one of that script's `REALM_LIB_PREFIXES` — the
+library-bearing subset of what a realm's mount table mirrors, read from the
+script rather than restated here. A missing `readelf` or `ldd` **fails** this
+test rather than skipping it, which is why `shim/ci/install-deps.sh` names
+`binutils` instead of inheriting it from `gcc`. Wired into `meson test`; needs
+nothing but the shim.
+
+```bash
+bash tests/acceptance/loader_independence.sh ./build/vitrin-shim
 ```
 
 [`tests/acceptance/shim_globals_and_client.sh`](tests/acceptance/shim_globals_and_client.sh)
@@ -508,8 +577,8 @@ the wire's one-bit-per-realm shape requires, with a second `held` failed by the
 mock core so "the shim relays levels instead of edges" is red rather than
 invisible; and (B) an app killed while still holding one must still leave the
 shim releasing, which is the leak that pins a human's panel awake forever. It
-is wired into `meson test` alongside `xdg_conformance.sh` and
-`focus_succession.sh`, and is built only where `wayland-protocols` ships the
+is among the `tests/acceptance/` scripts wired into `meson test` listed at the
+top of this section, and is built only where `wayland-protocols` ships the
 idle-inhibit XML. **It runs under the mock core, so it is a component test and
 never milestone evidence**; the bare-metal half — that a panel actually stayed
 lit — is [`../docs/drm-bringup.md`](../docs/drm-bringup.md) step 17, written

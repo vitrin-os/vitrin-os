@@ -173,11 +173,12 @@ class RealGtk(IntegrationTest):
             shim_pid, f"the core forked no shim; children were {children_of(core.pid)}"
         )
         # The mock-freeness check, by INODE rather than by name. A confined
-        # shim is bound at `/vitrin/shim`, so its `comm` is `shim` whichever
-        # binary it is (P2.6.2, #186) and a name test stopped telling the real
-        # shim from `vitrin-mock-shim`. The running image's inode does, and
-        # more sharply: a name says what a program is called, an inode says
-        # which file is executing.
+        # shim is bound at the core-chosen `/vitrin/vitrin-shim`, so its
+        # `comm` comes from that basename whichever binary it is (P2.6.2,
+        # #186; renamed from `/vitrin/shim` by #283) and a name test stopped
+        # telling the real shim from `vitrin-mock-shim`. The running image's
+        # inode does, and more sharply: a name says what a program is called,
+        # an inode says which file is executing.
         self.assertEqual(
             exe_identity(shim_pid),
             file_identity(self.shim_bin),
@@ -238,8 +239,9 @@ class RealGtk(IntegrationTest):
             (comm_of(core.pid), exe_identity(shim_pid), comm_of(app_pid)),
             ("vitrind", file_identity(self.shim_bin), APP_NAME),
             f"the spine must be exactly vitrind -> the real C shim -> {APP_NAME}; the "
-            "middle link is matched by inode because a confined shim's comm is `shim` "
-            "whichever binary it is (P2.6.2, #186)",
+            "middle link is matched by inode because a confined shim runs from the "
+            "bind target /vitrin/vitrin-shim and its comm is that basename whichever "
+            "binary it is (P2.6.2, #186; renamed from /vitrin/shim by #283)",
         )
 
         conn = core.connect()

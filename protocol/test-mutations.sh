@@ -143,8 +143,8 @@ check_rejected clipboard-status-without-description \
 # --- P2.6.5 (issue #189): the powerbox messages ------------------------------
 #
 # Each case is pinned on a message this issue ADDED, for the reason the
-# clipboard block above states: the corpus should exercise the schema against
-# the newest surface, not only against the oldest.
+# WS-E.2.1 clipboard block states: the corpus should exercise the schema
+# against the newest surface, not only against the oldest.
 #
 # ONE OF #189's ACCEPTANCE CRITERIA IS DELIBERATELY NOT HERE. It asked for an
 # `fd_count` mismatch case dying fatal `fd_violation`. `fd_count` is a byte of
@@ -189,11 +189,21 @@ check_rejected designation-kind-enum-on-string \
 # `request_file`'s `mode` is the cheapest way to exercise that on a message
 # this issue added -- the mutation also drops the enum reference, so a schema
 # that had quietly stopped rejecting `array` would be caught by either half.
-# (This comment described an array OF DESCRIPTORS until the review of #189
-# pointed out that no such mutation runs; the one-fd rule is a framing
-# invariant the schema does not model at all, and the case that does exercise
-# it is `designated-fd-allow-null` below plus decode_errors.rs's runtime
-# fd_count pair.)
+#
+# (Corrected twice, so what is true is stated plainly rather than patched
+# again. This comment first described an array OF DESCRIPTORS, which no
+# mutation here performs; the correction then named `designated-fd-allow-null`
+# as the case exercising the one-fd rule, in the same sentence that said the
+# schema does not model that rule -- and pointed the wrong way to find it. The
+# one-fd rule is a framing invariant no mutation of this document can reach:
+# fd_count is a header byte. `designated-fd-allow-null` exercises the dialect
+# rule that `allow-null` is admitted only on string and object arguments, which
+# is why an `fd` argument cannot be nullable; the framing invariant is that
+# case's motivation, not what its rejection proves. The invariant itself is
+# checked only at runtime, by decode_errors.rs's fd_count pair. Cases here are
+# cross-referenced by name and never by direction -- a direction is a claim
+# about this file's order that nothing checks and any reordering falsifies
+# silently.)
 check_rejected powerbox-mode-as-array \
   's|<arg name="mode" type="uint" enum="mode" summary="the access this ask is for; the human may narrow it, and designated.mode carries what was actually approved"/>|<arg name="mode" type="array" summary="the access this ask is for; the human may narrow it, and designated.mode carries what was actually approved"/>|'
 

@@ -1343,7 +1343,7 @@ The prefixes are nevertheless **defined**, and defining an unserved selector cos
 
 **Costs, stated:**
 - Issue #189's body is now wrong in two places and will stay wrong: a closed issue is not edited to match what shipped. This entry is the record; whoever reads #189 later has to reach it, and nothing forces them to.
-- Deviation 1 leaves `protocol/test-mutations.sh` with no case named for the framing invariant, so a reader auditing the corpus against the criterion list finds a gap and has to come here to learn it was moved rather than dropped. The alternative — a comment in the script — was also taken (the `powerbox-mode-as-array` case says the one-fd rule is a framing invariant the schema does not model), but a script comment is not a record of a plan being changed.
+- Deviation 1 leaves `protocol/test-mutations.sh` with no case named for the framing invariant, so a reader auditing the corpus against the criterion list finds a gap and has to come here to learn it was moved rather than dropped. The alternative — a comment in the script — was also taken (the P2.6.5 block header says in as many words that the criterion is deliberately not there, and points back at this entry), but a script comment is not a record of a plan being changed.
 - Neither deviation is held by any gate. A future edit could put "served" back into the IDL description while `SERVED_VERB_BITS` still omits bit 64, and nothing in CI would go red — `cargo xtask limits-check` holds the *verb mask* and the *interface count*, not this sentence. Naming that here is the whole of the mitigation.
 
 ## Part B — Open questions (PRD §20), with owners and decide-by gates

@@ -445,6 +445,114 @@ the binary the caller was specifically trying not to test. It also refuses a
 helper as a sibling and the resulting spawn failure reads like a confinement
 bug.
 
+### `p311_principal_socket_reach.py` — can a realm reach the core's principal socket?
+
+```bash
+cargo build --workspace
+meson setup shim/build shim && meson compile -C shim/build
+
+VITRIN_C_SHIM_BIN="$PWD/shim/build/vitrin-shim" PYTHONPATH=sdk/python/src \
+  VITRIN_P311_EVIDENCE_DIR=/tmp/p311 \
+  python3 -m unittest discover -s tests/integration \
+    -p 'p311_principal_socket_reach.py' -v
+```
+
+The third instrument in this directory that is **not** part of any suite's
+coverage claim, and the first one whose filename is a legal module name — so
+unlike `landlock-denials.sh` and `apparmor-realm-probe.py` above, whose hyphens
+make them unimportable, this one is kept out by the **`test_` prefix it does not
+have**. `run.sh`'s three-way partition (issue #288) globs
+`tests/integration/test_*.py` and requires every file it matches to be a
+milestone, property or supporting gate; this file is matched by neither that
+glob nor `unittest discover -p 'test_*.py'`, so the partition check has nothing
+to say about it and no green `run.sh` includes it. That is deliberate: it
+asserts the state of an **open** question ([#311](https://github.com/vitrin-os/vitrin-os/issues/311),
+routed here by D-038), and the three lists are a partition of *gates*. If #311
+is decided and the decision has a property, that property gets a `test_*.py`
+gate and this file is superseded.
+
+`$PWD/` on the shim path is not decoration: the core refuses a relative
+`command` outright, because it would resolve against the child's working
+directory — which the confined app can write — so the core would audit one
+program and exec another. `run.sh` exports `$REPO/$DEFAULT_SHIM` for the same
+reason.
+
+Three arms, one runtime tree, one byte-identical `realm.toml` (asserted, not
+intended): `--isolation=default`, `--isolation=default --landlock=off` (the arm
+that can *enumerate* the realm root, since the shipped ruleset denies `READ_DIR`
+on `/`), and `--isolation=off` (the positive control). Every `connect` outcome
+in the probe's report is **three-valued** — `1` reached, `0` the kernel refused,
+`-1` the kernel never answered — because a two-valued version reported an
+`EAGAIN` as a denial, which is confinement claimed without being measured. A
+confined arm's negative counts only when the errno is `EACCES`, `EPERM` or
+`ENOENT`; anything else, `-1` included, fails the run rather than widening what
+"confined" means.
+
+**Measured 2026-08-23** (Arch, kernel `7.1.9-arch1-2`, Landlock ABI 9,
+`--print-isolation` version 3, debug `vitrind`, real `vitrin-shim`,
+`/usr/bin/python3` 3.14.7 as the realm's app). The table is **one** run — the
+last of four that evening, the one the pushed code produced — all three arms,
+test green. **This is a measurement of one box on one date, not an answer to
+#311**: D-038's three questions (grant vs mount vs bind-of-an-fd; operator
+declaration vs consent; one-way or not) are an owner decision, and nothing here
+decides them.
+
+| | `default` | `default --landlock=off` | `off` |
+|---|---|---|---|
+| in-realm control (`WAYLAND_DISPLAY`) | connected | connected | connected |
+| host bound the demo principal on `core.sock` | yes | yes | yes |
+| 14 computed routes to `core.sock` | 0 reached — **all 14 `ENOENT`** | 0 reached — **all 14 `ENOENT`** | **6 reached** |
+| ...and completed `hello` with the real credential | — | — | 6 bound `vitrin://local/agent/demo` |
+| ...and with a wrong credential | — | — | all 6 refused `AuthFailed` |
+| abstract Unix names visible (`/proc/net/unix`) | 0 | 0 | 43 † |
+| realm's netns vs the core's | different | different | same |
+| visible pids | 2 | 2 | 679 † |
+| pids whose `/proc/<pid>/root` was a door | 0 | 0 | 152 † |
+| socket fds surviving the `execve` (of 5 fds) | 0 | 0 | 0 |
+| shim's socket fds re-opened via `/proc/<pid>/fd` | 0 of 4 — all `ENXIO` | 0 of 4 — all `ENXIO` | — |
+| filesystem walk | **refused at `/`, `EACCES`**; 389 entries, 1 socket | **`/` enumerable** (13 entries); 415 entries, not truncated, 1 socket | 60000 entries (budget cap), 142 sockets † |
+| the one socket the walk found | the shim's own `/run/vitrin/wayland-0` | the shim's own `/run/vitrin/wayland-0` | — |
+| `connect` outcomes the kernel never answered | **0** | **0** | **0** |
+
+† The `off` arm shares the host's pid, network and mount namespaces, so the four
+marked figures are a reading of this machine's own process table and filesystem
+at that instant, and they are the only numbers here that move between runs.
+Four runs the same evening gave 44/44/44/43 abstract names, 666–679 pids,
+146–154 doors and 141/141/141/142 sockets. **Every confined-arm figure in the
+table was identical in all four.** The whole three-arm run takes about half a
+second on this box, so re-running it is cheap — it is meant to be re-measured on
+the kernel and distribution a decision is actually made for, not cited from
+here.
+
+One of those six is worth naming, because it is the route a program would find
+without looking for it: `wayland-dotdot` is
+`dirname($WAYLAND_DISPLAY)/../core.sock`, and at `--isolation=off` the shim's
+socket sits in `…/vitrin-0/realm-0/`, so that expression **is** the core socket.
+The app is handed `$WAYLAND_DISPLAY`; one `..` from it reaches the core.
+
+Read it as three separate facts, because they have three different remedies.
+The mount table alone already hides the socket — the `--landlock=off` arm walked
+the realm's whole filesystem, was truncated by nothing, and found exactly one
+AF_UNIX inode, the shim's own. Its three `P311-WALK-DENIED` rows are `ENOENT`,
+`ENOENT` and `ENOTDIR` (`/run/user`, `/var`, `/vitrin/shim`) — seeds that do not
+exist in that realm, **not** places the walk was refused, which is the
+distinction that decides whether "found nothing" means anything. The Landlock
+domain is a **second** barrier and not a restatement of the first: it refuses
+the same walk at `/` with `EACCES`. At the shipped default that arm has seven
+`WALK-DENIED` rows: the same three non-existent seeds, plus **four real
+refusals** — `/`, `/home`, `/run` and `/vitrin`, all `EACCES`, none of which the
+mount-only arm reported.
+And the network namespace is what empties `/proc/net/unix`, which is the only
+thing that scopes the abstract namespace — 0 names inside against 43 in the
+control.
+
+What the run does **not** establish: that no route exists, only that none of the
+enumerated ones did on this kernel, and that a full walk of the realm's tree
+found no other AF_UNIX inode. The `off` arm's walk hit its 60000-inode budget
+cap (`truncated=1`), so its 142 sockets are a floor and not a census — that arm
+is a positive control and needs no exhaustiveness. The 0 in the last row is the
+row that makes every other 0 above it a measurement.
+
 ## Entry-point contract
 
 The job's steps are gated on this exact path via `hashFiles()`; a guard step

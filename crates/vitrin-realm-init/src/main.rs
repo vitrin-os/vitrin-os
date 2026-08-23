@@ -2989,7 +2989,7 @@ mod tests {
             "{}'s REALM_LIB_PREFIXES no longer matches this binary's mount table. It is \
              `/usr` plus the `lib*` entries of COMPAT_NAMES ({COMPAT_NAMES:?}); the script says \
              {found:?}. Whichever side moved, the other has to move with it -- shim/README.md and \
-             D-044 both point at the script for the current list rather than restating it, so the \
+             D-043 both point at the script for the current list rather than restating it, so the \
              script is the only place to change.",
             script.display()
         );

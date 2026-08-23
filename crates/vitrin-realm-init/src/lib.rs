@@ -1532,7 +1532,7 @@ mod tests {
             "the bind that creates `{IN_REALM_SHIM}` no longer takes \
              `sources.shim`, so `comm` may no longer be a function of the \
              bind target alone -- the doc comment on IN_REALM_SHIM, \
-             tests/integration/README.md and D-044 all reason from that and \
+             tests/integration/README.md and D-043 all reason from that and \
              have to be re-checked. What precedes the target is: {call:?}"
         );
     }

@@ -1399,6 +1399,146 @@ mod tests {
         assert_eq!(SERVED_VERB_BITS & UNSERVED_VERB_BITS, 0);
     }
 
+    /// The book publishes this partition **in words**, and until P2.6.5 nothing
+    /// read the sentence.
+    ///
+    /// `docs/book/src/03-grants-consent-revocation.md` is on the mdBook the
+    /// Pages workflow deploys, and its "What a grant is" bullet states the
+    /// served verbs, then how many *more* are defined and refused
+    /// `unsupported`, then names them. That is [`UNSERVED_VERB_BITS`] rendered
+    /// as English, on a surface a reader reaches before any of this code.
+    ///
+    /// **It drifted exactly the way this repo's gates exist to catch.** P2.6.5
+    /// (issue #189) added `designate_file` to the unserved set and reworded the
+    /// count in ten files -- `petitions.rs`, `grants.rs`, `consent/render.rs`,
+    /// `decode_errors.rs`, `test_verb_parity.py`, the IDL and four prose pages
+    /// -- and left the published book saying "one more is defined and refuses
+    /// `unsupported` -- `observe.cursor`". Every gate stayed green, because the
+    /// sentence was in no gate's table.
+    ///
+    /// So it is held here rather than in `cargo xtask limits-check`, and the
+    /// choice is deliberate: the value is not a literal any file states, it is
+    /// `Verb::VALID_MASK & !SERVED_VERB_BITS`. Reading it from `xtask` would
+    /// mean text-parsing a `1 | 2 | 4 | ...` expression out of *this* file and
+    /// another out of generated code, which is a second copy of the derivation.
+    /// Next to the constant it derives from, the test is the value.
+    ///
+    /// **Its honest bounds**, both of which are why it can be wrong in the safe
+    /// direction only:
+    ///
+    /// * it matches the one shape this bullet has ever had -- a `- **verbs**`
+    ///   list item carrying the phrase `N more are defined and refuse`. A
+    ///   rewrite that keeps the fact but changes those words goes RED while
+    ///   being correct; the failure names the file and the required phrase, so
+    ///   the fix is to move this string with the prose.
+    /// * it does not check the *served* half of the sentence. The book collapses
+    ///   the two layout verbs into "the two `layout.*` verbs", so there is no
+    ///   name-per-bit rendering on that side to compare against.
+    #[test]
+    fn the_books_grant_chapter_states_the_unserved_verb_count_and_names_them() {
+        const BOOK: &str = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../docs/book/src/03-grants-consent-revocation.md"
+        );
+        /// The register the count sits in: value-free, so rendering a different
+        /// count leaves it unmoved, and specific enough that its every
+        /// occurrence on the page is this claim (asserted below).
+        const CONTEXT: &str = " more are defined and refuse";
+
+        // The book spells a verb with a dot where the wire spells it with an
+        // underscore. Written out per bit rather than derived by `replace`, so
+        // a verb whose published spelling is not its wire spelling cannot pass
+        // silently -- and the union assertion below makes appending a bit to
+        // the IDL fail here until its spelling is added.
+        let spellings = [
+            (Verb::OBSERVE, "observe"),
+            (Verb::ACTUATE_POINTER, "actuate.pointer"),
+            (Verb::ACTUATE_TEXT, "actuate.text"),
+            (Verb::OBSERVE_CURSOR, "observe.cursor"),
+            (Verb::LAYOUT_ARRANGE, "layout.arrange"),
+            (Verb::LAYOUT_FOCUS, "layout.focus"),
+            (Verb::DESIGNATE_FILE, "designate.file"),
+            (Verb::REALM_LAUNCH, "realm.launch"),
+        ];
+        assert_eq!(
+            spellings.iter().fold(0, |acc, (v, _)| acc | v.bits()),
+            Verb::VALID_MASK,
+            "this table must name every wire verb bit: a bit appended to the IDL has a \
+             published spelling too, and deriving one by rule would invent it"
+        );
+
+        let unserved: Vec<&str> = spellings
+            .iter()
+            .filter(|(v, _)| v.bits() & UNSERVED_VERB_BITS != 0)
+            .map(|(_, name)| *name)
+            .collect();
+        // Non-vacuity: with an empty unserved set every assertion below would
+        // be trivially satisfiable, and the sentence would need rewriting
+        // rather than re-counting.
+        assert!(
+            !unserved.is_empty(),
+            "no verb is unserved any more. That is a real change to what this core promises: \
+             say so on {BOOK} deliberately and rewrite this test, rather than deleting it"
+        );
+
+        let text = std::fs::read_to_string(BOOK).expect("the book chapter exists");
+        let start = text
+            .find("- **verbs**")
+            .unwrap_or_else(|| panic!("{BOOK}: no `- **verbs**` bullet. Either the grant-anatomy list was renamed or it was rewritten into a shape this scan cannot read -- and an empty slice would otherwise be reported as a missing count"));
+        let bullet = &text[start..];
+        let bullet = &bullet[..bullet[1..].find("\n- **").map_or(bullet.len(), |i| i + 1)];
+        // Prose reflows; a Markdown line break inside the sentence is not
+        // drift. Collapse runs of whitespace before matching, the same choice
+        // `crates/xtask/src/limits.rs`'s `normalize` makes for an `Anchor`.
+        let bullet = bullet.split_whitespace().collect::<Vec<_>>().join(" ");
+        let page = text.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        // The count, in the surface's own register.
+        let word = match unserved.len() {
+            1 => "one",
+            2 => "two",
+            3 => "three",
+            4 => "four",
+            n => panic!(
+                "{n} unserved verbs, and this test has no word for it. Add it here and to {BOOK}"
+            ),
+        };
+        let rendered = if unserved.len() == 1 {
+            "one more is defined and refuses".to_string()
+        } else {
+            format!("{word}{CONTEXT}")
+        };
+        assert!(
+            bullet.contains(&rendered),
+            "{BOOK}: the `- **verbs**` bullet does not say {rendered:?}. \
+             `UNSERVED_VERB_BITS` holds {} verb(s) ({}), and the published sentence is the \
+             count's only rendering a reader ever sees.\n\nbullet was:\n{bullet}",
+            unserved.len(),
+            unserved.join(", ")
+        );
+        // ...and it is the ONLY place on the page carrying that register, so a
+        // stale second statement of the count cannot hide behind the first
+        // being right. This is the property a bare `contains` cannot give.
+        assert_eq!(
+            page.matches(CONTEXT).count() + page.matches("more is defined and refuses").count(),
+            1,
+            "{BOOK} states the unserved-verb count in more than one place (or in none). \
+             Every occurrence must be the canonical rendering; a second, disagreeing one \
+             is exactly the drift this test exists for"
+        );
+
+        // The names, in the same bullet. The count alone would pass while the
+        // sentence named the wrong two verbs.
+        for name in &unserved {
+            assert!(
+                bullet.contains(&format!("`{name}`")),
+                "{BOOK}: the `- **verbs**` bullet does not name `{name}`, which \
+                 `UNSERVED_VERB_BITS` says is defined and refused `unsupported`.\
+                 \n\nbullet was:\n{bullet}"
+            );
+        }
+    }
+
     // -- expiry (injected clock) -------------------------------------------
 
     #[test]

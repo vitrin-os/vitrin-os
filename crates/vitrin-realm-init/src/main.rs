@@ -1668,10 +1668,21 @@ fn drop_all_capabilities() -> Result<(), Fail> {
 /// runs in a forked child that enforces, measures one syscall and `_exit`s.
 ///
 /// The cargo test harness is multi-threaded, so the child may call nothing
-/// that allocates or locks. That is why [`landlock::create_ruleset`],
-/// [`landlock::add_path_rule`] and [`landlock::restrict_self`] are
-/// allocation-free and take a `&CStr` the parent built: the split is for this
-/// caller, not for tidiness.
+/// that allocates or locks. That is why [`landlock::add_path_rule`] and
+/// [`landlock::restrict_self`] are allocation-free and take a `&CStr` the
+/// parent built: the split is for this caller, not for tidiness.
+///
+/// # Why the ruleset is built in the PARENT
+///
+/// [`landlock::create_ruleset`] is allocation-free too and a child could call
+/// it, but none of these do. The ledger that holds
+/// `docs/book/src/limits.md`'s absolute records the rung a ruleset was
+/// **created** at, read off the ruleset itself; a ledger entry written in a
+/// child dies at `_exit` with everything else the child touched. So the parent
+/// builds the ruleset, hands it to [`landlock::RungsEntered::entering`], and
+/// the child inherits the descriptor across the `fork` and enforces it. The
+/// rung is therefore never written down twice, and the `Ruleset` closes in the
+/// parent when the measurement returns.
 ///
 /// # The sub-floor rungs: what these measurements ARE evidence about, and
 /// what they are NOT
@@ -1852,10 +1863,11 @@ mod tests {
     /// It is now held from both directions:
     ///
     /// - **against the tests**, by [`landlock::RungsEntered`]: minting the
-    ///   token `landlock::restrict_self` demands records the rung, and the
-    ///   ledger compares what it recorded against this table's row for the
-    ///   test when it drops. Retarget a measurement at another rung and the
-    ///   test goes red rather than quietly measuring something else.
+    ///   token `landlock::restrict_self` demands records the rung **the
+    ///   ruleset handed to the ledger was created at**, and the ledger compares
+    ///   what it recorded against this table's row for the test when it drops.
+    ///   Retarget a measurement at another rung and the test goes red rather
+    ///   than quietly measuring something else.
     /// - **against the published page**, by the generator: it parses this
     ///   table out of this file and refuses to emit unless every
     ///   `Rung::behavioural_tests` entry names a test this table says enters a
@@ -1877,6 +1889,15 @@ mod tests {
     /// [`landlock::RungsEntered::for_test`] refuses a name this table does not
     /// carry, so an undeclared domain is a compile error or a panic and never
     /// a green run.
+    ///
+    /// The token's **first** shape left one line of that open, and it was found
+    /// by compiling it rather than by reading: it carried a `u32` the ledger
+    /// was told, so `entering(1)` beside `create_ruleset(4)` recorded rung 1,
+    /// entered a rung-4 domain, and left every mechanism here green. The token
+    /// now carries the [`landlock::Ruleset`] itself and the ledger reads the
+    /// rung off it, so the declared rung and the built rung are one value --
+    /// `entering(4)` no longer type-checks, and a ruleset the ledger never saw
+    /// cannot be named to `restrict_self` at all.
     pub(crate) const BEHAVIOURAL_RUNGS: &[(&str, &[u32])] = &[
         (
             "a_realm_can_write_where_it_was_granted_and_nowhere_else",
@@ -1932,10 +1953,18 @@ mod tests {
     /// `docs/book/src/limits.md`'s *"No test in this repository enters a
     /// Landlock domain at rung 4 or rung 5"*.
     ///
-    /// Mints a token at a rung the named row does not carry and lets the
-    /// ledger drop. It enters **no** domain -- `landlock::restrict_self` is
-    /// never called, so the sentence above stays true while this test proves
+    /// Mints a token for a ruleset at a rung the named row does not carry and
+    /// lets the ledger drop. It enters **no** domain -- `landlock::restrict_self`
+    /// is never called, so the sentence above stays true while this test proves
     /// the mechanism that holds it fires.
+    ///
+    /// The ruleset is `Ruleset::unopened`, which holds no descriptor: the ledger
+    /// now reads the rung off a ruleset rather than being told one, and this
+    /// proof must still run on a machine with no Landlock at all. A
+    /// `#[should_panic]` test cannot be skipped -- `skip_unless!` returns, and a
+    /// test that returns without panicking is a failure -- so asking the kernel
+    /// for a rung-4 ruleset here would make the ledger's own non-vacuity proof
+    /// kernel-dependent.
     #[test]
     #[should_panic(expected = "BEHAVIOURAL_RUNGS declares")]
     fn a_ledger_that_recorded_a_rung_its_row_does_not_name_fails_on_drop() {
@@ -1944,7 +1973,8 @@ mod tests {
         );
         // Rung 4 is precisely the rung the published absolute is about; the
         // row for this name says `&[1]`.
-        let _minted = entered.entering(4);
+        let ruleset = landlock::Ruleset::unopened(4);
+        let _minted = entered.entering(&ruleset);
     }
 
     /// And the other end: a test the table does not declare cannot open a
@@ -2072,11 +2102,19 @@ mod tests {
             "rung_one_forbids_reparenting_that_the_rung_above_permits",
         );
         let measure = |rung: u32, rights: u64, to: &CString| -> i32 {
-            // Minted in the PARENT, so the recording survives the fork the
-            // measurement body runs in; `rung()` hands the same number back so
-            // the ruleset and the ledger cannot disagree.
-            let entering = entered.entering(rung);
-            let rung = entering.rung();
+            // Built in the PARENT and inherited across the fork, because that
+            // is what lets the ledger read the rung off the ruleset itself: the
+            // rung this measurement enters a domain at is not a number written
+            // twice, it is a field of the descriptor the child enforces.
+            let ruleset = landlock::create_ruleset(rung)
+                .expect("a ruleset at a rung the skip above says this kernel has");
+            assert_eq!(
+                ruleset.rung(),
+                rung,
+                "the ladder stepped down under this measurement, so the run would measure a \
+                 rung nobody asked for"
+            );
+            let entering = entered.entering(&ruleset);
             let _ = std::fs::remove_file(from_dir.join("f"));
             let _ = std::fs::remove_file(to_dir.join("f"));
             let _ = std::fs::remove_file(from_dir.join("g"));
@@ -2091,16 +2129,10 @@ mod tests {
                 if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } < 0 {
                     return SETUP_FAILED;
                 }
-                let Ok((ruleset, got)) = landlock::create_ruleset(rung) else {
-                    return SETUP_FAILED + 1;
-                };
-                if got != rung {
-                    return SETUP_FAILED + 2;
-                }
-                if landlock::add_path_rule(ruleset, &dir_c, rights).is_err() {
+                if landlock::add_path_rule(ruleset.fd(), &dir_c, rights).is_err() {
                     return SETUP_FAILED + 3;
                 }
-                if landlock::restrict_self(ruleset, entering, 0).is_err() {
+                if landlock::restrict_self(entering, 0).is_err() {
                     return SETUP_FAILED + 4;
                 }
                 if unsafe { libc::rename(source.as_ptr(), to.as_ptr()) } < 0 {
@@ -2374,11 +2406,12 @@ mod tests {
 
         // The kernel's own verdict on both, which is what makes the pinning
         // above a measurement rather than a restatement of the code.
-        let (ruleset, rung) = landlock::create_ruleset(1).expect("a rung-1 ruleset");
-        assert_eq!(rung, 1);
+        let ruleset = landlock::create_ruleset(1).expect("a rung-1 ruleset");
+        assert_eq!(ruleset.rung(), 1);
         let dir_c = Scratch::c(&dir_bind);
         let file_c = Scratch::c(&file_bind);
-        let added = |path: &CString, rights: u64| landlock::add_path_rule(ruleset, path, rights);
+        let added =
+            |path: &CString, rights: u64| landlock::add_path_rule(ruleset.fd(), path, rights);
         assert!(
             added(&dir_c, rights_of(&dir_bind)).is_ok(),
             "the kernel refused the directory bind's rights"
@@ -2396,8 +2429,9 @@ mod tests {
             "the refusal must be EINVAL -- if this kernel accepts READ_DIR on a file, the \
              two assertions above are measuring nothing"
         );
-        // SAFETY: this test's own descriptor, used nowhere else.
-        unsafe { libc::close(ruleset) };
+        // The descriptor closes with `ruleset`. This test never enters a
+        // domain: it never mints a token, and the token is now the only thing
+        // that names a descriptor to `restrict_self`.
     }
 
     /// The audit-log diagnostic (P2.6.3 follow-up): **off unless asked for,
@@ -2451,28 +2485,34 @@ mod tests {
             landlock_abi_at_least(7, "the Landlock audit-log flag")
         );
         // The kernel's verdict. `restrict_self` is irreversible, so this is
-        // the one thing here that has to fork. The rung goes through
-        // `RungsEntered` rather than being spelled twice, so the number this
-        // test enters a domain at and the number `BEHAVIOURAL_RUNGS` publishes
-        // for it are one value.
+        // the one thing here that has to fork. The ruleset is built in the
+        // parent and handed to the ledger, which reads the rung off it, so the
+        // rung this test enters a domain at and the rung `BEHAVIOURAL_RUNGS`
+        // publishes for it are one value and not two that agree.
         const AUDIT_RUNG: u32 = 7;
         let entered = landlock::RungsEntered::for_test(
             "the_audit_log_flag_is_off_unless_asked_for_and_the_kernel_takes_it",
         );
         let measure = |flags: libc::c_uint| -> i32 {
-            let entering = entered.entering(AUDIT_RUNG);
-            let rung = entering.rung();
+            let ruleset =
+                landlock::create_ruleset(AUDIT_RUNG).expect("a rung-7 ruleset on an ABI-7 kernel");
+            // The only measurement here whose rung is ABOVE the floor, so it
+            // is the only one `create_ruleset` may step down from -- as far as
+            // the floor of 6, where the log flags do not exist. The skip above
+            // says this kernel reports at least 7; a descent anyway would mean
+            // measuring the flags word at a rung that does not define it.
+            assert_eq!(
+                ruleset.rung(),
+                AUDIT_RUNG,
+                "the ladder stepped down to {} under a measurement of rung {AUDIT_RUNG}",
+                ruleset.rung()
+            );
+            let entering = entered.entering(&ruleset);
             fork_and_measure(move || {
                 if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } < 0 {
                     return SETUP_FAILED;
                 }
-                let Ok((ruleset, got)) = landlock::create_ruleset(rung) else {
-                    return SETUP_FAILED + 1;
-                };
-                if got != rung {
-                    return SETUP_FAILED + 2;
-                }
-                match landlock::restrict_self(ruleset, entering, flags) {
+                match landlock::restrict_self(entering, flags) {
                     Ok(()) => 0,
                     Err(fail) => fail.errno,
                 }
@@ -2538,8 +2578,9 @@ mod tests {
         // The rights the realm's own writable hierarchies carry, minus the
         // ones that need a rung above 1.
         const WRITE_AT_RUNG_1: u64 = (1 << 1) | (1 << 2) | (1 << 3) | (1 << 8);
-        // The rung, named once and recorded, so the number this test enters a
-        // domain at is the number `BEHAVIOURAL_RUNGS` publishes for it.
+        // The rung, named once and read back off the ruleset the ledger is
+        // handed, so the rung this test enters a domain at is the rung
+        // `BEHAVIOURAL_RUNGS` publishes for it.
         const WRITE_SET_RUNG: u32 = 1;
         let entered = landlock::RungsEntered::for_test(
             "a_realm_can_write_where_it_was_granted_and_nowhere_else",
@@ -2549,24 +2590,24 @@ mod tests {
             (&inside, 0, "a write inside the granted hierarchy"),
             (&outside, libc::EACCES, "a write outside every granted rule"),
         ] {
-            let entering = entered.entering(WRITE_SET_RUNG);
-            let rung = entering.rung();
+            let ruleset = landlock::create_ruleset(WRITE_SET_RUNG)
+                .expect("a rung-1 ruleset on a kernel the skip above says has Landlock");
+            assert_eq!(
+                ruleset.rung(),
+                WRITE_SET_RUNG,
+                "rung 1 is the bottom of the ladder and cannot be stepped down from"
+            );
+            let entering = entered.entering(&ruleset);
             let code = fork_and_measure(|| {
                 // Landlock's precondition, which K10 has already set in the
                 // real sequence and which a test binary has not.
                 if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } < 0 {
                     return SETUP_FAILED;
                 }
-                let Ok((ruleset, got)) = landlock::create_ruleset(rung) else {
-                    return SETUP_FAILED + 1;
-                };
-                if got != rung {
-                    return SETUP_FAILED + 4;
-                }
-                if landlock::add_path_rule(ruleset, &granted_c, WRITE_AT_RUNG_1).is_err() {
+                if landlock::add_path_rule(ruleset.fd(), &granted_c, WRITE_AT_RUNG_1).is_err() {
                     return SETUP_FAILED + 2;
                 }
-                if landlock::restrict_self(ruleset, entering, 0).is_err() {
+                if landlock::restrict_self(entering, 0).is_err() {
                     return SETUP_FAILED + 3;
                 }
                 let fd = unsafe {
@@ -2624,25 +2665,24 @@ mod tests {
             "the_truncate_rung_is_measured_and_its_absence_is_measured_with_it",
         );
         let measure = |rung: u32, rights: u64| -> (i32, u64) {
-            let entering = entered.entering(rung);
-            let rung = entering.rung();
+            let ruleset = landlock::create_ruleset(rung)
+                .expect("a ruleset at a rung the skip above says this kernel has");
+            assert_eq!(
+                ruleset.rung(),
+                rung,
+                "the ladder stepped down under us, so the run would be measuring a rung nobody \
+                 asked for"
+            );
+            let entering = entered.entering(&ruleset);
             std::fs::write(&victim, vec![b'x'; 100]).expect("re-fill the victim");
             let code = fork_and_measure(|| {
                 if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } < 0 {
                     return SETUP_FAILED;
                 }
-                let Ok((ruleset, got)) = landlock::create_ruleset(rung) else {
-                    return SETUP_FAILED + 1;
-                };
-                if got != rung {
-                    // The ladder stepped down under us, so the run would be
-                    // measuring a rung nobody asked for.
-                    return SETUP_FAILED + 2;
-                }
-                if landlock::add_path_rule(ruleset, &dir_c, rights).is_err() {
+                if landlock::add_path_rule(ruleset.fd(), &dir_c, rights).is_err() {
                     return SETUP_FAILED + 3;
                 }
-                if landlock::restrict_self(ruleset, entering, 0).is_err() {
+                if landlock::restrict_self(entering, 0).is_err() {
                     return SETUP_FAILED + 4;
                 }
                 if unsafe { libc::truncate(victim_c.as_ptr(), 0) } < 0 {

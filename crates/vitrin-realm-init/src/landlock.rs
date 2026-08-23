@@ -22,8 +22,11 @@
 //! Ordinary Rust is allowed (this binary is single-threaded by design -- see
 //! `main.rs`'s module docs), so the grant table below is built with `Vec` and
 //! `CString` rather than in async-signal-safe primitives. The three syscall
-//! wrappers are nonetheless allocation-free, because
-//! [`crate::tests`] drives them from a forked child.
+//! wrappers are nonetheless allocation-free, because [`crate::tests`] drives
+//! [`add_path_rule`] and [`restrict_self`] from a forked child. [`create_ruleset`]
+//! is called from the parent there -- the ledger has to read the rung off the
+//! ruleset, and a child's recording dies with the child -- and keeps the
+//! property anyway, because the shipped path calls all three in sequence.
 //!
 //! # Raw syscalls, and no `landlock` crate
 //!
@@ -459,6 +462,72 @@ pub fn kernel_abi() -> Result<u32, Fail> {
     }
 }
 
+/// A live Landlock ruleset, together with **the rung the kernel created it
+/// at**.
+///
+/// The rung is the kernel's answer and never the caller's request:
+/// [`create_ruleset`] steps down on `EINVAL`/`E2BIG`, and what is recorded here
+/// is where that walk stopped. It is the only thing in this tree that builds
+/// one **holding a descriptor**, both fields are private, and there is no
+/// constructor anywhere that takes a descriptor and a rung as two separate
+/// arguments -- so a descriptor cannot be labelled with a rung it was not
+/// created at. (The one other constructor, [`Ruleset::unopened`], exists in
+/// test builds and holds no descriptor at all.)
+///
+/// That is the entire point of the type. Entering a domain needs an
+/// [`Entering`]; an `Entering` holds one of these; and the ledger reads the
+/// rung **off the ruleset it is handed**. Before this type existed, the rung
+/// the ledger recorded and the rung the ruleset was built at were two numbers a
+/// human kept in step.
+pub struct Ruleset {
+    fd: RawFd,
+    /// The rung `landlock_create_ruleset` accepted -- not the rung asked for.
+    rung: u32,
+}
+
+impl Ruleset {
+    /// The descriptor, for [`add_path_rule`], which does not keep it.
+    pub fn fd(&self) -> RawFd {
+        self.fd
+    }
+
+    /// The rung this ruleset was **created** at.
+    pub fn rung(&self) -> u32 {
+        self.rung
+    }
+
+    /// A rung with **no descriptor**, for the ledger's own non-vacuity proof.
+    ///
+    /// `landlock_restrict_self` on `-1` cannot enter a domain at any rung, so
+    /// this is safe to hand to a [`RungsEntered`] on a machine that has no
+    /// Landlock at all -- which is what
+    /// `a_ledger_that_recorded_a_rung_its_row_does_not_name_fails_on_drop`
+    /// needs, and it is the only reason this exists. It is deliberately **not**
+    /// a way to attach a chosen rung to a real descriptor: there is no argument
+    /// here that could carry one.
+    #[cfg(test)]
+    pub fn unopened(rung: u32) -> Ruleset {
+        Ruleset { fd: -1, rung }
+    }
+}
+
+impl Drop for Ruleset {
+    /// Close the descriptor.
+    ///
+    /// After `landlock_restrict_self` the domain is enforced and the descriptor
+    /// is inert, and a measurement body that never got that far is a descriptor
+    /// nothing else will close: `main.rs` builds one per measurement, in the
+    /// parent, in a loop. `close` is async-signal-safe, so this keeps the
+    /// module's allocation-free contract.
+    fn drop(&mut self) {
+        if self.fd >= 0 {
+            // SAFETY: this value's own descriptor, handed out only as a
+            // `RawFd` to `add_path_rule` and to the one syscall below.
+            unsafe { libc::close(self.fd) };
+        }
+    }
+}
+
 /// Create a ruleset at `rung`, stepping **down** on `EINVAL`/`E2BIG` until the
 /// kernel accepts one or the floor is reached.
 ///
@@ -477,11 +546,14 @@ pub fn kernel_abi() -> Result<u32, Fail> {
 ///   this directly). A request below the floor is taken literally and is never
 ///   walked down further -- there is nothing below it worth reaching.
 ///
-/// The fallback is never masked: what comes back is the rung the kernel
-/// accepted, and every caller journals it.
+/// The fallback is never masked: what comes back is a [`Ruleset`] carrying the
+/// rung the kernel accepted, and every caller journals it.
 ///
-/// Allocation-free, so a forked child may call it.
-pub fn create_ruleset(rung: u32) -> Result<(RawFd, u32), Fail> {
+/// Allocation-free, so a forked child may call it -- though `main.rs`'s
+/// measurement bodies call it in the **parent** and let the forked child
+/// inherit the descriptor, because that is what lets the ledger read the rung
+/// off the ruleset itself instead of being told one; see [`Entering`].
+pub fn create_ruleset(rung: u32) -> Result<Ruleset, Fail> {
     // A caller asking below the floor means it: the cap flag, driving a
     // measurement. A caller asking at or above it may descend to the floor and
     // no further.
@@ -505,7 +577,10 @@ pub fn create_ruleset(rung: u32) -> Result<(RawFd, u32), Fail> {
             )
         };
         if rc >= 0 {
-            return Ok((rc as RawFd, rung));
+            return Ok(Ruleset {
+                fd: rc as RawFd,
+                rung,
+            });
         }
         let err = errno();
         // `EINVAL` is a mask bit this kernel does not know; `E2BIG` is a
@@ -565,8 +640,8 @@ pub fn add_path_rule(ruleset: RawFd, path: &CStr, rights: u64) -> Result<(), Fai
     Ok(())
 }
 
-/// The rung a caller has committed to **entering** a Landlock domain at, and
-/// the only thing [`restrict_self`] accepts in that position.
+/// The **ruleset** a caller has committed to entering a Landlock domain with,
+/// and the only thing [`restrict_self`] accepts.
 ///
 /// # The published absolute this exists to hold
 ///
@@ -585,33 +660,52 @@ pub fn add_path_rule(ruleset: RawFd, path: &CStr, rights: u64) -> Result<(), Fai
 /// So the opt-in is gone. `landlock_restrict_self` is the only syscall that
 /// enters a domain, [`restrict_self`] is the only place in this workspace that
 /// issues it, and it now demands this token -- which, in a test build, only
-/// [`RungsEntered::entering`] can mint, and which records the rung as it
-/// mints. The production mint is compiled **out** of test builds
-/// ([`Entering::production`]), so [`apply_with`]'s own path to a domain is not
-/// a way around the ledger either; see [`enter_domain`].
+/// [`RungsEntered::entering`] can mint. The production mint is compiled
+/// **out** of test builds ([`Entering::production`]), so [`apply_with`]'s own
+/// path to a domain is not a way around the ledger either; see
+/// [`enter_domain`].
+///
+/// # And it carries the ruleset, not a number beside it
+///
+/// The first shape of this type held a `u32` the ledger was **told**, and that
+/// left the absolute one line short. `entered.entering(1)` beside
+/// `create_ruleset(4)` recorded rung 1, entered a rung-4 domain, and every
+/// mechanism above stayed green: the ledger compared a number the test typed
+/// against a table the same test named, and neither of them was the ruleset.
+/// That was not a hypothetical -- the counterexample compiled. Each
+/// measurement body papered over it with a line of its own
+/// (`let rung = entering.rung();`), which is the remembered discipline this
+/// ledger exists to replace.
+///
+/// It now holds the [`Ruleset`] itself, [`RungsEntered::entering`] reads the
+/// rung **off** it, and [`restrict_self`] takes nothing else. The rung recorded
+/// and the rung the enforced descriptor was created at are therefore one value
+/// rather than two that agree -- there is no argument left for them to disagree
+/// in, and the disagreement is now a type error rather than a green run.
 ///
 /// What it does **not** cover is said where the claim is published rather than
-/// only here: a test that asks the *shipped* helper for a rung never links
-/// this module at all. That route is held at `crates/vitrin-core`'s realm
-/// spawn instead (`RUNGS_NO_TEST_ENTERS`).
+/// only here: a test that asks the *shipped* helper for a rung never links this
+/// module at all (held at `crates/vitrin-core`'s realm spawn,
+/// `RUNGS_NO_TEST_ENTERS`), and a test that issues syscall 446 by hand is held
+/// by nothing in this file. `docs/book/src/limits.md` names both.
 #[derive(Clone, Copy)]
-pub struct Entering(u32);
+pub struct Entering<'a>(&'a Ruleset);
 
-impl Entering {
-    /// The rung recorded, handed back so a call site spells the number once.
-    #[cfg(test)]
-    pub fn rung(self) -> u32 {
-        self.0
+impl<'a> Entering<'a> {
+    /// The rung the ruleset about to be entered was **created** at.
+    fn rung(self) -> u32 {
+        self.0.rung
     }
 
     /// The production mint, and its `cfg` is the load-bearing half.
     ///
     /// In a test build this function does not exist, so nothing outside
     /// [`RungsEntered`] can produce an [`Entering`] -- which is what makes the
-    /// ledger mandatory rather than conventional.
+    /// ledger mandatory rather than conventional. It takes the ruleset it is
+    /// about to enter, so there is no rung to supply here either.
     #[cfg(not(test))]
-    fn production(rung: u32) -> Entering {
-        Entering(rung)
+    fn production(ruleset: &'a Ruleset) -> Entering<'a> {
+        Entering(ruleset)
     }
 }
 
@@ -664,10 +758,17 @@ impl RungsEntered {
         }
     }
 
-    /// Record `rung` and mint the token [`restrict_self`] demands.
-    pub fn entering(&self, rung: u32) -> Entering {
-        self.entered.borrow_mut().push(rung);
-        Entering(rung)
+    /// Record the rung `ruleset` was **created** at, and mint the token
+    /// [`restrict_self`] demands for that ruleset.
+    ///
+    /// The rung is read off the ruleset rather than handed in beside it, and
+    /// that is the whole difference from the shape this replaced. A ledger that
+    /// is *told* a number records what a test said; this one records what the
+    /// kernel built. `entering(1)` next to a rung-4 ruleset is no longer a
+    /// sentence this API can express.
+    pub fn entering<'a>(&self, ruleset: &'a Ruleset) -> Entering<'a> {
+        self.entered.borrow_mut().push(ruleset.rung);
+        Entering(ruleset)
     }
 }
 
@@ -710,12 +811,13 @@ impl Drop for RungsEntered {
 /// than a bare call. No test drives `apply_with` that far today: the two that
 /// call it stop at `--landlock=off` and at a probe answering `ENOSYS`.
 #[cfg(not(test))]
-fn enter_domain(ruleset: RawFd, rung: u32, flags: libc::c_uint) -> Result<(), Fail> {
-    restrict_self(ruleset, Entering::production(rung), flags)
+fn enter_domain(ruleset: &Ruleset, flags: libc::c_uint) -> Result<(), Fail> {
+    restrict_self(Entering::production(ruleset), flags)
 }
 
 #[cfg(test)]
-fn enter_domain(_ruleset: RawFd, rung: u32, _flags: libc::c_uint) -> Result<(), Fail> {
+fn enter_domain(ruleset: &Ruleset, _flags: libc::c_uint) -> Result<(), Fail> {
+    let rung = ruleset.rung();
     panic!(
         "landlock::apply_with reached `landlock_restrict_self` at rung {rung} under `cargo \
          test`. The production path may not enter a Landlock domain in a test build: the rungs \
@@ -731,10 +833,12 @@ fn enter_domain(_ruleset: RawFd, rung: u32, _flags: libc::c_uint) -> Result<(), 
 /// Requires `PR_SET_NO_NEW_PRIVS`, which K10 has already set. Irreversible by
 /// construction: there is no call that removes a Landlock domain.
 ///
-/// `entering` is a witness rather than an argument -- the kernel is told the
-/// ruleset and the flags, and the rung is already baked into the ruleset. It
-/// is named here so that no caller can reach this syscall without having gone
-/// through a mint that records the rung; see [`Entering`].
+/// The ruleset arrives **inside** `entering` rather than beside it, and that is
+/// what makes the recording exact: the descriptor this syscall is handed is the
+/// descriptor the ledger was handed, and the rung the ledger wrote down is the
+/// rung that descriptor was created at. No caller can reach this syscall
+/// without having gone through a mint, and no caller can name a rung here at
+/// all; see [`Entering`].
 ///
 /// `flags` is [`restrict_self_flags`]' answer -- zero for every shipped
 /// session. It is a parameter rather than a constant read in here so that the
@@ -742,17 +846,17 @@ fn enter_domain(_ruleset: RawFd, rung: u32, _flags: libc::c_uint) -> Result<(), 
 /// directly, name the flags word they are measuring instead of inheriting one.
 ///
 /// Allocation-free.
-pub fn restrict_self(ruleset: RawFd, entering: Entering, flags: libc::c_uint) -> Result<(), Fail> {
-    // The token's rung is not sent to the kernel -- it is already baked into
-    // `ruleset` -- so this reads it for the one invariant it can state, rather
-    // than discarding it and leaving the field unread in a shipped build.
+pub fn restrict_self(entering: Entering<'_>, flags: libc::c_uint) -> Result<(), Fail> {
+    // The rung is not sent to the kernel -- it is already baked into the
+    // ruleset -- so this reads it for the one invariant it can state, rather
+    // than leaving it unread in a shipped build.
     debug_assert!(
-        entering.0 >= 1,
+        entering.rung() >= 1,
         "a Landlock domain cannot be entered at rung 0: rung 0 is `--landlock=off`, which builds \
          no ruleset at all"
     );
     // SAFETY: an integer descriptor and a flags word.
-    let rc = unsafe { libc::syscall(SYS_LANDLOCK_RESTRICT_SELF, ruleset, flags) };
+    let rc = unsafe { libc::syscall(SYS_LANDLOCK_RESTRICT_SELF, entering.0.fd, flags) };
     if rc < 0 {
         return Err(Fail::at(Stage::Landlock));
     }
@@ -1131,7 +1235,8 @@ pub(crate) fn apply_with(
     // the clamp. Sending a boolean the core can derive would be a second
     // opinion about one session.
     let plan = plan_rung(kernel_abi, config.landlock);
-    let (ruleset, rung) = create_ruleset(plan.rung)?;
+    let ruleset = create_ruleset(plan.rung)?;
+    let rung = ruleset.rung();
 
     // The **diagnostic** flags word (see [`restrict_self_flags`]). Read from
     // this process's own environment, which the core populated from nothing
@@ -1176,18 +1281,17 @@ pub(crate) fn apply_with(
             // `EINVAL` -- which is also what makes a capped session behave
             // exactly like the older kernel it is imitating rather than
             // erroring differently.
-            match add_path_rule(ruleset, &entry.path, entry.rights & handled) {
+            match add_path_rule(ruleset.fd(), &entry.path, entry.rights & handled) {
                 Ok(()) => {}
                 Err(fail) if !entry.required && fail.errno == libc::ENOENT => {}
                 Err(fail) => return Err(fail),
             }
         }
-        enter_domain(ruleset, rung, flags)
+        enter_domain(&ruleset, flags)
     })();
-    // SAFETY: `ruleset` is this function's own descriptor. Closed on both
-    // paths: after `restrict_self` the domain is enforced and the descriptor
-    // is inert, and on the error path the caller is about to `_exit`.
-    unsafe { libc::close(ruleset) };
+    // The descriptor closes with `ruleset` when this function returns, on both
+    // paths: after `restrict_self` the domain is enforced and the descriptor is
+    // inert, and on the error path the caller is about to `_exit`.
     result?;
 
     Ok(Enforced { rung, kernel_abi })

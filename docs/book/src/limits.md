@@ -365,12 +365,20 @@ inferred from the word "Landlock":
   - **A test that issues the syscall itself** — `vitrin-realm-init`'s forked
     measurement bodies, the only code in this workspace that calls
     `landlock_restrict_self`. Held by the type system: that function demands a
-    token whose only mint in a test build is a ledger, the ledger records the
-    rung as it mints and compares what it recorded against `BEHAVIOURAL_RUNGS`
-    when it drops, and it refuses to open at all for a test name that table
-    does not declare. Declaring is therefore not something a test can forget,
-    and the production path (`landlock::apply_with`) has its own mint compiled
-    **out** of test builds so it is not a way round.
+    token whose only mint in a test build is a ledger, and the token carries the
+    **ruleset**, not a rung number beside it — so what the ledger records is the
+    rung the kernel *created that ruleset at*, and the ruleset it recorded is
+    the only descriptor the syscall can be given. It compares what it recorded
+    against `BEHAVIOURAL_RUNGS` when it drops, and it refuses to open at all for
+    a test name that table does not declare. Declaring is therefore not
+    something a test can forget, and the production path
+    (`landlock::apply_with`) has its own mint compiled **out** of test builds so
+    it is not a way round. (The token's first shape, the same day, carried a
+    rung *number*: a test could declare rung 1, build its ruleset at rung 4,
+    enter a rung-4 domain and leave every mechanism here green. That was found
+    by compiling the counterexample rather than by reading the code, and it is
+    closed by welding the two — `entering(4)` no longer type-checks, and a
+    ruleset the ledger never saw cannot be named to the syscall at all.)
   - **A test that asks the shipped helper for a rung**, entering the domain in
     another process where no Rust type can reach it. The core's own confinement
     suite is held at its single realm-spawn point, which refuses a spawn that
@@ -381,11 +389,19 @@ inferred from the word "Landlock":
 
   **What that does not cover, stated rather than implied.** The scan reads
   literals in the suite's files, so a rung composed at runtime from pieces
-  would pass it. And `VITRIN_LANDLOCK=abi:4` set in the *environment* by
+  would pass it. `VITRIN_LANDLOCK=abi:4` set in the *environment* by
   whoever runs the suite is invisible to all of it — that is an operator
   pinning a session, which the bullets above describe as the instrument these
-  measurements are taken with, and it is not a test in this repository. The
-  sentence in bold is about the files, and it is now the files that hold it.
+  measurements are taken with, and it is not a test in this repository. And the
+  first bullet holds one *function*, not the kernel's ABI: `landlock_restrict_self`
+  is syscall 446, a test could issue it by hand through `libc::syscall`, and
+  **nothing checks** that `landlock::restrict_self` remains its only caller —
+  that `restrict_self` is the only such call today is a fact about the tree as
+  it stands, not a mechanism. The first and the third would each make the
+  sentence in bold silently false and neither is held; the second is an
+  operator rather than a test, and is out of its scope by construction.
+  The sentence in bold is about the files, and it is the files that hold it
+  — as far as a literal can be read.
 - **This build's ladder stops at rung 9, and a newer kernel is clamped to it.**
   ABI 10 exists in mainline and this build does not request it. A kernel
   reporting more than 9 gets a rung-9 ruleset, and that is journaled per realm

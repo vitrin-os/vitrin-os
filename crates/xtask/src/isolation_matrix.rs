@@ -1382,9 +1382,12 @@ pub fn render(corpus: &Corpus, sources: &Sources) -> Result<String> {
     //   1. `vitrin-realm-init`'s forked measurement bodies, which issue
     //      `landlock_restrict_self` themselves. Held by the type system:
     //      `landlock::restrict_self` demands an `Entering`, whose only mint in
-    //      a test build is `RungsEntered`, which records the rung and compares
-    //      it against `BEHAVIOURAL_RUNGS` when it drops. The `PINS` above keep
-    //      that shape from being deleted quietly.
+    //      a test build is `RungsEntered`, which records the rung the ruleset
+    //      it is handed was CREATED at -- not a number the test supplied
+    //      alongside it -- and compares what it recorded against
+    //      `BEHAVIOURAL_RUNGS` when it drops. The token carries that ruleset,
+    //      so it is the only descriptor that can be enforced. The `PINS` above
+    //      keep that shape from being deleted quietly.
     //   2. A test that asks the *shipped helper* for a rung -- the core's own
     //      confinement suite, and the integration suite. Held at the core's
     //      realm spawn by `RUNGS_NO_TEST_ENTERS`, and in `tests/integration`
@@ -2167,15 +2170,42 @@ pub static PINS: &[CodePin] = &[
     },
     CodePin {
         path: LANDLOCK_RS,
-        needle: "pub fn restrict_self(ruleset: RawFd, entering: Entering, flags: libc::c_uint)",
-        means: "entering a Landlock domain still demands the `Entering` token, which is what \
-                makes the rung a test enters recordable rather than optional. Take the token \
-                back out and the limits page's \"No test in this repository enters a Landlock \
-                domain at rung 4 or rung 5\" goes back to being held by an opt-in.",
+        needle: "pub fn restrict_self(entering: Entering<'_>, flags: libc::c_uint)",
+        means: "entering a Landlock domain still demands the `Entering` token, and the token is \
+                still the ONLY argument that names a descriptor here. Take the token back out \
+                and the limits page's \"No test in this repository enters a Landlock domain at \
+                rung 4 or rung 5\" goes back to being held by an opt-in; add a second argument \
+                naming a ruleset or a rung and it goes back to being held by two numbers that \
+                have to agree.",
     },
     CodePin {
         path: LANDLOCK_RS,
-        needle: "#[cfg(not(test))] fn production(rung: u32) -> Entering {",
+        needle: "pub fn entering<'a>(&self, ruleset: &'a Ruleset) -> Entering<'a> {",
+        means: "the ledger still reads the rung OFF the ruleset it is handed rather than being \
+                told one. The shape before this took a `u32`: `entering(1)` beside \
+                `create_ruleset(4)` recorded rung 1, entered a rung-4 domain, and left every \
+                mechanism on this page green -- found by compiling it. Give this a rung \
+                parameter again and that hole is back.",
+    },
+    CodePin {
+        path: LANDLOCK_RS,
+        needle: "pub fn create_ruleset(rung: u32) -> Result<Ruleset, Fail> {",
+        means: "a descriptor and the rung the kernel created it at still leave this function \
+                welded into ONE value. Hand back the pair again and a caller can carry a rung-4 \
+                descriptor around labelled rung 1, which is exactly the shape the ledger was \
+                fixed to stop.",
+    },
+    CodePin {
+        path: LANDLOCK_RS,
+        needle: "pub fn unopened(rung: u32) -> Ruleset { Ruleset { fd: -1, rung } }",
+        means: "the one constructor that names a rung without asking the kernel still holds NO \
+                descriptor, which is why it cannot enter a domain and is safe for the ledger's \
+                own non-vacuity proof. Let it take an fd and it becomes the way to label any \
+                descriptor with any rung.",
+    },
+    CodePin {
+        path: LANDLOCK_RS,
+        needle: "#[cfg(not(test))] fn production(ruleset: &'a Ruleset) -> Entering<'a> {",
         means: "the production mint is still compiled OUT of test builds, so `apply_with`'s own \
                 path to a domain is not a way around the ledger. Drop the `cfg` and a test could \
                 enter a domain at any rung by driving the shipped path.",

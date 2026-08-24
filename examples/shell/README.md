@@ -32,8 +32,15 @@ can write to is the host terminal you started it in.
 The intended eventual shape is this program running **as a realm** — drawing
 through its own shim like any other app, while holding the layout verbs through
 the ordinary grant path. That needs no new protocol. What it does need is for
-the shell's realm to reach the core socket, which is a confinement question of
-its own, and it is named here rather than built here.
+the shell's realm to reach the core socket — a confinement question of its own,
+answered on 2026-08-24 by
+[D-046](../../docs/plan/20-decision-log.md#d-046--a-shell-realm-reaches-the-core-socket-through-a-descriptor-the-core-mints-and-passes-down-the-spawn-path-it-already-has-the-authority-is-an-operators-declaration-and-a-humans-consent-and-what-the-connection-may-carry-is-fenced-structurally-rather-than-by-consent)
+(issue [#311](https://github.com/vitrin-os/vitrin-os/issues/311)): the core
+mints the connection and passes it into the realm as an inherited descriptor,
+on an operator's `realm.toml` declaration **and** a human's consent, and it may
+carry `layout_focus`, `layout_arrange` and `realm_launch` and never `observe` or
+either actuation verb. **Nothing of that is built** — this program is still the
+line-oriented one, for the reason above.
 
 ## Why it has no hotkey: a principal cannot receive physical input
 

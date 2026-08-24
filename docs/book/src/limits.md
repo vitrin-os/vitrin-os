@@ -1562,9 +1562,43 @@ is a line-oriented program in a host terminal, and that is not a placeholder
 for a graphical one: no amount of client work reaches the output. The intended
 eventual shape is the shell running **as a realm**, drawing through its own
 shim like any other app while holding the layout verbs through the ordinary
-grant path — which needs no new protocol, but does need that realm to reach the
-core socket, and that is a confinement question nobody has answered. Until
-then, anything you would call a desktop shell — a bar, a launcher, an OSD, a
+grant path — which needs no new protocol, and does need that realm to reach the
+core socket. Since 2026-08-24 that is **decided and unbuilt** rather than
+unanswered
+([#311](https://github.com/vitrin-os/vitrin-os/issues/311),
+[**D-046**](https://github.com/vitrin-os/vitrin-os/blob/main/docs/plan/20-decision-log.md#d-046--a-shell-realm-reaches-the-core-socket-through-a-descriptor-the-core-mints-and-passes-down-the-spawn-path-it-already-has-the-authority-is-an-operators-declaration-and-a-humans-consent-and-what-the-connection-may-carry-is-fenced-structurally-rather-than-by-consent)),
+and this is **what a shell realm may reach that an app realm may not**:
+
+- **Exactly one extra thing: a principal connection to the core.** The core
+  mints it and passes it down the spawn path as an inherited file descriptor —
+  so nothing is mounted, no path is opened, no Landlock rule is added, and the
+  realm's mount table stays closed. A measured walk of a realm's whole
+  filesystem finds exactly one socket, the shim's own, and that stays true after
+  this. Everything else about a shell realm — its mount table, its Landlock
+  domain, its namespaces, its retained supplementary groups — is the confinement
+  every realm gets. **An app realm is handed one socket, its own shim's, and
+  nothing else.**
+- **What the connection buys is fenced.** It may petition, and it may hold
+  `layout_focus`, `layout_arrange` and `realm_launch` over *other* realms — the
+  last of which is authority to create realms, the widest authority here, and it
+  is granted rather than assumed. `observe`, `actuate_pointer` and
+  `actuate_text` are refused to it **regardless of what a human approves**.
+- **A realm with no principal connection can hold no grant at all**, because a
+  grant row keys on a principal identity and a realm has none. That is the real
+  size of the widening: one realm becomes both a confinement subject and an
+  authority holder.
+- **The authority to hand one over is an operator's `realm.toml` declaration
+  *and* a human's consent** — both, not either — at the `while_running` rung,
+  because the durable rungs are structurally impossible in this build (they need
+  a verified binary identity, which is Phase 3). So the consent is **once per
+  core start**, the card's "remember me" is rendered disabled with its reason,
+  and there is no connected-apps surface to forget it from later.
+- **None of this is built.** It is a decision about work not yet done; no code
+  in this tree passes such a descriptor, and the fence stated above is an
+  intention until a chokepoint enforces it.
+
+Until the shell realm exists, anything you would call a desktop shell — a bar, a
+launcher, an OSD, a
 window-switcher overlay — cannot exist on this display server, and the
 replacements are core-owned surfaces (the trusted band, the consent card, the
 attention marker, the lock screen and the status strip) that no client can add

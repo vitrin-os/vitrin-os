@@ -110,6 +110,15 @@
 //! on a verb *name*, and `egress` alone appears in some forty files that
 //! enumerate nothing at all.
 //!
+//! **A marker of an unregistered KIND, in a file registered for some other
+//! kind, is invisible in the same way** -- and this one is easier to walk
+//! into, because the file looks covered. The check loop iterates [`CARRIERS`]
+//! rows, so it only ever looks for markers of that row's kind; the
+//! outside-the-registry sweep below keys on the PATH, so a file with any row
+//! at all satisfies it. Adding a second kind of marker to an existing carrier
+//! therefore requires a second row, and forgetting it produces a marker that
+//! reads as checked and is not.
+//!
 //! What the registry does buy is that the moment a set moves, every registered
 //! surface must be visited -- and the failure message names the ones that were
 //! not.

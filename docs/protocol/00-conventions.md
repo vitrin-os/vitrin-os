@@ -619,13 +619,16 @@ narrower than requested); on any other outcome they are zero.
 
 **Use-time refusals** — `vitrin_grant.refused(verb, code, retry_after_ms)` from
 the single enforcement chokepoint, covering capture, actuation, launch, the
-layout verbs and egress alike — a closed list of use classes, grouped by facet
-shape rather than by verb, and whose two past lapses are recorded at
-[`vitrin_grant.refusal`](04-vitrin_grant.md#refusal).
+layout verbs, **designation** and egress alike — **six** classes, a closed list
+grouped by facet shape rather than by verb, and whose **three** past lapses are
+recorded at [`vitrin_grant.refusal`](04-vitrin_grant.md#refusal); the third and
+worst is the one where the list called itself closed while omitting
+designation.
 `retry_after_ms` is greater than zero only for `rate_limited`.
 Which codes a given use can draw is not uniform: `preempted` and
-`consent_held` are attention-shaped (actuation and the layout verbs),
-`capacity` is launch-only, and a launch is
+`consent_held` are attention-shaped (actuation and the layout verbs; never
+egress; **undecided for designation**, which P2.6.6 answers when it builds the
+picker), `capacity` is launch-only, and a launch is
 never refused `no_surface` (a vacant realm is the state `realm_launch` exists
 to leave). The single voice is the invariant; the applicable set is per-verb
 and is stated on each facet's page. One code is also **conditional**:

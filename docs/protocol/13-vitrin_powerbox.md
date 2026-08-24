@@ -391,11 +391,16 @@ must actually accompany the frame; either disjunct alone failing is
 | `internal` | a server-side failure while carrying the ask out |
 
 `no_surface` is never produced: a designation reaches the realm's *shim*, which
-exists whether or not its app has committed a surface. `preempted` and
+exists whether or not its app has committed a surface. `capacity` is never
+produced either — it concerns creating a realm. `preempted` and
 `consent_held` are attention-shaped — they reach actuation and the layout
 verbs — and whether they should reach a request that *raises a prompt of its
 own* is a question P2.6.6 has to answer when it builds the picker; nothing here
-forecloses either answer.
+forecloses either answer. That open question is **normative** and now says so
+in the IDL, at [`vitrin_grant.refusal`](04-vitrin_grant.md#refusal), which
+carries designation's reachable set alongside every other class's: leaving it
+open in prose while the IDL's own enumeration silently closed it was the state
+this page inherited.
 
 ## Flows
 

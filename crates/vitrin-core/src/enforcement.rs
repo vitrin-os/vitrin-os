@@ -1191,18 +1191,30 @@ impl Chokepoint {
     /// invariant that `retry_after_ms` is nonzero only for
     /// `rate_limited`, in release builds too.
     ///
-    /// **This function is one voice for four of the IDL's five use
-    /// classes, not five**, and the fifth is named here rather than left
-    /// to be inferred from a `match` with no arm. `vitrin_grant.refusal`
-    /// enumerates capture, actuation, launch, the layout verbs and
-    /// **egress**; [`UseKind`] has no egress variant, because this core
-    /// dispatches neither `vitrin_grant.get_egress` nor
-    /// `vitrin_egress.request_connect` at all -- both are answered
-    /// `invalid_opcode` today, which the IDL's own `vitrin_egress`
-    /// description records as a gap between the document and this binary.
-    /// So no egress refusal is ever built here, and the reason is an
-    /// absent dispatch arm rather than an exemption at the chokepoint.
-    /// The task that lands the out-of-core proxy owns closing it.
+    /// **This function is one voice for four of the IDL's six use
+    /// classes, not six**, and the missing two are named here rather than
+    /// left to be inferred from a `match` with no arm.
+    /// `vitrin_grant.refusal` enumerates capture, actuation, launch, the
+    /// layout verbs, **designation** and **egress**; [`UseKind`] has a
+    /// variant for the first four and for neither of the last two,
+    /// because this core dispatches none of `vitrin_grant.get_powerbox`,
+    /// `vitrin_powerbox`'s two asks, `vitrin_grant.get_egress` or
+    /// `vitrin_egress.request_connect` -- every one of them is answered
+    /// `invalid_opcode` today, which the IDL's own `vitrin_powerbox` and
+    /// `vitrin_egress` descriptions record as a gap between the document
+    /// and this binary. So no designation and no egress refusal is ever
+    /// built here, and in both cases the reason is an absent dispatch arm
+    /// rather than an exemption at the chokepoint. P2.6.6 (the core-drawn
+    /// picker) and the task that lands the out-of-core proxy own closing
+    /// the two halves.
+    ///
+    /// That count read **five** until this commit, and why is worth
+    /// keeping: it was written here on the egress branch (P2.7.2) while
+    /// `designate_file` (P2.6.5) was landing on a parallel one, so the
+    /// IDL enumeration this comment restates had itself omitted
+    /// designation. Restating a normative list is only ever as sound as
+    /// the list -- which is why the number is spelled out here rather
+    /// than left as "every class `UseKind` does not cover".
     fn voice_refusal<F>(
         &mut self,
         grant_wire_id: u32,

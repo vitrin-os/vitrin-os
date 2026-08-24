@@ -821,14 +821,25 @@ outcome is the **only** thing the core says about arbitration.
 ### refusal
 
 Use-time refusal codes, emitted by the enforcement chokepoint on every refused
-*use* of a grant — capture, actuation, launch, the layout verbs and egress
-alike. That list is a **closed enumeration** of the use classes this enum
-answers for, and the IDL records that it has gone stale twice: it read
-"capture, actuation and launch" after the layout verbs had already earned two
-paragraphs below, and still read so once egress became a fifth class. It groups
-by **facet shape**, not by verb — the two actuators are one class and the two
-layout interfaces are one — so a verb appended to this protocol either joins a
-class named here or adds one. Each code maps to a distinct typed SDK exception
+*use* of a grant — capture, actuation, launch, the layout verbs, **designation**
+and egress alike. **Six** classes. That list is a **closed enumeration** of the
+use classes this enum answers for, and the IDL records that it has gone stale
+three times, each lapse worse than the last: it read "capture, actuation and
+launch" after the layout verbs had already earned two paragraphs below; it
+still read so once egress had a paragraph of its own too; and the rewrite that
+closed both of those **declared the list closed in the same sentence that
+omitted designation**, while
+[`vitrin_powerbox.request_file`](13-vitrin_powerbox.md#request_file) two
+thousand lines further down the IDL names
+`vitrin_grant.refused(designate_file, …)` as one of its three terminals. A gap
+is a gap; an incomplete list calling itself closed is a contradiction against
+its own document. The mechanism was `designate_file` (P2.6.5) and `egress`
+(P2.7.2) landing on two branches at once, each able to see only its own new
+class — the shape to expect from the *next* append too, not an accident
+peculiar to these two. It groups by **facet shape**, not by verb — the two
+actuators are one class, the two layout interfaces are one, the powerbox's two
+asks are one — so a verb appended to this protocol either joins a class named
+here or adds one. Each code maps to a distinct typed SDK exception
 (NotGranted, GrantExpired, Revoked, RateLimited, Preempted, ConsentHeld,
 NoSurface, OperationFailed, AtCapacity).
 
@@ -860,6 +871,24 @@ has no live surface", which is the state `realm_launch` exists to leave, so a
 launch is never refused `no_surface`. `capacity` concerns creating a realm and
 so reaches only `realm_launch`. A code's absence from a verb's reachable set
 is a property of the operation, never a promise the code is unused.
+
+**`designate_file` reaches the grant-lifecycle four** (`not_granted`,
+`expired`, `revoked`, `rate_limited`) **and `internal`** — and it is the one
+class whose set this document does **not** yet close. Never `no_surface`, for a
+reason that is neither launch's nor egress's: a designation is delivered to the
+realm's *shim*, which exists from the moment the realm does, whether or not its
+app has ever committed a surface. Never `capacity`. **What is not settled is
+`preempted` and `consent_held`.** Both are attention-shaped, and
+[`request_file`](13-vitrin_powerbox.md#request_file)/`request_dir` are the only
+**uses of a grant** in this protocol that *raise a prompt of their own* (a
+petition does too, but a petition is not a use), so the argument that mutes an
+actuation while the human's hand is on the input does not transfer unexamined
+to a request whose whole purpose is to put something in front of that same
+human. P2.6.6 answers it when it builds the picker; nothing here forecloses
+either answer, and a server must not read the silence as licence to give either
+code a third meaning. What *is* settled: two pickers colliding is already
+answered, by [`vitrin_powerbox.refusal`](13-vitrin_powerbox.md#refusal)'s
+`busy` on that interface's own event. Only the human's hand is undecided.
 
 **`egress` reaches the grant-lifecycle four** (`not_granted`, `expired`,
 `revoked`, `rate_limited`) **and `internal`, and nothing else.** Never

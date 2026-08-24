@@ -11,8 +11,8 @@ Request opcodes (document order):
     vitrin_principal:        get_realm=0
     vitrin_realm:            request_grant=0
     vitrin_grant:            get_launcher=0, get_layout_focus=1,
-                             get_layout_arrange=2, get_egress=3
-                                                    (all since=2)
+                             get_layout_arrange=2, get_powerbox=3,
+                             get_egress=4           (all since=2)
     vitrin_view:             capture_frame=0
     vitrin_actuator_pointer: move=0, button=1, scroll=2
     vitrin_actuator_text:    type=0
@@ -22,12 +22,16 @@ Request opcodes (document order):
     vitrin_egress:           request_connect=0      (since=2)
 
 NOT ENCODED HERE, and named rather than left as a gap in the table above:
-`vitrin_grant.get_egress` and everything on `vitrin_egress`. The opcodes are
-listed because they are principal-facing and this module's tables claim to be
-that half of the IDL, but no codec below emits them: the verb is outside every
-deployment's served set (no mediating proxy exists — P2.7.3), so an SDK call
-that minted the facet could only ever reach a refusal. Adding the codecs is
-P2.7.3's, alongside the proxy that makes an answer possible.
+`vitrin_grant.get_powerbox`, `vitrin_grant.get_egress`, and everything on
+`vitrin_powerbox` and `vitrin_egress`. The two mint opcodes are listed because
+they are principal-facing and this module's tables claim to be that half of the
+IDL, but no codec below emits them: each verb is outside every deployment's
+served set (no core-drawn picker and no consent copy for it — P2.6.6/P2.6.8;
+no mediating proxy — P2.7.3), so an SDK call that minted either facet could
+only ever reach a refusal. Adding the codecs belongs to those tasks, alongside
+the mechanisms that make an answer possible. The two facets' own messages are
+left out of both tables entirely rather than listed and disowned, because
+neither facet is reachable without its mint.
 
 Event opcodes (document order):
     vitrin_handshake:        error=0, done=1
@@ -62,9 +66,10 @@ OP_MOVE = 0
 OP_BUTTON = 1
 OP_SCROLL = 2
 OP_TYPE = 0
-# Three of vitrin_grant's four since="2" structural mints, in document order.
-# The fourth is `get_egress` (opcode 3), listed in the table above and
-# deliberately not encoded here -- see the note under it.
+# Three of vitrin_grant's five since="2" structural mints, in document order.
+# The other two are `get_powerbox` (opcode 3) and `get_egress` (opcode 4),
+# listed in the table above and deliberately not encoded here -- see the note
+# under it.
 OP_GET_LAUNCHER = 0
 OP_GET_LAYOUT_FOCUS = 1
 OP_GET_LAYOUT_ARRANGE = 2

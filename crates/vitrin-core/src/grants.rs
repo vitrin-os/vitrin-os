@@ -515,7 +515,7 @@ impl NetSelector {
 /// the served set is a property of *this build*, and it did not widen
 /// when the wire went from 1 to 2.
 ///
-/// The wire bitfield ([`Verb::VALID_MASK`]) is deliberately wider, and five
+/// The wire bitfield ([`Verb::VALID_MASK`]) is deliberately wider, and six
 /// bits have been put on it ahead of anyone serving them: D-017 and D-018
 /// define `observe_cursor`, `layout_arrange` and `layout_focus` from day one
 /// so the decided cursor and layout models are expressible before v0 freezes,

@@ -2533,10 +2533,14 @@ mod tests {
         assert!(router.bind_to(&RealmId::new("realm-b")).is_none());
 
         // The chord goes down, through the physical path, into realm-b.
-        let view = (64, 48);
+        let view: crate::view::ViewGeometry = (64u32, 48u32).into();
         assert!(
             router
-                .route_physical(crate::input::tests::chord_press(), view, Some(view))
+                .route_physical(
+                    crate::input::tests::chord_press(),
+                    view,
+                    Some(view.usable())
+                )
                 .is_none(),
             "the gate withholds the chord's press from the app, as it always has"
         );

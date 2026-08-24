@@ -1162,7 +1162,7 @@ pub(crate) mod tests {
         let mut scene = crate::scene::Scene::new();
         scene
             .commit(crate::scene::SurfaceContent::from_rgba(client, W, H).expect("client surface"));
-        let replica = scene.compose(W, H);
+        let replica = scene.compose((W, H).into());
 
         assert_ne!(
             genuine, replica,
@@ -1206,15 +1206,14 @@ pub(crate) mod tests {
         );
 
         // Capture path vs human-visible path off the same scene + prompt.
-        let capture = scene.compose(W, H);
+        let capture = scene.compose((W, H).into());
         let human = crate::backend::compose_human_visible(
             &scene,
             &mut consent,
             &mut crate::lock::LockSurface::new(TrustedIndicator::for_test()),
             &crate::backend::blank::BlankSurface::for_test(),
             &mut crate::status::StatusStrip::new(crate::status::StatusConfig::off()),
-            W,
-            H,
+            (W, H).into(),
             false,
         );
 

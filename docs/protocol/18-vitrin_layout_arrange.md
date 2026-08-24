@@ -129,8 +129,16 @@ The difference is a **size**, not a decoration.
 
 - **`fullscreen`** means the realm's view size **tracks the output's**. The
   core sends [`vitrin_shim_session.configure`](09-vitrin_shim_session.md) with
-  the output's size on entering the mode, and again whenever the output
-  resizes while the realm is in it, so the app fills the output edge to edge.
+  the **usable** view — the output minus whatever rows the core reserves along
+  the top edge for its own always-present chrome — on entering the mode, and
+  again whenever the output resizes while the realm is in it, so the app fills
+  every pixel of the output that is the app's to fill. This clause said *"the
+  output's size"* until the reservation existed: the core has always drawn a
+  trusted band across the top of every human-visible frame, and a `configure`
+  carrying the output's full height told every app to lay out into rows it
+  would never see. What is reserved is a deployment property, not a wire one —
+  a shim reads the size it is given and never computes it — so no argument, no
+  type and no version changed with it.
 - **`windowed`** means it does **not**. The core imposes no size at all, sends
   nothing, the realm's view keeps whatever size it already had, and the
   compositor letterboxes that buffer centered and unscaled inside the output.
@@ -143,13 +151,14 @@ re-sent when the view resizes"), not a new mechanism.
 That is why "windowed" is an **absence** rather than a second size. A core
 that chose one would be choosing where a window goes and how big it is, which
 is window-management policy and belongs outside the core (PRD §5.1's permanent
-invariant). The only two sizes in the system are the output's and the one the
-realm already has, and these two modes are exactly the choice between them.
+invariant). The only two sizes in the system are the output's usable view and
+the one the realm already has, and these two modes are exactly the choice
+between them.
 
 ### A consequence worth stating plainly
 
-While the output's size and the realm's size are equal, **the two modes are
-indistinguishable** and switching between them changes nothing an observer can
+While the output's usable view and the realm's size are equal, **the two modes
+are indistinguishable** and switching between them changes nothing an observer can
 see. They diverge the moment the output resizes under a windowed realm, and
 converge again the moment that realm is fullscreened.
 
@@ -215,7 +224,7 @@ is fatal `invalid_argument`.
 | entry | value | meaning |
 |---|---|---|
 | `windowed` | 0 | compose the realm's view at the size its own app last committed, letterboxed centered and unscaled inside the output |
-| `fullscreen` | 1 | configure the realm's view to the output's size, so the app fills the output |
+| `fullscreen` | 1 | configure the realm's view to the output's **usable** size — the output minus whatever rows the core reserves for its own always-present chrome — so the app fills every pixel of the output that is the app's to fill |
 
 ## Growth
 

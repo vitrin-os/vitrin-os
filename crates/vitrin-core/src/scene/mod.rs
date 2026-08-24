@@ -43,8 +43,10 @@
 //! [`Scene::commit_with_damage`] additionally accepts the bounding box of
 //! the wire `damage` rectangles a commit named, and [`Scene::take_damage_view`]
 //! hands a presentation backend the accumulated damage since its last take,
-//! mapped into view coordinates through the same [`layout::place`]
-//! placement [`Scene::compose`] itself uses. This is what lets the nested
+//! mapped into view coordinates through the same [`ViewGeometry::place`]
+//! placement [`Scene::compose`] itself uses — reserved rows included, so
+//! damage an app names at its own origin lands where that app's pixels
+//! actually are (issue #304). This is what lets the nested
 //! backend upload only the changed region of its window texture instead of
 //! the whole view on every commit — the shim already tracks and forwards
 //! real damage (`shim/src/upstream.c`); before this it was latched by
@@ -89,6 +91,7 @@ use std::fmt;
 pub(crate) use realms::RealmScenes;
 
 use crate::test_pattern;
+use crate::view::ViewGeometry;
 
 /// Bytes per pixel of the composed view: tightly packed RGBA8888, rows
 /// top-down — the same layout [`test_pattern::render`] produces and the
@@ -290,7 +293,7 @@ impl Scene {
     /// A geometry change (the new content's size differs from what was
     /// committed before, or there was no prior surface at all) always
     /// widens the pending damage to "everything": the *placement* of the
-    /// surface within the view moves too ([`layout::place`] is a function of
+    /// surface within the view moves too ([`ViewGeometry::place`] is a function of
     /// both sizes), so a rectangle bounded in the old geometry could name
     /// the wrong pixels in the new one.
     pub fn commit_with_damage(&mut self, content: SurfaceContent, damage: Option<DamageRect>) {
@@ -320,10 +323,13 @@ impl Scene {
     }
 
     /// Take (and reset) the damage accumulated since the last call, mapped
-    /// into `view`-sized view coordinates through the same [`layout::place`]
-    /// placement [`Self::compose`] uses — so a caller's idea of "what
-    /// changed on screen" can never drift from what composition itself would
-    /// draw differently.
+    /// into `geom`'s view coordinates through the same
+    /// [`ViewGeometry::place`] placement [`Self::compose`] uses — so a
+    /// caller's idea of "what changed on screen" can never drift from what
+    /// composition itself would draw differently. **Including the reserved
+    /// rows**: the placement is translated below the core's own chrome, so a
+    /// damage rectangle from an app that thinks its origin is `(0, 0)` lands
+    /// where that app's pixels actually are.
     ///
     /// `None` means "the caller must treat the whole view as changed": no
     /// surface is committed, or the pending damage is
@@ -338,13 +344,14 @@ impl Scene {
     /// (`shim/src/upstream.c`), and the core already latches it
     /// ([`crate::shim`]'s `handle_damage`/`handle_commit`) — this is the
     /// seam that stops it being discarded at the shim→core→GPU boundary.
-    pub fn take_damage_view(&mut self, view: (u32, u32)) -> Option<DamageRect> {
+    pub fn take_damage_view(&mut self, geom: ViewGeometry) -> Option<DamageRect> {
         let pending = std::mem::replace(&mut self.pending_damage, PendingDamage::Clean);
         let (local, surface) = match (pending, &self.surface) {
             (PendingDamage::Rect(r), Some(s)) => (r, s),
             _ => return None,
         };
-        let placement = layout::place(view, (surface.width, surface.height));
+        let view = geom.output();
+        let placement = geom.place((surface.width, surface.height));
         let x1 = (placement.x + i64::from(local.x)).clamp(0, i64::from(view.0));
         let y1 = (placement.y + i64::from(local.y)).clamp(0, i64::from(view.1));
         let x2 = (placement.x + i64::from(local.x) + i64::from(local.width.max(0)))
@@ -368,23 +375,34 @@ impl Scene {
     /// Size of the committed client surface, if any — the geometry the
     /// input router (P1.3.7, [`crate::input`]) maps pointer coordinates
     /// through. Router and composition use the same deterministic
-    /// [`layout::place`], so they can never disagree about where the
+    /// [`ViewGeometry::place`], so they can never disagree about where the
     /// surface sits in the view.
     pub fn surface_size(&self) -> Option<(u32, u32)> {
         self.surface.as_ref().map(|s| (s.width, s.height))
     }
 
-    /// Compose the realm view at `width x height`: tightly packed RGBA8888,
-    /// rows top-down, every pixel opaque. Pure and deterministic — same
-    /// scene + same size = same bytes. Zero-sized views yield an empty
-    /// buffer.
+    /// Compose the realm view at `geom`'s **output** size: tightly packed
+    /// RGBA8888, rows top-down, every pixel opaque. Pure and deterministic —
+    /// same scene + same geometry = same bytes. Zero-sized views yield an
+    /// empty buffer.
     ///
     /// This is the one composition implementation both backends present
     /// (module docs); everything below is byte assembly, no renderer.
-    pub fn compose(&self, width: u32, height: u32) -> Vec<u8> {
+    ///
+    /// **The buffer is the whole output; the client is placed inside the
+    /// usable rectangle** (issue #304). The rows the core reserves for the
+    /// trusted band — and for the status strip when `--status` is on — are
+    /// matte here, and the human-visible output stage draws over exactly
+    /// them. So a client committing the size it was told at `configure`
+    /// keeps every row of it, and a *capture* of this view shows the app
+    /// where the human sees it rather than 28 rows higher.
+    pub fn compose(&self, geom: ViewGeometry) -> Vec<u8> {
+        let (width, height) = geom.output();
         let Some(surface) = &self.surface else {
             // Empty scene: the documented deterministic background, byte
             // for byte — the P1.3.2/P1.3.6 goldens assert exactly this.
+            // Deliberately NOT inset: there is no client to reserve rows
+            // for, and the pattern is the background of the whole output.
             return test_pattern::render(width, height);
         };
 
@@ -395,18 +413,22 @@ impl Scene {
             return out;
         }
 
-        // Single-maximized placement (the quarantined policy module), then
-        // clip the placed rectangle to the view. With both the view and the
-        // surface non-degenerate the overlap is always at least 1x1.
-        let placement = layout::place((width, height), (surface.width, surface.height));
+        // Single-maximized placement (the quarantined policy module) inside
+        // the usable rectangle, then clip the placed rectangle to the view.
+        // The clip is against the *whole* view rather than the usable
+        // rectangle: a surface larger than what it was configured with is
+        // still center-cropped rather than refused, exactly as before, and
+        // the band overdraws whatever reaches its rows — which is the
+        // behaviour an app that ignores its `configure` has always had.
+        let placement = geom.place((surface.width, surface.height));
         let dst_x = placement.x.max(0) as usize;
-        let dst_y = placement.y.max(0) as usize;
+        let dst_y = (placement.y.max(0) as usize).min(vh);
         let src_x = (-placement.x).max(0) as usize;
         let src_y = (-placement.y).max(0) as usize;
         let sw = surface.width as usize;
         let sh = surface.height as usize;
-        let copy_w = (vw - dst_x).min(sw - src_x);
-        let copy_h = (vh - dst_y).min(sh - src_y);
+        let copy_w = (vw.saturating_sub(dst_x)).min(sw - src_x);
+        let copy_h = (vh - dst_y).min(sh.saturating_sub(src_y));
 
         // **The matte is painted only where the client will not cover it.**
         //
@@ -495,39 +517,64 @@ pub(crate) mod tests {
         // The documented deterministic background: byte-exact, so the
         // pre-existing headless/capture goldens keep holding.
         assert_eq!(
-            Scene::new().compose(1280, 800),
+            Scene::new().compose((1280, 800).into()),
             test_pattern::render(1280, 800)
         );
-        assert!(Scene::new().compose(0, 600).is_empty());
+        assert!(Scene::new().compose((0, 600).into()).is_empty());
     }
 
     #[test]
-    fn exact_size_surface_is_the_view_byte_for_byte() {
-        // The steady state of single-maximized: the composed view IS the
-        // client buffer — no matte visible, no pixel moved.
-        let (w, h) = (64, 48);
-        let pixels = client_pixels(w, h);
-        let mut scene = Scene::new();
-        scene.commit(SurfaceContent::from_rgba(pixels.clone(), w, h).unwrap());
-        assert_eq!(scene.compose(w, h), pixels);
+    fn a_surface_at_the_configured_size_is_the_view_below_the_reserved_rows() {
+        // The steady state of single-maximized **since issue #304**: the app
+        // commits the size `configure` gave it — the usable view — and the
+        // composed view is the reserved rows as matte followed by that buffer,
+        // byte for byte, with no pixel of it moved sideways and none of it
+        // overdrawn. Before the inset the app was configured at the output's
+        // full height and the composed view *was* the client buffer; what
+        // changed is which size the app is told, not how it is placed.
+        for strip_h in [0, crate::status::DEFAULT_HEIGHT] {
+            let geom = ViewGeometry::new((64, 48), strip_h);
+            let (w, h) = geom.usable();
+            let pixels = client_pixels(w, h);
+            let mut scene = Scene::new();
+            scene.commit(SurfaceContent::from_rgba(pixels.clone(), w, h).unwrap());
+            let out = scene.compose(geom);
+
+            let reserved_bytes = geom.reserved_top() as usize * 64 * BYTES_PER_PIXEL;
+            assert!(reserved_bytes > 0, "every session reserves the band's rows");
+            assert!(
+                out[..reserved_bytes]
+                    .chunks_exact(BYTES_PER_PIXEL)
+                    .all(|px| px == LETTERBOX_RGBA),
+                "the reserved rows are the core's, and the client is not in them"
+            );
+            assert_eq!(
+                &out[reserved_bytes..],
+                pixels.as_slice(),
+                "every row the app was configured for is on screen, unmoved"
+            );
+        }
     }
 
     #[test]
     fn smaller_surface_is_letterboxed_centered_unscaled() {
         let (vw, vh) = (100, 80);
         let (sw, sh) = (40, 20);
+        let geom: ViewGeometry = (vw, vh).into();
+        let (uw, uh) = geom.usable();
         let pixels = client_pixels(sw, sh);
         let mut scene = Scene::new();
         scene.commit(SurfaceContent::from_rgba(pixels.clone(), sw, sh).unwrap());
-        let out = scene.compose(vw, vh);
+        let out = scene.compose(geom);
 
         // Matte in all four view corners.
         for (x, y) in [(0, 0), (vw - 1, 0), (0, vh - 1), (vw - 1, vh - 1)] {
             assert_eq!(px(&out, vw, x, y), LETTERBOX_RGBA);
         }
-        // The client bytes sit centered at 1:1: every surface pixel is
-        // exactly where the placement puts it, unresampled.
-        let (ox, oy) = ((vw - sw) / 2, (vh - sh) / 2);
+        // The client bytes sit centered at 1:1 **inside the usable
+        // rectangle** (issue #304): every surface pixel is exactly where the
+        // placement puts it, unresampled.
+        let (ox, oy) = ((uw - sw) / 2, geom.reserved_top() + (uh - sh) / 2);
         for y in 0..sh {
             for x in 0..sw {
                 assert_eq!(px(&out, vw, ox + x, oy + y), px(&pixels, sw, x, y));
@@ -549,15 +596,21 @@ pub(crate) mod tests {
         // compose against regression.
         let (vw, vh) = (100, 20);
         let (sw, sh) = (40, 50);
+        let geom: ViewGeometry = (vw, vh).into();
         let pixels = client_pixels(sw, sh);
         let mut scene = Scene::new();
         scene.commit(SurfaceContent::from_rgba(pixels.clone(), sw, sh).unwrap());
-        let out = scene.compose(vw, vh);
+        let out = scene.compose(geom);
 
-        // Horizontally centered at 1:1; vertically the surface's central
-        // vh-tall band fills the whole view height.
-        let ox = (vw - sw) / 2; // 30
-        let cy = (sh - vh) / 2; // 15
+        // Horizontally centered at 1:1; vertically the surface is cropped
+        // against the USABLE rectangle (issue #304) and then clipped to the
+        // view, so a vh-tall band of it still fills the whole view height —
+        // just a different band. Read off the placement rather than restated,
+        // because restating it would be a second copy of the inset.
+        let placement = geom.place((sw, sh));
+        let ox = placement.x as u32;
+        let cy = (-placement.y) as u32;
+        assert!(cy > 0, "the fixture must actually crop vertically");
         for y in 0..vh {
             for x in 0..sw {
                 assert_eq!(px(&out, vw, ox + x, y), px(&pixels, sw, x, cy + y));
@@ -576,13 +629,17 @@ pub(crate) mod tests {
     fn larger_surface_is_center_cropped_unscaled() {
         let (vw, vh) = (40, 30);
         let (sw, sh) = (60, 50);
+        let geom: ViewGeometry = (vw, vh).into();
         let pixels = client_pixels(sw, sh);
         let mut scene = Scene::new();
         scene.commit(SurfaceContent::from_rgba(pixels.clone(), sw, sh).unwrap());
-        let out = scene.compose(vw, vh);
+        let out = scene.compose(geom);
 
-        // The view shows the surface's central vw x vh window, 1:1.
-        let (cx, cy) = ((sw - vw) / 2, (sh - vh) / 2);
+        // The view shows a vw x vh window of the surface, 1:1 — centred
+        // horizontally and, since issue #304, centred in the usable rectangle
+        // vertically and then clipped to the view.
+        let placement = geom.place((sw, sh));
+        let (cx, cy) = ((-placement.x) as u32, (-placement.y) as u32);
         for y in 0..vh {
             for x in 0..vw {
                 assert_eq!(px(&out, vw, x, y), px(&pixels, sw, cx + x, cy + y));
@@ -593,10 +650,23 @@ pub(crate) mod tests {
     #[test]
     fn client_alpha_is_forced_opaque() {
         // A translucent client buffer composites as opaque bytes: only the
-        // alpha byte changes, the color bytes are the client's own.
+        // alpha byte changes, the color bytes are the client's own. The view
+        // is one pixel wide and exactly one row taller than the reservation,
+        // so the single client pixel has a row of its own to land in.
+        let geom: ViewGeometry = (1u32, crate::consent::TRUST_BAND_HEIGHT + 1).into();
+        assert_eq!(geom.usable(), (1, 1));
         let mut scene = Scene::new();
         scene.commit(SurfaceContent::from_rgba(vec![0x10, 0x20, 0x30, 0x00], 1, 1).unwrap());
-        assert_eq!(scene.compose(1, 1), [0x10, 0x20, 0x30, 0xff]);
+        let out = scene.compose(geom);
+        assert_eq!(
+            px(&out, 1, 0, geom.reserved_top()),
+            [0x10, 0x20, 0x30, 0xff]
+        );
+        assert_eq!(
+            px(&out, 1, 0, 0),
+            LETTERBOX_RGBA,
+            "the band's rows are reserved"
+        );
     }
 
     /// **The matte painted only where the client will not cover it is
@@ -617,11 +687,12 @@ pub(crate) mod tests {
     #[test]
     fn compose_matches_a_whole_view_fill() {
         /// The implementation this replaced: fill every pixel, then blit.
-        fn naive(scene: &Scene, width: u32, height: u32) -> Vec<u8> {
-            let composed = scene.compose(width, height);
+        fn naive(scene: &Scene, geom: ViewGeometry) -> Vec<u8> {
+            let composed = scene.compose(geom);
             let Some(surface) = &scene.surface else {
                 return composed;
             };
+            let (width, height) = geom.output();
             let (vw, vh) = (width as usize, height as usize);
             let mut out = vec![0u8; vw * vh * BYTES_PER_PIXEL];
             for px in out.chunks_exact_mut(BYTES_PER_PIXEL) {
@@ -630,15 +701,21 @@ pub(crate) mod tests {
             if out.is_empty() {
                 return out;
             }
-            let placement = layout::place((width, height), (surface.width, surface.height));
+            // The one thing this naive version does NOT re-derive is the
+            // placement: it asks the same `ViewGeometry::place` the
+            // implementation does, because what is under test here is the
+            // matte's coverage, not where the client goes. A second copy of
+            // the placement arithmetic would make the comparison agree with a
+            // broken inset.
+            let placement = geom.place((surface.width, surface.height));
             let dst_x = placement.x.max(0) as usize;
-            let dst_y = placement.y.max(0) as usize;
+            let dst_y = (placement.y.max(0) as usize).min(vh);
             let src_x = (-placement.x).max(0) as usize;
             let src_y = (-placement.y).max(0) as usize;
             let sw = surface.width as usize;
             let sh = surface.height as usize;
-            let copy_w = (vw - dst_x).min(sw - src_x);
-            let copy_h = (vh - dst_y).min(sh - src_y);
+            let copy_w = vw.saturating_sub(dst_x).min(sw - src_x);
+            let copy_h = (vh - dst_y).min(sh.saturating_sub(src_y));
             for row in 0..copy_h {
                 let src_off = ((src_y + row) * sw + src_x) * BYTES_PER_PIXEL;
                 let dst_off = ((dst_y + row) * vw + dst_x) * BYTES_PER_PIXEL;
@@ -660,25 +737,34 @@ pub(crate) mod tests {
             (200, 90),
         ] {
             for (vw, vh) in [(64u32, 64u32), (101, 59), (17, 33), (1, 1), (0, 0), (5, 0)] {
-                let mut scene = Scene::new();
-                scene.commit(SurfaceContent::from_rgba(client_pixels(cw, ch), cw, ch).unwrap());
-                assert_eq!(
-                    scene.compose(vw, vh),
-                    naive(&scene, vw, vh),
-                    "client {cw}x{ch} in view {vw}x{vh}: the matte must be painted everywhere \
-                     the client does not cover, or an edge of the view is left black"
-                );
-                // ...and the letterbox really is present in at least one of
-                // these, or the comparison above is between two identical
-                // no-ops.
-                if (vw > cw || vh > ch) && vw > 0 && vh > 0 {
-                    assert!(
-                        scene
-                            .compose(vw, vh)
-                            .chunks_exact(BYTES_PER_PIXEL)
-                            .any(|px| px == LETTERBOX_RGBA),
-                        "client {cw}x{ch} in view {vw}x{vh} must letterbox"
+                // **Over both halves of the reservation** (issue #304): a
+                // `--status`-off session, which reserves the band's rows, and a
+                // `--status` one, which reserves the strip's on top of them.
+                // The matte's coverage is the property, and a taller
+                // reservation is the case most likely to leave an edge black.
+                for strip_h in [0, crate::status::DEFAULT_HEIGHT] {
+                    let geom = ViewGeometry::new((vw, vh), strip_h);
+                    let mut scene = Scene::new();
+                    scene.commit(SurfaceContent::from_rgba(client_pixels(cw, ch), cw, ch).unwrap());
+                    assert_eq!(
+                        scene.compose(geom),
+                        naive(&scene, geom),
+                        "client {cw}x{ch} in view {vw}x{vh} (strip {strip_h}): the matte must be \
+                         painted everywhere the client does not cover, or an edge of the view is \
+                         left black"
                     );
+                    // ...and the letterbox really is present in at least one of
+                    // these, or the comparison above is between two identical
+                    // no-ops.
+                    if (vw > cw || vh > ch) && vw > 0 && vh > 0 {
+                        assert!(
+                            scene
+                                .compose(geom)
+                                .chunks_exact(BYTES_PER_PIXEL)
+                                .any(|px| px == LETTERBOX_RGBA),
+                            "client {cw}x{ch} in view {vw}x{vh} must letterbox"
+                        );
+                    }
                 }
             }
         }
@@ -688,7 +774,10 @@ pub(crate) mod tests {
     fn compose_is_deterministic() {
         let mut scene = Scene::new();
         scene.commit(SurfaceContent::from_rgba(client_pixels(33, 17), 33, 17).unwrap());
-        assert_eq!(scene.compose(101, 59), scene.compose(101, 59));
+        assert_eq!(
+            scene.compose((101, 59).into()),
+            scene.compose((101, 59).into())
+        );
     }
 
     #[test]
@@ -700,7 +789,7 @@ pub(crate) mod tests {
         assert_ne!(g0, g1, "commit must bump the generation");
         scene.clear_surface();
         assert_ne!(g1, scene.generation(), "clear must bump the generation");
-        assert_eq!(scene.compose(64, 64), test_pattern::render(64, 64));
+        assert_eq!(scene.compose((64, 64).into()), test_pattern::render(64, 64));
     }
 
     // ------------------------------------------------------------------
@@ -723,7 +812,7 @@ pub(crate) mod tests {
             }),
         );
         assert_eq!(
-            scene.take_damage_view((64, 64)),
+            scene.take_damage_view((64u32, 64u32).into()),
             None,
             "the very first commit must report unbounded damage regardless of the hint"
         );
@@ -739,7 +828,7 @@ pub(crate) mod tests {
                 height: 8,
             }),
         );
-        scene.take_damage_view((64, 64)); // drain, so the next take is clean
+        scene.take_damage_view((64u32, 64u32).into()); // drain, so the next take is clean
         scene.commit_with_damage(
             SurfaceContent::from_rgba(client_pixels(16, 8), 16, 8).unwrap(),
             Some(DamageRect {
@@ -750,7 +839,7 @@ pub(crate) mod tests {
             }),
         );
         assert_eq!(
-            scene.take_damage_view((64, 64)),
+            scene.take_damage_view((64u32, 64u32).into()),
             None,
             "a geometry change must report unbounded damage"
         );
@@ -760,13 +849,13 @@ pub(crate) mod tests {
     fn a_commit_naming_no_damage_is_unbounded() {
         let mut scene = Scene::new();
         scene.commit(SurfaceContent::from_rgba(client_pixels(8, 8), 8, 8).unwrap());
-        scene.take_damage_view((64, 64)); // drain the initial unbounded state
+        scene.take_damage_view((64u32, 64u32).into()); // drain the initial unbounded state
         scene.commit_with_damage(
             SurfaceContent::from_rgba(client_pixels(8, 8), 8, 8).unwrap(),
             None,
         );
         assert_eq!(
-            scene.take_damage_view((64, 64)),
+            scene.take_damage_view((64u32, 64u32).into()),
             None,
             "a commit with no boundable hint must be treated as unbounded, not skipped"
         );
@@ -778,7 +867,7 @@ pub(crate) mod tests {
         let (sw, sh) = (40, 20);
         let mut scene = Scene::new();
         scene.commit(SurfaceContent::from_rgba(client_pixels(sw, sh), sw, sh).unwrap());
-        scene.take_damage_view((vw, vh)); // drain the initial unbounded state
+        scene.take_damage_view((vw, vh).into()); // drain the initial unbounded state
 
         // A 10x6 rectangle at (2, 3) in the surface's own coordinates.
         scene.commit_with_damage(
@@ -790,9 +879,9 @@ pub(crate) mod tests {
                 height: 6,
             }),
         );
-        let placement = layout::place((vw, vh), (sw, sh));
+        let placement = ViewGeometry::from((vw, vh)).place((sw, sh));
         assert_eq!(
-            scene.take_damage_view((vw, vh)),
+            scene.take_damage_view((vw, vh).into()),
             Some(DamageRect {
                 x: placement.x as i32 + 2,
                 y: placement.y as i32 + 3,
@@ -804,7 +893,7 @@ pub(crate) mod tests {
         // Taken: a further take with nothing new pending is unbounded
         // (nothing has changed, but there is also nothing bounded to hand
         // back — see PendingDamage::Clean).
-        assert_eq!(scene.take_damage_view((vw, vh)), None);
+        assert_eq!(scene.take_damage_view((vw, vh).into()), None);
     }
 
     #[test]
@@ -817,9 +906,9 @@ pub(crate) mod tests {
         let (sw, sh) = (60, 50);
         let mut scene = Scene::new();
         scene.commit(SurfaceContent::from_rgba(client_pixels(sw, sh), sw, sh).unwrap());
-        scene.take_damage_view((vw, vh));
+        scene.take_damage_view((vw, vh).into());
 
-        let placement = layout::place((vw, vh), (sw, sh));
+        let placement = ViewGeometry::from((vw, vh)).place((sw, sh));
         assert!(placement.x < 0, "the fixture must actually crop");
         // Damage confined to the cropped-away left margin (x in [0, -placement.x)).
         let margin = (-placement.x) as i32;
@@ -833,7 +922,7 @@ pub(crate) mod tests {
                 height: 1,
             }),
         );
-        let rect = scene.take_damage_view((vw, vh)).expect("bounded");
+        let rect = scene.take_damage_view((vw, vh).into()).expect("bounded");
         assert_eq!((rect.width, rect.height), (0, 0));
     }
 
@@ -841,9 +930,9 @@ pub(crate) mod tests {
     fn clearing_the_surface_is_unbounded_damage() {
         let mut scene = Scene::new();
         scene.commit(SurfaceContent::from_rgba(client_pixels(8, 8), 8, 8).unwrap());
-        scene.take_damage_view((64, 64));
+        scene.take_damage_view((64u32, 64u32).into());
         scene.clear_surface();
-        assert_eq!(scene.take_damage_view((64, 64)), None);
+        assert_eq!(scene.take_damage_view((64u32, 64u32).into()), None);
     }
 
     #[test]
@@ -851,7 +940,7 @@ pub(crate) mod tests {
         let (vw, vh) = (64, 64);
         let mut scene = Scene::new();
         scene.commit(SurfaceContent::from_rgba(client_pixels(64, 64), 64, 64).unwrap());
-        scene.take_damage_view((vw, vh));
+        scene.take_damage_view((vw, vh).into());
 
         scene.commit_with_damage(
             SurfaceContent::from_rgba(client_pixels(64, 64), 64, 64).unwrap(),
@@ -871,11 +960,15 @@ pub(crate) mod tests {
                 height: 4,
             }),
         );
+        // The union, translated by the same placement the composite draws
+        // with — read off `ViewGeometry::place` rather than restated, so a
+        // broken inset cannot be agreed with by a second copy of it.
+        let placement = ViewGeometry::from((vw, vh)).place((64, 64));
         assert_eq!(
-            scene.take_damage_view((vw, vh)),
+            scene.take_damage_view((vw, vh).into()),
             Some(DamageRect {
-                x: 0,
-                y: 0,
+                x: placement.x as i32,
+                y: placement.y as i32,
                 width: 24,
                 height: 24,
             }),

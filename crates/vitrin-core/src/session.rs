@@ -677,6 +677,27 @@ pub(crate) trait Presenter {
     /// overlap, no resize). The input router maps view coordinates to
     /// surface coordinates against it.
     fn view_size(&self) -> (u32, u32);
+    /// The session's status strip height in rows — [`crate::status::StatusStrip::height`],
+    /// which is `0` when `--status` is off.
+    ///
+    /// A backend implements *this* rather than [`Self::view_geometry`] on
+    /// purpose: the strip is the only per-backend input to the geometry, and
+    /// the derivation that turns it into reserved rows lives once, in
+    /// [`crate::view::ViewGeometry`]. A backend that computed its own geometry
+    /// would be the second place the inset is decided, which is the failure
+    /// issue #215 named and issue #304 closed.
+    fn status_height(&self) -> u32;
+    /// **The one geometry every placement and every `configure` comes from**
+    /// (issue #304): this output's size together with the rows the core keeps
+    /// above the client — the trusted band always, the status strip when
+    /// `--status` is on.
+    ///
+    /// Provided, never overridden: the two halves a backend actually owns are
+    /// [`Self::view_size`] and [`Self::status_height`], and this is the single
+    /// derivation from them.
+    fn view_geometry(&self) -> crate::view::ViewGeometry {
+        crate::view::ViewGeometry::new(self.view_size(), self.status_height())
+    }
     /// **Record a new output size.** The backend that owns the output has
     /// already changed it — this is the propagation, not the resize itself:
     /// it hands the new size to the scene registry, which bumps every realm's
@@ -1457,9 +1478,12 @@ pub(crate) fn start_realm_in<H: RuntimeHost>(
     // overlap, no resize. Every realm now has its own scene and its own
     // capture, but every one of them composes at this one geometry, so every
     // shim is still configured identically.
-    let (width, height) = {
+    // ...and it is the *geometry*, not the bare output size, since issue #304:
+    // what a shim is told at `configure` is the usable view, the output minus
+    // the rows the core reserves for the trusted band and the status strip.
+    let geom = {
         let (_, view) = host.split();
-        view.view_size()
+        view.view_geometry()
     };
 
     // Collected before the loop: `spawn_realm` needs `&Realm` out of the
@@ -1484,7 +1508,7 @@ pub(crate) fn start_realm_in<H: RuntimeHost>(
     }
 
     for realm_id in configured {
-        if let Err(err) = start_one_realm_in(host, paths, &realm_id, width, height) {
+        if let Err(err) = start_one_realm_in(host, paths, &realm_id, geom) {
             // Blocking, and safe to be: the event loop has not started (this
             // runs between `install` and `event_loop.run`), so there is no
             // dispatch to stall — and rung 0 still needs the loop *handle*,
@@ -1514,8 +1538,7 @@ fn start_one_realm_in<H: RuntimeHost>(
     host: &mut H,
     paths: &SpawnPaths,
     realm_id: &RealmId,
-    width: u32,
-    height: u32,
+    geom: crate::view::ViewGeometry,
 ) -> Result<(), Box<dyn Error>> {
     let spawned = {
         let runtime = host.runtime();
@@ -1532,7 +1555,7 @@ fn start_one_realm_in<H: RuntimeHost>(
         // (WS-E.1.1) — the journal's `spawned_by` field comes from here.
         spawn::spawn_realm(realm, paths, recorder, spawn::SpawnOrigin::Startup)?
     };
-    attach_spawned_realm(host, spawned, width, height)
+    attach_spawned_realm(host, spawned, geom)
 }
 
 /// **Steps 2–5 of [`start_one_realm_in`]**: everything after the fork.
@@ -1547,8 +1570,7 @@ fn start_one_realm_in<H: RuntimeHost>(
 fn attach_spawned_realm<H: RuntimeHost>(
     host: &mut H,
     mut spawned: spawn::SpawnedRealm,
-    width: u32,
-    height: u32,
+    geom: crate::view::ViewGeometry,
 ) -> Result<(), Box<dyn Error>> {
     // Read back rather than assumed: this is the id the spawn actually
     // derived every path it owns from — the realm's runtime directory, its
@@ -1560,7 +1582,7 @@ fn attach_spawned_realm<H: RuntimeHost>(
     let pid = spawned.pid();
 
     // Step 2: `configure` on the still-blocking fd, before calloop owns it.
-    let server = spawned.start_shim_session(width, height)?;
+    let server = spawned.start_shim_session(geom)?;
 
     let parts = spawned.into_parts();
     let handle = host.loop_handle();
@@ -3195,7 +3217,7 @@ fn apply_layout<H: RuntimeHost>(host: &mut H, acts: Vec<LayoutAct>) {
         return;
     }
     let (runtime, view) = host.split();
-    let view_size = view.view_size();
+    let view_geom = view.view_geometry();
     let mut rebound = false;
     for act in acts {
         match act {
@@ -3258,7 +3280,7 @@ fn apply_layout<H: RuntimeHost>(host: &mut H, acts: Vec<LayoutAct>) {
                 if mode != LayoutMode::Fullscreen {
                     continue;
                 }
-                reconfigure_realm(&realm, entry, view_size);
+                reconfigure_realm(&realm, entry, view_geom);
             }
         }
     }
@@ -3409,9 +3431,9 @@ fn apply_launches<H: RuntimeHost>(host: &mut H, launches: Vec<PendingLaunch>) {
     if launches.is_empty() {
         return;
     }
-    let (width, height) = {
+    let geom = {
         let (_, view) = host.split();
-        view.view_size()
+        view.view_geometry()
     };
     for launch in launches {
         // The journal first, always, and for both outcomes: what the
@@ -3435,7 +3457,7 @@ fn apply_launches<H: RuntimeHost>(host: &mut H, launches: Vec<PendingLaunch>) {
             );
             continue;
         }
-        if let Err(err) = attach_spawned_realm(host, spawned, width, height) {
+        if let Err(err) = attach_spawned_realm(host, spawned, geom) {
             tracing::error!(
                 instance = %minted,
                 %err,
@@ -3461,15 +3483,19 @@ fn apply_launches<H: RuntimeHost>(host: &mut H, launches: Vec<PendingLaunch>) {
 /// runtime condition, not an authority answer — the shim's death is the
 /// transport's to classify — so it is logged and swallowed here, exactly as
 /// the seat delivery path does.
-fn reconfigure_realm(realm: &RealmId, entry: &mut RealmRuntime, size: (u32, u32)) {
+fn reconfigure_realm(realm: &RealmId, entry: &mut RealmRuntime, geom: crate::view::ViewGeometry) {
     let Some(server) = entry.server.as_mut() else {
         return;
     };
     let outbox = &entry.outbox;
     let mut send = |frame: &[u8]| outbox.send(frame);
-    match server.reconfigure(size.0, size.1, &mut send) {
+    // Logged as the size the shim was actually told — the usable view, not the
+    // output — because that is the number an operator would compare against
+    // what the app reports (issue #304).
+    let (w, h) = geom.usable();
+    match server.reconfigure(geom, &mut send) {
         Ok(true) => tracing::info!(
-            %realm, w = size.0, h = size.1,
+            %realm, w, h,
             "the realm's view now tracks the output"
         ),
         // Already that size: the two arrangements are indistinguishable
@@ -3511,11 +3537,14 @@ pub(crate) fn apply_output_resize<H: RuntimeHost>(host: &mut H, size: (u32, u32)
     // (D-018(5), decision 4) — deliberately not `Scene::generation`, which
     // the damage path keys on and which a resize is not a repaint of.
     view.set_view_size(size);
+    // Read back *after* the propagation, so what the shims are told is derived
+    // from the size the presenter now holds rather than from the argument.
+    let geom = view.view_geometry();
     for (realm_id, entry) in runtime.realms.iter_mut() {
         if entry.arrangement != LayoutMode::Fullscreen {
             continue;
         }
-        reconfigure_realm(realm_id, entry, size);
+        reconfigure_realm(realm_id, entry, geom);
     }
 }
 
@@ -3663,7 +3692,7 @@ pub(crate) fn route_physical_turn<H: crate::input::PreemptionHook>(
     scenes: &crate::scene::realms::RealmScenes,
     switch: Option<&std::cell::RefCell<crate::deadman::DeadManSwitch>>,
     inputs: impl IntoIterator<Item = SeatInput>,
-    view: (u32, u32),
+    view: crate::view::ViewGeometry,
     now: Instant,
 ) {
     let Runtime {
@@ -3676,7 +3705,7 @@ pub(crate) fn route_physical_turn<H: crate::input::PreemptionHook>(
     // observed (doc comment above).
     router.observe_at(now);
     // **The seat target's own surface geometry** (WS-E.1.3): the router maps
-    // view coordinates to surface coordinates through `layout::place`, so it
+    // view coordinates to surface coordinates through `ViewGeometry::place`, so it
     // must be handed the geometry of the surface the event is about. With one
     // scene those were the same thing; with several, a hidden realm's
     // committed size would silently place a human's click for the app being
@@ -3722,7 +3751,7 @@ pub(crate) fn route_physical_turn<H: crate::input::PreemptionHook>(
     // it is the only one of the three that writes to a filesystem: whatever
     // its latency, an attention window and a clipboard gesture from the same
     // turn are already resolved before a `write(2)` is attempted.
-    drain_screenshot_gestures(runtime, scenes, view);
+    drain_screenshot_gestures(runtime, scenes, view.output());
     // ...and the brightness keys, after all four (D-041, issue #303). Last
     // because it is the only one of them that writes to a **kernel** file and
     // nothing else in this turn depends on it: an attention window, a clipboard
@@ -4485,7 +4514,7 @@ fn reconcile_pointer_constraints<H: RuntimeHost>(host: &mut H) {
             .as_ref()
             .and_then(|realm| view.scene(realm))
             .and_then(crate::scene::Scene::surface_size),
-        view: view.view_size(),
+        view: view.view_geometry(),
         // The HUMAN's pointer, never the shared one: an agent's actuation must
         // not be able to activate a lock, because activating one hides the
         // human's own cursor (`RealmSeat::human_pointer`).
@@ -4648,7 +4677,7 @@ fn route_seat<H: RuntimeHost>(host: &mut H, seat: Vec<(RealmId, SeatInput)>) {
         return;
     }
     let (runtime, view) = host.split();
-    let view_size = view.view_size();
+    let view_geom = view.view_geometry();
     let Runtime {
         router,
         realms,
@@ -4674,11 +4703,11 @@ fn route_seat<H: RuntimeHost>(host: &mut H, seat: Vec<(RealmId, SeatInput)>) {
         };
         // **The granted realm's own surface geometry** (WS-E.1.3). The router
         // maps view coordinates to surface coordinates through
-        // `layout::place`, so it must be handed the geometry of the surface
+        // `ViewGeometry::place`, so it must be handed the geometry of the surface
         // the event is about -- which is this grant's realm, whether or not
         // that realm is the one on screen.
         let surface = view.scene(realm_id).and_then(|scene| scene.surface_size());
-        let Some(delivery) = router.route_emulated(realm_id, input, view_size, surface) else {
+        let Some(delivery) = router.route_emulated(realm_id, input, view_geom, surface) else {
             continue;
         };
         let mut send = |frame: &[u8]| realm.outbox.send(frame);
@@ -5335,6 +5364,12 @@ mod tests {
     const OTHER_IDENTITY: &str = "vitrin://local/agent/other";
     const OTHER_TOKEN: &str = "1a2b3c4d5e6f70819a2b3c4d5e6f70819a2b3c4d5e6f70819a2b3c4d5e6f7081";
     const VIEW: (u32, u32) = (64, 40);
+    /// The rig's [`crate::view::ViewGeometry`]: [`VIEW`] with `--status` off,
+    /// so the reservation is the trusted band's rows and nothing else — which
+    /// is exactly what [`TestView`] reports through `Presenter::view_geometry`.
+    fn view_geom() -> crate::view::ViewGeometry {
+        VIEW.into()
+    }
     /// The wire id the rig's petition mints for its `vitrin_grant`.
     const GRANT_ID: u32 = 4;
 
@@ -5442,8 +5477,7 @@ mod tests {
                 &mut no_lock(),
                 &self.blank,
                 &mut no_status(),
-                w,
-                h,
+                (w, h).into(),
                 false,
             )
         }
@@ -5455,12 +5489,20 @@ mod tests {
             let (w, h) = self.size;
             self.scenes
                 .scene(realm)
-                .map(|scene| scene.compose(w, h))
+                .map(|scene| scene.compose((w, h).into()))
                 .unwrap_or_else(|| crate::test_pattern::render(w, h))
         }
     }
 
     impl Presenter for TestView {
+        /// No status strip in the in-crate test host: `--status` is opt-in and
+        /// nothing here passes it, so the reservation these tests run under is
+        /// the trusted band's rows alone — the same geometry every default
+        /// session has.
+        fn status_height(&self) -> u32 {
+            0
+        }
+
         /// The attention marker is presentation the invariant tests never
         /// assert on; what they *do* assert is that no arrangement puts
         /// anything into a capture, and this rig's `human_visible` goes
@@ -5540,7 +5582,7 @@ mod tests {
             // call, and a refresh that asked about a realm it should have
             // skipped must be visible whatever the answer was.
             *self.view_rgbas.entry(realm.clone()).or_insert(0) += 1;
-            Some(self.scenes.scene(realm)?.compose(VIEW.0, VIEW.1))
+            Some(self.scenes.scene(realm)?.compose((VIEW.0, VIEW.1).into()))
         }
         /// Counts the requests the nested backend turns into
         /// `Window::request_redraw`. Overridden rather than inherited as the
@@ -6224,7 +6266,7 @@ mod tests {
                 &rig.host.view.scenes,
                 Some(&switch),
                 crate::input::physical_key(evdev, None, state),
-                VIEW,
+                view_geom(),
                 Instant::now(),
             );
         };
@@ -6288,7 +6330,7 @@ mod tests {
         rig.host
             .runtime
             .router
-            .route_emulated(&realm, emulated, VIEW, None)
+            .route_emulated(&realm, emulated, view_geom(), None)
             .expect("an emulated key is delivered, not consumed");
         drain_backlight_steps(&mut rig.host.runtime);
         assert_eq!(
@@ -6373,7 +6415,7 @@ mod tests {
                 &rig.host.view.scenes,
                 Some(&switch),
                 crate::input::physical_key(evdev, None, state),
-                VIEW,
+                view_geom(),
                 Instant::now(),
             );
         };
@@ -6425,7 +6467,7 @@ mod tests {
                 .scenes
                 .scene(realm)
                 .expect("the realm has a scene")
-                .compose(VIEW.0, VIEW.1)
+                .compose((VIEW.0, VIEW.1).into())
                 .chunks_exact(4)
                 .flat_map(|p| [p[0], p[1], p[2]])
                 .collect()
@@ -9203,7 +9245,7 @@ mod tests {
                 &rig.host.view.scenes,
                 Some(&switch),
                 inputs,
-                VIEW,
+                view_geom(),
                 Instant::now(),
             );
         };
@@ -9644,7 +9686,7 @@ mod tests {
             crate::scene::SurfaceContent::from_rgba(crate::scene::tests::client_pixels(w, h), w, h)
                 .expect("well-formed fixture"),
         );
-        scene.compose(VIEW.0, VIEW.1)
+        scene.compose((VIEW.0, VIEW.1).into())
     }
 
     /// **THE confidentiality property (decision 1), byte-exact.**
@@ -10121,7 +10163,11 @@ mod tests {
         // What the output composites is the survivor's own view, not the
         // deterministic background.
         assert_eq!(
-            rig.host.view.scenes.bound().compose(VIEW.0, VIEW.1),
+            rig.host
+                .view
+                .scenes
+                .bound()
+                .compose((VIEW.0, VIEW.1).into()),
             want_b,
             "the output composites the survivor's pixels; a binding left on the dead realm \
              renders its cleared scene -- the background -- for the rest of the session"
@@ -10138,7 +10184,11 @@ mod tests {
             None
         );
         assert_eq!(
-            rig.host.view.scenes.bound().compose(VIEW.0, VIEW.1),
+            rig.host
+                .view
+                .scenes
+                .bound()
+                .compose((VIEW.0, VIEW.1).into()),
             crate::test_pattern::render(VIEW.0, VIEW.1),
             "with no realm serving the output is the documented deterministic background"
         );
@@ -10173,8 +10223,8 @@ mod tests {
         rig.host.runtime.router.route_emulated(
             &bound,
             SeatInput::emulated(crate::input::SeatInputKind::Motion { x: 12.0, y: 9.0 }),
-            VIEW,
-            Some(VIEW),
+            view_geom(),
+            Some(view_geom().usable()),
         );
         assert_eq!(
             rig.host.runtime.router.agent_pointer(&bound),
@@ -10196,8 +10246,8 @@ mod tests {
         rig.host.runtime.router.route_emulated(
             &hidden,
             SeatInput::emulated(crate::input::SeatInputKind::Motion { x: 30.0, y: 20.0 }),
-            VIEW,
-            Some(VIEW),
+            view_geom(),
+            Some(view_geom().usable()),
         );
         assert_eq!(
             rig.host.runtime.router.agent_pointer(&bound),
@@ -10937,7 +10987,7 @@ mod tests {
                     &rig.host.view.scenes,
                     Some(&switch),
                     crate::input::physical_key(EVDEV_A, Some(KEYSYM_A), state),
-                    VIEW,
+                    view_geom(),
                     Instant::now(),
                 );
             }
@@ -11361,7 +11411,7 @@ mod tests {
                     &rig.host.view.scenes,
                     None,
                     crate::input::physical_key(EVDEV_A, Some(KEYSYM_A), state),
-                    VIEW,
+                    view_geom(),
                     Instant::now(),
                 );
             }
@@ -11391,7 +11441,7 @@ mod tests {
                     &rig.host.view.scenes,
                     None,
                     crate::input::physical_key(chord.evdev(), None, state),
-                    VIEW,
+                    view_geom(),
                     Instant::now(),
                 );
             }
@@ -11756,7 +11806,7 @@ mod tests {
                 &rig.host.view.scenes,
                 None,
                 crate::input::physical_key(chord.evdev(), None, state),
-                VIEW,
+                view_geom(),
                 Instant::now(),
             );
         }
@@ -11909,7 +11959,7 @@ mod tests {
                     &rig.host.view.scenes,
                     None,
                     crate::input::physical_key(EVDEV_A, Some(KEYSYM_A), state),
-                    VIEW,
+                    view_geom(),
                     Instant::now(),
                 );
             }
@@ -12127,8 +12177,9 @@ mod tests {
                 .as_ref()
                 .expect("serving")
                 .configured_size(),
-            VIEW,
-            "a realm is spawned configured to the output's size"
+            view_geom().usable(),
+            "a realm is spawned configured to the output's USABLE view: the output minus the \
+             rows the core reserves above the client (issue #304)"
         );
 
         // Windowed first: the core imposes no size, so nothing is sent even
@@ -12151,7 +12202,7 @@ mod tests {
                 .as_ref()
                 .expect("serving")
                 .configured_size(),
-            VIEW,
+            view_geom().usable(),
             "windowed must impose no size: the realm keeps the one it had and the \
              compositor letterboxes it"
         );
@@ -12168,8 +12219,8 @@ mod tests {
                 .as_ref()
                 .expect("serving")
                 .configured_size(),
-            bigger,
-            "fullscreen must re-send configure at the output's size — the IDL's \
+            crate::view::ViewGeometry::new(bigger, 0).usable(),
+            "fullscreen must re-send configure at the output's usable view — the IDL's \
              'may be re-sent when the view resizes', finally exercised"
         );
     }
@@ -12233,9 +12284,9 @@ mod tests {
                 .as_ref()
                 .expect("serving")
                 .configured_size(),
-            bigger,
+            crate::view::ViewGeometry::new(bigger, 0).usable(),
             "a realm in the fullscreen arrangement must be re-configured at the output's \
-             new size: that is what 'the view size tracks the output's' means, and it is \
+             new usable view: that is what 'the view size tracks the output's' means, and it is \
              stated as normative wire semantics in the IDL, on prose page 18, in \
              `ShimServer::reconfigure`'s own docs and in D-022(4)"
         );
@@ -12245,7 +12296,7 @@ mod tests {
                 .as_ref()
                 .expect("serving")
                 .configured_size(),
-            VIEW,
+            view_geom().usable(),
             "a windowed realm must be left alone: the core imposes no size on it, so the \
              resize is exactly the moment the two modes stop being indistinguishable"
         );
@@ -12300,7 +12351,7 @@ mod tests {
             &rig.host.view.scenes,
             Some(&switch),
             crate::input::physical_key(EVDEV_LEFTCTRL, Some(KEYSYM_CONTROL_L), KeyState::Pressed),
-            VIEW,
+            view_geom(),
             Instant::now(),
         );
         assert_eq!(
@@ -12405,7 +12456,7 @@ mod tests {
                 x: at.0,
                 y: at.1,
             })],
-            VIEW,
+            view_geom(),
             Instant::now(),
         );
     }

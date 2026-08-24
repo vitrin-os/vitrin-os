@@ -2709,19 +2709,6 @@ The limit set follows.
     `const` assertion that turns an overgrown marker into a compile error.
   - The **dead-man hold indicator is still composited last of all**, so nothing
     added here can hide a hold in progress.
-- <!-- limit: status-strip-overdraws-the-view -->
-  **The status strip is opt-in, and the realm view is still NOT inset**
-  (created by WS-E.2.3). #215 asks for the app to be *configured* smaller by
-  `TRUST_BAND_HEIGHT + STATUS_STRIP_HEIGHT`; that is unmet, and the strip
-  therefore overdraws 20 rows of client content the way the band already
-  overdraws 8. A correct inset needs one usable-view value reaching
-  `scene::layout::place` from three paths (`Scene::compose`, the router's
-  `surface_local`, `dmabuf::human_visible_frame`) that share no carrier for a
-  second number, plus the `configure` size the shim is told — a `ViewGeometry`
-  refactor of its own, and a half-done version (one path reserving rows the
-  others do not) is strictly worse than none. `--status` is off by default so
-  no session pays the overdraw without asking; the cost is published in
-  `docs/book/src/limits.md`.
 - <!-- limit: status-strip-reads-sysfs -->
   **A recurring filesystem read inside the TCB** (created by WS-E.2.3). Before
   it, the core read `realm.toml` and `principals.toml` once at startup and

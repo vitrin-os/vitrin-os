@@ -351,6 +351,40 @@ realm view -> consent overlay -> lock cover -> STATUS STRIP -> trusted band
 - **The zero-copy draw list gained its first stateful member.** `dmabuf::human_visible_frame` was a pure function returning solid-colour draws, which is what made "no arm omits the band" structurally true. `Draw::StatusStrip` carries a rectangle only — the texture is the executor's — so the function stays pure, but the frame now depends on an upload that can fail. A failed upload drops the strip for that frame and logs; it never drops the band and never refuses to present, because the strip asserts nothing about authenticity and the band asserts everything.
 - **It is not a panel.** Three facts, no tray, no notifications, no workspace switcher, no click targets, and no interaction at all — a principal cannot receive physical input and the core is not taking a fifth gesture for a status bar.
 
+> **AMENDED 2026-08-24 BY [#304](https://github.com/vitrin-os/vitrin-os/issues/304): THE FIRST COST BULLET IS NO LONGER TRUE, AND NEITHER IS THIS ENTRY'S OWN HEADING.**
+> Everything above is left as written — a decision log that edits its own past
+> is worth nothing, and D-033's and D-034's amendments set the precedent this
+> follows. Exactly one bullet has stopped being true and it is named here.
+>
+> **False as of 2026-08-24: *"The realm view is NOT inset, and #215 asked for
+> it"*, and with it the heading's *"and the app's rows are still overdrawn"*.**
+> The `ViewGeometry` refactor that bullet describes as *"of its own"* is built:
+> `crates/vitrin-core/src/view.rs` carries one value — the output's size plus
+> the rows the core reserves — and it reaches all five sites the bullet
+> enumerates, `Scene::compose` and `Scene::take_damage_view`, the router's
+> `surface_local`, `dmabuf::human_visible_frame`, and the `configure` the shim
+> is told. The reservation is derived from `status::STRIP_TOP` rather than
+> restated, so the "two places computing the usable view rectangle" the bullet
+> feared has one. `docs/book/src/limits.md`'s `status-strip-overdraws-the-view`
+> limit was **deleted** rather than reworded, which is what #304's acceptance
+> criterion asks for.
+>
+> **Two things the bullet said that are still worth keeping.** The half-done
+> shape it warned about — one path reserving rows the others do not — is what
+> #304 was written to refuse, and it is now held by a test rather than by a
+> warning (`the_view_geometry_has_one_derivation` in
+> `crates/vitrin-core/src/view.rs`). And decision 5 above, `--status` off by
+> default, is **unchanged and for its original reason**: the byte-for-byte
+> comparison in `band_witness` and in `tests/integration/test_real_trust_band.py`
+> is still a function of wall-clock time with a clock on the screen. What
+> changed is only what the flag costs an app — a smaller `configure` instead of
+> overdrawn rows. **The trusted band's own 8 rows were never conditional and are
+> now reserved for every session**, `--status` or not, which is the half of this
+> that #215's text did not separate out.
+>
+> **Decision 1 is untouched and still load-bearing:** nothing is ever
+> composited into the band, and nothing in #304 goes near that.
+
 ---
 
 ### D-027 — The human's screenshot key reads the REALM VIEW, and it is a chord rather than a bare Print
@@ -1059,7 +1093,50 @@ So there are no rows to hand a shell realm. There are rows the core takes from t
 - **The status read may end up on the wire for a cosmetic.** See above; a `track:protocol` edit whose justification is a battery percentage is a bad trade that has to be made explicitly if it is made.
 - **[D-025](#d-025--a-locked-screen-does-not-suspend-agent-observation-the-gap-is-published-not-papered-over) is untouched and must stay untouched.** The lock cover composites above everything a realm draws, so a shell realm does not paint over a lock, and nothing here changes that. D-026(2) put the strip *over* the lock cover; the composite reconciliation in `crates/vitrin-core/src/backend/mod.rs:221-236` reversed it and accepted the cost in as many words — *"an opaque lock cover now hides the clock, so 'the strip is always there' gains the exception 'except behind a lock'"*. So the core's strip does **not** survive a lock today, a shell realm's pixels must not either, and the ordering that guarantees it is precisely the thing this decision changes. Whoever builds this must re-assert that ordering as a test rather than inherit it.
 
-**What cannot be known here, and is therefore not claimed.** **Nothing in this entry is built.** There is no code, no closed issue, no measurement and no hardware run behind any sentence above; it is a decision about work not yet done, and the numbers it will owe do not exist yet. When it is built, the halves CI can hold are the least interesting ones: that a shell realm's surface composites where the strip used to is a golden-image comparison, and headless is the only backend CI runs (D-019(4)); that the drawing client and the arranging principal are the same program is **not expressible as a test at all**; and that a human correctly stops trusting a clock that moved one row's worth of meaning is not a property of software. The honest status of this entry is **decided, unbuilt, and gated on a confinement question nobody has answered.**
+**What cannot be known here, and is therefore not claimed.** **Nothing in this entry is built.** There is no code, no closed issue, no measurement and no hardware run behind any sentence above; it is a decision about work not yet done, and the numbers it will owe do not exist yet.
+
+> **AMENDED 2026-08-24: THE INSET THIS ENTRY CALLED ITS LARGEST PIECE OF UNBUILT
+> WORK IS BUILT. NOTHING ELSE IN THE ENTRY IS.** Everything above stands as
+> written — the amendment convention D-033, D-034 and D-041 established, and the
+> reason is the same: a decision log that edits its own past is worth nothing.
+> Exactly three passages have stopped being true and they are named here.
+>
+> **False as of 2026-08-24: *"No rows are reserved."*** Rows are reserved.
+> `crates/vitrin-core/src/view.rs` holds `ViewGeometry` — an output size plus the
+> rows the core keeps above the client — and the `configure` a shim is sent now
+> carries `ViewGeometry::usable()`, so an app is *told* a smaller view instead of
+> having its top rows overdrawn. The trusted band's 8 rows are reserved for every
+> session; the status strip's rows are reserved on top of them only when
+> `--status` is on.
+>
+> **False with it: *"That is the `ViewGeometry` thread #215 asked for and closed
+> without … This entry does not build it"*, and the cost bullet *"The unmet inset
+> becomes blocking work this entry does not do, and nothing tracks it."*** It was
+> tracked, by this entry's own issue: [#304](https://github.com/vitrin-os/vitrin-os/issues/304)
+> carries the inset as a required task and it is that task, not the shell, that
+> landed on 2026-08-24. The value reaches all five sites this entry enumerates —
+> `Scene::compose`, `Scene::take_damage_view`, the router's `surface_local`,
+> `dmabuf::human_visible_frame`, and the shim's `configure` — and
+> `crates/vitrin-core/src/scene/layout.rs` did **not** grow: the translation
+> below the reserved rows is `ViewGeometry::place`'s, and `layout::place` is asked
+> the same question it always was.
+> [D-046](#d-046--a-shell-realm-reaches-the-core-socket-through-a-descriptor-the-core-mints-and-passes-down-the-spawn-path-it-already-has-the-authority-is-an-operators-declaration-and-a-humans-consent-and-what-the-connection-may-carry-is-fenced-structurally-rather-than-by-consent)'s
+> *"The `ViewGeometry` inset is untouched … it still has no issue"* is false on the
+> same date and for the same reason.
+>
+> **Everything else in this entry is still unbuilt.** No shell realm draws; the
+> core still draws the status strip itself; decision 2's *"stops drawing the
+> status strip itself"* has not happened; `limits.md`'s strip bullets still
+> describe a core-drawn strip. What the inset changed is only the *premise*: the
+> rows a shell realm would be composited into now exist as a reservation instead
+> of as overdraw, so the prerequisite this entry named is met and the decision it
+> gates is not.
+>
+> **One published claim was deleted rather than reworded**, per #304's acceptance
+> criterion: `docs/book/src/limits.md`'s `status-strip-overdraws-the-view` bullet
+> is gone from the page and from this workstream's `limit-set` region. The cost
+> bullet above — *"a published limit that changes meaning is worse than a new
+> one"* — is why it was deleted and not edited. When it is built, the halves CI can hold are the least interesting ones: that a shell realm's surface composites where the strip used to is a golden-image comparison, and headless is the only backend CI runs (D-019(4)); that the drawing client and the arranging principal are the same program is **not expressible as a test at all**; and that a human correctly stops trusting a clock that moved one row's worth of meaning is not a property of software. The honest status of this entry is **decided, unbuilt, and gated on a confinement question nobody has answered.**
 
 ---
 ### D-039 — Global hotkeys are served as named actions the core resolves, never as keystrokes it forwards; the attention key's one bit becomes an operator-configured chord table, and no verb for observing the human's input is designed
@@ -1534,7 +1611,7 @@ Three findings from that run carry the reasoning below, and they have three diff
 - **The core still cannot verify that the thing drawing the bar is the thing holding arrange.** D-038's security note stands. The descriptor route does give the core one thing a `connect()` route could not — it knows which realm it minted the connection for — but that is *realm*-level and only if the builder records it; it does not say which process inside the realm holds the descriptor, and the principal identity is still whatever credential `hello` presents. The pairing remains a deployment fact rather than an invariant, and no test in this workspace will assert it.
 - **Decision 2's disabled checkbox REVERSES what this core does today, and that is recorded here rather than left for whoever builds it to discover (derivation).** `crates/vitrin-core/src/consent/mod.rs`'s `PromptContent::choices` states the opposite rule and grounds it in PRD P2's honest-UI requirement: a durable rung is *absent* — *"not greyed out, not hidden-but-implied"* — *"because it is not representable, and a rung added later cannot be forgotten here"*, which `grants.rs:617` restates as *"absent, not hidden"*. Two tests pin it: `exactly_the_three_mvp_choices_are_rendered_for_a_while_running_petition`, and `a_once_petition_is_not_offered_a_longer_rung`, whose comment reads *"The button is ABSENT -- not disabled, not greyed -- for the same reason durable rungs are."* Note the loop: the **same** uninhabited `ProvenanceRef` that forces the `while_running` rung is why the control cannot be rendered at all today, so decision 2's two halves lean on one fact in opposite directions. The owner's clause is recorded as taken and is not softened here; what this bullet records is that it is a **change** to a shipped, tested, PRD-grounded design rather than an inheritance from it, and that building it means either re-arguing that rule against P2 or rendering the disabled control outside the rung row. It amends no *entry* — the rule lives in code, not in this log — and `docs/book/src/limits.md` now says the same thing.
 - **A credential still has to reach the shell realm, and nothing here says how.** The descriptor is transport; `hello` is mandatory and presents a credential to the pluggable verifier. How a confined realm comes to hold one — a file in its private storage, an allow-listed environment entry, a core-minted token — is **undecided**, and it is exactly where decision 2's clean "operator declares, human consents" could quietly become "the operator pasted a token into a realm's environment". Decision 2 is about authority, not about credential delivery; conflating the two is easy and is the reason this bullet exists.
-- **The `ViewGeometry` inset is untouched.** D-038 names it as the single largest piece of unbuilt work the shell decision implies, across `crate::scene::layout::place`, `Scene::compose`, the router's `surface_local`, `crate::dmabuf::human_visible_frame` and the shim's `configure` size. This entry does not build it, does not schedule it, and it still has **no issue**.
+- **The `ViewGeometry` inset is untouched.** D-038 names it as the single largest piece of unbuilt work the shell decision implies, across `crate::scene::layout::place`, `Scene::compose`, the router's `surface_local`, `crate::dmabuf::human_visible_frame` and the shim's `configure` size. This entry does not build it, does not schedule it, and it still has **no issue**. *(**Overtaken 2026-08-24**: the inset landed as a required task of [#304](https://github.com/vitrin-os/vitrin-os/issues/304) — `crates/vitrin-core/src/view.rs`, all five sites threaded — so the last clause was wrong when written and the rest is now spent. See D-038's amendment. This bullet stays as written; the correction is appended rather than substituted.)*
 - **The measurement is one box on one date**, and none of the boxes this project actually worries about. Not Ubuntu 24.04, not the ABI-6 VPS target, no sub-floor rung. It also does not establish that no route exists — only that none of the enumerated ones did there, and that an untruncated walk found no other socket inode.
 - **[D-025](#d-025--a-locked-screen-does-not-suspend-agent-observation-the-gap-is-published-not-papered-over) is untouched and must stay untouched.** A shell realm's pixels must not paint over a lock cover, exactly as D-038 requires, and whoever builds this re-asserts that ordering as a test rather than inheriting it.
 - **It says nothing about the status read.** D-038 reopened *"a recurring filesystem read inside the TCB"* as an open question — the battery and the clock a client-drawn strip would need. A descriptor to the core socket is not a hole into `/sys`, and this entry neither widens the mount table nor puts a battery percentage on the wire.

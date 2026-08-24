@@ -24,6 +24,16 @@
 //! Stacking, overlap and per-realm resize were all declined explicitly
 //! (issue #209 decision 3).
 //!
+//! **The view inset did not grow it either** (issue #304). The core reserves
+//! rows along the top edge for the trusted band and, when `--status` is on,
+//! the status strip, so a surface is centred in the *usable* rectangle rather
+//! than in the whole output. That could have arrived here as a second
+//! placement rule and deliberately did not: [`place`] is still asked the one
+//! question it has ever been asked — centre one surface in one rectangle —
+//! and [`crate::view::ViewGeometry::place`] is the single caller that knows
+//! the rectangle does not start at `y = 0`. That type lives outside this
+//! module for exactly the reason this paragraph exists.
+//!
 //! No decorations by construction: the shim disables server-side
 //! decorations via xdg-decoration (P1.6.1) and the core draws nothing
 //! around the surface — [`place`] returns a bare offset, there is no frame

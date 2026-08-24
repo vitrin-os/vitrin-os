@@ -613,6 +613,11 @@ impl DrmView {
         if size.w <= 0 || size.h <= 0 {
             return Ok(());
         }
+        // This frame's geometry, read once and shared by both branches (issue
+        // #304): the placement the client's pixels get and the rows the band
+        // and the strip are drawn into are one value, so the two presentation
+        // paths cannot reserve differently.
+        let geom = Presenter::view_geometry(self);
         // Sampled once for the whole frame, from one clock reading, exactly as
         // the nested backend samples it: a hold that completes mid-frame is
         // judged consistently within it.
@@ -647,7 +652,7 @@ impl DrmView {
                     .focused()
                     .and_then(|realm| self.scenes.scene(realm))
                     .and_then(crate::scene::Scene::surface_size),
-                view: (size.w.max(0) as u32, size.h.max(0) as u32),
+                view: geom,
                 // This backend's own accumulated position, which IS the human's
                 // pointer here: `DrmView::human_cursor` is fed only by
                 // `handle_libinput`, and the sprite is drawn at the same value.
@@ -680,7 +685,7 @@ impl DrmView {
             let sync = present_human_visible(
                 &mut self.output.renderer,
                 &mut framebuffer,
-                size,
+                geom,
                 SCANOUT_TRANSFORM,
                 content,
                 indicator,
@@ -715,7 +720,7 @@ impl DrmView {
             agent_cursor,
             human_cursor,
             self.attention,
-            size,
+            geom,
         );
         let buffer_size: Size<i32, Buffer> = (size.w, size.h).into();
         let full = Rectangle::from_size(size);
@@ -798,6 +803,10 @@ impl Presenter for DrmView {
         DrmView::view_size(self)
     }
 
+    fn status_height(&self) -> u32 {
+        self.status.height()
+    }
+
     /// Propagation, not a resize. Nothing in this backend changes mode after
     /// startup today, so in production this is unreached — exactly as the
     /// headless backend documents for its fixed virtual output. It is
@@ -853,7 +862,7 @@ impl Presenter for DrmView {
     /// because it retains a readable image that is *not* human-visible
     /// output).
     fn view_rgba(&mut self, realm: &RealmId) -> Option<Vec<u8>> {
-        super::winit::capture_pixels(self.scenes.scene(realm)?, self.output.mode)
+        super::winit::capture_pixels(self.scenes.scene(realm)?, Presenter::view_geometry(self))
     }
 
     /// Mark a presentation owed and try to queue it now.
@@ -1603,18 +1612,21 @@ impl DrmState {
     /// suite staying green.
     fn route_physical_inputs(&mut self, inputs: Vec<input::SeatInput>, view: (u32, u32)) {
         // Fed from the same local the route uses, on the line before it: a
-        // drifted hit test can turn a click aimed at Deny into an Allow.
+        // drifted hit test can turn a click aimed at Deny into an Allow. The
+        // consent card is drawn in OUTPUT coordinates, so the grab keeps the
+        // bare size while the router takes the geometry (issue #304).
         self.grab.borrow_mut().set_view(view);
         // One clock sample for the whole turn, so the grab, the dead-man
         // watcher and the presence tap judge it against one instant.
         self.now.set(Instant::now());
+        let geom = session::Presenter::view_geometry(&self.view);
         let scenes = &self.view.scenes;
         session::route_physical_turn(
             &mut self.runtime,
             scenes,
             Some(&self.deadman),
             inputs,
-            view,
+            geom,
             self.now.get(),
         );
         // Backstop 2 of 3 for the elapse check: a physical event is not a
@@ -2807,11 +2819,14 @@ mod tests {
             .commit(SurfaceContent::from_rgba(client_pixels(300, 200), 300, 200).expect("content"));
 
         // What `view_rgba` serves, from the function it serves it through.
-        let capture =
-            super::super::winit::capture_pixels(&scene, size).expect("a nonzero view has pixels");
+        let capture = super::super::winit::capture_pixels(
+            &scene,
+            (size.w.max(0) as u32, size.h.max(0) as u32).into(),
+        )
+        .expect("a nonzero view has pixels");
         assert_eq!(
             capture,
-            scene.compose(W as u32, H as u32),
+            scene.compose((W as u32, H as u32).into()),
             "the bare-metal capture must be the bare Scene::compose realm view"
         );
         // A degenerate mode has no realm view to serve, so the capture meets

@@ -276,7 +276,15 @@ pub(crate) fn render_once(size: Size<i32, Physical>) -> Result<Vec<u8>, Box<dyn 
     let buffer_size: Size<i32, Buffer> = (size.w, size.h).into();
     let mut framebuffer = renderer.create_buffer(Fourcc::Abgr8888, buffer_size)?;
 
-    let pixels = Scene::new().compose(size.w as u32, size.h as u32);
+    // **One of the three production sites that build a `ViewGeometry`**
+    // (`the_view_geometry_has_one_derivation`). An empty scene has no client
+    // to reserve rows for and this harness has no status strip, so `0` is the
+    // honest strip height rather than a shortcut: what it composes is the
+    // deterministic background of the whole output.
+    let pixels = Scene::new().compose(crate::view::ViewGeometry::new(
+        (size.w as u32, size.h as u32),
+        0,
+    ));
     composite(&mut renderer, &mut framebuffer, size, &pixels)?;
     readback(&mut renderer, &mut framebuffer, size)
 }
@@ -1178,6 +1186,10 @@ impl session::Presenter for HeadlessView {
         (size.w.max(0) as u32, size.h.max(0) as u32)
     }
 
+    fn status_height(&self) -> u32 {
+        self.output.status.height()
+    }
+
     /// Never called in production: this backend's virtual output is fixed at
     /// construction and has no resize event to raise one. Implemented rather
     /// than made to panic because "the output never resizes" is a property of
@@ -1221,14 +1233,12 @@ impl session::Presenter for HeadlessView {
         if self.scenes.focused() == Some(realm) {
             return self.latest_frame_rgba().ok();
         }
-        let (w, h) = (
-            self.output.size.w.max(0) as u32,
-            self.output.size.h.max(0) as u32,
-        );
+        let geom = session::Presenter::view_geometry(self);
+        let (w, h) = geom.output();
         if w == 0 || h == 0 {
             return None;
         }
-        Some(self.scenes.scene(realm)?.compose(w, h))
+        Some(self.scenes.scene(realm)?.compose(geom))
     }
 
     /// Take the router's agent-owned position for the sprite (D-019) — but
@@ -1658,6 +1668,24 @@ impl HeadlessView {
 }
 
 impl HeadlessOutput {
+    /// This output's [`crate::view::ViewGeometry`] (issue #304).
+    ///
+    /// **One of the three production sites that build one**, and the reason it
+    /// is not simply `session::Presenter::view_geometry` is
+    /// [`crate::lifecycle::RetainedOutput::scrub_retained_frame`]: the scrub
+    /// composites through [`Self::present`] holding only this struct, with no
+    /// `HeadlessView` and therefore no `Presenter` in reach. The two inputs are
+    /// the same two the trait's provided method names — the output's size and
+    /// [`crate::status::StatusStrip::height`] — and
+    /// `the_view_geometry_has_one_derivation` holds the set of sites that may
+    /// state them.
+    fn geometry(&self) -> crate::view::ViewGeometry {
+        crate::view::ViewGeometry::new(
+            (self.size.w.max(0) as u32, self.size.h.max(0) as u32),
+            self.status.height(),
+        )
+    }
+
     /// (Re)composite both retained images from `scene`.
     ///
     /// The single composition path: [`HeadlessView::redraw`] calls it with
@@ -1682,8 +1710,9 @@ impl HeadlessOutput {
             &RealmId,
         >,
     ) -> Result<(), Box<dyn Error>> {
-        let (w, h) = (self.size.w.max(0) as u32, self.size.h.max(0) as u32);
-        let view = scene.compose(w, h);
+        let geom = self.geometry();
+        let (w, h) = geom.output();
+        let view = scene.compose(geom);
         composite(
             &mut self.renderer,
             &mut self.view_framebuffer,
@@ -2215,13 +2244,19 @@ mod tests {
         let retained = state.latest_frame_rgba().expect("readback");
         assert_eq!(
             retained,
-            state.bound_scene().compose(VW, VH),
+            state.bound_scene().compose((VW, VH).into()),
             "retained framebuffer must be the shared Scene::compose output"
         );
 
-        // The client's shm bytes appear in the view, centered 1:1, matte
-        // around them (the letterbox decision).
-        let (ox, oy) = (((VW - SW) / 2) as usize, ((VH - SH) / 2) as usize);
+        // The client's shm bytes appear in the view, centered 1:1 inside the
+        // USABLE rectangle (issue #304), matte around them (the letterbox
+        // decision).
+        let geom: crate::view::ViewGeometry = (VW, VH).into();
+        let (uw, uh) = geom.usable();
+        let (ox, oy) = (
+            ((uw - SW) / 2) as usize,
+            (geom.reserved_top() + (uh - SH) / 2) as usize,
+        );
         for row in 0..SH as usize {
             let dst = ((oy + row) * VW as usize + ox) * test_pattern::BYTES_PER_PIXEL;
             let src = row * SW as usize * test_pattern::BYTES_PER_PIXEL;
@@ -2319,12 +2354,12 @@ mod tests {
             .scenes
             .scene(&bound)
             .expect("bound scene")
-            .compose(VW, VH);
+            .compose((VW, VH).into());
         let want_hidden = state
             .scenes
             .scene(&hidden)
             .expect("hidden scene")
-            .compose(VW, VH);
+            .compose((VW, VH).into());
         // Diagnosed rather than dumped: two view-sized buffers in an
         // `assert_eq!` message is a wall of bytes nobody reads, and the fact
         // that matters is *whose* pixels came back.
@@ -2415,7 +2450,11 @@ mod tests {
         let headless_capture = state.latest_frame_rgba().expect("headless readback");
         // Nested capture: the bare scene composed on the CPU, from the SAME
         // scene object that fed the headless readback above.
-        let nested_capture = capture_pixels(state.bound_scene(), size).expect("a nonzero view");
+        let nested_capture = capture_pixels(
+            state.bound_scene(),
+            (size.w.max(0) as u32, size.h.max(0) as u32).into(),
+        )
+        .expect("a nonzero view");
 
         // The P1.3.8 requirement: same scene, same pixels, byte for byte.
         assert_eq!(
@@ -2423,7 +2462,7 @@ mod tests {
             "nested and headless captures must be byte-identical for the same scene"
         );
         // ...and both are exactly the one shared composition.
-        assert_eq!(nested_capture, state.bound_scene().compose(VW, VH));
+        assert_eq!(nested_capture, state.bound_scene().compose((VW, VH).into()));
 
         // Overlay excluded on the nested side too: a prompt on the
         // human-visible composition changes it, but the nested capture is
@@ -2437,8 +2476,7 @@ mod tests {
             &mut no_lock(),
             &super::super::blank::BlankSurface::for_test(),
             &mut no_status(),
-            VW,
-            VH,
+            (VW, VH).into(),
             false,
         );
         assert_ne!(
@@ -2603,7 +2641,7 @@ mod tests {
         );
         assert_eq!(
             view,
-            state.bound_scene().compose(VW, VH),
+            state.bound_scene().compose((VW, VH).into()),
             "the capture source must be exactly Scene::compose -- the overlay \
              composites at the output stage, above this"
         );
@@ -2755,7 +2793,7 @@ mod tests {
              docs/book/src/limits.md rather than quietly fixed here"
         );
         assert!(
-            view == state.bound_scene().compose(VW, VH),
+            view == state.bound_scene().compose((VW, VH).into()),
             "the capture source must be exactly Scene::compose -- the lock composites at the \
              output stage, above this"
         );
@@ -2950,7 +2988,7 @@ mod tests {
         );
         assert_eq!(
             view,
-            state.bound_scene().compose(VW, VH),
+            state.bound_scene().compose((VW, VH).into()),
             "the capture source must be exactly Scene::compose -- the sprite composites \
              at the output stage, above this"
         );
@@ -3102,9 +3140,11 @@ mod tests {
         );
         assert_eq!(
             view,
-            state.bound_scene().compose(VW, VH),
-            "the capture source must be exactly Scene::compose -- the strip composites at the \
-             output stage, above this"
+            state
+                .bound_scene()
+                .compose(crate::session::Presenter::view_geometry(&state)),
+            "the capture source must be exactly Scene::compose at this session's own geometry \
+             -- the strip composites at the output stage, above this"
         );
         assert_eq!(
             ground(&view),
@@ -3439,8 +3479,7 @@ mod tests {
 
         let mut server = ShimServer::new(ShimConfig {
             realm: "realm-0".into(),
-            width: VW,
-            height: VH,
+            geom: (VW, VH).into(),
         });
         let size: Size<i32, Physical> = (VW as i32, VH as i32).into();
         let event_loop: EventLoop<'static, HeadlessView> =
@@ -3649,8 +3688,7 @@ mod tests {
                     &mut no_lock(),
                     &super::super::blank::BlankSurface::for_test(),
                     &mut no_status(),
-                    VW,
-                    VH,
+                    (VW, VH).into(),
                     false
                 ),
                 "retained output must be the shared compose (prompt_up = {prompt_up})"
@@ -3737,8 +3775,7 @@ mod tests {
                 &mut no_lock(),
                 &super::super::blank::BlankSurface::for_test(),
                 &mut no_status(),
-                VW,
-                VH,
+                (VW, VH).into(),
                 false
             ),
             "after a scrub the human-visible image must still be the shared \
@@ -3831,8 +3868,7 @@ mod tests {
             .expect("headless state under pixman"),
             server: Some(ShimServer::new(ShimConfig {
                 realm: "realm-0".into(),
-                width: W,
-                height: H,
+                geom: (W, H).into(),
             })),
             router: crate::input::InputRouter::detached(crate::input::NoopHook),
             start: Instant::now(),
@@ -3941,19 +3977,26 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         // Animated end-to-end, tear-free: each presented readback of the
-        // retained framebuffer is byte-exact frame k.
+        // retained framebuffer is the reserved rows as matte followed by
+        // byte-exact frame k. The mock renders at the size `configure` gave it,
+        // which since issue #304 is the USABLE view, so the composite is the
+        // inset observed through a real event loop.
         assert_eq!(state.presented.len(), FRAMES as usize);
+        let geom: crate::view::ViewGeometry = (W, H).into();
+        let (uw, uh) = geom.usable();
         for (k, frame) in state.presented.iter().enumerate() {
+            let mut expected =
+                crate::scene::LETTERBOX_RGBA.repeat((W * geom.reserved_top()) as usize);
+            expected.extend_from_slice(&frame_rgba(k as u32, uw, uh));
             assert_eq!(
-                frame,
-                &frame_rgba(k as u32, W, H),
-                "presented frame {k} must be the exact generator output"
+                frame, &expected,
+                "presented frame {k} must be the exact generator output, below the reserved rows"
             );
         }
         // After shim death the scene composes the deterministic background.
         assert!(state.server.is_none(), "server forgotten on disconnect");
         assert_eq!(
-            state.headless.bound_scene().compose(W, H),
+            state.headless.bound_scene().compose((W, H).into()),
             test_pattern::render(W, H),
             "shim death must drop the surface from the scene"
         );

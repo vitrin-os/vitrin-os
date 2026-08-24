@@ -377,11 +377,11 @@ pub(crate) fn window_pixels(
     agent_cursor: Option<(f64, f64)>,
     human_cursor: Option<(f64, f64)>,
     attention: bool,
-    size: Size<i32, Physical>,
+    geom: crate::view::ViewGeometry,
 ) -> Vec<u8> {
-    let (w, h) = (size.w.max(0) as u32, size.h.max(0) as u32);
+    let (w, h) = geom.output();
     let mut pixels =
-        super::compose_human_visible(scene, consent, lock, blank, status, w, h, attention);
+        super::compose_human_visible(scene, consent, lock, blank, status, geom, attention);
     // **After the lock cover, and before both cursors** (WS-E.3.5). After the
     // cover because the cover is opaque and the VT escape works *while
     // locked* (D-031(2)), so a notice drawn under it would be invisible in the
@@ -444,7 +444,7 @@ pub(crate) fn upload_status_texture<'t>(
     strip: &mut crate::status::StatusStrip,
     cache: &'t mut Option<(u64, u32, GlesTexture)>,
     width: u32,
-) -> Option<(&'t GlesTexture, u32)> {
+) -> Option<&'t GlesTexture> {
     let height = strip.height();
     if height == 0 || width == 0 {
         // Dropped rather than kept: a session that never turns the strip back
@@ -470,7 +470,7 @@ pub(crate) fn upload_status_texture<'t>(
             }
         }
     }
-    cache.as_ref().map(|(_, _, texture)| (texture, height))
+    cache.as_ref().map(|(_, _, texture)| texture)
 }
 
 /// **Whose retained texture this frame presents zero-copy** — the *bound*
@@ -591,14 +591,17 @@ pub(crate) fn zero_copy_source<'a, C>(
 ///
 /// `None` for a degenerate (zero-sized, e.g. minimized) window: there is no
 /// realm view, so the capture meets the chokepoint's `no_surface` refusal.
-pub(crate) fn capture_pixels(scene: &Scene, size: Size<i32, Physical>) -> Option<Vec<u8>> {
-    let (w, h) = (size.w.max(0) as u32, size.h.max(0) as u32);
+pub(crate) fn capture_pixels(scene: &Scene, geom: crate::view::ViewGeometry) -> Option<Vec<u8>> {
+    let (w, h) = geom.output();
     if w == 0 || h == 0 {
         return None;
     }
     // The bare realm view only — NOT `window_pixels`. Byte-for-byte what the
-    // headless backend retains and reads back for the same scene.
-    Some(scene.compose(w, h))
+    // headless backend retains and reads back for the same scene, **inset
+    // included** (issue #304): an agent's capture shows the app where the
+    // human sees it, with the reserved rows as matte, rather than 28 rows
+    // higher than the picture on the screen.
+    Some(scene.compose(geom))
 }
 
 // ============================================================================
@@ -2239,7 +2242,7 @@ pub(crate) fn route_turn<H: input::PreemptionHook>(
     router: &mut input::InputRouter<H>,
     switch: Option<&RefCell<DeadManSwitch>>,
     inputs: impl IntoIterator<Item = input::SeatInput>,
-    view: (u32, u32),
+    view: crate::view::ViewGeometry,
     surface: Option<(u32, u32)>,
     deliver: &mut dyn FnMut(input::SeatDelivery),
 ) {
@@ -2364,13 +2367,20 @@ impl NestedState {
         // Disjoint field borrows: `self.view.scenes` is read while
         // `self.runtime` is borrowed mutably, so they are split here rather
         // than reached through `&mut self` twice.
+        // The router maps into SURFACE coordinates, so it takes the geometry
+        // rather than the bare window size: the app's first row is below the
+        // rows the core reserves (issue #304), and a router that mapped against
+        // the output would put a click 28 rows too high in the app. The grab
+        // above keeps the bare size on purpose — the consent card is drawn in
+        // output coordinates, not the app's.
+        let geom = session::Presenter::view_geometry(&self.view);
         let scenes = &self.view.scenes;
         session::route_physical_turn(
             &mut self.runtime,
             scenes,
             Some(&self.deadman),
             inputs,
-            view,
+            geom,
             // The very sample taken above, not a second `Instant::now()`: the
             // grab, the watcher and the presence tap all judge this turn
             // against one instant.
@@ -2647,7 +2657,12 @@ impl NestedState {
                 // takes the backend: `renderer()` and `bind()` both want
                 // `self.view.backend`, and the returned borrow is of
                 // `status_texture` alone, so the two never overlap.
-                let status_width = size.w.max(0) as u32;
+                // The session's geometry, read once for this frame and shared
+                // by the strip's upload width and the draw list's placement
+                // (issue #304) -- so the rows the strip is drawn into and the
+                // rows the client is kept out of are one number.
+                let geom = session::Presenter::view_geometry(&self.view);
+                let status_width = geom.output().0;
                 let status = upload_status_texture(
                     self.view.backend.renderer(),
                     &mut self.view.status,
@@ -2668,7 +2683,7 @@ impl NestedState {
                 let _sync = present_human_visible(
                     renderer,
                     &mut framebuffer,
-                    size,
+                    geom,
                     // The window surface, not the offscreen harness — see
                     // `WINDOW_TRANSFORM`, which the CPU blit below reads too.
                     WINDOW_TRANSFORM,
@@ -2730,10 +2745,14 @@ impl NestedState {
         let scene_damage = if scene_dirty {
             self.view
                 .scenes
-                .take_bound_damage((size.w.max(0) as u32, size.h.max(0) as u32))
+                .take_bound_damage(session::Presenter::view_geometry(&self.view))
         } else {
             None
         };
+        // Read before the mutable field borrows below, exactly as `indicator`
+        // and `agent_cursor` are: `window_pixels` takes `&mut` to three of this
+        // struct's fields, so the geometry cannot be asked for inside the call.
+        let geom = session::Presenter::view_geometry(&self.view);
         if self.view.texture.as_ref().map(|v| &v.key) != Some(&key) {
             let pixels = window_pixels(
                 self.view.scenes.bound(),
@@ -2752,7 +2771,7 @@ impl NestedState {
                 // backend passes `Some` (WS-E.3.2, issue #218).
                 None,
                 self.view.attention,
-                size,
+                geom,
             );
             let buffer_size: Size<i32, Buffer> = (size.w, size.h).into();
 
@@ -3049,6 +3068,10 @@ impl session::Presenter for NestedView {
         (size.w.max(0) as u32, size.h.max(0) as u32)
     }
 
+    fn status_height(&self) -> u32 {
+        self.status.height()
+    }
+
     /// The host window is the output here, so its size is already the new one
     /// by the time `Resized` is dispatched — [`Self::view_size`] reads it
     /// back from the backend. What this propagates is the scene registry's
@@ -3149,7 +3172,10 @@ impl session::Presenter for NestedView {
         // realm has no privileged path here — nested composes on the CPU for
         // both, which is why this backend needed no second implementation to
         // stop leaking siblings' pixels.
-        capture_pixels(self.scenes.scene(realm)?, self.backend.window_size())
+        capture_pixels(
+            self.scenes.scene(realm)?,
+            session::Presenter::view_geometry(self),
+        )
     }
 
     fn request_present(&mut self) {
@@ -3580,7 +3606,7 @@ mod tests {
             None,
             None,
             false,
-            size,
+            (size.w.max(0) as u32, size.h.max(0) as u32).into(),
         );
 
         notice.raise(
@@ -3601,7 +3627,7 @@ mod tests {
             None,
             None,
             false,
-            size,
+            (size.w.max(0) as u32, size.h.max(0) as u32).into(),
         );
         assert_ne!(
             with, without,
@@ -3718,9 +3744,9 @@ mod tests {
             None,
             None,
             false,
-            size,
+            (size.w.max(0) as u32, size.h.max(0) as u32).into(),
         );
-        let composed = scene.compose(W as u32, H as u32);
+        let composed = scene.compose((W as u32, H as u32).into());
         let band_bytes =
             crate::consent::TRUST_BAND_HEIGHT as usize * W as usize * crate::scene::BYTES_PER_PIXEL;
         assert_eq!(
@@ -3761,7 +3787,7 @@ mod tests {
             None,
             None,
             false,
-            size,
+            (size.w.max(0) as u32, size.h.max(0) as u32).into(),
         );
         assert_ne!(
             with_prompt, plain,
@@ -3777,8 +3803,7 @@ mod tests {
                 &mut no_lock(),
                 &no_blank(),
                 &mut no_status(),
-                W as u32,
-                H as u32,
+                (W as u32, H as u32).into(),
                 false
             ),
             "nested must upload the same composition headless retains, so the \
@@ -3859,7 +3884,7 @@ mod tests {
                     None,
                     None,
                     false,
-                    size
+                    (size.w.max(0) as u32, size.h.max(0) as u32).into()
                 )),
                 indicator.color(),
                 "the CPU path dropped the trusted band (hold={hold:?})"
@@ -3878,7 +3903,7 @@ mod tests {
                 None,
                 None,
                 false,
-                size
+                (size.w.max(0) as u32, size.h.max(0) as u32).into()
             )),
             indicator.color(),
             "a raised prompt must not cover the band it is checked against"
@@ -3901,7 +3926,7 @@ mod tests {
                     Some(aim),
                     None,
                     false,
-                    size
+                    (size.w.max(0) as u32, size.h.max(0) as u32).into()
                 )),
                 indicator.color(),
                 "an agent's cursor at {aim:?} painted into the trusted band"
@@ -3914,7 +3939,13 @@ mod tests {
         // against `trust_band_rect(size)` — asserting a function's output
         // equals that same function's output is vacuous, and this test used
         // to pass with the band collapsed to zero size.
-        let draws = crate::dmabuf::human_visible_frame(size, (300, 200), indicator, None, None, 0);
+        let draws = crate::dmabuf::human_visible_frame(
+            (size.w.max(0) as u32, size.h.max(0) as u32).into(),
+            (300, 200),
+            indicator,
+            None,
+            None,
+        );
         let last = crate::dmabuf::HUMAN_VISIBLE_DRAWS - 1;
         let crate::dmabuf::Draw::TrustBand(band, band_rgba) = draws[last] else {
             panic!(
@@ -3993,7 +4024,7 @@ mod tests {
             None,
             None,
             false,
-            size,
+            (size.w.max(0) as u32, size.h.max(0) as u32).into(),
         );
         let with = window_pixels(
             &scene,
@@ -4006,7 +4037,7 @@ mod tests {
             Some(at),
             None,
             false,
-            size,
+            (size.w.max(0) as u32, size.h.max(0) as u32).into(),
         );
         assert_ne!(with, without, "the CPU path dropped the agent cursor");
         let count = |px: &[u8], rgba: [u8; 4]| {
@@ -4022,8 +4053,13 @@ mod tests {
         // same order, in the same colours — derived from one geometry function
         // (`crate::cursor::agent_cursor_rects`), which is why this can be an
         // equality rather than a family of hand-written expectations.
-        let draws =
-            crate::dmabuf::human_visible_frame(size, (400, 300), indicator, Some(at), None, 0);
+        let draws = crate::dmabuf::human_visible_frame(
+            (size.w.max(0) as u32, size.h.max(0) as u32).into(),
+            (400, 300),
+            indicator,
+            Some(at),
+            None,
+        );
         let gpu: Vec<_> = draws
             .iter()
             .filter_map(|draw| match draw {
@@ -4045,9 +4081,15 @@ mod tests {
         // ...and a frame with no cursor really has none, so the equality above
         // is not passing on an unconditional draw.
         assert!(
-            crate::dmabuf::human_visible_frame(size, (400, 300), indicator, None, None, 0)
-                .iter()
-                .all(|draw| !matches!(draw, crate::dmabuf::Draw::AgentCursor(..))),
+            crate::dmabuf::human_visible_frame(
+                (size.w.max(0) as u32, size.h.max(0) as u32).into(),
+                (400, 300),
+                indicator,
+                None,
+                None
+            )
+            .iter()
+            .all(|draw| !matches!(draw, crate::dmabuf::Draw::AgentCursor(..))),
             "the zero-copy path drew a cursor for a frame that has none"
         );
     }
@@ -4080,10 +4122,11 @@ mod tests {
         // == headless capture for the same scene" — the cross-backend proof
         // is made concrete against the real pixman readback in
         // `backend::headless`'s `nested_and_headless_captures_are_byte_identical`.
-        let capture = capture_pixels(&scene, size).expect("a nonzero view has pixels");
+        let capture = capture_pixels(&scene, (size.w.max(0) as u32, size.h.max(0) as u32).into())
+            .expect("a nonzero view has pixels");
         assert_eq!(
             capture,
-            scene.compose(W as u32, H as u32),
+            scene.compose((W as u32, H as u32).into()),
             "the nested capture must be the bare Scene::compose realm view"
         );
 
@@ -4098,8 +4141,7 @@ mod tests {
             &mut no_lock(),
             &no_blank(),
             &mut no_status(),
-            W as u32,
-            H as u32,
+            (W as u32, H as u32).into(),
             false,
         );
         assert_ne!(
@@ -4130,7 +4172,7 @@ mod tests {
             None,
             None,
             false,
-            size,
+            (size.w.max(0) as u32, size.h.max(0) as u32).into(),
         );
         assert_ne!(
             capture, with_hold,
@@ -4151,7 +4193,7 @@ mod tests {
             Some((400.0, 300.0)),
             None,
             false,
-            size,
+            (size.w.max(0) as u32, size.h.max(0) as u32).into(),
         );
         assert_ne!(
             capture, with_cursor,
@@ -4177,8 +4219,16 @@ mod tests {
 
         // A degenerate (minimized) window has no realm view to serve, so the
         // capture meets the chokepoint's `no_surface` refusal.
-        assert!(capture_pixels(&scene, size_of(0, 0)).is_none());
-        assert!(capture_pixels(&scene, size_of(W, 0)).is_none());
+        assert!(capture_pixels(
+            &scene,
+            (size_of(0, 0).w.max(0) as u32, size_of(0, 0).h.max(0) as u32).into()
+        )
+        .is_none());
+        assert!(capture_pixels(
+            &scene,
+            (size_of(W, 0).w.max(0) as u32, size_of(W, 0).h.max(0) as u32).into()
+        )
+        .is_none());
     }
 
     /// **The nested window shows the bound realm, and the texture key knows
@@ -4236,7 +4286,7 @@ mod tests {
             None,
             None,
             false,
-            size,
+            (size.w.max(0) as u32, size.h.max(0) as u32).into(),
         );
         assert_eq!(
             window_a,
@@ -4246,8 +4296,7 @@ mod tests {
                 &mut no_lock(),
                 &no_blank(),
                 &mut no_status(),
-                W as u32,
-                H as u32,
+                (W as u32, H as u32).into(),
                 false
             ),
             "the host window must be the bound realm's own composition"
@@ -4279,7 +4328,7 @@ mod tests {
             None,
             None,
             false,
-            size,
+            (size.w.max(0) as u32, size.h.max(0) as u32).into(),
         );
         assert!(
             window_a != window_b,
@@ -4312,12 +4361,24 @@ mod tests {
         // is bound — this backend composes both on the CPU, so the bound one
         // has no privileged path.
         assert_eq!(
-            capture_pixels(scenes.scene(&a).unwrap(), size).expect("a nonzero view"),
-            scenes.scene(&a).unwrap().compose(W as u32, H as u32)
+            capture_pixels(
+                scenes.scene(&a).unwrap(),
+                (size.w.max(0) as u32, size.h.max(0) as u32).into()
+            )
+            .expect("a nonzero view"),
+            scenes
+                .scene(&a)
+                .unwrap()
+                .compose((W as u32, H as u32).into())
         );
         assert!(
-            capture_pixels(scenes.scene(&a).unwrap(), size)
-                != capture_pixels(scenes.scene(&b).unwrap(), size),
+            capture_pixels(
+                scenes.scene(&a).unwrap(),
+                (size.w.max(0) as u32, size.h.max(0) as u32).into()
+            ) != capture_pixels(
+                scenes.scene(&b).unwrap(),
+                (size.w.max(0) as u32, size.h.max(0) as u32).into()
+            ),
             "two realms' captures must differ while both are live"
         );
     }
@@ -4859,7 +4920,7 @@ mod tests {
             None,
             None,
             false,
-            size,
+            (size.w.max(0) as u32, size.h.max(0) as u32).into(),
         );
         assert_eq!(
             idle,
@@ -4869,8 +4930,7 @@ mod tests {
                 &mut no_lock(),
                 &no_blank(),
                 &mut no_status(),
-                W as u32,
-                H as u32,
+                (W as u32, H as u32).into(),
                 false
             )
         );
@@ -4887,7 +4947,7 @@ mod tests {
             None,
             None,
             false,
-            size,
+            (size.w.max(0) as u32, size.h.max(0) as u32).into(),
         );
         assert_ne!(holding, idle, "a hold in progress must be visible");
         let below = (8 * W * 4) as usize;
@@ -4911,7 +4971,7 @@ mod tests {
             None,
             None,
             false,
-            size,
+            (size.w.max(0) as u32, size.h.max(0) as u32).into(),
         );
         let prompt_and_hold = window_pixels(
             &scene,
@@ -4924,7 +4984,7 @@ mod tests {
             None,
             None,
             false,
-            size,
+            (size.w.max(0) as u32, size.h.max(0) as u32).into(),
         );
         assert_ne!(prompt_and_hold, prompt_only);
 
@@ -5377,8 +5437,8 @@ mod tests {
         // The human's attention has to be somewhere for a physical delivery
         // to have a destination (WS-E.1.6).
         assert!(router.bind_to(&crate::input::tests::test_realm()).is_none());
-        let view = (640u32, 480u32);
-        let surface = Some(view);
+        let view: crate::view::ViewGeometry = (640u32, 480u32).into();
+        let surface = Some(view.usable());
         let mut delivered: Vec<input::SeatDeliveryKind> = Vec::new();
 
         // The press alone reaches nobody: it is withheld pending the
@@ -5453,10 +5513,14 @@ mod tests {
             Rc::clone(&now),
             input::NoopHook,
         ));
-        let view = (640u32, 480u32);
+        let view: crate::view::ViewGeometry = (640u32, 480u32).into();
 
         assert_eq!(deadman.borrow().deadline(), None);
-        let _ = router.route_physical(crate::input::tests::chord_press(), view, Some(view));
+        let _ = router.route_physical(
+            crate::input::tests::chord_press(),
+            view,
+            Some(view.usable()),
+        );
         assert_eq!(
             deadman.borrow().deadline(),
             Some(now.get() + crate::deadman::DEFAULT_HOLD),

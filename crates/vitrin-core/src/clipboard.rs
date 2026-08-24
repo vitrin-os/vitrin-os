@@ -866,7 +866,9 @@ mod tests {
                          state: KeyState,
                          delivered: &mut Vec<_>| {
                 for input in crate::input::physical_key(evdev, None, state) {
-                    if let Some(d) = router.route_physical(input, (640, 480), Some((640, 480))) {
+                    if let Some(d) =
+                        router.route_physical(input, (640u32, 480u32).into(), Some((640, 480)))
+                    {
                         delivered.push(d);
                     }
                 }

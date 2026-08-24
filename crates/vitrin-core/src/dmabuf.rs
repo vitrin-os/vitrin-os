@@ -159,7 +159,8 @@ use vitrin_protocol::generated::vitrin_view::Format;
 
 use crate::consent::{TrustedIndicator, TRUST_BAND_HEIGHT};
 use crate::grants::RealmId;
-use crate::scene::{layout, BYTES_PER_PIXEL, LETTERBOX_RGBA};
+use crate::scene::{BYTES_PER_PIXEL, LETTERBOX_RGBA};
+use crate::view::ViewGeometry;
 
 /// Counter of core-side CPU copies of client pixels — the zero-copy
 /// instrumentation. Bumped by the shim server at its one copy site (the shm
@@ -626,7 +627,7 @@ pub(crate) enum Draw {
     /// Clear the whole view to the letterbox matte.
     Matte,
     /// Blit the client's imported texture into this destination rectangle,
-    /// 1:1 and unscaled ([`layout::place`]).
+    /// 1:1 and unscaled ([`ViewGeometry::place`]).
     Content(Rectangle<i32, Physical>),
     /// Fill this rectangle with a piece of the agent cursor sprite
     /// ([`crate::cursor`]). Human-visible only, like everything else here,
@@ -723,7 +724,7 @@ const AGENT_CURSOR_SLOT: usize = 3;
 const HUMAN_CURSOR_SLOT: usize = AGENT_CURSOR_SLOT + crate::cursor::AGENT_CURSOR_RECTS;
 
 /// Everything one human-visible GPU frame draws, in order: the letterbox
-/// matte, the client's content at its [`layout::place`] position, the agent
+/// matte, the client's content at its [`ViewGeometry::place`] position, the agent
 /// cursor sprite if one is shown, and the trusted band last.
 ///
 /// **The band is not optional and there is no arm of this function that
@@ -748,21 +749,34 @@ const HUMAN_CURSOR_SLOT: usize = AGENT_CURSOR_SLOT + crate::cursor::AGENT_CURSOR
 /// and GPU paths cannot draw different crosshairs — the drift
 /// [`trust_band_rect`] exists to prevent for the band.
 ///
-/// `status_h` is the status strip's height in rows
-/// ([`crate::status::StatusStrip::height`]), `0` when the session has no strip.
-/// It rides in the draw list for the same reason the band and the cursor do —
-/// so a presentation path gets it by construction — but unlike the band it is
-/// legitimately absent, and `every_zero_copy_frame_ends_with_the_trusted_band`
-/// checks the band is still the *last* draw either way.
+/// `geom` is this output's [`ViewGeometry`] (issue #304): its size, and the
+/// rows the core reserves above the client. **It subsumes the `status_h: u32`
+/// this function used to take beside the view size** — that parameter was
+/// partial awareness of exactly this problem, the GPU path knowing the strip's
+/// height because it had to draw it, and leaving it alongside a `ViewGeometry`
+/// would be the second carrier for one number that #304 exists to remove. The
+/// strip's height is [`ViewGeometry::strip_height`], `0` when the session has
+/// no strip; it rides in the draw list for the same reason the band and the
+/// cursor do — so a presentation path gets it by construction — but unlike the
+/// band it is legitimately absent, and
+/// `every_zero_copy_frame_ends_with_the_trusted_band` checks the band is still
+/// the *last* draw either way.
+///
+/// The content rectangle comes from [`ViewGeometry::place`], the same call the
+/// CPU compositor and the input router make, so the zero-copy path reserves the
+/// same rows they do — the "one path reserving rows the others do not" failure
+/// that made a half-done inset worse than none.
 pub(crate) fn human_visible_frame(
-    view: Size<i32, Physical>,
+    geom: ViewGeometry,
     content: (u32, u32),
     indicator: TrustedIndicator,
     agent_cursor: Option<(f64, f64)>,
     human_cursor: Option<(f64, f64)>,
-    status_h: u32,
 ) -> [Draw; HUMAN_VISIBLE_DRAWS] {
-    let placement = layout::place((view.w.max(0) as u32, view.h.max(0) as u32), content);
+    let (vw, vh) = geom.output();
+    let view: Size<i32, Physical> = (vw as i32, vh as i32).into();
+    let status_h = geom.strip_height();
+    let placement = geom.place(content);
     let dst = Rectangle::new(
         (placement.x as i32, placement.y as i32).into(),
         (content.0 as i32, content.1 as i32).into(),
@@ -883,8 +897,12 @@ pub(crate) const MEMORY_TARGET_TRANSFORM: Transform = Transform::Normal;
 /// way — which is the defect first light found (`backend::drm`'s
 /// `SCANOUT_TRANSFORM`).
 ///
-/// `status` is the status strip's already-uploaded texture and its height in
-/// rows, or `None` for a session with no strip. It is a *texture* rather than a
+/// `geom` is this output's [`ViewGeometry`]: its size, and the rows the core
+/// reserves above the client (issue #304). The strip's height rides in it, so
+/// this function is not handed one number twice.
+///
+/// `status` is the status strip's already-uploaded texture, or `None` for a
+/// session with no strip. It is a *texture* rather than a
 /// forced fall-back to the CPU compositor because this path exists precisely
 /// because 2560x1600@240 cannot be CPU-composited: a re-upload of one
 /// 2560x20 RGBA texture is 200 KiB, and the snapshot changes once a minute
@@ -897,22 +915,23 @@ pub(crate) const MEMORY_TARGET_TRANSFORM: Transform = Transform::Normal;
 pub(crate) fn present_human_visible(
     renderer: &mut GlesRenderer,
     framebuffer: &mut smithay::backend::renderer::gles::GlesTarget<'_>,
-    view: Size<i32, Physical>,
+    geom: ViewGeometry,
     transform: Transform,
     content: &GpuContent,
     indicator: TrustedIndicator,
     agent_cursor: Option<(f64, f64)>,
     human_cursor: Option<(f64, f64)>,
-    status: Option<(&GlesTexture, u32)>,
+    status: Option<&GlesTexture>,
 ) -> Result<SyncPoint, GlesError> {
+    let (vw, vh) = geom.output();
+    let view: Size<i32, Physical> = (vw as i32, vh as i32).into();
     let mut frame = renderer.render(framebuffer, view, transform)?;
     for draw in human_visible_frame(
-        view,
+        geom,
         (content.width, content.height),
         indicator,
         agent_cursor,
         human_cursor,
-        status.map_or(0, |(_, height)| height),
     ) {
         match draw {
             // An empty cursor slot. Nothing to submit, and deliberately not
@@ -966,7 +985,7 @@ pub(crate) fn present_human_visible(
             // when the caller passed a texture, so the `else` is unreachable
             // defence rather than a mode.
             Draw::StatusStrip(rect) => {
-                if let Some((texture, _)) = status {
+                if let Some(texture) = status {
                     Frame::render_texture_from_to(
                         &mut frame,
                         texture,
@@ -1153,7 +1172,13 @@ mod tests {
             // same positions in the same loop, because a bare-metal frame
             // carries both and the band's slot must survive either.
             for cursor in [None, Some((10.0, 10.0)), Some((0.0, 0.0))] {
-                let draws = human_visible_frame(size, content, indicator, cursor, cursor, 0);
+                let draws = human_visible_frame(
+                    (size.w.max(0) as u32, size.h.max(0) as u32).into(),
+                    content,
+                    indicator,
+                    cursor,
+                    cursor,
+                );
                 assert_eq!(draws[0], Draw::Matte, "{view:?}/{content:?}");
                 assert!(
                     matches!(draws[1], Draw::Content(_)),
@@ -1228,10 +1253,16 @@ mod tests {
         let indicator = TrustedIndicator::from_rgb(0x11, 0x22, 0x33);
         let size: Size<i32, Physical> = (800, 600).into();
         let count = |cursor| {
-            human_visible_frame(size, (400, 300), indicator, cursor, None, 0)
-                .iter()
-                .filter(|draw| matches!(draw, Draw::AgentCursor(..)))
-                .count()
+            human_visible_frame(
+                (size.w.max(0) as u32, size.h.max(0) as u32).into(),
+                (400, 300),
+                indicator,
+                cursor,
+                None,
+            )
+            .iter()
+            .filter(|draw| matches!(draw, Draw::AgentCursor(..)))
+            .count()
         };
         assert_eq!(count(None), 0);
         assert_eq!(
@@ -1257,7 +1288,13 @@ mod tests {
         let at = Some((100.0, 100.0));
 
         // Human only: the agent's slots stay empty.
-        let human_only = human_visible_frame(size, (400, 300), indicator, None, at, 0);
+        let human_only = human_visible_frame(
+            (size.w.max(0) as u32, size.h.max(0) as u32).into(),
+            (400, 300),
+            indicator,
+            None,
+            at,
+        );
         assert_eq!(
             human_only
                 .iter()
@@ -1271,7 +1308,13 @@ mod tests {
 
         // Both at once -- the bare-metal frame -- and every slot of both is
         // filled, with the band still last.
-        let both = human_visible_frame(size, (400, 300), indicator, at, at, 0);
+        let both = human_visible_frame(
+            (size.w.max(0) as u32, size.h.max(0) as u32).into(),
+            (400, 300),
+            indicator,
+            at,
+            at,
+        );
         assert_eq!(
             both.iter()
                 .filter(|d| matches!(d, Draw::AgentCursor(..)))
@@ -1392,7 +1435,13 @@ mod tests {
         let indicator = TrustedIndicator::from_rgb(0x7F, 0x10, 0xC0);
         let size: Size<i32, Physical> = (640, 480).into();
 
-        let off = human_visible_frame(size, (400, 300), indicator, None, None, 0);
+        let off = human_visible_frame(
+            (size.w.max(0) as u32, size.h.max(0) as u32).into(),
+            (400, 300),
+            indicator,
+            None,
+            None,
+        );
         assert!(
             matches!(off[HUMAN_VISIBLE_DRAWS - 1], Draw::TrustBand(..)),
             "the band must be the last draw"
@@ -1402,7 +1451,13 @@ mod tests {
             "a session with no strip must emit no strip draw"
         );
 
-        let on = human_visible_frame(size, (400, 300), indicator, None, None, 20);
+        let on = human_visible_frame(
+            ViewGeometry::new((size.w.max(0) as u32, size.h.max(0) as u32), 20),
+            (400, 300),
+            indicator,
+            None,
+            None,
+        );
         assert_eq!(
             off[HUMAN_VISIBLE_DRAWS - 1],
             on[HUMAN_VISIBLE_DRAWS - 1],
@@ -1765,8 +1820,7 @@ mod gpu_tests {
         let (mut core, shim_conn) = Connection::pair().expect("socketpair");
         let mut server = ShimServer::new(ShimConfig {
             realm: "realm-0".into(),
-            width: W,
-            height: H,
+            geom: (W, H).into(),
         });
         server
             .send_configure(&mut |frame| core.send_message(frame, None))
@@ -1883,7 +1937,7 @@ mod gpu_tests {
             ),
             "shm buffer released promptly, got {shm_release:?}"
         );
-        assert_eq!(scene.compose(W, H), frame_rgba(7, W, H));
+        assert_eq!(scene.compose((W, H).into()), frame_rgba(7, W, H));
         assert_eq!(
             (
                 server.copy_meter().copies(),
@@ -1927,8 +1981,7 @@ mod gpu_tests {
         let (mut core, shim_conn) = Connection::pair().expect("socketpair");
         let mut server = ShimServer::new(ShimConfig {
             realm: "realm-0".into(),
-            width: W,
-            height: H,
+            geom: (W, H).into(),
         });
         server
             .send_configure(&mut |frame| core.send_message(frame, None))
@@ -1980,7 +2033,7 @@ mod gpu_tests {
     }
 
     /// The center-crop acceptance for [`render_content`]: content larger
-    /// than the view (legal mid-resize; [`layout::place`] goes negative)
+    /// than the view (legal mid-resize; [`ViewGeometry::place`] goes negative)
     /// must fill the **whole** view with the client's central pixels, 1:1 —
     /// exactly what `Scene::compose` does on the CPU path. Pins the
     /// dst-local damage contract of `Frame::render_texture_from_to`:

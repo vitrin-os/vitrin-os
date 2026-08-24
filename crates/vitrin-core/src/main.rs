@@ -369,6 +369,14 @@ mod test_pattern;
 /// TOML crate out of the TCB; having a single lexer is what keeps that
 /// choice from multiplying parsers.
 mod toml_subset;
+/// **The usable realm view** (issue #304): `ViewGeometry`, the one value that
+/// carries an output's size together with the rows the core reserves above the
+/// client — the trusted band always, the status strip when `--status` is on.
+/// Every path that places client pixels and the `configure` the shim is told
+/// take the placement from it, which is what closes the unmet half of issue
+/// #215: the app is configured smaller instead of having its top rows
+/// overdrawn.
+mod view;
 /// **The VT escape** (WS-E.3.5, D-031): `Ctrl-Alt-F1`..`Ctrl-Alt-F12`, matched
 /// on physical input only, consumed in every realm, and turned into the one
 /// `Session::change_vt` call this workspace contains. Bare metal only, because

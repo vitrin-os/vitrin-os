@@ -842,7 +842,8 @@ mod tests {
         assert_eq!(pressed.len(), 1, "the chord must survive the intake table");
         let mut delivered = Vec::new();
         for input in pressed {
-            if let Some(d) = router.route_physical(input, (640, 480), Some((640, 480))) {
+            if let Some(d) = router.route_physical(input, (640u32, 480u32).into(), Some((640, 480)))
+            {
                 delivered.push(d);
             }
         }

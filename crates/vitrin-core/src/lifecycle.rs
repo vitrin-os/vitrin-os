@@ -1641,7 +1641,7 @@ mod tests {
             // (P1.5.2's lesson -- `/proc/<pid>/exe` flipping only proves
             // the kernel installed the image, with ld.so still running).
             let mut server = spawned
-                .start_shim_session(VIEW_W, VIEW_H)
+                .start_shim_session((VIEW_W, VIEW_H).into())
                 .expect("configure must reach the shim over the inherited socketpair");
             let msg = spawned
                 .connection_mut()
@@ -1869,7 +1869,7 @@ mod tests {
             // was there to go stale.
             wait_until_painted(&mut rig, &mut life);
             assert!(life.view_is_live(&rig.scene), "the realm must be live");
-            let painted = rig.scene.compose(VIEW_W, VIEW_H);
+            let painted = rig.scene.compose((VIEW_W, VIEW_H).into());
             assert_ne!(
                 painted,
                 crate::test_pattern::render(VIEW_W, VIEW_H),
@@ -1973,7 +1973,7 @@ mod tests {
         wait_until_painted(&mut rig, &mut life);
 
         // Before: a capture on this live view really produces a frame.
-        let view = rig.scene.compose(VIEW_W, VIEW_H);
+        let view = rig.scene.compose((VIEW_W, VIEW_H).into());
         assert!(life.view_is_live(&rig.scene));
         let before = crate::principal::tests::capture_once(Some(crate::capture::RealmViewFrame {
             rgba: &view,
@@ -1999,7 +1999,7 @@ mod tests {
         // After: the embedder derives `realm_view` from the ONE seam, and
         // it is now None -- so the pre-existing chokepoint refuses.
         assert!(!life.view_is_live(&rig.scene));
-        let composed = rig.scene.compose(VIEW_W, VIEW_H);
+        let composed = rig.scene.compose((VIEW_W, VIEW_H).into());
         let after = crate::principal::tests::capture_once(life.view_is_live(&rig.scene).then_some(
             crate::capture::RealmViewFrame {
                 rgba: &composed,

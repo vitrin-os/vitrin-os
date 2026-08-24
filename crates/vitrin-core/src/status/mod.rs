@@ -95,34 +95,44 @@
 //! and by `tests/integration/test_real_trust_band.py`. A strip on by default
 //! would make that comparison — and every human-visible golden — a function of
 //! wall-clock time for every session that never asked for a status bar. It also
-//! costs the app rows (see the next section), which a session that did not ask
+//! costs the app rows (see the next section) — now as a smaller `configure`
+//! rather than as overdraw, but still rows — which a session that did not ask
 //! for a strip should not pay.
 //!
-//! # The realm view is NOT inset, and that is an unmet part of issue #215
+//! # The realm view IS inset, and the strip's rows are the conditional half
 //!
-//! Issue #215 asks for the app to be *configured* smaller by
-//! `TRUST_BAND_HEIGHT + STATUS_STRIP_HEIGHT`, so it lays out correctly instead
-//! of having its top rows silently overdrawn. **That is not implemented here**,
-//! and the strip therefore overdraws [`DEFAULT_HEIGHT`] rows of client content
-//! the way the band already overdraws 8.
+//! Issue #215 asked for the app to be *configured* smaller by
+//! `TRUST_BAND_HEIGHT + STATUS_STRIP_HEIGHT` so it lays out correctly instead
+//! of having its top rows silently overdrawn. **That landed under issue #304**,
+//! as [`crate::view::ViewGeometry`]: one value carrying the output's size and
+//! the rows the core keeps, threaded through every path that places a client's
+//! pixels — [`crate::scene::Scene::compose`], [`crate::scene::Scene::take_damage_view`],
+//! the input router's `surface_local`, [`crate::dmabuf::human_visible_frame`] —
+//! and through the `configure` the shim is told
+//! ([`crate::shim::ShimServer::send_configure`]). The failure the issue itself
+//! named — *"two places computing the usable view rectangle is how the CPU and
+//! GPU paths drift"* — is answered by there being one: every one of those sites
+//! asks [`crate::view::ViewGeometry::place`], and the reservation is derived
+//! from [`STRIP_TOP`] rather than restated.
 //!
-//! The reason is worth stating rather than hiding, because the issue itself
-//! names the failure the fix would risk: "two places computing the usable view
-//! rectangle is how the CPU and GPU paths drift". A correct inset means one
-//! usable-view value reaching [`crate::scene::layout::place`] — which is asked
-//! by [`crate::scene::Scene::compose`], by the router's `surface_local`, and by
-//! [`crate::dmabuf::human_visible_frame`], three paths that receive the view
-//! size from three different places and share no carrier for a second number.
-//! Threading it means a `ViewGeometry` value travelling everywhere a `(u32,
-//! u32)` travels today, plus the `configure` size the shim is told; making it a
-//! process-global instead trades that churn for a mutable global inside the TCB
-//! and a test harness that cannot isolate it. Neither is a change that belongs
-//! bolted onto a status strip, and a half-done inset — one path reserving rows
-//! the others do not — is strictly worse than none.
+//! **Which rows are conditional, and which are not.** The two halves of the
+//! reservation do not have the same status and the difference is the one a
+//! reader is most likely to get wrong:
 //!
-//! Until it lands: `--status` is opt-in, so no session pays the overdraw
-//! without asking, and the cost is published in `docs/book/src/limits.md` as
-//! what it is.
+//! - The **trusted band's [`TRUST_BAND_HEIGHT`] rows are unconditional**. The
+//!   band is drawn on every human-visible frame, last of all, with no arm of
+//!   either compositor omitting it — so a session that never passed `--status`
+//!   is still inset by 8. It was inset by nothing before #304, which is why
+//!   the band's own overdraw was part of the same defect rather than a separate
+//!   one.
+//! - The **strip's [`DEFAULT_HEIGHT`] rows are conditional**, because
+//!   `--status` is opt-in. With it off [`StatusStrip::height`] is `0` and the
+//!   reservation is the band's rows alone; `ViewGeometry::new` takes that
+//!   height rather than a flag, so "no strip" is `0` and not a special case.
+//!
+//! What a session pays for `--status`, then, is exactly the strip's own rows —
+//! not the band's, which every session pays — and it pays them by being
+//! *configured* for them rather than by losing them.
 
 pub(crate) mod battery;
 pub(crate) mod render;

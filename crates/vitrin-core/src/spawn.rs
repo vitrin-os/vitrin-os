@@ -1121,13 +1121,11 @@ impl SpawnedRealm {
     /// non-blocking path.
     pub fn start_shim_session(
         &mut self,
-        width: u32,
-        height: u32,
+        geom: crate::view::ViewGeometry,
     ) -> Result<ShimServer, TransportError> {
         let server = ShimServer::new(ShimConfig {
             realm: self.realm_id.as_str().to_string(),
-            width,
-            height,
+            geom,
         });
         let conn = &mut self.connection;
         server.send_configure(&mut |bytes: &[u8]| conn.send_message(bytes, None))?;
@@ -4525,7 +4523,7 @@ pub(crate) mod tests {
     /// construction, not merely made less likely.
     fn bring_up_shim(spawned: &mut SpawnedRealm) -> (ShimServer, vitrin_ipc::Message) {
         let server = spawned
-            .start_shim_session(1280, 800)
+            .start_shim_session((1280u32, 800u32).into())
             .expect("configure must reach the shim over the inherited socketpair");
         let msg = spawned
             .connection_mut()

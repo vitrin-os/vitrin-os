@@ -319,8 +319,14 @@ impl From<TransportError> for ShimFault {
 /// geometry the shim advertises to its app.
 pub(crate) struct ShimConfig {
     pub realm: String,
-    pub width: u32,
-    pub height: u32,
+    /// **The output's geometry, not the size the app is told** (issue #304).
+    /// `configure` carries [`crate::view::ViewGeometry::usable`] — the output
+    /// minus the rows the core reserves for the trusted band and, when
+    /// `--status` is on, the status strip. Holding the whole geometry rather
+    /// than the already-subtracted pair is what stops this struct becoming a
+    /// second place the inset is computed: there is exactly one subtraction and
+    /// it is `ViewGeometry`'s.
+    pub geom: crate::view::ViewGeometry,
 }
 
 /// A staged (pending) buffer: the decoded `attach`, fd owned until the
@@ -550,14 +556,25 @@ impl ShimServer {
     /// shim connection, guaranteed to precede the processing of any shim
     /// request. Call once, immediately after establishing the connection
     /// and before dispatching anything the shim sent.
+    ///
+    /// **It carries the USABLE view, not the output size** (issue #304). The
+    /// IDL calls this argument "the realm-view size the shim advertises to its
+    /// app", and the app's view really is the output minus the rows the core
+    /// keeps: the trusted band always, the status strip when `--status` is on.
+    /// Sending the output size is what made the app lay out for rows that were
+    /// then overdrawn — the fourth of the five sites #304 threads, and the only
+    /// one that is observable off this machine. No wire change: the argument,
+    /// its type and its description are untouched; only the number is now
+    /// true.
     pub fn send_configure<F>(&self, send: &mut F) -> Result<(), TransportError>
     where
         F: FnMut(&[u8]) -> Result<(), TransportError>,
     {
+        let (width, height) = self.config.geom.usable();
         let configure = session::events::Configure {
             realm: self.config.realm.clone(),
-            width: self.config.width,
-            height: self.config.height,
+            width,
+            height,
         };
         send(&configure.encode(SHIM_SESSION_ID))
     }
@@ -585,18 +602,16 @@ impl ShimServer {
     /// so nothing a shim could have cached about who it is can change here.
     pub fn reconfigure<F>(
         &mut self,
-        width: u32,
-        height: u32,
+        geom: crate::view::ViewGeometry,
         send: &mut F,
     ) -> Result<bool, TransportError>
     where
         F: FnMut(&[u8]) -> Result<(), TransportError>,
     {
-        if (self.config.width, self.config.height) == (width, height) {
+        if self.config.geom == geom {
             return Ok(false);
         }
-        self.config.width = width;
-        self.config.height = height;
+        self.config.geom = geom;
         self.send_configure(send)?;
         Ok(true)
     }
@@ -611,7 +626,7 @@ impl ShimServer {
     /// as a real `configure`, rather than that a flag flipped.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn configured_size(&self) -> (u32, u32) {
-        (self.config.width, self.config.height)
+        self.config.geom.usable()
     }
 
     /// Dispatch one decoded frame from the shim connection.
@@ -1398,14 +1413,54 @@ pub(crate) mod tests {
     const VIEW_H: u32 = 48;
     const SURFACE_ID: u32 = 2;
 
+    /// The geometry these tests run at: an output of `VIEW_W x VIEW_H` with
+    /// `--status` off, so the reservation is the trusted band's rows and nothing
+    /// else — the geometry of every default session.
+    fn geom() -> crate::view::ViewGeometry {
+        (VIEW_W, VIEW_H).into()
+    }
+
+    /// The realm view one mock frame composes to.
+    ///
+    /// **The inset, observed end to end** (issue #304): [`MockShim`] renders its
+    /// buffers at the size `configure` gave it, which since #304 is the *usable*
+    /// view, so a composed frame is the reserved rows as matte followed by the
+    /// client's own buffer — flush, with nothing between them and nothing of the
+    /// client's overdrawn.
+    ///
+    /// Written as "matte, then the buffer" rather than by re-deriving a
+    /// placement, deliberately: a helper that called `ViewGeometry::place` would
+    /// agree with a broken placement by copying it.
+    fn composed(frame: u32) -> Vec<u8> {
+        let (uw, uh) = geom().usable();
+        matte_then(geom(), &frame_rgba(frame, uw, uh))
+    }
+
+    /// A `--status`-off geometry whose **usable** view is `w x h`: the output
+    /// is that plus the reserved rows. What a test that wants an app of a
+    /// given size asks for, now that the app is not told the output's height.
+    fn usable_geom(w: u32, h: u32) -> crate::view::ViewGeometry {
+        let reserved = crate::consent::TRUST_BAND_HEIGHT;
+        crate::view::ViewGeometry::new((w, h + reserved), 0)
+    }
+
+    /// The composed view of a client buffer that exactly fills `geom.usable()`:
+    /// the reserved rows as matte, then the buffer. Assembled rather than
+    /// placed, so it cannot agree with a broken `ViewGeometry::place`.
+    fn matte_then(geom: crate::view::ViewGeometry, client: &[u8]) -> Vec<u8> {
+        let mut out =
+            crate::scene::LETTERBOX_RGBA.repeat((geom.output().0 * geom.reserved_top()) as usize);
+        out.extend_from_slice(client);
+        out
+    }
+
     /// A fresh server + socketpair: core end, shim end, with `configure`
     /// already sent (the guaranteed-first message).
     fn setup() -> (ShimServer, Scene, Connection, Connection) {
         let (mut core, shim) = Connection::pair().expect("socketpair");
         let server = ShimServer::new(ShimConfig {
             realm: "realm-0".into(),
-            width: VIEW_W,
-            height: VIEW_H,
+            geom: (VIEW_W, VIEW_H).into(),
         });
         server
             .send_configure(&mut |frame| core.send_message(frame, None))
@@ -1538,6 +1593,113 @@ pub(crate) mod tests {
         }
     }
 
+    /// **The inset, stated as the property it protects** (issue #304, the unmet
+    /// half of issue #215).
+    ///
+    /// An app is told a view size at `configure` and lays out for exactly it.
+    /// This drives that end to end — real socketpair, real `configure`, the mock
+    /// shim rendering a buffer at the size it was told, a real commit latched
+    /// into the scene — and then runs the human-visible output stage over the
+    /// composed view with `--status` **on**. The assertion is the one an inset
+    /// exists to make true: **every client pixel that reached the realm view is
+    /// still on the human's screen.**
+    ///
+    /// It is a component test, not milestone evidence: [`MockShim`] is a
+    /// unit-test scaffold and no claim here rests on a mock-free gate.
+    ///
+    /// **It fails without the inset, and that was measured rather than
+    /// assumed.** Written first against the pre-change tree — where `configure`
+    /// carried the output's full height — it reported `left: 1280, right: 3072`:
+    /// of the 64x48 = 3072 client pixels in the realm view, only 64x20 = 1280
+    /// survived the output stage, the band's 8 rows and the strip's 20 having
+    /// overdrawn exactly `28 * 64 = 1792` of them.
+    #[test]
+    fn a_configured_app_loses_no_row_to_the_band_or_the_strip() {
+        let _fd = crate::capture::tests::fd_lock();
+
+        // A session that asked for a strip, so BOTH halves of the reservation
+        // are live: the band's rows, which no session declines, and the
+        // strip's, which this one opted into. The server is built at that
+        // geometry -- the same one `Presenter::view_geometry` hands the runtime
+        // -- so the `configure` the mock reads is the usable view of a
+        // `--status` session, not of a default one.
+        let mut strip = crate::status::StatusStrip::with_root(
+            crate::status::tests::on(),
+            std::path::Path::new("/nonexistent/vitrin/power_supply"),
+        );
+        assert!(strip.refresh(
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(45_296),
+            std::time::Instant::now(),
+            None,
+        ));
+        assert_eq!(strip.height(), crate::status::DEFAULT_HEIGHT);
+        let with_strip = crate::view::ViewGeometry::new((VIEW_W, VIEW_H), strip.height());
+
+        let (mut core, shim) = Connection::pair().expect("socketpair");
+        let mut server = ShimServer::new(ShimConfig {
+            realm: "realm-0".into(),
+            geom: with_strip,
+        });
+        server
+            .send_configure(&mut |frame| core.send_message(frame, None))
+            .expect("configure");
+        let mut scene = Scene::new();
+        let mut mock = MockShim::start(shim).expect("bring-up");
+        assert_eq!((mock.width, mock.height), with_strip.usable());
+
+        // The app renders at exactly the size `configure` gave it.
+        mock.attach_frame(0).unwrap();
+        mock.commit().unwrap();
+        assert!(process_n(&mut server, &mut scene, &mut core, 4).unwrap());
+        let view = scene.compose(with_strip);
+
+        let indicator = crate::consent::TrustedIndicator::for_test();
+        let output = crate::backend::human_visible_from_view(
+            view.clone(),
+            &mut crate::consent::ConsentSurface::new(indicator),
+            &mut crate::lock::LockSurface::new(indicator),
+            &crate::backend::blank::BlankSurface::for_test(),
+            &mut strip,
+            VIEW_W,
+            VIEW_H,
+            false,
+        );
+
+        // The client's own pixels, counted on both sides of the output stage.
+        // The mock's frames are a pure function of (frame, x, y) and share no
+        // value with the matte, the band or the strip's greys, so this counts
+        // client content and nothing else.
+        let (uw, uh) = with_strip.usable();
+        let client = frame_rgba(0, uw, uh);
+        let distinct: std::collections::BTreeSet<[u8; 4]> = client
+            .chunks_exact(4)
+            .map(|p| [p[0], p[1], p[2], p[3]])
+            .collect();
+        let count = |buf: &[u8]| -> usize {
+            buf.chunks_exact(4)
+                .filter(|p| distinct.contains(&[p[0], p[1], p[2], p[3]]))
+                .count()
+        };
+        let in_view = count(&view);
+        assert!(
+            in_view > 0,
+            "the realm view must carry client pixels at all"
+        );
+        assert_eq!(
+            count(&output),
+            in_view,
+            "the band and the strip overdrew client rows: the app was configured \
+             at the output's full height instead of the usable view"
+        );
+
+        // ...and the strip really did draw, so the equality above is not the
+        // equality of two frames with no chrome on either.
+        assert_ne!(
+            view, output,
+            "the output stage must have changed the frame, or nothing was drawn to overdraw with"
+        );
+    }
+
     #[test]
     fn configure_is_the_first_message_with_the_assigned_identity() {
         let _fd = crate::capture::tests::fd_lock();
@@ -1548,7 +1710,20 @@ pub(crate) mod tests {
             session::events::Configure::decode(&msg.bytes, msg.fd).unwrap();
         assert_eq!(object_id, SHIM_SESSION_ID);
         assert_eq!(configure.realm, "realm-0");
-        assert_eq!((configure.width, configure.height), (VIEW_W, VIEW_H));
+        // **The USABLE view, not the output** (issue #304): the shim is told
+        // what its app actually has, which is the output minus the rows the
+        // core reserves — here the trusted band's, `--status` being off.
+        assert_eq!(
+            (configure.width, configure.height),
+            geom().usable(),
+            "configure must carry the usable view, or the app lays out for rows it never sees"
+        );
+        assert_ne!(
+            (configure.width, configure.height),
+            (VIEW_W, VIEW_H),
+            "...and the usable view is really smaller than the output, or the assertion above \
+             would hold with no inset at all"
+        );
     }
 
     #[test]
@@ -1556,7 +1731,11 @@ pub(crate) mod tests {
         let _fd = crate::capture::tests::fd_lock();
         let (mut server, mut scene, mut core, shim) = setup();
         let mut mock = MockShim::start(shim).expect("bring-up");
-        assert_eq!((mock.width, mock.height), (VIEW_W, VIEW_H));
+        assert_eq!(
+            (mock.width, mock.height),
+            geom().usable(),
+            "the app renders at the size `configure` gave it: the usable view"
+        );
 
         // create_surface, then one full frame: attach + damage + commit.
         mock.attach_frame(0).unwrap();
@@ -1565,7 +1744,7 @@ pub(crate) mod tests {
         assert!(committed, "commit must ask the embedder to redraw");
 
         // Atomic latch: the scene now composes exactly frame 0.
-        assert_eq!(scene.compose(VIEW_W, VIEW_H), frame_rgba(0, VIEW_W, VIEW_H));
+        assert_eq!(scene.compose((VIEW_W, VIEW_H).into()), composed(0));
 
         // buffer_done(released) is prompt (the copy is done) and precedes
         // the presentation-paced frame_done.
@@ -1602,21 +1781,21 @@ pub(crate) mod tests {
         mock.attach_frame(0).unwrap();
         mock.commit().unwrap();
         process_n(&mut server, &mut scene, &mut core, 4).unwrap();
-        let frame0 = frame_rgba(0, VIEW_W, VIEW_H);
-        assert_eq!(scene.compose(VIEW_W, VIEW_H), frame0);
+        let frame0 = composed(0);
+        assert_eq!(scene.compose((VIEW_W, VIEW_H).into()), frame0);
 
         // Stage frame 1 (attach + damage) without committing: a redraw at
         // any interleaving point still composes frame 0, byte for byte.
         mock.attach_frame(1).unwrap();
         process_n(&mut server, &mut scene, &mut core, 1).unwrap(); // attach only
         assert_eq!(
-            scene.compose(VIEW_W, VIEW_H),
+            scene.compose((VIEW_W, VIEW_H).into()),
             frame0,
             "attach staged, not applied"
         );
         process_n(&mut server, &mut scene, &mut core, 1).unwrap(); // damage
         assert_eq!(
-            scene.compose(VIEW_W, VIEW_H),
+            scene.compose((VIEW_W, VIEW_H).into()),
             frame0,
             "damage staged, not applied"
         );
@@ -1626,7 +1805,7 @@ pub(crate) mod tests {
         mock.commit().unwrap();
         let committed = process_n(&mut server, &mut scene, &mut core, 1).unwrap();
         assert!(committed);
-        assert_eq!(scene.compose(VIEW_W, VIEW_H), frame_rgba(1, VIEW_W, VIEW_H));
+        assert_eq!(scene.compose((VIEW_W, VIEW_H).into()), composed(1));
     }
 
     #[test]
@@ -1669,8 +1848,8 @@ pub(crate) mod tests {
                 SurfaceEvent::FrameDone { time_ms: n * 16 }
             );
             assert_eq!(
-                scene.compose(VIEW_W, VIEW_H),
-                frame_rgba(n, VIEW_W, VIEW_H),
+                scene.compose((VIEW_W, VIEW_H).into()),
+                composed(n),
                 "tick {n} presents exactly frame {n}"
             );
         }
@@ -1718,7 +1897,7 @@ pub(crate) mod tests {
         }
         assert!(!server.wants_presentation());
         // The scene holds the last commit.
-        assert_eq!(scene.compose(VIEW_W, VIEW_H), frame_rgba(1, VIEW_W, VIEW_H));
+        assert_eq!(scene.compose((VIEW_W, VIEW_H).into()), composed(1));
     }
 
     #[test]
@@ -1742,7 +1921,7 @@ pub(crate) mod tests {
         send_commit(mock_conn(&mut mock), SURFACE_ID);
         let committed = process_n(&mut server, &mut scene, &mut core, 2).unwrap();
         assert!(committed);
-        assert_eq!(scene.compose(VIEW_W, VIEW_H), frame_rgba(0, VIEW_W, VIEW_H));
+        assert_eq!(scene.compose((VIEW_W, VIEW_H).into()), composed(0));
         server
             .presented(9, &mut |frame| core.send_message(frame, None))
             .unwrap();
@@ -1781,7 +1960,7 @@ pub(crate) mod tests {
                 status: BufferStatus::Released,
             }
         );
-        assert_eq!(scene.compose(VIEW_W, VIEW_H), frame_rgba(1, VIEW_W, VIEW_H));
+        assert_eq!(scene.compose((VIEW_W, VIEW_H).into()), composed(1));
     }
 
     #[test]
@@ -1835,10 +2014,16 @@ pub(crate) mod tests {
         process_n(&mut server, &mut scene, &mut core, 5).unwrap();
 
         // The composed view letterboxes the smaller buffer, centered 1:1
-        // (the P1.3.3 matte), client bytes unresampled.
-        let out = scene.compose(VIEW_W, VIEW_H);
+        // (the P1.3.3 matte), client bytes unresampled — inside the USABLE
+        // rectangle since issue #304, so the vertical centring is of the rows
+        // below the reservation and the horizontal centring is unchanged.
+        let out = scene.compose(geom());
         let expected_small = frame_rgba(1, sw, sh);
-        let (ox, oy) = (((VIEW_W - sw) / 2) as usize, ((VIEW_H - sh) / 2) as usize);
+        let (uw, uh) = geom().usable();
+        let (ox, oy) = (
+            ((uw - sw) / 2) as usize,
+            (geom().reserved_top() + (uh - sh) / 2) as usize,
+        );
         for y in 0..sh as usize {
             let dst = ((oy + y) * VIEW_W as usize + ox) * BYTES_PER_PIXEL;
             let src = y * sw as usize * BYTES_PER_PIXEL;
@@ -2010,7 +2195,7 @@ pub(crate) mod tests {
             }
         );
         // Previous content stays; the pacing loop is not stalled.
-        assert_eq!(scene.compose(VIEW_W, VIEW_H), frame_rgba(0, VIEW_W, VIEW_H));
+        assert_eq!(scene.compose((VIEW_W, VIEW_H).into()), composed(0));
         server
             .presented(3, &mut |frame| core.send_message(frame, None))
             .unwrap();
@@ -2062,7 +2247,7 @@ pub(crate) mod tests {
         );
         // The scene never saw a partial frame.
         assert_eq!(
-            scene.compose(VIEW_W, VIEW_H),
+            scene.compose((VIEW_W, VIEW_H).into()),
             test_pattern::render(VIEW_W, VIEW_H)
         );
     }
@@ -2106,8 +2291,8 @@ pub(crate) mod tests {
             }
         );
         assert_eq!(
-            scene.compose(VIEW_W, VIEW_H),
-            frame_rgba(0, VIEW_W, VIEW_H),
+            scene.compose((VIEW_W, VIEW_H).into()),
+            composed(0),
             "previously committed content remains on screen"
         );
         server
@@ -2123,7 +2308,7 @@ pub(crate) mod tests {
         mock.attach_frame(1).unwrap();
         mock.commit().unwrap();
         process_n(&mut server, &mut scene, &mut core, 3).unwrap();
-        assert_eq!(scene.compose(VIEW_W, VIEW_H), frame_rgba(1, VIEW_W, VIEW_H));
+        assert_eq!(scene.compose((VIEW_W, VIEW_H).into()), composed(1));
     }
 
     #[test]
@@ -2274,7 +2459,7 @@ pub(crate) mod tests {
         mock.attach_frame(0).unwrap();
         mock.commit().unwrap();
         process_n_with(&mut server, &mut scene, &mut core, Some(&mut importer), 3).unwrap();
-        assert_eq!(scene.compose(VIEW_W, VIEW_H), frame_rgba(0, VIEW_W, VIEW_H));
+        assert_eq!(scene.compose((VIEW_W, VIEW_H).into()), composed(0));
     }
 
     #[test]
@@ -2322,8 +2507,8 @@ pub(crate) mod tests {
             }
         );
         assert_eq!(
-            scene.compose(VIEW_W, VIEW_H),
-            frame_rgba(0, VIEW_W, VIEW_H),
+            scene.compose((VIEW_W, VIEW_H).into()),
+            composed(0),
             "previously committed content remains on screen"
         );
         server
@@ -2340,7 +2525,7 @@ pub(crate) mod tests {
         mock.attach_frame(1).unwrap();
         mock.commit().unwrap();
         process_n_with(&mut server, &mut scene, &mut core, Some(&mut importer), 3).unwrap();
-        assert_eq!(scene.compose(VIEW_W, VIEW_H), frame_rgba(1, VIEW_W, VIEW_H));
+        assert_eq!(scene.compose((VIEW_W, VIEW_H).into()), composed(1));
         assert_eq!(
             server.copy_meter().copies(),
             2,
@@ -2415,7 +2600,7 @@ pub(crate) mod tests {
             "pacing is independent of the deferred buffer disposition"
         );
         assert_eq!(
-            scene.compose(VIEW_W, VIEW_H),
+            scene.compose((VIEW_W, VIEW_H).into()),
             test_pattern::render(VIEW_W, VIEW_H),
             "zero-copy content never enters the CPU scene"
         );
@@ -2467,7 +2652,7 @@ pub(crate) mod tests {
                 status: BufferStatus::Released,
             }
         );
-        assert_eq!(scene.compose(VIEW_W, VIEW_H), frame_rgba(5, VIEW_W, VIEW_H));
+        assert_eq!(scene.compose((VIEW_W, VIEW_H).into()), composed(5));
         assert_eq!(
             server.copy_meter().copies(),
             1,
@@ -2551,7 +2736,7 @@ pub(crate) mod tests {
             "teardown must drop the GPU content"
         );
         assert_eq!(
-            scene.compose(VIEW_W, VIEW_H),
+            scene.compose((VIEW_W, VIEW_H).into()),
             test_pattern::render(VIEW_W, VIEW_H)
         );
     }
@@ -2746,8 +2931,14 @@ pub(crate) mod tests {
         send_commit(&mut shim, SURFACE_ID);
         process_n(&mut server, &mut scene, &mut core, 3).unwrap();
         // Composition is opaque (P1.3.3): the client's color bytes appear
-        // exactly, alpha forced 0xFF at compose.
-        assert_eq!(scene.compose(1, 1), [0x10, 0x20, 0x30, 0xff]);
+        // exactly, alpha forced 0xFF at compose. Composed at a geometry whose
+        // usable view is the one pixel the client committed, so the pixel has
+        // a row of its own below the reservation (issue #304).
+        let geom = usable_geom(1, 1);
+        assert_eq!(
+            scene.compose(geom),
+            matte_then(geom, &[0x10, 0x20, 0x30, 0xff])
+        );
     }
 
     #[test]
@@ -2786,7 +2977,8 @@ pub(crate) mod tests {
         );
         send_commit(&mut shim, SURFACE_ID);
         process_n(&mut server, &mut scene, &mut core, 3).unwrap();
-        assert_eq!(scene.compose(w, h), rgba);
+        let geom = usable_geom(w, h);
+        assert_eq!(scene.compose(geom), matte_then(geom, &rgba));
     }
 
     #[test]
@@ -2816,7 +3008,7 @@ pub(crate) mod tests {
         // Stage a pending attach the server still holds the fd of.
         mock.attach_frame(1).unwrap();
         process_n(&mut server, &mut scene, &mut core, 2).unwrap();
-        assert_eq!(scene.compose(VIEW_W, VIEW_H), frame_rgba(0, VIEW_W, VIEW_H));
+        assert_eq!(scene.compose((VIEW_W, VIEW_H).into()), composed(0));
 
         // Stage an implicit grab in the realm's router (emulated is the
         // origin a test outside `crate::input` can mint; grab mechanics
@@ -2828,8 +3020,8 @@ pub(crate) mod tests {
         // The router's seat state is per realm and per shim generation, so
         // every route below names the realm, exactly as `session::route_seat`
         // does -- or the scoped reset has nothing of this realm's to forget.
-        let view = (VIEW_W, VIEW_H);
-        let surface = Some((VIEW_W, VIEW_H));
+        let view: crate::view::ViewGeometry = (VIEW_W, VIEW_H).into();
+        let surface = Some(view.usable());
         let button = |state| SeatInputKind::Button {
             button: 0x110,
             state,
@@ -2837,7 +3029,12 @@ pub(crate) mod tests {
         assert!(router
             .route_emulated(
                 &realm,
-                SeatInput::emulated(SeatInputKind::Motion { x: 1.0, y: 1.0 }),
+                SeatInput::emulated(SeatInputKind::Motion {
+                    x: 1.0,
+                    // A view coordinate inside the app: its first row is the
+                    // one after the reservation (issue #304).
+                    y: 1.0 + f64::from(view.reserved_top()),
+                }),
                 view,
                 surface,
             )
@@ -2869,7 +3066,7 @@ pub(crate) mod tests {
         drop(core);
         // Never a stale frame: the scene falls back to the background.
         assert_eq!(
-            scene.compose(VIEW_W, VIEW_H),
+            scene.compose((VIEW_W, VIEW_H).into()),
             test_pattern::render(VIEW_W, VIEW_H)
         );
         // Every held buffer fd (including the staged pending one) closed.
@@ -3019,8 +3216,7 @@ pub(crate) mod tests {
 
         let mut server = ShimServer::new(ShimConfig {
             realm: "realm-0".into(),
-            width: VIEW_W,
-            height: VIEW_H,
+            geom: (VIEW_W, VIEW_H).into(),
         });
         let mut scene = Scene::new();
         server
@@ -3085,7 +3281,7 @@ pub(crate) mod tests {
         // The commit really reached the scene: the realm view now has the
         // shim's composed content at the geometry the core configured.
         assert_eq!(
-            scene.compose(VIEW_W, VIEW_H).len(),
+            scene.compose((VIEW_W, VIEW_H).into()).len(),
             VIEW_W as usize * VIEW_H as usize * BYTES_PER_PIXEL,
             "the committed frame must compose at the configured realm-view size"
         );

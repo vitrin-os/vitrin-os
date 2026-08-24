@@ -2443,10 +2443,23 @@ mod tests {
             Verb::VALID_MASK
         );
         let names: Vec<&str> = reserved.iter().map(String::as_str).collect();
-        let gap = format!(
-            "because {} are allocated to verbs the IDL does not define yet",
-            names.join(" and ")
-        );
+        // The template agrees in NUMBER with the set it renders. It was
+        // written when the gap held 128 and 256 and hard-coded the plural;
+        // P2.7.2 took 128 for `egress`, leaving one bit and a sentence the
+        // book could only satisfy ungrammatically ("256 are allocated to
+        // verbs"). A gate that can only be satisfied by bad English is a gate
+        // people rewrite the prose around, so it renders both forms.
+        let gap = if names.len() == 1 {
+            format!(
+                "because {} is allocated to a verb the IDL does not define yet",
+                names[0]
+            )
+        } else {
+            format!(
+                "because {} are allocated to verbs the IDL does not define yet",
+                names.join(" and ")
+            )
+        };
         assert!(
             bullet.contains(&gap),
             "{BOOK}: the {MARKER:?} bullet does not say {gap:?}. The bits still outside \

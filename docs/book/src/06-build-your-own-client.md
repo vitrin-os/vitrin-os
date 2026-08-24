@@ -62,8 +62,8 @@ writing a Go, TypeScript or C++ SDK forks it.
   for `designate.file`) — so never
   bake the served set into a client. Transcribe the *values* from the IDL
   rather than assuming consecutive bits — `realm.launch` is 512, because 256
-  are allocated to verbs the IDL does not define yet and are still out
-  of range; 64 was one of them until `designate.file` landed on it, and 128
+  is allocated to a verb the IDL does not define yet and is still out
+  of range; 64 was in that gap until `designate.file` landed on it, and 128
   until `egress` did at P2.7.2 — so the set that sentence names is down to
   one. The Python
   SDK's `test_verb_parity.py` pins this against the IDL; write the equivalent.

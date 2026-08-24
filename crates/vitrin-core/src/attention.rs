@@ -1000,13 +1000,22 @@ mod tests {
         // above -- an equality against a two-element array, not a membership
         // test -- is already what forbids adding one.
         //
-        // **This is a FOURTH mask-pin site**, and
-        // `docs/plan/02-phase-2-semantic-epochs.md` §5 named only three when
-        // it told a verb-adding task where to re-pin. It fires for every verb
+        // **This pin was missing from the registry's list**, and
+        // `docs/plan/02-phase-2-semantic-epochs.md` §5 named three sites that
+        // did not include it when it told a verb-adding task where to re-pin.
+        // It fires for every verb
         // addition, not only for one that would betray decision 7 — so a
         // reader who trusted the registry's list would meet it as a surprise
         // failure and be tempted to read it as "this change allocated an
-        // attention verb", which it never means. §5's list now says four.
+        // attention verb", which it never means. §5 now splits its sites by
+        // KIND instead of counting them — this file and
+        // `crates/vitrin-protocol/tests/decode_errors.rs` are the two that
+        // hold the literal — and a sibling test scans the tree for a literal
+        // pin the list does not name, so the omission cannot come back.
+        // This comment said "§5's list now says four" until the P2.6.5 and
+        // P2.7.2 branches were merged: the four-item list was the wording on
+        // one branch and the other rewrote the paragraph, which is the same
+        // merge hazard the mask itself just went through.
         //
         // TWO FURTHER ASSERTIONS STOOD HERE AND WERE DELETED RATHER THAN
         // KEPT. `VALID_MASK & DESIGNATE_FILE == DESIGNATE_FILE` cannot fail

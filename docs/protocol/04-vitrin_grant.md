@@ -35,10 +35,11 @@ handle is not something the agent commands; it is something the agent observes.
 Authority is exercised through the facets, and the grant merely reports how the
 petition resolved and, thereafter, why any use was refused.
 
-Version 2 adds four requests, and none is a command either:
+Version 2 adds five requests, and none is a command either:
 [`get_launcher`](#get_launcher), [`get_layout_focus`](#get_layout_focus),
-[`get_layout_arrange`](#get_layout_arrange) and
-[`get_powerbox`](#get_powerbox) are **structural mints** that hand back a
+[`get_layout_arrange`](#get_layout_arrange),
+[`get_powerbox`](#get_powerbox) and [`get_egress`](#get_egress) are
+**structural mints** that hand back a
 facet. The grant still answers no authority question itself. This is where
 *every* facet added after version 1 must be minted, for one mechanical reason:
 `request_grant`'s five `new_id` arguments are frozen forever, so a sixth

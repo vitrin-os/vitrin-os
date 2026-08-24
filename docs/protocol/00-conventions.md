@@ -744,7 +744,7 @@ mint**. This classification, together with the ordering guarantee (§4), is what
 lets the SDK stay single-threaded and blocking.
 
 The structural mints are `get_realm`, `create_surface`, `get_seat`, and (since
-version 2) `get_launcher`, `get_layout_focus`, `get_layout_arrange` and
+version 2) `get_launcher`, `get_layout_focus`, `get_layout_arrange`,
 `get_powerbox` and `get_egress` — **eight**: the
 request only mints an object, so it is neither
 reply-bearing nor refusable — no terminal event, no wire acknowledgement. A
@@ -753,7 +753,7 @@ or vacant surfaces that on first *use* (e.g. petitions resolving
 `unavailable`, or an inert facet refusing `not_granted`), never at mint time.
 
 `get_egress` ([`vitrin_grant`](04-vitrin_grant.md#get_egress)) is the newest
-and is a mint like the other six in every structural respect, including the
+and is a mint like the other seven in every structural respect, including the
 one that reads oddest: no deployment serves the `egress` verb, so *every*
 facet it mints refuses `not_granted` on first use — and the mint is still
 always legal, because minting is not an authority oracle. A separate and

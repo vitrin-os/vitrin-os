@@ -94,22 +94,27 @@ from vitrin_os import Verb
 verbs = Verb.OBSERVE | Verb.ACTUATE_POINTER
 ```
 
-<!-- vitrin-verb-set: all-verbs = observe, actuate_pointer, actuate_text, observe_cursor, layout_arrange, layout_focus, realm_launch, egress | count: eight -->
+<!-- vitrin-verb-set: all-verbs = observe, actuate_pointer, actuate_text, observe_cursor, layout_arrange, layout_focus, designate_file, egress, realm_launch | count: nine -->
 
-The enum has **eight** members, and the petition above asked for three of
+The enum has **nine** members, and the petition above asked for three of
 them: `OBSERVE`, `ACTUATE_POINTER` and `ACTUATE_TEXT`. Three more are
 **served** by this core on the same terms — `LAYOUT_ARRANGE`, `LAYOUT_FOCUS`
 and `REALM_LAUNCH`, exercised by `grant.set_fullscreen()`, `grant.focus()` and
 `grant.launch()`.
 
-<!-- vitrin-verb-set: unserved-verbs = observe_cursor, egress -->
+<!-- vitrin-verb-set: unserved-verbs = observe_cursor, designate_file, egress -->
 
-The remaining two — `OBSERVE_CURSOR` and `EGRESS` — are defined and resolve
+The remaining three — `OBSERVE_CURSOR`, `DESIGNATE_FILE` and `EGRESS` — are
+defined and resolve
 `unsupported`: the first because per-principal cursor delivery does not exist
-yet, the second because the out-of-core proxy an outbound connection would be
-made through does not exist. `EGRESS` does have a facet on the wire
-(`vitrin_egress`), which is worth knowing only so it is not mistaken for
-evidence the verb works: a facet is the request you would ask through, and
+yet, the second because no core-drawn file picker and no consent copy for it
+exist yet, the third because the out-of-core proxy an outbound connection
+would be
+made through does not exist. `DESIGNATE_FILE` and `EGRESS` both have a facet
+on the wire
+(`vitrin_powerbox` and `vitrin_egress`), which is worth knowing only so it is
+not mistaken for
+evidence either verb works: a facet is the request you would ask through, and
 there is nothing behind it to answer.
 
 Whether a verb is served is a property of the *deployment*, not of the

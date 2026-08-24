@@ -696,12 +696,15 @@ impl PetitionRegistry {
             return declined(Outcome::Unsupported);
         }
         // A verb bit the IDL defines but this core does not enforce.
-        // vitrin-verb-set: unserved-verbs = observe_cursor, egress
-        // Two today: `observe_cursor` (D-017) and `egress` (P2.7.2).
+        // vitrin-verb-set: unserved-verbs = observe_cursor, designate_file, egress
+        // Three today: `observe_cursor` (D-017), `designate_file` (P2.6.5,
+        // which put the bit on the wire and deliberately left the picker and
+        // the consent copy to P2.6.6/P2.6.8) and `egress` (P2.7.2).
         // `layout_arrange` and `layout_focus` left that set at WS-E.1.4 and
         // `realm_launch` at WS-E.1.1, each when the core gained the
-        // mechanism its refusal stood for; `egress` joined it when the IDL
-        // gained the bit and this core gained nothing to enforce by it. The
+        // mechanism its refusal stood for; the other two joined it when the
+        // IDL gained their bits and this core gained nothing to enforce by
+        // them. The
         // set itself is derived (`UNSERVED_VERB_BITS`), so this comment is
         // the only thing here that could go stale -- and `cargo xtask
         // verb-sets --check` reads the marker line above so that it cannot.
@@ -1352,19 +1355,31 @@ mod tests {
         // the ones it does not implement. The failure this guards is the
         // silent one: accepting the bit and enforcing nothing.
         //
-        // **Two bits now**, and every movement in or out was a decision
-        // rather than a subtraction: WS-E.1.4 (issue #210) served the layout
-        // pair, and WS-E.1.1 (issue #207) served `realm_launch` once the core
-        // gained the spawn path, the realm cap and the consent copy its
-        // absence used to stand for. `observe_cursor` remains, because
-        // per-principal cursor delivery is still M2's. `egress` **joined**
-        // at P2.7.2 (issue #196): the bit is on the wire so a petition for
+        // **Three bits now**, and every movement in either direction was a
+        // decision rather than a subtraction: WS-E.1.4 (issue #210) served the
+        // layout pair, and WS-E.1.1 (issue #207) served `realm_launch` once
+        // the core gained the spawn path, the realm cap and the consent copy
+        // its absence used to stand for. `observe_cursor` stays, because
+        // per-principal cursor delivery is still M2's. `designate_file`
+        // JOINED at P2.6.5 (issue #189): the bit is on the wire so a petition
+        // for it is an answer rather than a connection death, and it is
+        // refused here until P2.6.6's picker and P2.6.8's consent copy exist.
+        // `egress` **joined**
+        // at P2.7.2 (issue #196) on the same terms: the bit is on the wire so
+        // a petition for
         // it is answered rather than killed, and this core enforces nothing
         // by it — the mediating proxy is P2.7.3's — so admission refuses it,
-        // whole. That is the fail-closed default working rather than a
+        // whole.
+        //
+        // Both joins are the fail-closed default working rather than a
         // separate rule: `UNSERVED_VERB_BITS` is derived from
-        // `Verb::VALID_MASK`, so the new bit was unserved the moment the IDL
-        // defined it, and `SERVED_VERB_BITS` was not touched.
+        // `Verb::VALID_MASK`, so each new bit was unserved the moment the IDL
+        // defined it, and `SERVED_VERB_BITS` was not touched by either task.
+        //
+        // This is also the whole of those tasks' core-side behaviour, so it is
+        // asserted rather than assumed: a petition naming either bit
+        // resolves `unsupported`, alone and mixed, on the same terms
+        // `observe_cursor` does.
         let t0 = t0();
         let mut reg = registry(ConsentPolicy::AutoApprove);
         let conn = reg.register_connection();
@@ -1372,10 +1387,14 @@ mod tests {
         let mut wire_id = 10;
         // **Derived from `UNSERVED_VERB_BITS`, not hand-listed.** This set has
         // shrunk three times (D-018's two verbs, then `realm_launch` at
-        // WS-E.1.1), grown once (`egress` at P2.7.2) and will move again when
-        // cursor delivery and the egress proxy land. A hand-written list would
+        // WS-E.1.1), grown twice (`designate_file` at P2.6.5, `egress` at
+        // P2.7.2) and will move again when
+        // cursor delivery, the picker and the egress proxy land. A
+        // hand-written list would
         // keep passing while a newly appended, unclassified bit went
-        // unexercised — the shape of failure this repo keeps finding — so the
+        // unexercised — the shape of failure this repo keeps finding, and the
+        // shape this very list took when P2.6.5 and P2.7.2 each hand-listed
+        // the other's bit out of existence — so the
         // loop reads the constant instead. The exact membership is pinned in
         // `consent::render`'s catalogue test, which is what forces a human to
         // classify a new bit; here the membership is only *used*.

@@ -60,41 +60,67 @@ fn invalid_enum_value_is_rejected() {
 
 #[test]
 fn invalid_bitfield_value_is_rejected() {
-    // `vitrin_grant.verb` is a bitfield with VALID_MASK 1|2|4|8|16|32|512|128
-    // = 703. Whether a defined bit is *served* is a property of a deployment
+    // `vitrin_grant.verb` is a bitfield with VALID_MASK
+    // 1|2|4|8|16|32|64|128|512
+    // = 767. Whether a defined bit is *served* is a property of a deployment
     // and is settled at petition admission (`unsupported`), deliberately not
     // a decode error, so the codec must accept every defined bit whatever
     // any core does with it. That is unchanged by WS-E.1.4 serving
     // `layout_arrange` (16) and `layout_focus` (32), and by WS-E.1.1 serving
     // `realm_launch` (512), in the reference core: this file is the codec's,
     // and the codec never knew which bits were served. Bit 8
-    // (`observe_cursor`) and bit 128 (`egress`, P2.7.2) remain
-    // defined-and-unserved there (D-017; and the egress proxy is P2.7.3's).
+    // (`observe_cursor`) remains defined-and-unserved there (D-017), and
+    // P2.6.5's bit 64 (`designate_file`) and P2.7.2's bit 128 (`egress`)
+    // join it there -- unserved by
+    // *every* deployment until the picker and its consent copy exist
+    // (P2.6.6/P2.6.8) and until the out-of-core mediating proxy exists
+    // (P2.7.3), and in range here regardless, which is the whole point of
+    // defining a bit before serving it.
     //
-    // The 64/256 gap is not free space: those bits are allocated (to
-    // `designate_file`, `publish_tree`) but not yet defined in the IDL, so
-    // today they are still out of range and fatal. That is exactly why
-    // `realm_launch` took 512 rather than the next unused-looking bit, and
-    // why `egress` took 128 from the same registry rather than the next one
-    // after 512.
-    assert_eq!(gen::vitrin_grant::Verb::VALID_MASK, 703);
-    for reserved in [64u32, 256] {
-        let err = gen::vitrin_grant::Verb::from_bits(reserved).unwrap_err();
+    // **Re-pinned twice**, 575 -> 639 for E2.6 and 639 -> 767 for E2.7, per
+    // the repo-wide registry in
+    // `docs/plan/02-phase-2-semantic-epochs.md` §5, which re-pins the mask
+    // once per epic rather than once per task. 256 is the ONE bit left that
+    // is not free space: it is allocated (to `publish_tree`) but not yet
+    // defined in the IDL, so today it is still out of range and
+    // fatal. That is exactly why `realm_launch` took 512 rather than the next
+    // unused-looking bit, and why `designate_file` and `egress` took 64 and
+    // 128 from the same registry rather than the next ones after 512.
+    assert_eq!(gen::vitrin_grant::Verb::VALID_MASK, 767);
+    // The reserved bits are DERIVED from the mask rather than listed. They
+    // were a hand-maintained literal through two allocations, and the list
+    // shrank to one element when `designate_file` and `egress` merged -- at
+    // which point a literal list is also a clippy `single_element_loop`. The
+    // equality below is the tripwire that keeps this non-vacuous: it goes red
+    // when a reserved bit is allocated, which is exactly when a human must
+    // re-read the paragraph above.
+    let reserved: Vec<u32> = (0..10)
+        .map(|shift| 1u32 << shift)
+        .filter(|bit| gen::vitrin_grant::Verb::VALID_MASK & bit == 0)
+        .collect();
+    assert_eq!(
+        reserved,
+        [256],
+        "the set of allocated-but-undefined verb bits below 512 moved; \
+         re-read the paragraph above before re-pinning it"
+    );
+    for bit in reserved {
+        let err = gen::vitrin_grant::Verb::from_bits(bit).unwrap_err();
         assert_eq!(
             err,
             DecodeError::InvalidBitfieldValue {
                 interface: "vitrin_grant",
                 enum_name: "verb",
-                value: reserved,
+                value: bit,
             }
         );
     }
     // every subset of the defined bits, including all of them together, is
-    // legal -- enumerated as (low six bits) x (the two high bits present or
-    // not) rather than a flat `0..=703` range, which would sweep through the
-    // reserved bits above.
-    for low in 0..=63u32 {
-        for high in [0u32, 128, 512, 128 | 512] {
+    // legal -- enumerated as (low eight bits) x (bit 512 present or not)
+    // rather than a flat `0..=767` range, which would sweep through the
+    // reserved bit above.
+    for low in 0..=255u32 {
+        for high in [0u32, 512] {
             gen::vitrin_grant::Verb::from_bits(low | high)
                 .expect("every subset of defined bits is valid");
         }
@@ -104,10 +130,11 @@ fn invalid_bitfield_value_is_rejected() {
     // second argument, after a valid `outcome`.
     let bytes = craft_frame(gen::vitrin_grant::events::Resolved::OPCODE, 0, |out| {
         vitrin_protocol::wire::write_uint(out, gen::vitrin_grant::Outcome::ALL[0].to_wire());
-        // 256 rather than 64 or 128: it is the reserved bit with the
-        // furthest-off owner (`publish_tree`, P2.4.1), so this case stays a
-        // decode failure for longest. 128 stopped being one when `egress`
-        // landed, which is what moved this line.
+        // 256 rather than 64 or 128: it is the ONLY reserved bit left, its
+        // owner (`publish_tree`, P2.4.1) is the furthest off, so this case
+        // stays a decode failure for longest. 64 stopped being one when
+        // `designate_file` landed and 128 when `egress` did, which is what
+        // moved this line.
         vitrin_protocol::wire::write_uint(out, 256); // invalid verbs bit
         vitrin_protocol::wire::write_uint(out, gen::vitrin_grant::Persistence::ALL[0].to_wire());
         vitrin_protocol::wire::write_uint(out, 0); // expiry_ms
@@ -123,6 +150,93 @@ fn invalid_bitfield_value_is_rejected() {
     );
 }
 
+/// `vitrin_powerbox.designated` declares exactly one fd, so a frame whose
+/// header disagrees dies fatal `fd_violation` -- P2.6.5's own case of the
+/// invariant `00-conventions.md` §2.4 makes framing-level rather than
+/// signature-level.
+///
+/// **This test and the one below it carry issue #189's acceptance criterion
+/// 5, which asked for the case in `protocol/test-mutations.sh`.** That script
+/// mutates the IDL and asserts the RELAX NG schema rejects it; `fd_count` is
+/// a header byte the dialect cannot express, so no mutation there could prove
+/// anything about it. The relocation is D-045 in
+/// `docs/plan/20-decision-log.md`, including what it does NOT cover: these
+/// are codec unit tests, not a hostile peer driven through a live `vitrind`.
+///
+/// Both directions are covered, because the cheap check (`fd.is_some()` vs
+/// `HAS_FD`) passes one of them: a header claiming **one** fd for a message
+/// that carries one, decoded with none supplied, and a header claiming
+/// **none** for the same message while the fd really is supplied.
+#[test]
+fn designated_fd_count_mismatch_is_rejected_in_both_directions() {
+    let (reader, writer) = std::io::pipe().unwrap();
+    let value = gen::vitrin_powerbox::events::Designated {
+        fd: std::os::fd::OwnedFd::from(reader),
+        designation_id: 7,
+        kind: gen::vitrin_powerbox::Kind::File,
+        mode: gen::vitrin_powerbox::Mode::Read,
+        name: "notes.txt".to_string(),
+    };
+    let mut bytes = value.encode(3);
+    assert_eq!(bytes[7], 1, "fd_count byte for a one-fd message must be 1");
+
+    // (a) the header is honest, but no fd accompanies the frame.
+    let err = gen::vitrin_powerbox::events::Designated::decode(&bytes, None).unwrap_err();
+    assert_eq!(
+        err,
+        DecodeError::FdCountMismatch {
+            expected: 1,
+            actual: 0,
+        }
+    );
+    assert_eq!(
+        err.to_wire_error(),
+        gen::vitrin_handshake::Error::FdViolation,
+        "an fd_count mismatch is the fatal wire code fd_violation"
+    );
+
+    // (b) the header lies low: it declares 0 fds while the fd is really
+    // there. `fd.is_some() == HAS_FD` alone would wave this through.
+    bytes[7] = 0;
+    let err =
+        gen::vitrin_powerbox::events::Designated::decode(&bytes, Some(writer.into())).unwrap_err();
+    assert_eq!(
+        err,
+        DecodeError::FdCountMismatch {
+            expected: 1,
+            actual: 0,
+        }
+    );
+    assert_eq!(
+        err.to_wire_error(),
+        gen::vitrin_handshake::Error::FdViolation
+    );
+}
+
+/// The shim-side half of the same designation carries exactly one fd too,
+/// and an unsolicited fd on a message that declares none is the other arm of
+/// `fd_violation`. `request_dir` is the zero-argument, zero-fd request that
+/// makes the arm testable on this epic's own surface.
+#[test]
+fn request_dir_rejects_an_unsolicited_fd() {
+    let bytes = gen::vitrin_powerbox::requests::RequestDir {}.encode(3);
+    assert_eq!(bytes[7], 0, "fd_count byte for a zero-fd message must be 0");
+    let fd = std::io::pipe().unwrap().0;
+    let err = gen::vitrin_powerbox::requests::RequestDir::decode(&bytes, Some(fd.into()))
+        .expect_err("an unsolicited fd must be fatal");
+    assert_eq!(
+        err,
+        DecodeError::FdCountMismatch {
+            expected: 0,
+            actual: 1,
+        }
+    );
+    assert_eq!(
+        err.to_wire_error(),
+        gen::vitrin_handshake::Error::FdViolation
+    );
+}
+
 #[test]
 fn every_verb_is_classified_as_facet_bearing_or_not() {
     // A count that documents itself. `docs/protocol/04-vitrin_grant.md`
@@ -135,7 +249,8 @@ fn every_verb_is_classified_as_facet_bearing_or_not() {
     //
     // **This comment used to quote those two sentences, and no longer does.**
     // It quoted "Six" and "six" while the page -- shipped by this same branch
-    // -- says seven. The first quotation had been accurate and went stale the
+    // -- said seven, and the page says eight since the powerbox facet merged
+    // in. The first quotation had been accurate and went stale the
     // moment the egress facet moved the count. The second never matched
     // anything: the page's other site read "Every other verb does", so "the
     // other six do" was a paraphrase wearing quotation marks and was wrong
@@ -151,7 +266,7 @@ fn every_verb_is_classified_as_facet_bearing_or_not() {
     // no fact would go red. And that job is already done, by an instrument
     // built for it: `cargo xtask verb-sets --check` registers
     // `docs/protocol/04-vitrin_grant.md` as a `facet-verbs` carrier, reads
-    // the marker beside that first sentence (`| count: seven`), derives the
+    // the marker beside that first sentence (`| count: eight`), derives the
     // set from the IDL, and fails with the path in it when the two disagree.
     // A second reader here would be a second definition of one check --
     // exactly what `crates/xtask/src/verb_sets.rs` exists to stop.
@@ -168,10 +283,13 @@ fn every_verb_is_classified_as_facet_bearing_or_not() {
     // it exists to hold became false. Issue #196's round-2 review levered that
     // by adding `verb="egress"` to `vitrin_consent` and watching the test
     // pass. The seventh then landed for real, and the derived form is what
-    // made the two literals below go red so a human re-read the prose. Both
+    // made the two literals below go red so a human re-read the prose. An
+    // EIGHTH landed at the same time on another branch -- `vitrin_powerbox`,
+    // P2.6.5's `designate_file` facet -- and the derived form is why merging
+    // the two cost one literal rather than a rewrite. Both
     // sides come out of the generator:
     //
-    //   * `gen::FACET_VERBS` is emitted from `interface/@verb`, so a seventh
+    //   * `gen::FACET_VERBS` is emitted from `interface/@verb`, so a ninth
     //     facet moves its length;
     //   * `Verb::ENTRIES` is emitted from the verb bitfield's entries, so the
     //     facetless remainder is a set difference rather than a literal.
@@ -200,8 +318,8 @@ fn every_verb_is_classified_as_facet_bearing_or_not() {
     // partition itself, which is derived above.
     assert_eq!(
         facet.len(),
-        7,
-        "the IDL no longer declares seven `interface/@verb` facets ({facet:?}); \
+        8,
+        "the IDL no longer declares eight `interface/@verb` facets ({facet:?}); \
          docs/protocol/04-vitrin_grant.md states this count twice, and \
          `cargo xtask verb-sets --check` holds every surface that enumerates it"
     );
@@ -232,6 +350,7 @@ fn every_verb_is_classified_as_facet_bearing_or_not() {
     // still pass if the generator emitted an empty slice for either.
     assert!(facet.contains(&gen::vitrin_view::VERB));
     assert!(facet.contains(&gen::vitrin_launcher::VERB));
+    assert!(facet.contains(&gen::vitrin_powerbox::VERB));
     assert!(facet.contains(&gen::vitrin_egress::VERB));
     assert!(!facetless.is_empty());
 }

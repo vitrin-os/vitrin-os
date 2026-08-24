@@ -14,30 +14,23 @@ import enum
 
 # protocol/@version — the wire version integer offered in hello. The "v0"
 # in the document family's name is the spec generation; the wire integer
-# starts at 1 (the schema forbids 0) and is 2 today.
+# starts at 1 (the schema forbids 0) and is 2 today. Every version-1
+# signature is byte-identical at version 2, so this SDK offering 2 changes
+# nothing about the messages it already sends — it only widens what it can
+# send and must decode.
 #
-# What version 2 appends ON THE PRINCIPAL CONNECTION CLASS, which is the only
-# one this SDK speaks: the realm_launch and egress verbs;
-# vitrin_principal.attention; the four structural mints on vitrin_grant
-# (get_launcher, get_layout_focus, get_layout_arrange, get_egress); the four
-# interfaces they mint (vitrin_launcher, vitrin_layout_focus,
-# vitrin_layout_arrange, vitrin_egress) with their requests launch/launched,
-# focus, set_fullscreen and request_connect/connected/connect_failed; the
-# vitrin_layout_arrange.mode and vitrin_egress.failure enums; the capacity
-# refusal code; and the layout_held outcome. The shim connection class gains
-# version-2 messages of its own (selection, pointer constraints, idle inhibit,
-# relative motion, gestures); this SDK never speaks those and does not
-# enumerate them.
-#
-# This paragraph said "in full" and was not: it omitted
-# vitrin_principal.attention — a since="2" event on an interface this SDK does
-# decode — from the day it was written, then the egress additions on top. It
-# names its connection class now so the claim is one a reader can check
-# against `grep 'since="2"' protocol/vitrin-v0.xml` rather than believe.
-#
-# Every version-1 signature is byte-identical at version 2, so this SDK
-# offering 2 changes nothing about the messages it already sends — it only
-# widens what it can send and must decode.
+# THIS COMMENT USED TO ENUMERATE VERSION 2 "in full", and the list was
+# already false when P2.6.5 (issue #189) came to append to it: it named the
+# launcher and the two layout facets and stopped there, while the wire had
+# since gained the cross-realm clipboard, the pointer constraint, the idle
+# inhibit, the seat's relative-motion and gesture events, and now the
+# powerbox and the egress facet. A second closed list of the same facts is how
+# one of them goes
+# stale — the normative enumeration is `docs/protocol/00-conventions.md`
+# §7.3, which is extended in the same edit as any `since=` addition, and it
+# is deliberately not restated here. That this file and a parallel branch
+# each rewrote the same paragraph, one restoring the list and one deleting
+# it, is the argument for deleting it.
 PROTOCOL_VERSION = 2
 
 # --- object-id ranges (conventions section 3) ------------------------------
@@ -86,20 +79,22 @@ class Verb(enum.IntFlag):
     petitioned one. Read "unsupported" as "not here, not now", never as "not
     in this protocol".
 
-    The 64/256 gap is deliberate and must not be filled by guesswork: those
-    bits are allocated repo-wide to verbs the IDL does not define yet, so they
-    are still *out of range* and fatal. `realm_launch` took 512 for exactly
-    that reason, and `egress` took 128 from the same registry rather than the
-    next bit after 512.
+    256 is the one bit left in that gap, and it must not be filled by
+    guesswork: it is allocated repo-wide to a verb the IDL does not define
+    yet, so it is still *out of range* and fatal. `realm_launch` took 512 for
+    exactly that reason. 64 and 128 were in that gap until P2.6.5 landed
+    `designate_file` and P2.7.2 landed `egress` on them, each from the same
+    registry rather than from the next unused-looking power of two.
     """
 
-    # vitrin-verb-set: all-verbs = observe, actuate_pointer, actuate_text, observe_cursor, layout_arrange, layout_focus, realm_launch, egress
+    # vitrin-verb-set: all-verbs = observe, actuate_pointer, actuate_text, observe_cursor, layout_arrange, layout_focus, designate_file, egress, realm_launch
     OBSERVE = 1
     ACTUATE_POINTER = 2
     ACTUATE_TEXT = 4
     OBSERVE_CURSOR = 8  # refused "unsupported" by every deployment at version 2
     LAYOUT_ARRANGE = 16  # served by the reference core since WS-E.1.4
     LAYOUT_FOCUS = 32  # served by the reference core since WS-E.1.4
+    DESIGNATE_FILE = 64  # refused "unsupported" by every deployment (P2.6.6/P2.6.8 owed)
     EGRESS = 128  # refused "unsupported" by every deployment at version 2
     REALM_LAUNCH = 512  # resolves "unsupported" until a deployment serves it
 
@@ -113,6 +108,7 @@ VERB_MASK = int(
     | Verb.OBSERVE_CURSOR
     | Verb.LAYOUT_ARRANGE
     | Verb.LAYOUT_FOCUS
+    | Verb.DESIGNATE_FILE
     | Verb.EGRESS
     | Verb.REALM_LAUNCH
 )
@@ -135,8 +131,16 @@ VERB_MASK = int(
 # grant carrying the bit to be exercised through. The IDL says exactly that,
 # and this constant is derived from the IDL's own summaries.
 #
-# `egress` (128, P2.7.2 / issue #196) is also out, and its IDL summary carries
-# the same marker phrase for a reason that goes further than the version: the
+# `designate_file` (P2.6.5, issue #189) is out for BOTH reasons at once, which
+# is why the constant did not move when the bit landed: a version-1 connection
+# cannot mint `vitrin_powerbox` either, AND no deployment serves the verb at
+# any version until the core-drawn picker (P2.6.6) and its consent copy
+# (P2.6.8) exist. A petition naming it resolves "unsupported" everywhere
+# today.
+#
+# `egress` (128, P2.7.2 / issue #196) is out on the same two counts, and its
+# IDL summary carries the same marker phrase for a reason that goes further
+# than the version: the
 # out-of-core mediating proxy a connection would be made through does not
 # exist, and that is P2.7.3's. Its FACET does exist — `vitrin_egress`, minted
 # by `vitrin_grant.get_egress`, a separate interface of its own rather than a
@@ -170,6 +174,7 @@ VERB_BY_DOTTED_NAME: dict[str, Verb] = {
     "observe.cursor": Verb.OBSERVE_CURSOR,
     "layout.arrange": Verb.LAYOUT_ARRANGE,
     "layout.focus": Verb.LAYOUT_FOCUS,
+    "designate.file": Verb.DESIGNATE_FILE,
     "egress": Verb.EGRESS,
     "realm.launch": Verb.REALM_LAUNCH,
 }

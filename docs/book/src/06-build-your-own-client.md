@@ -48,24 +48,25 @@ writing a Go, TypeScript or C++ SDK forks it.
 **Three things to get right, because they are what a naïve port breaks:**
 
 - **Carry every defined verb, whether or not this core serves it**
-  (`observe.cursor`, `layout.arrange`, `layout.focus`, `realm.launch`,
-  `egress`). An
+  (`observe`, `actuate.pointer`, `actuate.text`, `observe.cursor`,
+  `layout.arrange`, `layout.focus`, `designate.file`, `egress`,
+  `realm.launch`). An
   out-of-range verb bit is fatal `invalid_argument` and kills the connection.
   Omitting one turns a recoverable `unsupported` refusal into a dead socket
   for any user who petitions it. Which of them a deployment *serves* is that
-  deployment's business and can change under you — this core serves the two
-  layout verbs and `realm.launch`, and refuses `observe.cursor` and
-  `egress`
-  <!-- vitrin-verb-set: unserved-verbs = observe_cursor, egress -->
-  (the second because no mediating proxy exists, *not* because its facet is
-  missing — `vitrin_egress` is on the wire) — so never
-  bake the served set into a
-  client. Transcribe the *values* from the IDL rather than assuming
-  consecutive bits — `realm.launch` is 512, because 64 and 256 are allocated
-  to verbs the IDL does not define yet and are still out of range, and 128
-  was one of them until `egress` landed on it at P2.7.2. The Python
-  SDK's `test_verb_parity.py` pins this against the IDL; write the
-  equivalent.
+  deployment's business and can change under you — this core refuses
+  `observe.cursor`, `designate.file` and `egress`, and serves the other six
+  <!-- vitrin-verb-set: unserved-verbs = observe_cursor, designate_file, egress -->
+  (`egress` because no mediating proxy exists, *not* because its facet is
+  missing — `vitrin_egress` is on the wire, exactly as `vitrin_powerbox` is
+  for `designate.file`) — so never
+  bake the served set into a client. Transcribe the *values* from the IDL
+  rather than assuming consecutive bits — `realm.launch` is 512, because 256
+  are allocated to verbs the IDL does not define yet and are still out
+  of range; 64 was one of them until `designate.file` landed on it, and 128
+  until `egress` did at P2.7.2 — so the set that sentence names is down to
+  one. The Python
+  SDK's `test_verb_parity.py` pins this against the IDL; write the equivalent.
 - **Model fatal versus recoverable in your type system.** If your users can
   catch a fatal error and retry, your API is lying to them. The Python SDK
   makes them separate hierarchies for this reason.

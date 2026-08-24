@@ -315,7 +315,18 @@ static inline vitrin_decode_status_t vitrin_frame_header_decode(
 /* test_header_compiles.c) checks its own list length against this with */
 /* _Static_assert, so a message added to the IDL cannot ship without a */
 /* compile-time proof that its marshal functions type-check. */
-#define VITRIN_MESSAGE_COUNT 52
+#define VITRIN_MESSAGE_COUNT 58
+
+/* Total number of enums (plain and bitfield) across every interface. */
+/* The same gate VITRIN_MESSAGE_COUNT gives the message list, for the */
+/* enum list beside it. It exists because that list had NO gate and went */
+/* stale repeatedly: shim/tests/test_header_compiles.c was silently short */
+/* four enums (vitrin_shim_session's three pointer-constraint enums and */
+/* its idle_inhibit_state) when P2.6.5 came to append to it, having */
+/* already recorded two earlier misses in its own comment. An */
+/* untype-checked validity predicate is exactly the class of check that */
+/* stops checking while still compiling green. */
+#define VITRIN_ENUM_COUNT 26
 
 /* ==================================================================== */
 /* Section 1: per-interface metadata and enums.                          */
@@ -425,13 +436,15 @@ typedef uint32_t vitrin_grant_verb_t;
 #define VITRIN_GRANT_VERB_LAYOUT_ARRANGE ((vitrin_grant_verb_t)16)
 /* bind the output to a view of the granted realm and direct input there - one act, because routing keys to a realm the human cannot see is focus theft in its sharpest form; exercised through vitrin_layout_focus; separate from layout_arrange because focus theft is at once the sharpest attack and the most legitimate need, so it must be attenuable alone */
 #define VITRIN_GRANT_VERB_LAYOUT_FOCUS ((vitrin_grant_verb_t)32)
-/* launch the realm template this grant addresses into a new realm instance, through the vitrin_launcher facet; the template names the program and no command ever crosses the wire, so this is authority over an operator-written template rather than over an arbitrary command; bits 64 and 256 are allocated to verbs not yet defined here and were skipped rather than reused (128 was one of them until egress landed on it); refused unsupported in version 1, which cannot mint the facet at all, and by any deployment that does not serve it */
-#define VITRIN_GRANT_VERB_REALM_LAUNCH ((vitrin_grant_verb_t)512)
+/* designate one file or one directory subtree to the granted realm, through the vitrin_powerbox facet; the human picks in a core-drawn picker and what crosses the wire is a file descriptor, never a path, so this is authority to ASK for a designation rather than authority over any named file; a delivered fd is kernel authority the core cannot recall, so revocation stops future designations and kills the grant row while the payload keeps every fd already handed over until its realm dies - PRD P2's revocation is immediate and transitive is FALSE for designations already made; refused unsupported in version 1, which cannot mint the facet at all, and by every deployment until the picker (P2.6.6) and its consent copy (P2.6.8) exist */
+#define VITRIN_GRANT_VERB_DESIGNATE_FILE ((vitrin_grant_verb_t)64)
 /* open one outbound connection to the single host:port named by this grant's net: resource selector, through an out-of-core mediating proxy that asks the enforcement chokepoint per connection and holds no grant of its own; exercised through the vitrin_egress facet, which is a separate interface of its own rather than a request on the filesystem powerbox, since interface/@verb is one value per interface; the selector's grammar is wildcard-free, so a blanket egress grant is inexpressible rather than refused, and one selector covers exactly itself - though not every spelling of one endpoint is one selector, since the host is compared byte-exactly and kept as presented; SPECIFIED BUT NOT IMPLEMENTED ANYWHERE YET: a DNS name is to resolve only in the proxy and the addresses it resolved to at grant time are to be pinned into the grant row, so that a connection to an unpinned address is refused not_granted even under a name-scoped grant - no proxy, no resolver and no pinned column with a value exist today; the dotted SDK name is egress unchanged, the wire name carrying no underscore to replace; refused unsupported in version 1 and by every deployment at version 2 - the facet exists now, so what is missing is the proxy behind it rather than a request to ask through */
 #define VITRIN_GRANT_VERB_EGRESS ((vitrin_grant_verb_t)128)
+/* launch the realm template this grant addresses into a new realm instance, through the vitrin_launcher facet; the template names the program and no command ever crosses the wire, so this is authority over an operator-written template rather than over an arbitrary command; bit 256 is allocated to a verb not yet defined here and was skipped rather than reused, as 64 was until designate_file landed on it and 128 was until egress did; refused unsupported in version 1, which cannot mint the facet at all, and by any deployment that does not serve it */
+#define VITRIN_GRANT_VERB_REALM_LAUNCH ((vitrin_grant_verb_t)512)
 /* Union of every defined entry's bits; a wire value with any other bit
    set is invalid. */
-#define VITRIN_GRANT_VERB_VALID_MASK ((vitrin_grant_verb_t)(1 | 2 | 4 | 8 | 16 | 32 | 512 | 128))
+#define VITRIN_GRANT_VERB_VALID_MASK ((vitrin_grant_verb_t)(1 | 2 | 4 | 8 | 16 | 32 | 64 | 128 | 512))
 
 /* Bitmask validity check for `vitrin_grant_verb_t`: rejects any bit outside
    VITRIN_GRANT_VERB_VALID_MASK. */
@@ -1056,6 +1069,92 @@ static inline bool vitrin_layout_arrange_mode_is_valid(uint32_t v) {
     switch (v) {
         case VITRIN_LAYOUT_ARRANGE_MODE_WINDOWED:
         case VITRIN_LAYOUT_ARRANGE_MODE_FULLSCREEN:
+            return true;
+        default:
+            return false;
+    }
+}
+
+/* ==== vitrin_powerbox (version 1) ==== */
+/* powerbox facet */
+
+#define VITRIN_POWERBOX_INTERFACE_NAME "vitrin_powerbox"
+#define VITRIN_POWERBOX_INTERFACE_VERSION 1u
+/* Every request on this interface exercises the grant verb `designate_file`. */
+#define VITRIN_POWERBOX_VERB "designate_file"
+
+/* Enum `mode` on `vitrin_powerbox`.
+ *
+ * the access a designation carries
+ *
+ * Plain enum: a wire value MUST exactly equal one defined entry. */
+typedef enum {
+    /* the descriptor is opened for reading */
+    VITRIN_POWERBOX_MODE_READ = 0,
+    /* the descriptor is opened for reading and writing, so the holder may change or truncate what it names */
+    VITRIN_POWERBOX_MODE_READ_WRITE = 1,
+} vitrin_powerbox_mode_t;
+
+/* Whole-value membership check for `vitrin_powerbox_mode_t` (decode a wire value by
+   whether it equals one of the defined entries above). */
+static inline bool vitrin_powerbox_mode_is_valid(uint32_t v) {
+    switch (v) {
+        case VITRIN_POWERBOX_MODE_READ:
+        case VITRIN_POWERBOX_MODE_READ_WRITE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+/* Enum `kind` on `vitrin_powerbox`.
+ *
+ * what a designated descriptor names
+ *
+ * Plain enum: a wire value MUST exactly equal one defined entry. */
+typedef enum {
+    /* a single file */
+    VITRIN_POWERBOX_KIND_FILE = 0,
+    /* a directory, designating the whole subtree beneath it as one descriptor */
+    VITRIN_POWERBOX_KIND_DIRECTORY = 1,
+} vitrin_powerbox_kind_t;
+
+/* Whole-value membership check for `vitrin_powerbox_kind_t` (decode a wire value by
+   whether it equals one of the defined entries above). */
+static inline bool vitrin_powerbox_kind_is_valid(uint32_t v) {
+    switch (v) {
+        case VITRIN_POWERBOX_KIND_FILE:
+        case VITRIN_POWERBOX_KIND_DIRECTORY:
+            return true;
+        default:
+            return false;
+    }
+}
+
+/* Enum `refusal` on `vitrin_powerbox`.
+ *
+ * why a raised picker produced no descriptor
+ *
+ * Plain enum: a wire value MUST exactly equal one defined entry. */
+typedef enum {
+    /* the human dismissed the picker without choosing; the ordinary answer, and asking again later is legal */
+    VITRIN_POWERBOX_REFUSAL_CANCELLED = 0,
+    /* the picker was raised and expired unanswered, on the deployment's own deadline; distinct from cancelled because nobody decided anything */
+    VITRIN_POWERBOX_REFUSAL_TIMED_OUT = 1,
+    /* a picker for this principal is already up; at most one at a time, because two stacked in front of one human is the consent-fatigue shape the busy petition outcome already names */
+    VITRIN_POWERBOX_REFUSAL_BUSY = 2,
+    /* the human chose, and the core would not designate it: the entry could not be resolved without following a symlink or losing a race between the confirmation and the open, so the core refuses rather than delivering a descriptor that may not name what the human saw; says nothing about whether the entry exists */
+    VITRIN_POWERBOX_REFUSAL_UNRESOLVABLE = 3,
+} vitrin_powerbox_refusal_t;
+
+/* Whole-value membership check for `vitrin_powerbox_refusal_t` (decode a wire value by
+   whether it equals one of the defined entries above). */
+static inline bool vitrin_powerbox_refusal_is_valid(uint32_t v) {
+    switch (v) {
+        case VITRIN_POWERBOX_REFUSAL_CANCELLED:
+        case VITRIN_POWERBOX_REFUSAL_TIMED_OUT:
+        case VITRIN_POWERBOX_REFUSAL_BUSY:
+        case VITRIN_POWERBOX_REFUSAL_UNRESOLVABLE:
             return true;
         default:
             return false;
@@ -2249,7 +2348,99 @@ static inline vitrin_decode_status_t vitrin_grant_req_get_layout_arrange_decode(
     return VITRIN_DECODE_OK;
 }
 
-/* Request `get_egress` (opcode 3) on `vitrin_grant`.
+/* Request `get_powerbox` (opcode 3) on `vitrin_grant`.
+ *
+ * mint the powerbox facet for this grant
+ */
+typedef struct {
+    /* the powerbox facet, born inert (confers nothing until this grant is granted with designate_file) (new_id: vitrin_powerbox) */
+    uint32_t powerbox;
+} vitrin_grant_req_get_powerbox_t;
+
+#define VITRIN_GRANT_REQ_GET_POWERBOX_OPCODE ((uint8_t)3)
+#define VITRIN_GRANT_REQ_GET_POWERBOX_HAS_FD 0
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_GRANT_REQ_GET_POWERBOX_SINCE 2u
+
+/* Encodes into a complete frame (header + argument payload). Returns the
+   number of bytes written (fits in an int32_t: the wire format's own u16
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
+static inline int32_t vitrin_grant_req_get_powerbox_encode(const vitrin_grant_req_get_powerbox_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN + 4;
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
+        return VITRIN_ENCODE_ERR_OVERFLOW;
+    }
+    vitrin_frame_header_t hdr;
+    hdr.object_id = object_id;
+    hdr.size = (uint16_t)size;
+    hdr.opcode = VITRIN_GRANT_REQ_GET_POWERBOX_OPCODE;
+    hdr.fd_count = (uint8_t)VITRIN_GRANT_REQ_GET_POWERBOX_HAS_FD;
+    vitrin_frame_header_encode(&hdr, out);
+    size_t pos = VITRIN_HEADER_LEN;
+    vitrin_raw_write_u32(out + pos, msg->powerbox);
+    pos += 4u;
+    return (int32_t)size;
+}
+
+/* Decodes one complete frame's bytes (in/in_len -- exactly one frame, e.g.
+   already delimited by a transport layer using the header's own size field,
+   out of scope here) plus, iff HAS_FD below, the fd received alongside it
+   out-of-band (fd = -1 if none). On success writes the frame's object_id to
+   *out_object_id and the decoded message to *out and returns
+   VITRIN_DECODE_OK; otherwise returns a negative vitrin_decode_status_t and
+   leaves *out_object_id and *out unspecified.
+
+   docs/protocol/00-conventions.md 2.4/5.2 define fd_violation as two
+   independent disjuncts, both checked here: the header's own fd_count byte
+   disagreeing with this message's signature, and the out-of-band fd
+   parameter disagreeing with it. A hostile or buggy peer can make either
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
+static inline vitrin_decode_status_t vitrin_grant_req_get_powerbox_decode(
+    const uint8_t *in, size_t in_len, int fd,
+    uint32_t *out_object_id, vitrin_grant_req_get_powerbox_t *out) {
+    int fd_present = (fd >= 0) ? 1 : 0;
+    if (fd_present != VITRIN_GRANT_REQ_GET_POWERBOX_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    vitrin_frame_header_t hdr;
+    vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
+    if (hdr_st != VITRIN_DECODE_OK) {
+        return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_GRANT_REQ_GET_POWERBOX_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
+    }
+    if (hdr.fd_count != (uint8_t)VITRIN_GRANT_REQ_GET_POWERBOX_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    size_t pos = VITRIN_HEADER_LEN;
+    vitrin_decode_status_t st_powerbox = vitrin_raw_read_u32(in, in_len, &pos, &out->powerbox);
+    if (st_powerbox != VITRIN_DECODE_OK) { return st_powerbox; }
+    if (pos != in_len) {
+        return VITRIN_DECODE_ERR_TRAILING_BYTES;
+    }
+    *out_object_id = hdr.object_id;
+    return VITRIN_DECODE_OK;
+}
+
+/* Request `get_egress` (opcode 4) on `vitrin_grant`.
  *
  * mint the egress facet for this grant
  */
@@ -2258,7 +2449,7 @@ typedef struct {
     uint32_t egress;
 } vitrin_grant_req_get_egress_t;
 
-#define VITRIN_GRANT_REQ_GET_EGRESS_OPCODE ((uint8_t)3)
+#define VITRIN_GRANT_REQ_GET_EGRESS_OPCODE ((uint8_t)4)
 #define VITRIN_GRANT_REQ_GET_EGRESS_HAS_FD 0
 /* First protocol version at which this message is defined (`message/@since`); */
 /* this opcode is not defined on a connection whose negotiated version is    */
@@ -4230,6 +4421,128 @@ static inline vitrin_decode_status_t vitrin_shim_session_evt_pointer_constraint_
     if (st_state != VITRIN_DECODE_OK) { return st_state; }
     if (!vitrin_shim_session_pointer_constraint_status_is_valid(state_raw)) { return VITRIN_DECODE_ERR_INVALID_ENUM; }
     out->state = (vitrin_shim_session_pointer_constraint_status_t)state_raw;
+    if (pos != in_len) {
+        return VITRIN_DECODE_ERR_TRAILING_BYTES;
+    }
+    *out_object_id = hdr.object_id;
+    return VITRIN_DECODE_OK;
+}
+
+/* Event `designation` (opcode 4) on `vitrin_shim_session`.
+ *
+ * hand this realm one designated file descriptor
+ */
+typedef struct {
+    /* the designated file or directory descriptor; ownership transfers to the receiver, which MUST close it (not present in the byte buffer; carried out-of-band via SCM_RIGHTS) */
+    int fd;
+    /* the core's opaque id for this designation, matching the journal record and the asking agent's designated event */
+    uint32_t designation_id;
+    /* whether the descriptor is a file or a directory subtree */
+    vitrin_powerbox_kind_t kind;
+    /* the EFFECTIVE access the human approved, which may be narrower than what was asked */
+    vitrin_powerbox_mode_t mode;
+    /* basename of what the human chose, for display only - never a path (max 255 bytes) */
+    vitrin_string_t name;
+} vitrin_shim_session_evt_designation_t;
+
+#define VITRIN_SHIM_SESSION_EVT_DESIGNATION_OPCODE ((uint8_t)4)
+#define VITRIN_SHIM_SESSION_EVT_DESIGNATION_HAS_FD 1
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_SHIM_SESSION_EVT_DESIGNATION_SINCE 2u
+
+/* Encodes into a complete frame (header + argument payload). Returns the
+   number of bytes written (fits in an int32_t: the wire format's own u16
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
+static inline int32_t vitrin_shim_session_evt_designation_encode(const vitrin_shim_session_evt_designation_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
+    if (msg->name.len > 255u) {
+        return VITRIN_ENCODE_ERR_STRING_TOO_LONG;
+    }
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN + 4 + 4 + 4 + vitrin_raw_string_wire_len(msg->name.len);
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
+        return VITRIN_ENCODE_ERR_OVERFLOW;
+    }
+    vitrin_frame_header_t hdr;
+    hdr.object_id = object_id;
+    hdr.size = (uint16_t)size;
+    hdr.opcode = VITRIN_SHIM_SESSION_EVT_DESIGNATION_OPCODE;
+    hdr.fd_count = (uint8_t)VITRIN_SHIM_SESSION_EVT_DESIGNATION_HAS_FD;
+    vitrin_frame_header_encode(&hdr, out);
+    size_t pos = VITRIN_HEADER_LEN;
+    /* fd: fd argument, never written to the byte buffer */
+    vitrin_raw_write_u32(out + pos, msg->designation_id);
+    pos += 4u;
+    vitrin_raw_write_u32(out + pos, (uint32_t)msg->kind);
+    pos += 4u;
+    vitrin_raw_write_u32(out + pos, (uint32_t)msg->mode);
+    pos += 4u;
+    pos += vitrin_raw_write_string(out + pos, msg->name);
+    return (int32_t)size;
+}
+
+/* Decodes one complete frame's bytes (in/in_len -- exactly one frame, e.g.
+   already delimited by a transport layer using the header's own size field,
+   out of scope here) plus, iff HAS_FD below, the fd received alongside it
+   out-of-band (fd = -1 if none). On success writes the frame's object_id to
+   *out_object_id and the decoded message to *out and returns
+   VITRIN_DECODE_OK; otherwise returns a negative vitrin_decode_status_t and
+   leaves *out_object_id and *out unspecified.
+
+   docs/protocol/00-conventions.md 2.4/5.2 define fd_violation as two
+   independent disjuncts, both checked here: the header's own fd_count byte
+   disagreeing with this message's signature, and the out-of-band fd
+   parameter disagreeing with it. A hostile or buggy peer can make either
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
+static inline vitrin_decode_status_t vitrin_shim_session_evt_designation_decode(
+    const uint8_t *in, size_t in_len, int fd,
+    uint32_t *out_object_id, vitrin_shim_session_evt_designation_t *out) {
+    int fd_present = (fd >= 0) ? 1 : 0;
+    if (fd_present != VITRIN_SHIM_SESSION_EVT_DESIGNATION_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    vitrin_frame_header_t hdr;
+    vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
+    if (hdr_st != VITRIN_DECODE_OK) {
+        return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_SHIM_SESSION_EVT_DESIGNATION_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
+    }
+    if (hdr.fd_count != (uint8_t)VITRIN_SHIM_SESSION_EVT_DESIGNATION_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    size_t pos = VITRIN_HEADER_LEN;
+    out->fd = fd;
+    vitrin_decode_status_t st_designation_id = vitrin_raw_read_u32(in, in_len, &pos, &out->designation_id);
+    if (st_designation_id != VITRIN_DECODE_OK) { return st_designation_id; }
+    uint32_t kind_raw;
+    vitrin_decode_status_t st_kind = vitrin_raw_read_u32(in, in_len, &pos, &kind_raw);
+    if (st_kind != VITRIN_DECODE_OK) { return st_kind; }
+    if (!vitrin_powerbox_kind_is_valid(kind_raw)) { return VITRIN_DECODE_ERR_INVALID_ENUM; }
+    out->kind = (vitrin_powerbox_kind_t)kind_raw;
+    uint32_t mode_raw;
+    vitrin_decode_status_t st_mode = vitrin_raw_read_u32(in, in_len, &pos, &mode_raw);
+    if (st_mode != VITRIN_DECODE_OK) { return st_mode; }
+    if (!vitrin_powerbox_mode_is_valid(mode_raw)) { return VITRIN_DECODE_ERR_INVALID_ENUM; }
+    out->mode = (vitrin_powerbox_mode_t)mode_raw;
+    vitrin_decode_status_t st_name = vitrin_raw_read_string(in, in_len, &pos, 255u, &out->name);
+    if (st_name != VITRIN_DECODE_OK) { return st_name; }
     if (pos != in_len) {
         return VITRIN_DECODE_ERR_TRAILING_BYTES;
     }
@@ -6273,6 +6586,409 @@ static inline vitrin_decode_status_t vitrin_layout_arrange_req_set_fullscreen_de
     if (st_mode != VITRIN_DECODE_OK) { return st_mode; }
     if (!vitrin_layout_arrange_mode_is_valid(mode_raw)) { return VITRIN_DECODE_ERR_INVALID_ENUM; }
     out->mode = (vitrin_layout_arrange_mode_t)mode_raw;
+    if (pos != in_len) {
+        return VITRIN_DECODE_ERR_TRAILING_BYTES;
+    }
+    *out_object_id = hdr.object_id;
+    return VITRIN_DECODE_OK;
+}
+
+/* ==== vitrin_powerbox messages ==== */
+
+/* Request `request_file` (opcode 0) on `vitrin_powerbox`.
+ *
+ * ask the human to designate one file
+ */
+typedef struct {
+    /* the access this ask is for; the human may narrow it, and designated.mode carries what was actually approved */
+    vitrin_powerbox_mode_t mode;
+} vitrin_powerbox_req_request_file_t;
+
+#define VITRIN_POWERBOX_REQ_REQUEST_FILE_OPCODE ((uint8_t)0)
+#define VITRIN_POWERBOX_REQ_REQUEST_FILE_HAS_FD 0
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_POWERBOX_REQ_REQUEST_FILE_SINCE 2u
+
+/* Encodes into a complete frame (header + argument payload). Returns the
+   number of bytes written (fits in an int32_t: the wire format's own u16
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
+static inline int32_t vitrin_powerbox_req_request_file_encode(const vitrin_powerbox_req_request_file_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN + 4;
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
+        return VITRIN_ENCODE_ERR_OVERFLOW;
+    }
+    vitrin_frame_header_t hdr;
+    hdr.object_id = object_id;
+    hdr.size = (uint16_t)size;
+    hdr.opcode = VITRIN_POWERBOX_REQ_REQUEST_FILE_OPCODE;
+    hdr.fd_count = (uint8_t)VITRIN_POWERBOX_REQ_REQUEST_FILE_HAS_FD;
+    vitrin_frame_header_encode(&hdr, out);
+    size_t pos = VITRIN_HEADER_LEN;
+    vitrin_raw_write_u32(out + pos, (uint32_t)msg->mode);
+    pos += 4u;
+    return (int32_t)size;
+}
+
+/* Decodes one complete frame's bytes (in/in_len -- exactly one frame, e.g.
+   already delimited by a transport layer using the header's own size field,
+   out of scope here) plus, iff HAS_FD below, the fd received alongside it
+   out-of-band (fd = -1 if none). On success writes the frame's object_id to
+   *out_object_id and the decoded message to *out and returns
+   VITRIN_DECODE_OK; otherwise returns a negative vitrin_decode_status_t and
+   leaves *out_object_id and *out unspecified.
+
+   docs/protocol/00-conventions.md 2.4/5.2 define fd_violation as two
+   independent disjuncts, both checked here: the header's own fd_count byte
+   disagreeing with this message's signature, and the out-of-band fd
+   parameter disagreeing with it. A hostile or buggy peer can make either
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
+static inline vitrin_decode_status_t vitrin_powerbox_req_request_file_decode(
+    const uint8_t *in, size_t in_len, int fd,
+    uint32_t *out_object_id, vitrin_powerbox_req_request_file_t *out) {
+    int fd_present = (fd >= 0) ? 1 : 0;
+    if (fd_present != VITRIN_POWERBOX_REQ_REQUEST_FILE_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    vitrin_frame_header_t hdr;
+    vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
+    if (hdr_st != VITRIN_DECODE_OK) {
+        return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_POWERBOX_REQ_REQUEST_FILE_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
+    }
+    if (hdr.fd_count != (uint8_t)VITRIN_POWERBOX_REQ_REQUEST_FILE_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    size_t pos = VITRIN_HEADER_LEN;
+    uint32_t mode_raw;
+    vitrin_decode_status_t st_mode = vitrin_raw_read_u32(in, in_len, &pos, &mode_raw);
+    if (st_mode != VITRIN_DECODE_OK) { return st_mode; }
+    if (!vitrin_powerbox_mode_is_valid(mode_raw)) { return VITRIN_DECODE_ERR_INVALID_ENUM; }
+    out->mode = (vitrin_powerbox_mode_t)mode_raw;
+    if (pos != in_len) {
+        return VITRIN_DECODE_ERR_TRAILING_BYTES;
+    }
+    *out_object_id = hdr.object_id;
+    return VITRIN_DECODE_OK;
+}
+
+/* Request `request_dir` (opcode 1) on `vitrin_powerbox`.
+ *
+ * ask the human to designate one directory subtree
+ */
+typedef struct {
+    /* no arguments -- a truly empty struct is not portable standard C */
+    char reserved;
+} vitrin_powerbox_req_request_dir_t;
+
+#define VITRIN_POWERBOX_REQ_REQUEST_DIR_OPCODE ((uint8_t)1)
+#define VITRIN_POWERBOX_REQ_REQUEST_DIR_HAS_FD 0
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_POWERBOX_REQ_REQUEST_DIR_SINCE 2u
+
+/* Encodes into a complete frame (header + argument payload). Returns the
+   number of bytes written (fits in an int32_t: the wire format's own u16
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
+static inline int32_t vitrin_powerbox_req_request_dir_encode(const vitrin_powerbox_req_request_dir_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN;
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
+        return VITRIN_ENCODE_ERR_OVERFLOW;
+    }
+    vitrin_frame_header_t hdr;
+    hdr.object_id = object_id;
+    hdr.size = (uint16_t)size;
+    hdr.opcode = VITRIN_POWERBOX_REQ_REQUEST_DIR_OPCODE;
+    hdr.fd_count = (uint8_t)VITRIN_POWERBOX_REQ_REQUEST_DIR_HAS_FD;
+    vitrin_frame_header_encode(&hdr, out);
+    (void)msg;
+    return (int32_t)size;
+}
+
+/* Decodes one complete frame's bytes (in/in_len -- exactly one frame, e.g.
+   already delimited by a transport layer using the header's own size field,
+   out of scope here) plus, iff HAS_FD below, the fd received alongside it
+   out-of-band (fd = -1 if none). On success writes the frame's object_id to
+   *out_object_id and the decoded message to *out and returns
+   VITRIN_DECODE_OK; otherwise returns a negative vitrin_decode_status_t and
+   leaves *out_object_id and *out unspecified.
+
+   docs/protocol/00-conventions.md 2.4/5.2 define fd_violation as two
+   independent disjuncts, both checked here: the header's own fd_count byte
+   disagreeing with this message's signature, and the out-of-band fd
+   parameter disagreeing with it. A hostile or buggy peer can make either
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
+static inline vitrin_decode_status_t vitrin_powerbox_req_request_dir_decode(
+    const uint8_t *in, size_t in_len, int fd,
+    uint32_t *out_object_id, vitrin_powerbox_req_request_dir_t *out) {
+    int fd_present = (fd >= 0) ? 1 : 0;
+    if (fd_present != VITRIN_POWERBOX_REQ_REQUEST_DIR_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    vitrin_frame_header_t hdr;
+    vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
+    if (hdr_st != VITRIN_DECODE_OK) {
+        return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_POWERBOX_REQ_REQUEST_DIR_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
+    }
+    if (hdr.fd_count != (uint8_t)VITRIN_POWERBOX_REQ_REQUEST_DIR_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    size_t pos = VITRIN_HEADER_LEN;
+    out->reserved = 0;
+    if (pos != in_len) {
+        return VITRIN_DECODE_ERR_TRAILING_BYTES;
+    }
+    *out_object_id = hdr.object_id;
+    return VITRIN_DECODE_OK;
+}
+
+/* Event `designated` (opcode 0) on `vitrin_powerbox`.
+ *
+ * the descriptor the human designated
+ */
+typedef struct {
+    /* the designated file or directory descriptor; ownership transfers to the receiver, which MUST close it (not present in the byte buffer; carried out-of-band via SCM_RIGHTS) */
+    int fd;
+    /* the core's opaque id for this designation, matching the journal record and the realm's designation event */
+    uint32_t designation_id;
+    /* whether the descriptor is a file or a directory subtree */
+    vitrin_powerbox_kind_t kind;
+    /* the EFFECTIVE access the human approved, which may be narrower than the ask */
+    vitrin_powerbox_mode_t mode;
+    /* basename of what the human chose, for display only - never a path (max 255 bytes) */
+    vitrin_string_t name;
+} vitrin_powerbox_evt_designated_t;
+
+#define VITRIN_POWERBOX_EVT_DESIGNATED_OPCODE ((uint8_t)0)
+#define VITRIN_POWERBOX_EVT_DESIGNATED_HAS_FD 1
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_POWERBOX_EVT_DESIGNATED_SINCE 2u
+
+/* Encodes into a complete frame (header + argument payload). Returns the
+   number of bytes written (fits in an int32_t: the wire format's own u16
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
+static inline int32_t vitrin_powerbox_evt_designated_encode(const vitrin_powerbox_evt_designated_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
+    if (msg->name.len > 255u) {
+        return VITRIN_ENCODE_ERR_STRING_TOO_LONG;
+    }
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN + 4 + 4 + 4 + vitrin_raw_string_wire_len(msg->name.len);
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
+        return VITRIN_ENCODE_ERR_OVERFLOW;
+    }
+    vitrin_frame_header_t hdr;
+    hdr.object_id = object_id;
+    hdr.size = (uint16_t)size;
+    hdr.opcode = VITRIN_POWERBOX_EVT_DESIGNATED_OPCODE;
+    hdr.fd_count = (uint8_t)VITRIN_POWERBOX_EVT_DESIGNATED_HAS_FD;
+    vitrin_frame_header_encode(&hdr, out);
+    size_t pos = VITRIN_HEADER_LEN;
+    /* fd: fd argument, never written to the byte buffer */
+    vitrin_raw_write_u32(out + pos, msg->designation_id);
+    pos += 4u;
+    vitrin_raw_write_u32(out + pos, (uint32_t)msg->kind);
+    pos += 4u;
+    vitrin_raw_write_u32(out + pos, (uint32_t)msg->mode);
+    pos += 4u;
+    pos += vitrin_raw_write_string(out + pos, msg->name);
+    return (int32_t)size;
+}
+
+/* Decodes one complete frame's bytes (in/in_len -- exactly one frame, e.g.
+   already delimited by a transport layer using the header's own size field,
+   out of scope here) plus, iff HAS_FD below, the fd received alongside it
+   out-of-band (fd = -1 if none). On success writes the frame's object_id to
+   *out_object_id and the decoded message to *out and returns
+   VITRIN_DECODE_OK; otherwise returns a negative vitrin_decode_status_t and
+   leaves *out_object_id and *out unspecified.
+
+   docs/protocol/00-conventions.md 2.4/5.2 define fd_violation as two
+   independent disjuncts, both checked here: the header's own fd_count byte
+   disagreeing with this message's signature, and the out-of-band fd
+   parameter disagreeing with it. A hostile or buggy peer can make either
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
+static inline vitrin_decode_status_t vitrin_powerbox_evt_designated_decode(
+    const uint8_t *in, size_t in_len, int fd,
+    uint32_t *out_object_id, vitrin_powerbox_evt_designated_t *out) {
+    int fd_present = (fd >= 0) ? 1 : 0;
+    if (fd_present != VITRIN_POWERBOX_EVT_DESIGNATED_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    vitrin_frame_header_t hdr;
+    vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
+    if (hdr_st != VITRIN_DECODE_OK) {
+        return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_POWERBOX_EVT_DESIGNATED_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
+    }
+    if (hdr.fd_count != (uint8_t)VITRIN_POWERBOX_EVT_DESIGNATED_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    size_t pos = VITRIN_HEADER_LEN;
+    out->fd = fd;
+    vitrin_decode_status_t st_designation_id = vitrin_raw_read_u32(in, in_len, &pos, &out->designation_id);
+    if (st_designation_id != VITRIN_DECODE_OK) { return st_designation_id; }
+    uint32_t kind_raw;
+    vitrin_decode_status_t st_kind = vitrin_raw_read_u32(in, in_len, &pos, &kind_raw);
+    if (st_kind != VITRIN_DECODE_OK) { return st_kind; }
+    if (!vitrin_powerbox_kind_is_valid(kind_raw)) { return VITRIN_DECODE_ERR_INVALID_ENUM; }
+    out->kind = (vitrin_powerbox_kind_t)kind_raw;
+    uint32_t mode_raw;
+    vitrin_decode_status_t st_mode = vitrin_raw_read_u32(in, in_len, &pos, &mode_raw);
+    if (st_mode != VITRIN_DECODE_OK) { return st_mode; }
+    if (!vitrin_powerbox_mode_is_valid(mode_raw)) { return VITRIN_DECODE_ERR_INVALID_ENUM; }
+    out->mode = (vitrin_powerbox_mode_t)mode_raw;
+    vitrin_decode_status_t st_name = vitrin_raw_read_string(in, in_len, &pos, 255u, &out->name);
+    if (st_name != VITRIN_DECODE_OK) { return st_name; }
+    if (pos != in_len) {
+        return VITRIN_DECODE_ERR_TRAILING_BYTES;
+    }
+    *out_object_id = hdr.object_id;
+    return VITRIN_DECODE_OK;
+}
+
+/* Event `refused` (opcode 1) on `vitrin_powerbox`.
+ *
+ * the picker was raised and produced no descriptor
+ */
+typedef struct {
+    /* why the ask produced no descriptor */
+    vitrin_powerbox_refusal_t code;
+} vitrin_powerbox_evt_refused_t;
+
+#define VITRIN_POWERBOX_EVT_REFUSED_OPCODE ((uint8_t)1)
+#define VITRIN_POWERBOX_EVT_REFUSED_HAS_FD 0
+/* First protocol version at which this message is defined (`message/@since`); */
+/* this opcode is not defined on a connection whose negotiated version is    */
+/* lower, where using it is fatal `invalid_opcode`.                          */
+#define VITRIN_POWERBOX_EVT_REFUSED_SINCE 2u
+
+/* Encodes into a complete frame (header + argument payload). Returns the
+   number of bytes written (fits in an int32_t: the wire format's own u16
+   size field caps a frame at 65535 bytes), VITRIN_ENCODE_ERR_OVERFLOW if
+   out_capacity is too small or the frame would exceed 65535 bytes, or
+   VITRIN_ENCODE_ERR_STRING_TOO_LONG if a string argument exceeds its own
+   documented `(max N bytes)` bound. Nothing is written to `out` on either
+   error. Any fd argument is never written here -- send it out-of-band via
+   SCM_RIGHTS alongside these bytes. */
+static inline int32_t vitrin_powerbox_evt_refused_encode(const vitrin_powerbox_evt_refused_t *msg, uint32_t object_id, uint8_t *out, size_t out_capacity) {
+    uint64_t size = (uint64_t)VITRIN_HEADER_LEN + 4;
+    if (size > 0xffffu || size > (uint64_t)out_capacity) {
+        return VITRIN_ENCODE_ERR_OVERFLOW;
+    }
+    vitrin_frame_header_t hdr;
+    hdr.object_id = object_id;
+    hdr.size = (uint16_t)size;
+    hdr.opcode = VITRIN_POWERBOX_EVT_REFUSED_OPCODE;
+    hdr.fd_count = (uint8_t)VITRIN_POWERBOX_EVT_REFUSED_HAS_FD;
+    vitrin_frame_header_encode(&hdr, out);
+    size_t pos = VITRIN_HEADER_LEN;
+    vitrin_raw_write_u32(out + pos, (uint32_t)msg->code);
+    pos += 4u;
+    return (int32_t)size;
+}
+
+/* Decodes one complete frame's bytes (in/in_len -- exactly one frame, e.g.
+   already delimited by a transport layer using the header's own size field,
+   out of scope here) plus, iff HAS_FD below, the fd received alongside it
+   out-of-band (fd = -1 if none). On success writes the frame's object_id to
+   *out_object_id and the decoded message to *out and returns
+   VITRIN_DECODE_OK; otherwise returns a negative vitrin_decode_status_t and
+   leaves *out_object_id and *out unspecified.
+
+   docs/protocol/00-conventions.md 2.4/5.2 define fd_violation as two
+   independent disjuncts, both checked here: the header's own fd_count byte
+   disagreeing with this message's signature, and the out-of-band fd
+   parameter disagreeing with it. A hostile or buggy peer can make either
+   one lie without the other, so neither check substitutes for the other.
+
+   The header's opcode and size fields are validated in the same
+   defense-in-depth spirit: the dispatcher already selected this message by
+   opcode and delimited the frame by size, but a dispatcher bug (or a
+   header whose size field lies about the delivered byte count, fatal
+   `oversized` per conventions 2.1) must surface as an error here, not as a
+   silently mis-decoded message. */
+static inline vitrin_decode_status_t vitrin_powerbox_evt_refused_decode(
+    const uint8_t *in, size_t in_len, int fd,
+    uint32_t *out_object_id, vitrin_powerbox_evt_refused_t *out) {
+    int fd_present = (fd >= 0) ? 1 : 0;
+    if (fd_present != VITRIN_POWERBOX_EVT_REFUSED_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    vitrin_frame_header_t hdr;
+    vitrin_decode_status_t hdr_st = vitrin_frame_header_decode(in, in_len, &hdr);
+    if (hdr_st != VITRIN_DECODE_OK) {
+        return hdr_st;
+    }
+    if (hdr.opcode != VITRIN_POWERBOX_EVT_REFUSED_OPCODE) {
+        return VITRIN_DECODE_ERR_OPCODE_MISMATCH;
+    }
+    if ((size_t)hdr.size != in_len) {
+        return VITRIN_DECODE_ERR_SIZE_MISMATCH;
+    }
+    if (hdr.fd_count != (uint8_t)VITRIN_POWERBOX_EVT_REFUSED_HAS_FD) {
+        return VITRIN_DECODE_ERR_FD_MISMATCH;
+    }
+    size_t pos = VITRIN_HEADER_LEN;
+    uint32_t code_raw;
+    vitrin_decode_status_t st_code = vitrin_raw_read_u32(in, in_len, &pos, &code_raw);
+    if (st_code != VITRIN_DECODE_OK) { return st_code; }
+    if (!vitrin_powerbox_refusal_is_valid(code_raw)) { return VITRIN_DECODE_ERR_INVALID_ENUM; }
+    out->code = (vitrin_powerbox_refusal_t)code_raw;
     if (pos != in_len) {
         return VITRIN_DECODE_ERR_TRAILING_BYTES;
     }

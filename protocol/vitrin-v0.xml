@@ -164,9 +164,10 @@
     bitfield="true" enum argument is checked as a bitmask: any bit set
     outside the union of defined entry values is out-of-range and fatal
     "invalid_argument", while any combination of defined bits is legal.
-    Thus request_grant's verbs accepts any combination of the eight defined
-    verb bits (value 703) but a bit reserved for a future verb (for example
-    value 256) is fatal. A verb bit is NOT version-gated: the bitfield is one
+    Thus request_grant's verbs accepts any combination of the nine defined
+    verb bits (value 767) but a bit reserved for a future verb
+    (for example value 256) is fatal - and 256 is now the only such bit
+    left. A verb bit is NOT version-gated: the bitfield is one
     mask, checked identically on every negotiated version, so a version-1
     connection may name realm_launch and is answered "unsupported" rather
     than killed - which is the whole point of defining a bit before it is
@@ -592,15 +593,35 @@
         resource selects what within the realm; null or empty means the
         whole realm (the only granularity version 1 serves). The string
         vocabulary is type-prefixed ("surface:...", "node:...",
-        "net:HOST:PORT") and grows
-        by version without a new request (max 256 bytes). The net: prefix
+        "file:...", "dir:...", "net:HOST:PORT") and grows
+        by version without a new request (max 256 bytes). "file:" and "dir:"
+        are the powerbox's selectors, named by a petition for
+        designate_file: "file:" asks for one file and "dir:" for a subtree,
+        which is delivered as a single directory fd rather than as a batch.
+        NAMING A PREFIX IS NOT NAMING A PATH. The selector says what KIND of
+        thing this grant may cover; the path is chosen by the human in the
+        core-drawn picker and never crosses the wire in either direction
+        (see vitrin_powerbox). A petition MAY leave resource null and let
+        the human choose without a stated kind at all.
+        The net: prefix
         is the one whose grammar is normative rather than illustrative -
         it names the single host and single port an egress grant covers,
         admits no wildcard, no CIDR and no list, and is defined with the
         egress verb entry it is inseparable from (see vitrin_grant.verb).
-        A selector whose prefix this deployment does not serve, and a
-        net: selector that does not parse, both resolve "unsupported"
-        rather than being widened to something that does parse. verbs is the
+        It is also the one prefix that DOES name its resource on the wire,
+        which is the opposite of what "file:" and "dir:" do, and the two
+        are not in tension: a host:port is a public name the human is shown
+        and approves, while a path is a secret the picker chooses and the
+        wire never carries.
+        Adding a prefix breaks no client at any version, because an
+        unserved prefix already resolves "unsupported" recoverably - which
+        is also what "file:", "dir:" and "net:" resolve to in every
+        deployment today, since no deployment serves designate_file or
+        egress yet. A net: selector that does not parse resolves
+        "unsupported" on the same terms, rather than being widened to
+        something that does parse. Whether a
+        prefix is SERVED is a property of a deployment, exactly as it is
+        for a verb: read "unsupported" as "not here, not now". verbs is the
         requested verb set and MUST be non-zero (an empty petition is fatal
         "invalid_argument"). expiry_ms of 0 means bounded only by the
         persistence rung. max_event_rate is in events per second, governs
@@ -677,12 +698,18 @@
       recoverably, never fatally.
 
       Version 1 defines no requests on this interface; version 2 defines
-      four, all structural mints: get_launcher, get_layout_focus,
-      get_layout_arrange and get_egress. All five facts follow from
+      five, all structural mints: get_launcher, get_layout_focus,
+      get_layout_arrange, get_powerbox and get_egress. All six facts follow
+      from
       the same rule: request_grant's five new_id arguments are frozen
       forever, so a sixth facet can never be co-minted and must instead be
       minted HERE, on the grant that authorizes it. Every later facet
-      arrives the same way.
+      arrives the same way. This sentence is a COUNT over the requests
+      below it, so a mint appended without moving it makes this description
+      state something false about a shipped interface; the count is stated
+      as a number AND as a list for the same reason 00-conventions.md's
+      version table is - the disagreement between the two is the cheapest
+      way for a reader to notice a drop.
 
       TWO LAYOUT MINTS, NOT ONE, and the reason is structural rather than
       stylistic. Each facet interface declares the ONE grant verb its every
@@ -779,12 +806,51 @@
       <arg name="layout_arrange" type="new_id" interface="vitrin_layout_arrange" summary="the arrangement facet, born inert (confers nothing until this grant is granted with layout_arrange)"/>
     </request>
 
+    <request name="get_powerbox" since="2">
+      <description summary="mint the powerbox facet for this grant">
+        A structural mint: it creates the vitrin_powerbox facet through
+        which the designate_file verb is exercised, and nothing else.
+        Identical in every structural respect to get_launcher and the two
+        layout mints - always legal whatever verbs this grant holds and
+        whether or not it has resolved, born inert, duplicates permitted
+        and conferring nothing extra, never refusable, and a malformed mint
+        is a fatal object-graph error rather than an authority answer.
+
+        WHY A MINT HERE, for the reason every facet after version 1 has:
+        request_grant's five new_id arguments are frozen forever, so no
+        later facet can be co-minted.
+
+        THE MINT IS NOT AN ORACLE. A powerbox minted from a grant that does
+        not hold designate_file refuses on first use rather than at mint
+        time, and today EVERY deployment's grant is in that position -
+        designate_file is refused "unsupported" at admission until P2.6.8's
+        consent copy exists, so no grant carries the bit and no petition
+        that names it resolves granted. A server that implements this
+        request therefore mints successfully and refuses every use
+        "not_granted", which is the defined-but-unserved staging and not a
+        defect.
+
+        THE REFERENCE CORE DOES NOT IMPLEMENT THIS REQUEST YET, AND THAT IS
+        SAID HERE RATHER THAN LEFT TO BE DISCOVERED. vitrind negotiates
+        exactly version 2 and has no dispatch arm for this opcode, so a
+        get_powerbox sent to it is answered with fatal "invalid_opcode" and
+        the connection dies - not the mint-then-refuse above. It is a
+        conformance gap in that implementation rather than a property of
+        this request, it is the first mint this IDL has declared without
+        one, and it closes in P2.6.6 together with the picker. A core-side
+        test pins the gap by asserting the fatal answer, so the arm cannot
+        land without this paragraph being deleted in the same change.
+      </description>
+      <arg name="powerbox" type="new_id" interface="vitrin_powerbox" summary="the powerbox facet, born inert (confers nothing until this grant is granted with designate_file)"/>
+    </request>
+
     <request name="get_egress" since="2">
       <description summary="mint the egress facet for this grant">
         A structural mint: it creates the vitrin_egress facet through which
         the egress verb is exercised, and nothing else. Identical in every
-        structural respect to get_launcher, get_layout_focus and
-        get_layout_arrange - always legal whatever verbs this grant holds
+        structural respect to get_launcher, get_layout_focus,
+        get_layout_arrange and get_powerbox - always legal whatever verbs
+        this grant holds
         and whether or not it has resolved, born inert, duplicates
         permitted, never reply-bearing and never refusable, and a malformed
         mint is a fatal object-graph error rather than an authority answer.
@@ -797,7 +863,17 @@
         against. Same rule, same answer as the layout facet, which is two
         interfaces for exactly this reason (see get_layout_arrange). An
         earlier plan row anticipated one powerbox carrying request_file,
-        request_dir AND request_connect; the dialect cannot express it.
+        request_dir AND request_connect; the dialect cannot express it, and
+        vitrin_powerbox - which is now in this document, one request above
+        this one - carries the file half only, for that reason.
+
+        THIS REQUEST IS OPCODE 4 AND NOT OPCODE 3, WHICH IS NOT A DETAIL.
+        get_egress and get_powerbox were drafted in parallel and both were
+        written as the fourth mint on this interface. get_powerbox shipped
+        first, so it holds opcode 3 permanently; opcodes are assigned by
+        declaration order and are immutable once shipped, so the unshipped
+        one moved. Renumbering the shipped one instead would have been a
+        silent wire break for every client already generated against it.
 
         THE USE THIS MINTS CANNOT SUCCEED ANYWHERE TODAY, and that is a
         property of every deployment rather than of some. egress is refused
@@ -808,7 +884,10 @@
         deployment served realm_launch: minting is not an authority oracle,
         and a facet that refuses on first use leaks nothing.
 
-        NOT IMPLEMENTED BY THE REFERENCE CORE. Stated here rather than only
+        NOT IMPLEMENTED BY THE REFERENCE CORE, which it is now the SECOND
+        mint on this interface to have to say - get_powerbox was the first,
+        and the two gaps are separately owned rather than one gap with two
+        names. Stated here rather than only
         in the prose page, because a reader of this document would
         otherwise reasonably infer that the shipped vitrind answers this
         opcode as described above. It does not: its grant-object dispatch
@@ -864,8 +943,9 @@
         bits, whose values are immutable. Every entry has one SDK-level
         dotted name, formed by replacing the first underscore of the wire
         name with a dot: observe, actuate.pointer, actuate.text,
-        observe.cursor, layout.arrange, layout.focus, realm.launch,
-        egress. The rule degenerates for a wire name that carries no
+        observe.cursor, layout.arrange, layout.focus, designate.file,
+        egress, realm.launch. The rule degenerates for a wire name that
+        carries no
         underscore, and egress is the first: there is nothing to replace,
         so the dotted name is the wire name unchanged. Stated rather than
         left to be derived, because "replace the first underscore" has no
@@ -875,27 +955,43 @@
         no name to invent.
 
         BIT VALUES ARE ALLOCATED ONCE, REPO-WIDE, AND ARE IMMUTABLE. The
-        gap between 32 and 512 is deliberate: 64 and 256 are reserved
-        by allocation to verbs that have not landed yet, and reusing one
+        gap between 32 and 512 now holds ONE bit rather than three: 256 is
+        the only value still reserved
+        by allocation to a verb that has not landed yet, and reusing one
         later would be a permanent wire collision rather than a rename.
         A bit is not free merely because this document does not define it.
-        128 was one of those reserved bits until egress landed on it; it
-        was taken from the allocation registry rather than chosen as the
-        next unused-looking power of two, which is the whole point of
-        allocating repo-wide.
+        64 was reserved on those terms and is now designate_file, taken
+        from the same registry rather than from the next unused-looking
+        power of two - which is precisely the mistake the registry caught
+        once already, when a parallel workstream drafted realm_launch at
+        64 and landed it at 512 instead. 128 was reserved on the same terms
+        and is now egress, drawn from the registry for the same reason;
+        that two parallel workstreams each drew a bit from it and neither
+        collided is the registry doing its whole job.
 
-        <!-- vitrin-verb-set: unserved-verbs = observe_cursor, egress -->
+        <!-- vitrin-verb-set: unserved-verbs = observe_cursor, designate_file, egress -->
         DEFINED BUT UNSERVED. A verb may be defined here and refused
         "unsupported" by a deployment that does not serve it, exactly as
         the durable persistence rungs are. observe_cursor is refused by
         every deployment at version 2, because per-principal cursor
-        delivery does not exist. egress is refused by every deployment
+        delivery does not exist. designate_file is refused by every
+        deployment too, and for a reason that is scheduled rather than
+        open-ended: no core-drawn picker exists to mint an fd (P2.6.6) and
+        no human-readable consent copy names what approving it costs
+        (P2.6.8, Q13's rule that no verb is served before its copy exists).
+        Both halves must land before any deployment may answer a
+        designate_file petition anything but "unsupported".
+        egress is refused by every deployment
         too, and for a reason that is about mechanism rather than about
         policy: the mediating proxy a connection would be made through
         does not exist yet, so no deployment can enforce what the verb
         names. Its FACET now exists (vitrin_egress, minted by get_egress),
         so the reason has narrowed since the bit landed - there is a
         request to exercise the verb, and there is nothing behind it.
+        Both of the two newest bits are therefore in this posture at once,
+        and their reasons are NOT the same one: designate_file waits on a
+        picker and its consent copy, egress on a proxy, and closing either
+        does nothing for the other.
         layout_arrange, layout_focus and
         realm_launch were in that same position when they were allocated
         and are now SERVABLE - each has a facet interface, a chokepoint arm
@@ -922,10 +1018,12 @@
         that has none, and it has none by construction - it widens what
         capture_frame composites rather than adding a request, so there is
         nothing for the attribute to sit on and there never will be. It
-        was one of two until this document gained vitrin_egress; the other
-        was egress, which was facetless only YET. layout_arrange has
+        was one of three until this document gained vitrin_powerbox and
+        vitrin_egress; the other two were designate_file and egress, which
+        were facetless only YET. layout_arrange has
         vitrin_layout_arrange, layout_focus has vitrin_layout_focus,
-        realm_launch has vitrin_launcher, and egress has vitrin_egress,
+        realm_launch has vitrin_launcher, designate_file has
+        vitrin_powerbox, and egress has vitrin_egress,
         each a since-gated mint on
         vitrin_grant because request_grant's five new_id arguments are
         frozen forever. The layout verbs take TWO facets rather than one
@@ -1046,10 +1144,16 @@
         deployment does not enforce. It is not an independent authority
         and is never inert-but-held. No other verb pair carries a
         dependency: observe, actuate_pointer, actuate_text,
-        layout_arrange, layout_focus, realm_launch and egress are each
+        layout_arrange, layout_focus, designate_file, egress and
+        realm_launch are
+        each
         independently petitionable. realm_launch in particular does NOT
         imply observe: authority to start an app is not authority to watch
-        it, and an agent that wants both petitions for both. egress
+        it, and an agent that wants both petitions for both.
+        designate_file does not imply observe either, and the direction
+        that matters is the other one: it is authority to put a FILE in
+        front of the human's picker and hand the resulting descriptor to a
+        realm, never authority to read what the realm then draws. egress
         likewise implies nothing and is implied by nothing: reaching one
         host:port is not authority over the realm's pixels, and holding
         every other verb buys no packet.
@@ -1060,8 +1164,9 @@
       <entry name="observe_cursor" value="8" summary="capture frames that include the human principal's cursor - reading the human's attention, hence a verb and not a display preference; meaningful only alongside observe, and a petition naming it without observe resolves unsupported; another agent principal's cursor is not purchasable by this or any verb; refused unsupported in version 1"/>
       <entry name="layout_arrange" value="16" summary="arrange the granted realm's view, subject to the ordering invariants no grant can purchase; exercised through vitrin_layout_arrange, which defines set_fullscreen and no other request - place, resize, raise and stacking are absent rather than refused, because a scene showing one unstacked realm cannot honour them; at most one holder per output, counting a live grant that carries this verb AND a petition still pending for it, so a second petition while either exists resolves layout_held"/>
       <entry name="layout_focus" value="32" summary="bind the output to a view of the granted realm and direct input there - one act, because routing keys to a realm the human cannot see is focus theft in its sharpest form; exercised through vitrin_layout_focus; separate from layout_arrange because focus theft is at once the sharpest attack and the most legitimate need, so it must be attenuable alone"/>
-      <entry name="realm_launch" value="512" summary="launch the realm template this grant addresses into a new realm instance, through the vitrin_launcher facet; the template names the program and no command ever crosses the wire, so this is authority over an operator-written template rather than over an arbitrary command; bits 64 and 256 are allocated to verbs not yet defined here and were skipped rather than reused (128 was one of them until egress landed on it); refused unsupported in version 1, which cannot mint the facet at all, and by any deployment that does not serve it"/>
+      <entry name="designate_file" value="64" summary="designate one file or one directory subtree to the granted realm, through the vitrin_powerbox facet; the human picks in a core-drawn picker and what crosses the wire is a file descriptor, never a path, so this is authority to ASK for a designation rather than authority over any named file; a delivered fd is kernel authority the core cannot recall, so revocation stops future designations and kills the grant row while the payload keeps every fd already handed over until its realm dies - PRD P2's revocation is immediate and transitive is FALSE for designations already made; refused unsupported in version 1, which cannot mint the facet at all, and by every deployment until the picker (P2.6.6) and its consent copy (P2.6.8) exist"/>
       <entry name="egress" value="128" summary="open one outbound connection to the single host:port named by this grant's net: resource selector, through an out-of-core mediating proxy that asks the enforcement chokepoint per connection and holds no grant of its own; exercised through the vitrin_egress facet, which is a separate interface of its own rather than a request on the filesystem powerbox, since interface/@verb is one value per interface; the selector's grammar is wildcard-free, so a blanket egress grant is inexpressible rather than refused, and one selector covers exactly itself - though not every spelling of one endpoint is one selector, since the host is compared byte-exactly and kept as presented; SPECIFIED BUT NOT IMPLEMENTED ANYWHERE YET: a DNS name is to resolve only in the proxy and the addresses it resolved to at grant time are to be pinned into the grant row, so that a connection to an unpinned address is refused not_granted even under a name-scoped grant - no proxy, no resolver and no pinned column with a value exist today; the dotted SDK name is egress unchanged, the wire name carrying no underscore to replace; refused unsupported in version 1 and by every deployment at version 2 - the facet exists now, so what is missing is the proxy behind it rather than a request to ask through"/>
+      <entry name="realm_launch" value="512" summary="launch the realm template this grant addresses into a new realm instance, through the vitrin_launcher facet; the template names the program and no command ever crosses the wire, so this is authority over an operator-written template rather than over an arbitrary command; bit 256 is allocated to a verb not yet defined here and was skipped rather than reused, as 64 was until designate_file landed on it and 128 was until egress did; refused unsupported in version 1, which cannot mint the facet at all, and by any deployment that does not serve it"/>
     </enum>
 
     <enum name="persistence">
@@ -1548,7 +1653,7 @@
       fd, and drops the realm's surface - agents' next captures refuse
       "no_surface". Version 1 has no restart policy.
 
-      VERSION 2 ADDS THREE CONVERSATIONS TO THIS OBJECT, and each is here
+      VERSION 2 ADDS FOUR CONVERSATIONS TO THIS OBJECT, and each is here
       for the same structural reason rather than by accumulation. The
       cross-realm clipboard (request_selection, selection, offer_selection)
       is here because the CORE is the party that asks, and it must be able
@@ -1566,13 +1671,33 @@
       in the protocol whose asking party is not the one the interface it
       would otherwise belong to was built around.
 
+      THE FOURTH, designation, IS HERE FOR A DIFFERENT REASON AND THE
+      DIFFERENCE IS STATED RATHER THAN GLOSSED. It is not an exchange with
+      an inverted asking party: it is a one-way core-to-shim DELIVERY, and
+      the party that asked is neither the core nor the app but a third one
+      that this connection cannot name - an agent principal holding
+      designate_file, on a connection the shim knows nothing about. It
+      lands here because the shim bootstrap is the only object the core can
+      address before the shim has done anything but read configure, and
+      because a designation must reach a realm whose app may hold no
+      surface, no seat and no powerbox-aware code at all. The rule this
+      object now satisfies is therefore the wider one: it carries every
+      message whose counterparty is not the one the interface it would
+      otherwise belong to was built around.
+
       THIS PARAGRAPH SAID "THE ONLY TWO" UNTIL D-042 (issue #306), and
       it is corrected here rather than left standing: a closed count in a
       normative description is the same tripwire 00-conventions.md 7.3
       records going stale twice, and a third conversation makes a shipped
-      count false. It is now written as a rule ("every exchange whose
-      asking party is inverted") rather than as a number, so the next
-      addition satisfies it instead of falsifying it.
+      count false. It was then written as a rule ("every exchange whose
+      asking party is inverted") so the next addition would satisfy it
+      instead of falsifying it - and P2.6.5's designation falsified the
+      RULE instead, being a delivery rather than an exchange. The count is
+      restated above rather than dropped, because a number a reader can
+      check against the messages below is worth more than a rule that
+      quietly widens to admit whatever arrives next. Reversing a remedy a
+      decision recorded is itself a decision, so it is logged: see D-042's
+      2026-08-19 amendment in docs/plan/20-decision-log.md.
     </description>
 
     <event name="configure">
@@ -1969,6 +2094,69 @@
       <arg name="surface" type="object" interface="vitrin_shim_surface" allow-null="true" summary="the surface whose content asks to stay visible; MUST be null when state is released"/>
       <arg name="state" type="uint" enum="idle_inhibit_state" summary="whether this realm is holding an idle inhibit"/>
     </request>
+
+    <event name="designation" since="2">
+      <description summary="hand this realm one designated file descriptor">
+        The core's half of a completed designation: an agent holding
+        designate_file asked, the human chose in the core-drawn picker, and
+        this event delivers the resulting descriptor into the realm. The
+        shim relays it to its app over the realm's own designation socket
+        and holds nothing back; it is the app, not the shim, that the
+        descriptor is for.
+
+        EXACTLY ONE FD PER EVENT, and it is a framing invariant rather than
+        a property of this signature: fd_count is 0 or 1, and a mismatch is
+        fatal fd_violation (log-and-close on a shim connection). A subtree
+        designation is therefore ONE DIRECTORY FD, never a batch of the
+        files under it, and a picker that let a human multi-select emits N
+        of these events rather than one carrying N descriptors. Ownership
+        transfers to the shim, which MUST close it once relayed - or
+        immediately, on any path that does not relay it. There is no
+        message by which the shim declines one, and adding one would buy
+        nothing: a shim that cannot relay a descriptor closes it, and the
+        agent's own answer was already delivered on its own connection
+        before this event was sent.
+
+        WHAT THE CORE CANNOT TAKE BACK. Once this fd crosses, it is kernel
+        authority the core has no means to recall: no revocation, no
+        expiry, and no dead-man chord closes a descriptor in another
+        process. Revoking the grant stops FUTURE designations and kills the
+        grant row; every descriptor already delivered keeps working until
+        the realm dies. PRD P2's "revocation is immediate and transitive"
+        is FALSE for designations already made, and the residue ends with
+        the realm rather than with the grant. A deployment that cannot
+        accept that residue must not serve designate_file, because no
+        attenuation of a designation grant removes it.
+
+        WHO ASKED IS DELIBERATELY NOT ON THE WIRE HERE. A realm learns that
+        it was handed a descriptor, never which principal asked for it.
+        Naming the agent would make every designation a cross-principal
+        identifier the app could fingerprint and correlate, in the one
+        direction this protocol otherwise keeps closed - the app is the
+        least-trusted process in the system, and it has no petition, no
+        grant and no name for any principal.
+
+        designation_id is the core's own id for this designation, unique
+        for the life of the session and matching the id in the journal
+        record and in the asking agent's vitrin_powerbox.designated. It
+        exists so the two halves of one designation can be correlated by a
+        human reading a log, not so the app can guess anything about the
+        other half - it is opaque and must not be parsed or predicted.
+
+        name is a DISPLAY LABEL - the basename of what the human picked -
+        and never a path. Withholding the full path is not a
+        confidentiality measure and is not claimed as one: whoever holds
+        the descriptor can read its path out of /proc/self/fd. It is
+        withheld because a path in this signature would make paths part of
+        the contract, and keeping paths out of the wire is the whole shape
+        of a powerbox.
+      </description>
+      <arg name="fd" type="fd" summary="the designated file or directory descriptor; ownership transfers to the receiver, which MUST close it"/>
+      <arg name="designation_id" type="uint" summary="the core's opaque id for this designation, matching the journal record and the asking agent's designated event"/>
+      <arg name="kind" type="uint" enum="vitrin_powerbox.kind" summary="whether the descriptor is a file or a directory subtree"/>
+      <arg name="mode" type="uint" enum="vitrin_powerbox.mode" summary="the EFFECTIVE access the human approved, which may be narrower than what was asked"/>
+      <arg name="name" type="string" summary="basename of what the human chose, for display only - never a path (max 255 bytes)"/>
+    </event>
 
     <enum name="selection_status">
       <description summary="why a selection answer carries no data">
@@ -2606,15 +2794,18 @@
       whether a petition for it is refused "unsupported" is a property of
       the deployment rather than of the wire: a deployment that will not
       host process creation answers "unsupported" rather than killing the
-      connection. observe_cursor and egress are the TWO bits left in
-      that defined-but-unserved posture, refused by every deployment - the
-      first because per-principal cursor delivery does not exist, the
-      second because the out-of-core proxy a connection would be made
-      through does not exist. egress's reason narrowed when vitrin_egress
-      landed and did not go away: a facet is a request to ask through, not
-      a mechanism to answer with. Defining a verb before serving it is
-      what makes a petition for it an answer rather than a connection
-      death.
+      <!-- vitrin-verb-set: unserved-verbs = observe_cursor, designate_file, egress | count: three -->
+      connection. observe_cursor, designate_file and egress are the THREE
+      bits left in
+      that defined-but-unserved posture, refused by every deployment, and
+      their reasons are three different ones rather than one shared one -
+      no per-principal cursor delivery, no picker and consent copy, no
+      out-of-core proxy. The verb enum's own DEFINED BUT UNSERVED paragraph
+      is the list; this sentence restates it and carries the same
+      machine-checked marker, so the two cannot drift apart the way this
+      one silently did while a second verb was landing beside it. Defining
+      a verb before serving it is what makes a petition for it an answer
+      rather than a connection death.
     </description>
 
     <request name="launch" since="2">
@@ -2863,6 +3054,286 @@
       </description>
       <entry name="windowed" value="0" summary="compose the realm's view at the size its own app last committed, letterboxed centered and unscaled inside the output"/>
       <entry name="fullscreen" value="1" summary="configure the realm's view to the output's size, so the app fills the output"/>
+    </enum>
+  </interface>
+
+  <interface name="vitrin_powerbox" version="1" verb="designate_file">
+    <description summary="powerbox facet">
+      The designation capability: ask the human to choose one file or one
+      directory subtree, and have the resulting file descriptor delivered
+      to the granted realm. Minted by vitrin_grant.get_powerbox and born
+      inert - it confers nothing until its grant resolves granted with
+      designate_file in the effective verb set, every ask passes the single
+      enforcement chokepoint, and a chokepoint refusal is recoverable
+      through vitrin_grant.refused, never fatal.
+
+      THE PATH NEVER CROSSES THE WIRE, in either direction, and that is the
+      security property rather than an economy. request_file and
+      request_dir name no file: they raise the core-drawn picker, the human
+      chooses in front of the trusted indicator, and what comes back is a
+      descriptor. An agent holding this verb therefore holds authority to
+      ASK, never authority over any file it can name - which is what makes
+      a designation grant safe to hand out long before any particular file
+      is safe to hand over. The consequence a client must accept is that an
+      agent cannot script a designation: there is no request by which it
+      says which file it wants, and adding one later would defeat the whole
+      interface rather than extend it.
+
+      TWO PARTIES RECEIVE THE SAME DESIGNATION, on two connections. The
+      asking agent receives designated on this facet; the realm's shim
+      receives vitrin_shim_session.designation and relays the descriptor to
+      its app. They carry the same designation_id so a human reading the
+      journal can put the two halves together. Neither is derived from the
+      other on the wire, and the realm is never told which principal asked.
+
+      REVOCATION CANNOT RECALL A DELIVERED DESCRIPTOR. This is the one
+      limitation of this interface that will be misread if it is left
+      unstated, so it is stated here, in the normative text, rather than
+      only on the prose page. A file descriptor that has crossed a socket
+      is kernel authority: no revocation, no expiry, no dead-man chord and
+      no core-side bookkeeping closes it in another process. Revoking the
+      grant stops FUTURE designations and kills the grant row; every
+      descriptor already delivered keeps working until its realm dies.
+      PRD P2's "revocation is immediate and transitive" is therefore FALSE
+      for designations already made, and calling it true would be the kind
+      of claim this protocol's error taxonomy exists to avoid. The residue
+      ends with the realm, not with the grant. A deployment that cannot
+      accept it must not serve designate_file, because no attenuation of a
+      designation grant removes it - and E3.7's durable designation grants
+      multiply exactly this residue rather than reducing it.
+
+      REFUSALS COME IN TWO VOICES, and the split is deliberate rather than
+      a second chokepoint. vitrin_grant.refused(designate_file, ...)
+      answers whether this grant may ask AT ALL - the chokepoint's own
+      question, in the one voice that answers it for every verb, and it
+      never reaches the human. This interface's refused answers what
+      happened AFTER the ask was allowed and the picker was raised: the
+      human declined, or the core would not designate what they chose. Both
+      are terminals of the same request and exactly one of the three
+      arrives; see request_file.
+
+      WHAT THIS FACET IS NOT. It designates; it does not enumerate,
+      browse, stat, or open by name. There is no request that lists what a
+      previous designation covered, no request that re-opens one, and no
+      request that revokes one - the last because there would be nothing
+      for it to do (see above). A subtree arrives as one directory fd and
+      the receiver walks it with the kernel's own openat, which is what
+      makes "subtree" a real containment boundary rather than a prefix
+      match on strings this protocol never sees.
+
+      Version 1 does not define this interface's messages at all - it is
+      reachable only through a since="2" mint. The designate_file bit is
+      defined ahead of being served, exactly as realm_launch was: EVERY
+      deployment refuses it "unsupported" today, because the core-drawn
+      picker (P2.6.6) and the consent copy that names what approving it
+      costs (P2.6.8) do not exist yet. Defining the verb before serving it
+      is what makes a petition for it an answer rather than a connection
+      death.
+
+      ONE VERB PER INTERFACE, AND WHERE THAT ALREADY DECIDED THE NEXT
+      CHANGE. interface/@verb is one value, which is why this facet
+      declares designate_file and why the layout pair is two interfaces
+      rather than one. docs/plan/02-phase-2-semantic-epochs.md's E2.7
+      (P2.7.2) was drafted as a request_connect on THIS interface
+      exercising the egress verb, and this attribute cannot express that: a
+      second verb's requests would reach the chokepoint with no entry,
+      which is the exact failure the layout split exists to prevent. SO
+      EGRESS TOOK A FACET OF ITS OWN, exactly as the layout pair was
+      forced to, and this interface stays a designate_file facet at every
+      version. That is no longer a prediction: vitrin_egress is in this
+      document, below this interface, minted by vitrin_grant.get_egress.
+      The plan's wording is corrected under E2.7's own issue;
+      the rule, not the plan, is what decided it.
+    </description>
+
+    <request name="request_file" since="2">
+      <description summary="ask the human to designate one file">
+        Raises the core-drawn picker for a single file and, on the human's
+        confirmation, delivers its descriptor. Reply-bearing: EXACTLY ONE
+        terminal per request, in request order, never coalesced, and it is
+        one of three -
+
+        designated(...) when the human chose and the core resolved the
+        choice safely; refused(code) when the picker was raised and
+        produced no descriptor (the human cancelled, the prompt expired,
+        one was already up, or the core would not designate what they
+        chose); or vitrin_grant.refused(designate_file, ...) when the
+        chokepoint declined the ask before any picker was raised.
+
+        A three-way one-of rather than the usual pair, because there are
+        genuinely two different questions with two different answerers: the
+        chokepoint decides whether this grant may ask, and the human
+        decides what to designate. Collapsing them would make "the human
+        said no" indistinguishable from "your grant expired", which an
+        agent must be able to tell apart - one is worth asking again, the
+        other is not.
+
+        mode is what the agent ASKS FOR and what the picker OPENS AS: a
+        read ask is an open dialog, a read_write ask is one that also
+        offers to create. It is never what the agent GETS. The human may
+        narrow it, and designated.mode carries the effective answer - the
+        same shape resolved.verbs has toward request_grant's verbs.
+
+        There is deliberately NO filter, suggestion, hint or starting
+        directory argument. Each would be an agent-supplied string steering
+        what the human sees in a window the human is meant to trust, and a
+        signature is immutable forever, so a hint added here could never be
+        taken back. A deployment that wants a sensible starting directory
+        chooses one itself.
+
+        Pipelining is legal and terminals pair in request order, exactly as
+        capture_frame's do. Asks are rate-limited by the grant's
+        max_event_rate like every other use of a grant, which is what stops
+        an agent from raising pickers faster than a human can dismiss them;
+        the per-principal single-picker rule (refused "busy") is the other
+        half of the same protection.
+      </description>
+      <arg name="mode" type="uint" enum="mode" summary="the access this ask is for; the human may narrow it, and designated.mode carries what was actually approved"/>
+    </request>
+
+    <request name="request_dir" since="2">
+      <description summary="ask the human to designate one directory subtree">
+        Raises the core-drawn picker for a single directory and, on the
+        human's confirmation, delivers ONE DIRECTORY FD covering that
+        subtree. Identical to request_file in delivery class, terminals,
+        ordering, rate limiting and the absence of any steering argument.
+
+        A SUBTREE IS ONE DESCRIPTOR, not a batch. That is the one-fd
+        framing invariant doing real work rather than being worked around:
+        the receiver walks the subtree with openat from the directory fd,
+        so containment is the kernel's rather than a prefix match on
+        strings this protocol never carries. It is also why there is no
+        request that designates several files at once - a picker that let a
+        human multi-select emits one designated per file.
+
+        NO MODE ARGUMENT, deliberately, and the asymmetry with request_file
+        is argued rather than accidental. request_file's mode selects which
+        picker chrome the human sees (open, or open-and-create); a subtree
+        picker has one chrome, so a mode here would steer nothing and would
+        put the widest ask this verb can make - read-write over a whole
+        subtree - into the least visible place. The human's tick in the
+        picker decides it, and designated.mode carries the answer, so
+        nothing is left unstated on the wire. If a chrome-selecting mode is
+        ever needed for directories it arrives as a since-gated sibling
+        request; this signature is frozen forever like every other.
+      </description>
+    </request>
+
+    <event name="designated" since="2">
+      <description summary="the descriptor the human designated">
+        Exactly one per successful ask, in request order, never coalesced,
+        carrying EXACTLY ONE fd. Ownership transfers to the receiver, which
+        MUST close it after use; the core closes its own copy after
+        sending.
+
+        THE SAME DESCRIPTOR REACHES THE REALM SEPARATELY, as
+        vitrin_shim_session.designation on the shim connection, carrying
+        the same designation_id. An agent that only wanted the app to have
+        the file may close its own copy immediately; holding it is not
+        required for the realm's copy to work, and closing it does not
+        revoke the realm's.
+
+        THIS FD OUTLIVES THE GRANT. Revocation and expiry stop future asks
+        and kill the grant row; they do not close what this event already
+        delivered, on either connection. See the interface description.
+
+        designation_id is the core's own id, unique for the life of the
+        session and matching the journal record. Treat it as opaque.
+
+        kind says whether the descriptor is a file or a directory subtree.
+        It is redundant with which request was answered - terminals pair in
+        request order - and is carried anyway so a receiver that logs, or
+        that hands the descriptor onward, need not reconstruct it from a
+        request it may no longer have.
+
+        mode is the EFFECTIVE access the human approved, which may be
+        narrower than the ask. It describes what the core opened the
+        descriptor with; it is not a promise about the file's permissions,
+        which the kernel enforces and may change underneath any holder.
+
+        name is the basename of what the human chose, for display only. It
+        is not a path, and withholding the path is not claimed as
+        confidentiality: whoever holds the descriptor can read the path out
+        of /proc/self/fd. It is withheld so that no path is ever part of
+        this interface's contract.
+      </description>
+      <arg name="fd" type="fd" summary="the designated file or directory descriptor; ownership transfers to the receiver, which MUST close it"/>
+      <arg name="designation_id" type="uint" summary="the core's opaque id for this designation, matching the journal record and the realm's designation event"/>
+      <arg name="kind" type="uint" enum="kind" summary="whether the descriptor is a file or a directory subtree"/>
+      <arg name="mode" type="uint" enum="mode" summary="the EFFECTIVE access the human approved, which may be narrower than the ask"/>
+      <arg name="name" type="string" summary="basename of what the human chose, for display only - never a path (max 255 bytes)"/>
+    </event>
+
+    <event name="refused" since="2">
+      <description summary="the picker was raised and produced no descriptor">
+        The terminal of an ask that the chokepoint ALLOWED and that still
+        yielded nothing - the human's answer, or the core's own refusal to
+        designate what they chose. Exactly one per refused ask, in request
+        order, never coalesced.
+
+        NOT A SECOND ENFORCEMENT VOICE. Authority questions are answered by
+        vitrin_grant.refused, from the one chokepoint, for every verb; this
+        event answers a different question that the chokepoint never sees.
+        Reading a code here as an authority verdict is a mistake: every
+        code below is compatible with a perfectly live grant.
+
+        THIS EVENT IS NOT AN ORACLE ABOUT THE FILESYSTEM, and the codes are
+        chosen so it cannot become one. None of them says anything about
+        what exists, what is readable, or where the human was looking. A
+        code that distinguished "you chose a file you may not open" from
+        "you cancelled" would let an agent probe the human's filesystem one
+        prompt at a time, which is exactly the power a powerbox exists to
+        deny.
+
+        A refused ask leaves no residue: no descriptor was delivered, the
+        realm was told nothing, and the journal records the ask and its
+        outcome. Asking again is legal and is bounded by the same rate
+        ceiling as any other use.
+      </description>
+      <arg name="code" type="uint" enum="refusal" summary="why the ask produced no descriptor"/>
+    </event>
+
+    <enum name="mode">
+      <description summary="the access a designation carries">
+        A closed pair rather than a boolean, so that an access this scene
+        cannot yet express appends an entry instead of needing a second
+        request. Values are immutable and entries append; an out-of-range
+        value is fatal "invalid_argument".
+
+        THERE IS NO WRITE-ONLY RUNG, deliberately. The pair exists to be
+        put to a human in one sentence - may this app read it, or read and
+        change it - and a third rung whose difference the human cannot act
+        on is prompt noise rather than attenuation. A save-only flow is
+        served by read_write.
+      </description>
+      <entry name="read" value="0" summary="the descriptor is opened for reading"/>
+      <entry name="read_write" value="1" summary="the descriptor is opened for reading and writing, so the holder may change or truncate what it names"/>
+    </enum>
+
+    <enum name="kind">
+      <description summary="what a designated descriptor names">
+        Which of the two asks this designation answers. Values are
+        immutable and entries append; an out-of-range value is fatal
+        "invalid_argument".
+      </description>
+      <entry name="file" value="0" summary="a single file"/>
+      <entry name="directory" value="1" summary="a directory, designating the whole subtree beneath it as one descriptor"/>
+    </enum>
+
+    <enum name="refusal">
+      <description summary="why a raised picker produced no descriptor">
+        Answers are exhaustive rather than optional: every ask the
+        chokepoint allows gets exactly one terminal, and an ask that
+        designated nothing says why. The set is deliberately SMALL and
+        deliberately says nothing about the filesystem - see the refused
+        event. Each entry is distinguished because it means something
+        different to a client deciding whether to ask again, which is the
+        only decision this event informs.
+      </description>
+      <entry name="cancelled" value="0" summary="the human dismissed the picker without choosing; the ordinary answer, and asking again later is legal"/>
+      <entry name="timed_out" value="1" summary="the picker was raised and expired unanswered, on the deployment's own deadline; distinct from cancelled because nobody decided anything"/>
+      <entry name="busy" value="2" summary="a picker for this principal is already up; at most one at a time, because two stacked in front of one human is the consent-fatigue shape the busy petition outcome already names"/>
+      <entry name="unresolvable" value="3" summary="the human chose, and the core would not designate it: the entry could not be resolved without following a symlink or losing a race between the confirmation and the open, so the core refuses rather than delivering a descriptor that may not name what the human saw; says nothing about whether the entry exists"/>
     </enum>
   </interface>
 

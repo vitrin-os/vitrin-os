@@ -2121,6 +2121,12 @@ fn write_string_array(out: &mut String, k: &str, values: &[String]) {
 /// about the two layout verbs; `every_verb_bit_has_a_journal_label` keeps the
 /// next appended bit from re-opening it silently.
 ///
+/// It did exactly that for `designate_file` (P2.6.5): the bit landed in the
+/// IDL and this table went red on the same run. The label is added here even
+/// though **no deployment serves the verb yet** — an admission refusal is
+/// journaled with the verb the petition named, so a bit can reach this
+/// function long before any chokepoint arm exists for it.
+///
 /// `"unknown"` survives for a value that is not a single defined bit (a mask, or
 /// zero), which the chokepoint cannot produce — one facet, one verb — but which
 /// this function must still be total for.
@@ -2132,6 +2138,7 @@ fn verb_label(verb: Verb) -> &'static str {
         Verb::OBSERVE_CURSOR => "observe_cursor",
         Verb::LAYOUT_ARRANGE => "layout_arrange",
         Verb::LAYOUT_FOCUS => "layout_focus",
+        Verb::DESIGNATE_FILE => "designate_file",
         Verb::REALM_LAUNCH => "realm_launch",
         Verb::EGRESS => "egress",
         _ => "unknown",

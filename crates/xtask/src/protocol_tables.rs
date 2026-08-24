@@ -525,6 +525,9 @@ mod tests {
 
     /// Non-vacuity for the header half, at the exact value this branch got
     /// wrong: `vitrin_grant` gained a fourth request and its page said three.
+    /// It then gained a FIFTH -- `get_powerbox` and `get_egress` landed from
+    /// two branches at once -- so the page's real count is read from the IDL
+    /// rather than written here, and only the undercount is a literal.
     #[test]
     fn a_header_that_undercounts_its_requests_is_a_failure() {
         let page = "# vitrin_grant\n\n**Interface version:** 2 · **Connection class:** \
@@ -539,10 +542,10 @@ mod tests {
             .interface("vitrin_grant")
             .expect("vitrin_grant")
             .clone();
-        assert_eq!(
-            grant.requests.len(),
-            4,
-            "the IDL is what makes the header above wrong"
+        assert!(
+            grant.requests.len() > header.requests as usize,
+            "the IDL is what makes the header above wrong: it declares {} request(s)",
+            grant.requests.len()
         );
         assert_ne!(header.requests, grant.requests.len() as u32);
     }
@@ -608,12 +611,15 @@ mod tests {
         assert!(parse_header("**Interface version:** · **Messages:** 1 request\n").is_err());
     }
 
-    /// Non-vacuity for the bounds half: the derived set is the full seventeen
+    /// Non-vacuity for the bounds half: the derived set is the full nineteen
     /// and contains both of the arguments §2.3 had missed.
+    ///
+    /// Seventeen when this test was written; the powerbox's two `name`
+    /// arguments merged in from a parallel branch and made it nineteen.
     #[test]
     fn the_bounds_derivation_finds_every_string_argument() {
         let bounds = derive_bounds(&protocol());
-        assert_eq!(bounds.len(), 17);
+        assert_eq!(bounds.len(), 19);
         assert!(bounds.contains(&Bound {
             message: "vitrin_egress.request_connect".into(),
             arg: "host".into(),

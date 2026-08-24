@@ -131,7 +131,7 @@ grant handle, its consent observer, and the three authority facets.
 | `view` | `new_id` → [`vitrin_view`](./06-vitrin_view.md) | observation facet, inert until granted with `observe` |
 | `pointer` | `new_id` → [`vitrin_actuator_pointer`](./07-vitrin_actuator_pointer.md) | pointer facet, inert until granted with `actuate_pointer` |
 | `text` | `new_id` → [`vitrin_actuator_text`](./08-vitrin_actuator_text.md) | text facet, inert until granted with `actuate_text` |
-| `resource` | `string` (nullable, max 256 bytes) | resource selector within the realm; **null or empty** = the whole realm (the only granularity version 1 serves). Vocabulary is type-prefixed (`surface:…`, `node:…`, `net:HOST:PORT`) and grows by version. |
+| `resource` | `string` (nullable, max 256 bytes) | resource selector within the realm; **null or empty** = the whole realm (the only granularity version 1 serves). Vocabulary is type-prefixed (`surface:…`, `node:…`, `file:…`, `dir:…`, `net:HOST:PORT`) and grows by version. |
 | `verbs` | `uint` — bitfield [`vitrin_grant.verb`](./04-vitrin_grant.md#verb) | requested verb set; **MUST be non-zero** |
 | `expiry_ms` | `uint` | requested lifetime in milliseconds; `0` = bounded only by the persistence rung |
 | `max_event_rate` | `uint` | requested ceiling in **events per second**, governing observation and actuation alike; `0` = server default ceiling, **never** unlimited |
@@ -169,12 +169,31 @@ death.
 **Argument semantics.**
 - `resource` selects what within the realm. Null or empty means the whole
   realm. An unserved resource prefix does not fail structurally; it resolves
-  `unsupported`. One prefix's grammar is **normative rather than
-  illustrative**: `net:HOST:PORT`, which names the single host and single port
-  an [`egress`](./04-vitrin_grant.md#the-net-resource-prefix) grant covers and
+  `unsupported`.
+- **`file:` and `dir:` are the powerbox's selectors** *(version 2)*, named by a
+  petition for [`designate_file`](./04-vitrin_grant.md#verb): `file:` asks for
+  one file, `dir:` for a subtree, which is delivered as a **single directory
+  fd** rather than as a batch. Naming a prefix is **not naming a path** — the
+  selector says what *kind* of thing this grant may cover, and the path is
+  chosen by the human in the core-drawn picker and never crosses the wire in
+  either direction (see [`vitrin_powerbox`](./13-vitrin_powerbox.md)). A
+  petition may leave `resource` null and let the human choose without a stated
+  kind. Adding a prefix breaks no client at any version, because an unserved
+  prefix already resolves `unsupported` recoverably — which is also what these
+  two resolve to in **every deployment today**, since none serves
+  `designate_file` yet. Whether a prefix is *served* is a property of a
+  deployment, exactly as it is for a verb.
+- **`net:HOST:PORT` is the one prefix whose grammar is normative rather than
+  illustrative** *(version 2)*. It names the single host and single port an
+  [`egress`](./04-vitrin_grant.md#the-net-resource-prefix) grant covers and
   admits no wildcard, no CIDR and no list. A `net:` selector that does not
   parse resolves `unsupported` too — never `invalid_argument`, and never
-  widened to something that does parse.
+  widened to something that does parse. It is also the prefix that *does* name
+  its resource on the wire, which is the opposite of what `file:` and `dir:`
+  do and is not in tension with them: a `host:port` is a public name the human
+  is shown and approves, a path is a secret the picker chooses. Like the
+  powerbox's two, it resolves `unsupported` in every deployment today, since
+  none serves `egress` yet.
 - `verbs` is the requested verb bitfield. It MUST be non-zero — a petition for
   nothing is a client bug, not a world change (see failure modes below).
 - `expiry_ms` of `0` defers the lifetime to the persistence rung.
@@ -241,18 +260,18 @@ no wire message to withdraw a pending petition in version 1 (see
 that are **defined on [`vitrin_grant`](./04-vitrin_grant.md)** and documented
 there:
 
-<!-- vitrin-verb-set: all-verbs = observe, actuate_pointer, actuate_text, observe_cursor, layout_arrange, layout_focus, realm_launch, egress -->
+<!-- vitrin-verb-set: all-verbs = observe, actuate_pointer, actuate_text, observe_cursor, layout_arrange, layout_focus, designate_file, egress, realm_launch -->
 
 - `verbs` uses the bitfield [`vitrin_grant.verb`](./04-vitrin_grant.md#verb)
   (`observe` = 1, `actuate_pointer` = 2, `actuate_text` = 4,
   `observe_cursor` = 8, `layout_arrange` = 16, `layout_focus` = 32,
-  `egress` = 128, `realm_launch` = 512). Two of them —
-  `observe_cursor` and `egress` — are
+  `designate_file` = 64, `egress` = 128, `realm_launch` = 512). Three of them —
+  `observe_cursor`, `designate_file` and `egress` — are
   [defined but unserved](./04-vitrin_grant.md#defined-but-unserved): in range,
   so naming one is never fatal, and refused `unsupported` whole. The values are **not** consecutive
-  bits and must be transcribed rather than counted: 64 and 256 are allocated
-  to verbs this document does not define yet, and 128 was one of them until
-  `egress` landed on it.
+  bits and must be transcribed rather than counted: 256 is allocated
+  to a verb this document does not define yet, and 64 and 128 were too until
+  `designate_file` and `egress` landed on them.
 - `persistence` uses the enum
   [`vitrin_grant.persistence`](./04-vitrin_grant.md#persistence) (`once` = 0,
   `while_running` = 1, `until_revoked` = 2, `always` = 3).

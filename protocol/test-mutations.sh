@@ -159,6 +159,112 @@ check_rejected clipboard-status-enum-on-string \
 check_rejected clipboard-status-without-description \
   '/<enum name="selection_status">/,/<\/enum>/{/<description summary="why a selection answer carries no data">/,/<\/description>/d}'
 
+# --- P2.6.5 (issue #189): the powerbox messages ------------------------------
+#
+# Each case is pinned on a message this issue ADDED, for the reason the
+# WS-E.2.1 clipboard block states: the corpus should exercise the schema
+# against the newest surface, not only against the oldest.
+#
+# ONE OF #189's ACCEPTANCE CRITERIA IS DELIBERATELY NOT HERE. It asked for an
+# `fd_count` mismatch case dying fatal `fd_violation`. `fd_count` is a byte of
+# the frame header, not a construct of the IDL dialect, so no mutation of this
+# document could be rejected for it and a case named for it would be
+# exercising something else. It lives in
+# `crates/vitrin-protocol/tests/decode_errors.rs` instead, against the real
+# decoder and asserting the real wire code; the relocation is recorded as
+# D-045 in `docs/plan/20-decision-log.md` so the criterion reads as moved
+# rather than dropped.
+
+# The @verb set is closed even though this issue WIDENED it. `designate_file`
+# joining the choice list is a dialect change, and the risk a dialect change
+# carries is that the list stops being closed at all -- so mutate the new value
+# to a verb name the set does not admit. It must be rejected: an unadmitted
+# verb name would otherwise reach a backend and emit a chokepoint entry
+# nothing enforces.
+#
+# RE-PINNED FROM `egress` TO `observe_cursor`, and the reason is this file's
+# oldest recorded failure mode arriving for the third time. The case was
+# written as `verb="designate_file"` -> `verb="egress"` because `egress` was
+# then "the next verb the allocation registry names (128, E2.7) and one with
+# no facet interface today". P2.7.2 landed `vitrin_egress` in parallel, the
+# schema's closed set gained `egress`, and the mutated document became LEGAL --
+# so the case would have reported the schema as broken when the schema was
+# right, exactly as `verb-without-facet` did when `layout_arrange` gained an
+# interface. `observe_cursor` is facetless BY CONSTRUCTION and is the only
+# name that cannot do this again; see the block above `verb-without-facet` for
+# the full history. This case stays distinct from that one because it is
+# pinned on the surface P2.6.5 added rather than on the launcher's.
+check_rejected powerbox-verb-not-in-the-closed-set \
+  's|verb="designate_file"|verb="observe_cursor"|'
+
+# `designated` carries one of the protocol's five `fd` arguments, and
+# `allow-null` is
+# legal only on string and object arguments. An `allow-null` fd would be a
+# descriptor argument with a null form, which the one-fd framing invariant has
+# no way to express -- fd_count is 0 or 1 and is read from the header, not from
+# the payload.
+check_rejected designated-fd-allow-null \
+  's|<arg name="fd" type="fd" summary="the designated file or directory descriptor; ownership transfers to the receiver, which MUST close it"/>|<arg name="fd" type="fd" allow-null="true" summary="the designated file or directory descriptor; ownership transfers to the receiver, which MUST close it"/>|'
+
+# The display name is a bounded string, and the bound lives in a
+# machine-readable summary token the generated decoder reads. Dropping it from
+# `designated` must be a schema failure rather than an unbounded string
+# argument arriving over the wire.
+check_rejected designated-name-without-bound \
+  's|summary="basename of what the human chose, for display only - never a path (max 255 bytes)"|summary="basename of what the human chose, for display only - never a path"|'
+
+# Enum references are legal only on int and uint arguments: the designation's
+# `kind` may not be carried by the string beside it.
+check_rejected designation-kind-enum-on-string \
+  's|<arg name="name" type="string" summary="basename of what the human chose, for display only - never a path (max 255 bytes)"/>|<arg name="name" type="string" enum="vitrin_powerbox.kind" summary="basename of what the human chose, for display only - never a path (max 255 bytes)"/>|'
+
+# The argument-type set is closed at seven and admits no `array`. Retyping
+# `request_file`'s `mode` is the cheapest way to exercise that on a message
+# this issue added -- the mutation also drops the enum reference, so a schema
+# that had quietly stopped rejecting `array` would be caught by either half.
+#
+# (Corrected twice, so what is true is stated plainly rather than patched
+# again. This comment first described an array OF DESCRIPTORS, which no
+# mutation here performs; the correction then named `designated-fd-allow-null`
+# as the case exercising the one-fd rule, in the same sentence that said the
+# schema does not model that rule -- and pointed the wrong way to find it. The
+# one-fd rule is a framing invariant no mutation of this document can reach:
+# fd_count is a header byte. `designated-fd-allow-null` exercises the dialect
+# rule that `allow-null` is admitted only on string and object arguments, which
+# is why an `fd` argument cannot be nullable; the framing invariant is that
+# case's motivation, not what its rejection proves. The invariant itself is
+# checked only at runtime, by decode_errors.rs's fd_count pair. Cases here are
+# cross-referenced by name and never by direction -- a direction is a claim
+# about this file's order that nothing checks and any reordering falsifies
+# silently.)
+check_rejected powerbox-mode-as-array \
+  's|<arg name="mode" type="uint" enum="mode" summary="the access this ask is for; the human may narrow it, and designated.mode carries what was actually approved"/>|<arg name="mode" type="array" summary="the access this ask is for; the human may narrow it, and designated.mode carries what was actually approved"/>|'
+
+# `get_powerbox` is a structural mint, and a new_id argument MUST name the
+# interface it mints -- an untyped new_id would leave codegen with nothing to
+# emit and a client with no way to know what it just allocated. Pinned on the
+# mint this issue added rather than on one of the three that came before it.
+check_rejected get-powerbox-new-id-without-interface \
+  's|<arg name="powerbox" type="new_id" interface="vitrin_powerbox" |<arg name="powerbox" type="new_id" |'
+
+# Enum references are legal only on int and uint arguments. `vitrin_powerbox`
+# defines a refusal voice of its own, distinct from vitrin_grant.refused, and
+# its one argument is the enum that carries the code: a string form of it
+# would put an unbounded, uncheckable name where a closed set belongs.
+check_rejected powerbox-refused-code-as-string \
+  's|<arg name="code" type="uint" enum="refusal" summary="why the ask produced no descriptor"/>|<arg name="code" type="string" enum="refusal" summary="why the ask produced no descriptor (max 32 bytes)"/>|'
+
+# Enum entry values are required and immutable. An unvalued `refusal` entry
+# would leave the wire value to document order -- the renumbering hazard the
+# "values are immutable" rule exists to forbid.
+check_rejected powerbox-refusal-entry-without-value \
+  's|<entry name="cancelled" value="0" |<entry name="cancelled" |'
+
+# Every request carries a description. `request_dir` has no arguments at all,
+# so its description is the whole of what the message documents.
+check_rejected powerbox-request-dir-without-description \
+  '/<request name="request_dir" since="2">/,/<\/request>/{/<description summary="ask the human to designate one directory subtree">/,/<\/description>/d}'
+
 # --- P2.7.2 (issue #196), first half: the egress verb bit --------------------
 #
 # The surface that half added is one `vitrin_grant.verb` entry, and these two

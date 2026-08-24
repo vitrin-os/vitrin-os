@@ -19,11 +19,27 @@
 //! declarative `roundtrip_test!` table below, not as a missing hand-rolled
 //! test function nobody wrote.
 //!
-//! The three fd-bearing messages (`vitrin_view.frame_ready`,
-//! `vitrin_shim_surface.attach` and `vitrin_egress.connected` -- found by grep
-//! for an `fd`-typed arg) get their own hand-written `proptest!` blocks
-//! instead of the table, since they need a real disposable fd pair from
-//! `std::io::pipe()` rather than a pure value strategy.
+//! The fd-bearing messages (`vitrin_view.frame_ready`,
+//! `vitrin_shim_surface.attach`, P2.6.5's designation pair
+//! `vitrin_powerbox.designated` / `vitrin_shim_session.designation`, and
+//! P2.7.2's `vitrin_egress.connected`) get
+//! their own hand-written `proptest!` blocks instead of the table, since they
+//! need a real disposable fd pair from `std::io::pipe()` rather than a pure
+//! value strategy. **Two different gates hold two different properties, and
+//! neither one holds the other's:**
+//!
+//! * `every_idl_message_is_in_the_roundtrip_table` compares the
+//!   `impl_message!` table's length to the generated `MESSAGE_COUNT`, so a
+//!   message the IDL defines and the table omits is red. It has **no view of
+//!   whether a message has a test** -- deleting a `proptest!` block while
+//!   leaving its table entry leaves that gate green, which is exactly what a
+//!   review of #189 demonstrated by deleting one.
+//! * `every_fd_bearing_message_has_a_hand_written_block` closes that: it reads
+//!   `protocol/vitrin-v0.xml`, finds every message with an `fd`-typed
+//!   argument, and requires a `roundtrip_<interface>_<message>` function in
+//!   this file. The list above is therefore derived rather than counted, and
+//!   an fd-bearing message added to the IDL cannot reach the table without a
+//!   block of its own.
 
 use std::os::fd::OwnedFd;
 
@@ -90,6 +106,13 @@ type OfferSelection = gen::vitrin_shim_session::events::OfferSelection;
 type SessionPointerConstraint = gen::vitrin_shim_session::requests::PointerConstraint;
 type SessionPointerConstraintState = gen::vitrin_shim_session::events::PointerConstraintState;
 type SessionIdleInhibit = gen::vitrin_shim_session::requests::IdleInhibit;
+type SessionDesignation = gen::vitrin_shim_session::events::Designation;
+
+type GetPowerbox = gen::vitrin_grant::requests::GetPowerbox;
+type PowerboxRequestFile = gen::vitrin_powerbox::requests::RequestFile;
+type PowerboxRequestDir = gen::vitrin_powerbox::requests::RequestDir;
+type PowerboxDesignated = gen::vitrin_powerbox::events::Designated;
+type PowerboxRefused = gen::vitrin_powerbox::events::Refused;
 
 type Attach = gen::vitrin_shim_surface::requests::Attach;
 type Damage = gen::vitrin_shim_surface::requests::Damage;
@@ -236,6 +259,12 @@ impl_message!(
     SessionPointerConstraint,
     SessionPointerConstraintState,
     SessionIdleInhibit,
+    SessionDesignation,
+    GetPowerbox,
+    PowerboxRequestFile,
+    PowerboxRequestDir,
+    PowerboxDesignated,
+    PowerboxRefused,
     Attach,
     Damage,
     Commit,
@@ -277,6 +306,80 @@ fn every_idl_message_is_in_the_roundtrip_table() {
         "a message defined in protocol/vitrin-v0.xml is missing from (or extra in) \
          roundtrip.rs's impl_message! table"
     );
+}
+
+/// The gate the one above cannot be: **an fd-bearing message has a
+/// hand-written `proptest!` block of its own.**
+///
+/// The table gate compares two *lengths*. An fd-bearing message listed in
+/// `impl_message!` with no block below it therefore ships untested and green
+/// -- which a review of #189 demonstrated by deleting
+/// `roundtrip_vitrin_powerbox_designated` outright and watching the suite
+/// stay green. The module docs claimed that gate covered this; it never did.
+///
+/// So the set is read from the IDL rather than restated: every message with
+/// an `fd`-typed argument must have a `roundtrip_<interface>_<message>`
+/// function in this file, which is the naming every existing block already
+/// follows. Deleting a block is red; adding an fd-bearing message to the IDL
+/// without one is red.
+#[test]
+fn every_fd_bearing_message_has_a_hand_written_block() {
+    // This file's own source, so the check needs no second list to drift
+    // from. `include_str!` resolves relative to this file.
+    const THIS_FILE: &str = include_str!("roundtrip.rs");
+    let xml = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../protocol/vitrin-v0.xml"
+    ))
+    .expect("the IDL is two directories up from this crate");
+
+    let mut interface = String::new();
+    let mut message = String::new();
+    let mut fd_bearing: Vec<String> = Vec::new();
+    for line in xml.lines() {
+        let t = line.trim();
+        if let Some(name) = attr_value(t, "<interface name=\"") {
+            interface = name;
+        } else if let Some(name) = attr_value(t, "<request name=\"") {
+            message = name;
+        } else if let Some(name) = attr_value(t, "<event name=\"") {
+            message = name;
+        } else if t.starts_with("<arg ") && t.contains("type=\"fd\"") {
+            assert!(
+                !interface.is_empty() && !message.is_empty(),
+                "an fd argument outside any message: {t}"
+            );
+            fd_bearing.push(format!("roundtrip_{interface}_{message}"));
+        }
+    }
+
+    // Non-vacuity: the scan must actually find fd arguments. A parser that
+    // silently matched nothing would make every assertion below trivially
+    // true, which is the failure mode this whole test exists to refuse.
+    assert!(
+        fd_bearing.len() >= 4,
+        "the IDL scan found {} fd-bearing messages; it has defined at least \
+         four since P2.6.5, so the scan is broken rather than the IDL",
+        fd_bearing.len()
+    );
+    let missing: Vec<&String> = fd_bearing
+        .iter()
+        .filter(|f| !THIS_FILE.contains(&format!("fn {f}(")))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "protocol/vitrin-v0.xml defines fd-bearing messages with no hand-written \
+         round-trip block in this file: {missing:?}. The impl_message! table gate \
+         cannot see this -- it compares lengths, not coverage."
+    );
+}
+
+/// `<tag name="value"` -> `value`, for the one-attribute-per-line shape the
+/// IDL is written in.
+fn attr_value(line: &str, prefix: &str) -> Option<String> {
+    let rest = line.strip_prefix(prefix)?;
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
 }
 
 /// The property itself: encode the generated value, decode those bytes back,
@@ -811,6 +914,45 @@ fn set_fullscreen() -> impl Strategy<Value = SetFullscreen> {
     plain_enum(gen::vitrin_layout_arrange::Mode::ALL).prop_map(|mode| SetFullscreen { mode })
 }
 
+fn get_powerbox() -> impl Strategy<Value = GetPowerbox> {
+    any_u32().prop_map(|powerbox| GetPowerbox { powerbox })
+}
+
+fn powerbox_request_file() -> impl Strategy<Value = PowerboxRequestFile> {
+    plain_enum(gen::vitrin_powerbox::Mode::ALL).prop_map(|mode| PowerboxRequestFile { mode })
+}
+
+/// `request_dir` carries no arguments -- a subtree ask steers nothing, and
+/// its mode is the human's tick in the picker (IDL).
+fn powerbox_request_dir() -> impl Strategy<Value = PowerboxRequestDir> {
+    Just(PowerboxRequestDir {})
+}
+
+fn powerbox_refused() -> impl Strategy<Value = PowerboxRefused> {
+    plain_enum(gen::vitrin_powerbox::Refusal::ALL).prop_map(|code| PowerboxRefused { code })
+}
+
+/// Non-fd fields of the designation pair, in field order. `designated` and
+/// `vitrin_shim_session.designation` carry the *same* four non-fd arguments
+/// by design (one designation, two connections), so one strategy feeds both
+/// dedicated `proptest!` blocks below and the two cannot drift apart here
+/// while drifting apart in the IDL.
+fn designation_fields() -> impl Strategy<
+    Value = (
+        u32,
+        gen::vitrin_powerbox::Kind,
+        gen::vitrin_powerbox::Mode,
+        String,
+    ),
+> {
+    (
+        any_u32(),
+        plain_enum(gen::vitrin_powerbox::Kind::ALL),
+        plain_enum(gen::vitrin_powerbox::Mode::ALL),
+        bounded_string(255),
+    )
+}
+
 fn get_egress() -> impl Strategy<Value = GetEgress> {
     any_u32().prop_map(|egress| GetEgress { egress })
 }
@@ -908,6 +1050,19 @@ roundtrip_test!(
     roundtrip_vitrin_shim_session_idle_inhibit,
     session_idle_inhibit()
 );
+// vitrin_shim_session.designation: fd-bearing, see dedicated block below.
+
+roundtrip_test!(roundtrip_vitrin_grant_get_powerbox, get_powerbox());
+roundtrip_test!(
+    roundtrip_vitrin_powerbox_request_file,
+    powerbox_request_file()
+);
+roundtrip_test!(
+    roundtrip_vitrin_powerbox_request_dir,
+    powerbox_request_dir()
+);
+roundtrip_test!(roundtrip_vitrin_powerbox_refused, powerbox_refused());
+// vitrin_powerbox.designated: fd-bearing, see dedicated block below.
 
 // vitrin_shim_surface.attach: fd-bearing, see dedicated block below.
 roundtrip_test!(roundtrip_vitrin_shim_surface_damage, damage());
@@ -957,9 +1112,10 @@ roundtrip_test!(roundtrip_vitrin_egress_request_connect, request_connect());
 roundtrip_test!(roundtrip_vitrin_egress_connect_failed, connect_failed());
 
 // ---------------------------------------------------------------------------
-// The three fd-bearing messages in v0.xml (grep for an `fd`-typed arg):
-// `vitrin_view.frame_ready`, `vitrin_shim_surface.attach` and
-// `vitrin_egress.connected`. Each gets a
+// The five fd-bearing messages in v0.xml (grep for an `fd`-typed arg):
+// `vitrin_view.frame_ready`, `vitrin_shim_surface.attach`, the
+// designation pair `vitrin_powerbox.designated` /
+// `vitrin_shim_session.designation`, and `vitrin_egress.connected`. Each gets a
 // real, disposable fd pair from `std::io::pipe()` (stable since Rust 1.87;
 // this workspace pins its toolchain in `rust-toolchain.toml` and declares
 // `rust-version` in the workspace `Cargo.toml`) rather than skipping fd
@@ -1012,17 +1168,53 @@ proptest! {
 
 proptest! {
     #[test]
+    fn roundtrip_vitrin_powerbox_designated(
+        object_id in any::<u32>(),
+        (designation_id, kind, mode, name) in designation_fields(),
+    ) {
+        let (reader, writer) = std::io::pipe().expect("creating a disposable pipe for fd round-trip coverage");
+        let value = PowerboxDesignated {
+            fd: OwnedFd::from(reader),
+            designation_id,
+            kind,
+            mode,
+            name,
+        };
+        assert_roundtrip(value, object_id, Some(OwnedFd::from(writer)));
+    }
+}
+
+proptest! {
+    #[test]
+    fn roundtrip_vitrin_shim_session_designation(
+        object_id in any::<u32>(),
+        (designation_id, kind, mode, name) in designation_fields(),
+    ) {
+        let (reader, writer) = std::io::pipe().expect("creating a disposable pipe for fd round-trip coverage");
+        let value = SessionDesignation {
+            fd: OwnedFd::from(reader),
+            designation_id,
+            kind,
+            mode,
+            name,
+        };
+        assert_roundtrip(value, object_id, Some(OwnedFd::from(writer)));
+    }
+}
+
+proptest! {
+    #[test]
     fn roundtrip_vitrin_egress_connected(
         object_id in any::<u32>(),
         (host, port) in connected_fields(),
     ) {
-        // `connected` is the third fd-bearing message and the first one whose
+        // `connected` is the fifth fd-bearing message and the first one whose
         // fd is a SOCKET rather than a buffer. That distinction is the
         // interface's, not the codec's: `encode` never inspects the fd's
         // value and the fd's bytes never enter the buffer, so a pipe end
         // exercises this path exactly as a connected socket would. Using
         // `std::io::pipe()` keeps this block byte-identical in shape to its
-        // two siblings above rather than opening a socketpair to prove
+        // four siblings above rather than opening a socketpair to prove
         // something the codec cannot observe.
         let (reader, writer) = std::io::pipe().expect("creating a disposable pipe for fd round-trip coverage");
         let value = Connected {

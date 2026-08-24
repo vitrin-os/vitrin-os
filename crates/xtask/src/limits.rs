@@ -2358,9 +2358,10 @@ pub const CLAIMS: &[Claim] = &[
                consent. The authority is an operator's realm.toml declaration AND a human's \
                consent, at while_running, because this build has no durable rung to grant. \
                Decided in D-046; built nowhere.",
-        issue: "#311 (open) is the decision this claim publishes. #304 is the shell-as-a-realm \
-                work it unblocks; #194 owns the connected-apps surface the page says does not \
-                exist. Only the first is the tracking issue.",
+        issue: "#311 is the decision this claim publishes, and the commit that adds this row \
+                closes it -- so do not read the id as naming open work. #304 is the \
+                shell-as-a-realm work it unblocks; #194 owns the connected-apps surface the \
+                page says does not exist. Only the first is the tracking issue.",
         surfaces: &[
             Anchor {
                 path: LIMITS,

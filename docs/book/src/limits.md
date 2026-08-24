@@ -1591,8 +1591,12 @@ and this is **what a shell realm may reach that an app realm may not**:
   *and* a human's consent** — both, not either — at the `while_running` rung,
   because the durable rungs are structurally impossible in this build (they need
   a verified binary identity, which is Phase 3). So the consent is **once per
-  core start**, the card's "remember me" is rendered disabled with its reason,
-  and there is no connected-apps surface to forget it from later.
+  core start**, and there is no connected-apps surface to forget it from later.
+  D-046 further asks that the card **render** a disabled "remember me" with its
+  reason rather than omit it. That is a **reversal of what this core does
+  today**, not a description of it: a durable rung is currently *absent* from
+  the card — "not greyed out, not hidden-but-implied" — because it is not
+  representable at all, and two tests pin that. Nothing has changed the card.
 - **None of this is built.** It is a decision about work not yet done; no code
   in this tree passes such a descriptor, and the fence stated above is an
   intention until a chokepoint enforces it.

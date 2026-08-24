@@ -353,8 +353,8 @@ realm view -> consent overlay -> lock cover -> STATUS STRIP -> trusted band
 
 > **AMENDED 2026-08-24 BY [#304](https://github.com/vitrin-os/vitrin-os/issues/304): THE FIRST COST BULLET IS NO LONGER TRUE, AND NEITHER IS THIS ENTRY'S OWN HEADING.**
 > Everything above is left as written — a decision log that edits its own past
-> is worth nothing, and D-033's and D-034's amendments set the precedent this
-> follows. Exactly one bullet has stopped being true and it is named here.
+> is worth nothing, and D-031's, D-033's and D-041's amendments set the
+> precedent this follows. Exactly one bullet has stopped being true and it is named here.
 >
 > **False as of 2026-08-24: *"The realm view is NOT inset, and #215 asked for
 > it"*, and with it the heading's *"and the app's rows are still overdrawn"*.**
@@ -1097,7 +1097,7 @@ So there are no rows to hand a shell realm. There are rows the core takes from t
 
 > **AMENDED 2026-08-24: THE INSET THIS ENTRY CALLED ITS LARGEST PIECE OF UNBUILT
 > WORK IS BUILT. NOTHING ELSE IN THE ENTRY IS.** Everything above stands as
-> written — the amendment convention D-033, D-034 and D-041 established, and the
+> written — the amendment convention D-031, D-033 and D-041 established, and the
 > reason is the same: a decision log that edits its own past is worth nothing.
 > Exactly three passages have stopped being true and they are named here.
 >

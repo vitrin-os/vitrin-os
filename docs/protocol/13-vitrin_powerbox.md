@@ -222,6 +222,16 @@ Collapsing them would make *"the human said no"* indistinguishable from *"your
 grant expired"* — and an agent must be able to tell those apart, because one is
 worth asking again and the other is not.
 
+**This pair reached three first, and is no longer alone.**
+[`vitrin_egress.request_connect`](19-vitrin_egress.md#three-terminals-not-two)
+(P2.7.2) is the third member of the family, on an argument that shares nothing
+with this one but the arity — its extra arm is the *far end's* non-answer, not a
+second answerer. Recorded on both pages because *"the only request with three
+terminals"* is exactly the sentence that went stale when these two facets landed
+on parallel branches; [conventions
+§6.1](00-conventions.md#61-reply-bearing-requests) holds the whole table and
+says why no tool checks it.
+
 **`mode` is what the agent asks for, never what it gets.** It selects which
 picker chrome the human sees: a `read` ask is an open dialog, a `read_write`
 ask is one that also offers to create. The human may narrow it, and

@@ -3203,6 +3203,14 @@
         agent must be able to tell apart - one is worth asking again, the
         other is not.
 
+        This request and request_dir reached three FIRST, and are no
+        longer alone: vitrin_egress.request_connect is the third member,
+        on an argument that shares nothing with this one but the arity -
+        its extra arm is the far end's non-answer, not a second answerer.
+        Recorded on both sides because a "the only request with three
+        terminals" sentence is exactly what went stale when these two
+        facets landed on parallel branches.
+
         mode is what the agent ASKS FOR and what the picker OPENS AS: a
         read ask is an open dialog, a read_write ask is one that also
         offers to create. It is never what the agent GETS. The human may
@@ -3451,9 +3459,13 @@
         client is waiting for, so its terminals pair one-to-one exactly as
         capture_frame's and launch's do.
 
-        THREE TERMINALS, NOT TWO, and that is this interface's one
-        departure from every other reply-bearing request in this document.
-        Stated first because a client must handle all three:
+        THREE TERMINALS, NOT TWO - and this is the SECOND FACET to need
+        three, not the first and not a departure from every other
+        reply-bearing request in this document. vitrin_powerbox got there
+        first, at P2.6.5, on an argument of its own, and its request_file
+        and request_dir are the first two of the three requests in this
+        document that carry a three-terminal set. Stated first because a
+        client must handle all three:
 
           - connected(fd, host, port) - the chokepoint admitted the use
             and the connection was made;
@@ -3482,13 +3494,25 @@
         that reads a transport failure as a lost authority abandons work
         it is permitted to do, and an agent that reads a refusal as a
         transient failure retries forever against a wall. The cost is
-        named rather than hidden: clients now have three terminals to
-        handle here and AT MOST TWO anywhere else - two on capture_frame
-        and launch, one apiece on sync and request_grant - and the
-        asymmetry is bought deliberately. What does NOT move is the rule
-        itself: every reply-bearing request still receives exactly one
-        terminal. Three is the size of the set this request's one terminal
-        is drawn from, not a number of events it receives.
+        named rather than hidden, and it is SHARED rather than unique:
+        three-terminal requests are a small family - request_file,
+        request_dir and this one - against two on capture_frame and launch
+        and one apiece on sync and request_grant. The powerbox pair
+        reached three first and for an unrelated argument (two answerers,
+        the chokepoint and the human, where this request's third arm is
+        the far end's non-answer), so what the two share is the arity and
+        nothing else. Any sentence in this repository that calls three
+        terminals unique to one request is stale by construction: that
+        exact claim was written here while the powerbox was landing on a
+        parallel branch. NOTHING MACHINE-CHECKS IT, and the reason is
+        structural rather than an unbuilt tool - "which events terminate
+        this request" is not stated anywhere in this document, so no
+        derivation from it can see that this set has three members; see
+        docs/protocol/00-conventions.md section 6.1, which carries the
+        hand-kept table and the same warning. What does NOT move is the
+        rule itself: every reply-bearing request still receives exactly
+        one terminal. Three is the size of the set this request's one
+        terminal is drawn from, not a number of events it receives.
 
         AUTHORITY IS DECIDED BEFORE ANYTHING TOUCHES THE NETWORK, and the
         order is normative rather than an implementation preference. The

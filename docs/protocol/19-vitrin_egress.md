@@ -125,8 +125,11 @@ is waiting for, so its terminals pair one-to-one exactly as
 
 ### Three terminals, not two
 
-This is the interface's one departure from every other reply-bearing request
-in this protocol, and a client must handle all three:
+This is the **second facet** in this protocol to need three, not the first and
+not a departure from every other:
+[`vitrin_powerbox`](13-vitrin_powerbox.md#request_file) got there first, at
+P2.6.5, and its `request_file` and `request_dir` are the first two of the three
+requests that carry a three-terminal set. A client must handle all three:
 
 | terminal | means |
 |---|---|
@@ -157,12 +160,21 @@ blurring it is a bug in both directions: an agent that reads a transport
 failure as a lost authority abandons work it is permitted to do, and an agent
 that reads a refusal as a transient failure retries forever against a wall.
 
-**The cost, named rather than hidden.** Clients now handle three terminals
-here and **at most two** anywhere else — two on
+**The cost, named rather than hidden — and shared rather than unique.**
+Three-terminal requests are a family of three:
+[`request_file`](13-vitrin_powerbox.md#request_file),
+[`request_dir`](13-vitrin_powerbox.md#request_dir) and this one — against two on
 [`capture_frame`](06-vitrin_view.md) and [`launch`](16-vitrin_launcher.md#launch),
 one apiece on [`sync`](01-vitrin_handshake.md) and
-[`request_grant`](03-vitrin_realm.md#request_grant). That asymmetry is bought
-deliberately, and the seam it opens is general: a later reply-bearing request
+[`request_grant`](03-vitrin_realm.md#request_grant). The powerbox pair reached
+three first, and for an argument that shares nothing with this one but the
+arity: *two answerers*, the chokepoint and the human, where this request's third
+arm is the far end's non-answer. This paragraph said *"three terminals here and
+**at most two** anywhere else"* until the two facets, landed on parallel
+branches, were read side by side; nothing machine-checks it, because "which
+events terminate this request" is not stated in the IDL at all ([conventions
+§6.1](00-conventions.md#61-reply-bearing-requests) carries the table and the
+same warning). The seam this opens is general: a later reply-bearing request
 whose failure is not the server's decision adds *its own* terminal on *its own*
 facet, never a code in `refusal`.
 

@@ -1336,7 +1336,7 @@ has forced a decomposition someone had planned as one interface: a
 `vitrin_powerbox` carrying `request_file`, `request_dir` **and**
 `request_connect` cannot declare both `designate_file` and `egress`, so
 [`vitrin_egress`](19-vitrin_egress.md) is its own interface and the powerbox
-(page 13, not yet in this tree) carries the filesystem half alone. A proposal
+(page 13, landed at P2.6.5) carries the filesystem half alone. A proposal
 for one facet covering two verbs is wrong on sight.
 
 **A verb having a facet does not make it served.** `egress` has one here and no

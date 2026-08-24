@@ -520,8 +520,8 @@ is *asked for* — [`vitrin_egress`](19-vitrin_egress.md), carrying
 `request_connect`, `connected` and `connect_failed`, minted by
 [`get_egress`](#get_egress) — is its second half and is in the IDL now. It is
 **an interface of its own**, not a request on the filesystem powerbox
-`vitrin_powerbox` (page 13, which P2.6.5 creates and which does not exist on
-this branch), and the dialect settles that
+[`vitrin_powerbox`](13-vitrin_powerbox.md) (page 13, which P2.6.5 landed
+first), and the dialect settles that
 rather than taste: `interface/@verb` is one value per interface, so the
 interface that declares `verb="designate_file"` cannot also declare
 `verb="egress"` (see [Growth](#growth) for the full argument, and

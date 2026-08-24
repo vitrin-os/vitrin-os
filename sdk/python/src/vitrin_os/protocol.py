@@ -24,10 +24,13 @@ import enum
 # launcher and the two layout facets and stopped there, while the wire had
 # since gained the cross-realm clipboard, the pointer constraint, the idle
 # inhibit, the seat's relative-motion and gesture events, and now the
-# powerbox. A second closed list of the same facts is how one of them goes
+# powerbox and the egress facet. A second closed list of the same facts is how
+# one of them goes
 # stale — the normative enumeration is `docs/protocol/00-conventions.md`
 # §7.3, which is extended in the same edit as any `since=` addition, and it
-# is deliberately not restated here.
+# is deliberately not restated here. That this file and a parallel branch
+# each rewrote the same paragraph, one restoring the list and one deleting
+# it, is the argument for deleting it.
 PROTOCOL_VERSION = 2
 
 # --- object-id ranges (conventions section 3) ------------------------------
@@ -76,14 +79,15 @@ class Verb(enum.IntFlag):
     petitioned one. Read "unsupported" as "not here, not now", never as "not
     in this protocol".
 
-    The 128/256 gap is deliberate and must not be filled by guesswork:
-    those bits are allocated repo-wide to verbs the IDL does not define yet,
-    so they are still *out of range* and fatal. `realm_launch` took 512 for
-    exactly that reason. 64 was in that gap until P2.6.5 landed
-    `designate_file` on it, from the same registry rather than from the next
-    unused-looking power of two.
+    256 is the one bit left in that gap, and it must not be filled by
+    guesswork: it is allocated repo-wide to a verb the IDL does not define
+    yet, so it is still *out of range* and fatal. `realm_launch` took 512 for
+    exactly that reason. 64 and 128 were in that gap until P2.6.5 landed
+    `designate_file` and P2.7.2 landed `egress` on them, each from the same
+    registry rather than from the next unused-looking power of two.
     """
 
+    # vitrin-verb-set: all-verbs = observe, actuate_pointer, actuate_text, observe_cursor, layout_arrange, layout_focus, designate_file, egress, realm_launch
     OBSERVE = 1
     ACTUATE_POINTER = 2
     ACTUATE_TEXT = 4
@@ -91,6 +95,7 @@ class Verb(enum.IntFlag):
     LAYOUT_ARRANGE = 16  # served by the reference core since WS-E.1.4
     LAYOUT_FOCUS = 32  # served by the reference core since WS-E.1.4
     DESIGNATE_FILE = 64  # refused "unsupported" by every deployment (P2.6.6/P2.6.8 owed)
+    EGRESS = 128  # refused "unsupported" by every deployment at version 2
     REALM_LAUNCH = 512  # resolves "unsupported" until a deployment serves it
 
 
@@ -104,6 +109,7 @@ VERB_MASK = int(
     | Verb.LAYOUT_ARRANGE
     | Verb.LAYOUT_FOCUS
     | Verb.DESIGNATE_FILE
+    | Verb.EGRESS
     | Verb.REALM_LAUNCH
 )
 
@@ -131,6 +137,20 @@ VERB_MASK = int(
 # any version until the core-drawn picker (P2.6.6) and its consent copy
 # (P2.6.8) exist. A petition naming it resolves "unsupported" everywhere
 # today.
+#
+# `egress` (128, P2.7.2 / issue #196) is out on the same two counts, and its
+# IDL summary carries the same marker phrase for a reason that goes further
+# than the version: the
+# out-of-core mediating proxy a connection would be made through does not
+# exist, and that is P2.7.3's. Its FACET does exist — `vitrin_egress`, minted
+# by `vitrin_grant.get_egress`, a separate interface of its own rather than a
+# request on the filesystem powerbox, because `interface/@verb` is one value
+# per interface. This comment said "no facet at all" until that landed, and
+# the correction is worth keeping in this shape: a facet is a request to ask
+# through, not a mechanism to answer with, so gaining one moved nothing here.
+# The bit stays refused by **every** deployment at version 2, not merely by a
+# version-1 connection — which is why this constant does not move when it is
+# eventually served on some deployments and not others.
 # Those are refused "unsupported", and a petition mixing served and unserved
 # verbs is refused whole — the core never silently narrows a verb set.
 VERBS_SERVED_IN_VERSION_1 = int(
@@ -143,7 +163,10 @@ VERBS_SERVED_IN_VERSION_1 = int(
 
 # The SDK-level dotted names are these bits (per the IDL's verb enum text,
 # which fixes the spelling: the first underscore of the wire name becomes a
-# dot, so a second implementation has no name to invent).
+# dot, so a second implementation has no name to invent). A wire name carrying
+# no underscore has nothing to replace, so its dotted name is the wire name
+# unchanged — `egress` is the first, and the IDL states that case rather than
+# leaving it to be derived.
 VERB_BY_DOTTED_NAME: dict[str, Verb] = {
     "observe": Verb.OBSERVE,
     "actuate.pointer": Verb.ACTUATE_POINTER,
@@ -152,6 +175,7 @@ VERB_BY_DOTTED_NAME: dict[str, Verb] = {
     "layout.arrange": Verb.LAYOUT_ARRANGE,
     "layout.focus": Verb.LAYOUT_FOCUS,
     "designate.file": Verb.DESIGNATE_FILE,
+    "egress": Verb.EGRESS,
     "realm.launch": Verb.REALM_LAUNCH,
 }
 

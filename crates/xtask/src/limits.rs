@@ -3336,7 +3336,7 @@ fn core_fd_define(v: &[String]) -> String {
     format!("#define VITRIN_CORE_FD {}", v[0])
 }
 
-/// `1 | 2 | 4 | 8 | 16 | 32 | 64 | 512` -> `639`.
+/// `1 | 2 | 4 | 8 | 16 | 32 | 64 | 128 | 512` -> `767`.
 ///
 /// The generated constant is an OR of the IDL's entry values, and every
 /// surface below states the decimal. Summing here rather than reading a second
@@ -3383,8 +3383,8 @@ fn verb_mask_log_sentence(v: &[String]) -> String {
     format!("`Verb::VALID_MASK == {}`", verb_mask_decimal(v))
 }
 
-/// The IDL's own register for the mask: *"any combination of the eight defined
-/// verb bits (value 639)"*. The count is the mask's population count rather
+/// The IDL's own register for the mask: *"any combination of the nine defined
+/// verb bits (value 767)"*. The count is the mask's population count rather
 /// than a second number to keep in step -- a verb entry is one bit by
 /// construction, and the enum's values are immutable, so the two can only
 /// disagree by the mask being wrong.

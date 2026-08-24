@@ -10,10 +10,14 @@
 //! cannot fill yet, which are present-but-null so the schema never breaks
 //! when later phases fill them (each names its filling phase on its doc
 //! comment). Fields the PRD marks optional but the MVP cannot state are
-//! *type-level* null where possible: [`FocusCondition`] and
-//! [`ProvenanceRef`] are empty enums, so an MVP row cannot even represent a
-//! value there -- present-but-null enforced by construction, not
-//! convention. Rows are keyed by the verifier-canonical
+//! *type-level* null where possible: [`FocusCondition`],
+//! [`ProvenanceRef`] and [`PinnedAddrs`] are empty enums, so a row cannot
+//! even represent a value there -- present-but-null enforced by
+//! construction, not convention. [`PinnedAddrs`] is the one column added
+//! after the PRD's list (P2.7.2, issue #196): the addresses a `net:`
+//! host resolved to at grant time, kept in the row rather than in the
+//! egress proxy so a proxy restart cannot re-resolve away from what the
+//! human approved. Rows are keyed by the verifier-canonical
 //! [`PrincipalIdentity`] the identity layer binds (P1.4.1, issue #25) --
 //! the grant table never sees free client text.
 //!
@@ -175,7 +179,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU16, NonZeroU32};
 use std::time::{Duration, Instant};
 
 use vitrin_protocol::generated::vitrin_grant::{Persistence as WirePersistence, Refusal, Verb};
@@ -243,26 +247,266 @@ impl fmt::Display for RealmId {
 }
 
 /// `resource_ref` (PRD Doc 2 section 5.2): what within the realm the grant
-/// covers. Version 1 serves exactly one granularity -- the whole realm
-/// (`request_grant`'s null-or-empty `resource` selector) -- so this enum
-/// has exactly one variant; the finer type-prefixed selectors the wire
-/// vocabulary reserves (`surface:...`, `node:...`) arrive as new variants
-/// in Phase 2, refining [`ResourceRef::covers`] without changing the row
-/// shape.
+/// covers. Version 1 served exactly one granularity -- the whole realm
+/// (`request_grant`'s null-or-empty `resource` selector); the finer
+/// type-prefixed selectors the wire vocabulary reserves (`surface:...`,
+/// `node:...`) arrive as further variants, refining
+/// [`ResourceRef::covers`] without changing the row shape.
+///
+/// [`ResourceRef::Net`] is the first of those to land (P2.7.2, issue
+/// #196). **Nothing constructs it from the wire yet**, and that is stated
+/// rather than left to be discovered: `PetitionRegistry::admit` refuses
+/// every non-empty `resource` selector `unsupported`, so a `net:` petition
+/// is answered exactly as any other finer granularity is. What lands here
+/// is the *vocabulary* -- the parser, its round-trip, and the containment
+/// rule -- so P2.7.3/P2.7.4 wire an already-tested grammar into the
+/// admission path instead of writing one under time pressure at the
+/// enforcement chokepoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ResourceRef {
     /// Everything in the realm (wire selector: null or empty string).
     WholeRealm,
+    /// One outbound TCP endpoint (wire selector: `net:HOST:PORT`), the
+    /// resource an `egress` grant names. Exactly one host and exactly one
+    /// port: the grammar admits no wildcard, so this variant cannot hold
+    /// a set.
+    Net(NetSelector),
 }
 
 impl ResourceRef {
     /// Whether authority over `self` covers a use targeting `target`.
-    /// Version 1 is trivially total (whole realm covers whole realm);
-    /// Phase 2 variants add real containment arms here.
+    ///
+    /// The whole-realm arm is trivially total. The `net:` arm is **exact
+    /// match only**, and that is forced rather than chosen: the selector
+    /// grammar is wildcard-free by construction
+    /// (`protocol/vitrin-v0.xml`, `vitrin_grant.verb`), so there is no
+    /// subsumption to express and a `covers` that invented one -- port
+    /// ranges, parent domains, anything -- would be authority the human
+    /// never approved.
+    ///
+    /// `WholeRealm` does **not** cover a `Net`, deliberately. A grant over
+    /// "the whole realm" is authority over what the realm shows and what
+    /// is typed into it; reading it as also authorising outbound packets
+    /// would make every observe grant an egress grant, which is the exact
+    /// ambient-authority default this system exists to remove.
     pub fn covers(&self, target: &ResourceRef) -> bool {
         match (self, target) {
             (ResourceRef::WholeRealm, ResourceRef::WholeRealm) => true,
+            (ResourceRef::Net(held), ResourceRef::Net(want)) => held == want,
+            (ResourceRef::WholeRealm, ResourceRef::Net(_))
+            | (ResourceRef::Net(_), ResourceRef::WholeRealm) => false,
         }
+    }
+}
+
+/// One `net:HOST:PORT` selector, parsed. Exactly one host and exactly one
+/// port, because the wire grammar admits nothing else.
+///
+/// The host is kept as the **bytes the petition presented**, not as a
+/// resolved address: what the human approves is the selector, and the
+/// addresses it resolved to at approval time belong in a separate row
+/// column ([`GrantRow::pinned_addrs`], **present-but-null until P2.7.4**)
+/// so that a rebind cannot silently redirect authority the human already
+/// granted. Nothing resolves anything today.
+///
+/// **Comparison is byte-exact, so one endpoint can have more than one
+/// selector string** -- the consequence is stated here rather than left
+/// to be met later, because the IDL's port rule is easy to misread as a
+/// canonicality guarantee for the whole selector, and it is not one:
+///
+/// * DNS is case-insensitive, so `net:Example.com:443` and
+///   `net:example.com:443` name the same endpoint and are two selectors.
+/// * One IPv6 address has many legal literals, and the literal is kept
+///   verbatim, so `net:[2001:db8::1]:443` and
+///   `net:[2001:0db8:0000:0000:0000:0000:0000:0001]:443` are two
+///   selectors.
+///
+/// Both spellings of each pair parse, both round-trip byte-identically,
+/// and neither covers the other -- pinned by
+/// `one_endpoint_can_have_several_selector_strings_and_none_covers_another`.
+/// That errs **narrow** -- the wrong answer is a refusal, never an
+/// unapproved connection -- which is the only direction this type is
+/// allowed to be wrong in. Normalising instead would make the row hold a
+/// string the human was never shown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NetSelector {
+    host: NetHost,
+    port: NonZeroU16,
+}
+
+/// The host half of a [`NetSelector`]: a bracketed IPv6 literal or
+/// anything else the grammar admits (a DNS name or an IPv4 literal).
+///
+/// The distinction is kept because it is the one thing re-serialization
+/// cannot recover: `2001:db8::1` and `[2001:db8::1]` parse to the same
+/// address but only one of them is a legal selector, so a round-trip that
+/// dropped the brackets would emit a string this parser then rejects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NetHost {
+    /// A DNS name or an IPv4 literal, verbatim.
+    Plain(String),
+    /// An IPv6 literal, held **without** its brackets and re-emitted with
+    /// them.
+    V6(String),
+}
+
+/// Why a `net:` selector did not parse. Every variant is a **recoverable**
+/// answer (`resolved(unsupported)`), never a fatal decode error: the wire
+/// bound on `resource` is a byte length, and its *content* is a policy
+/// question the IDL answers with `unsupported` rather than by killing the
+/// connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NetSelectorError {
+    /// The string does not begin with `net:`.
+    NotANetSelector,
+    /// No `:` separating host from port, or an empty host.
+    MalformedHostPort,
+    /// The port is not a bare decimal integer in `1..=65535`. A range, a
+    /// list, a leading `+`/`-`, whitespace, a leading zero, and `0` all
+    /// land here. The leading zero is refused rather than tolerated for a
+    /// narrower reason than "one endpoint, one spelling" -- which is
+    /// **false** here, see [`NetSelector`]: the port is the one half of
+    /// the selector this type *normalises* (it becomes a `NonZeroU16`),
+    /// so `0443` would re-serialize to `443` and break the byte-identity
+    /// round-trip that makes the stored selector and the string the human
+    /// was shown the same string.
+    BadPort,
+    /// The host contains something the wildcard-free grammar forbids: `*`,
+    /// `/` (a CIDR suffix), `,` (a list), an empty label in any position
+    /// (a leading `.` -- the any-subdomain spelling -- a doubled `..`, or a
+    /// trailing `.`), whitespace, or a control character.
+    ForbiddenHostSyntax,
+    /// A bracketed host that is not a well-formed IPv6 literal, or an
+    /// unbracketed host containing a `:` (which would make the final colon
+    /// ambiguous).
+    MalformedIpv6,
+}
+
+impl NetSelector {
+    /// The wire prefix this selector is spelled with.
+    pub const PREFIX: &'static str = "net:";
+
+    /// Parse one `net:HOST:PORT` selector.
+    ///
+    /// **Wildcard-free by construction, and the refusals are the point.**
+    /// `*.example.com`, `10.0.0.0/8`, `a.com:443,b.com:443`, `443-8443`,
+    /// an empty host, port `0` and port `65536` are each rejected here, so
+    /// a blanket egress grant is *inexpressible* rather than refused by a
+    /// policy someone can relax later. `covers` is exact match precisely
+    /// because this function admits no pattern to be inexact about.
+    ///
+    /// **What this does NOT do, stated so nobody infers it**: it does not
+    /// validate that the host is a well-formed DNS name or IP literal. It
+    /// enforces a *denylist* -- `*`, `/`, `,`, `[`, `]`, `:`, whitespace,
+    /// control characters, and an empty label in any position (a leading
+    /// `.`, a doubled `..`, a trailing `.`) -- and keeps
+    /// whatever else it was handed, so `net:-:443`,
+    /// `net:user@evil.com:443`, `net:999.999.999.999:443` and a Unicode
+    /// homograph of a real name all parse. None of them widens authority
+    /// ([`ResourceRef::covers`] is exact match, so no accepted selector can
+    /// name more than one endpoint -- that is the whole of what
+    /// "wildcard-free" buys), but a homograph is a confusion attack on the
+    /// *human*, and P2.7.3 -- the first task that renders one of these
+    /// strings on a consent card -- owns deciding the host charset before
+    /// it does.
+    pub fn parse(selector: &str) -> Result<Self, NetSelectorError> {
+        let rest = selector
+            .strip_prefix(Self::PREFIX)
+            .ok_or(NetSelectorError::NotANetSelector)?;
+
+        // Split at the LAST colon: an IPv6 literal carries its own, and the
+        // brackets are what make that unambiguous.
+        let (host_part, port_part) = rest
+            .rsplit_once(':')
+            .ok_or(NetSelectorError::MalformedHostPort)?;
+        if host_part.is_empty() {
+            return Err(NetSelectorError::MalformedHostPort);
+        }
+
+        // The port: a bare decimal integer, nothing else. `parse::<u16>`
+        // already refuses `+443`, `443-8443`, `443,80`, whitespace and
+        // 65536; `NonZeroU16` refuses 0, which is not an endpoint a
+        // connection can be made to. The canonical-spelling check after it
+        // refuses `0443`, which `parse` would otherwise accept as 443 and
+        // which would then re-serialize to a different string than the one
+        // the human approved.
+        let port: NonZeroU16 = port_part.parse().map_err(|_| NetSelectorError::BadPort)?;
+        if port_part != port.to_string() {
+            return Err(NetSelectorError::BadPort);
+        }
+
+        let host = if let Some(inner) = host_part.strip_prefix('[') {
+            let inner = inner
+                .strip_suffix(']')
+                .ok_or(NetSelectorError::MalformedIpv6)?;
+            // Must be a real IPv6 literal: brackets are not a licence to
+            // smuggle arbitrary text past the colon rule.
+            if inner.parse::<std::net::Ipv6Addr>().is_err() {
+                return Err(NetSelectorError::MalformedIpv6);
+            }
+            NetHost::V6(inner.to_string())
+        } else {
+            // An unbracketed host may not contain a colon: it would make
+            // the host/port split a guess.
+            if host_part.contains(':') || host_part.contains(']') {
+                return Err(NetSelectorError::MalformedIpv6);
+            }
+            if host_part
+                .chars()
+                .any(|c| matches!(c, '*' | '/' | ',' | '[') || c.is_whitespace() || c.is_control())
+            {
+                return Err(NetSelectorError::ForbiddenHostSyntax);
+            }
+            // An EMPTY LABEL IN ANY POSITION, which is three spellings of
+            // one rule. A leading dot is the any-subdomain spelling in every
+            // syntax that has one; a doubled dot is how a parser is talked
+            // into treating one; a trailing dot is the DNS root label, which
+            // names the *same* endpoint as the dotless spelling and would
+            // therefore be a second selector string for it, bought for
+            // nothing. `covers` is byte-exact, so admitting it would not
+            // widen authority -- it would only mean a human who approved
+            // `net:example.com:443` sees a connection to
+            // `net:example.com.:443` refused, which is the surprising
+            // direction of a rule with no upside. Erring narrow is free
+            // here: nothing renders or accepts one of these strings yet.
+            //
+            // The trailing case was MISSING while all three carriers of this
+            // rule said "an empty label" -- the parse doc, the error
+            // variant's doc and docs/protocol/04-vitrin_grant.md's gap list.
+            // Issue #196's round-2 review found `net:example.com.:443`
+            // parsing and round-tripping. Closed by making the code match
+            // the three sentences rather than by narrowing the three
+            // sentences, because the rule they state is the one intended.
+            if host_part.starts_with('.') || host_part.ends_with('.') || host_part.contains("..") {
+                return Err(NetSelectorError::ForbiddenHostSyntax);
+            }
+            NetHost::Plain(host_part.to_string())
+        };
+
+        Ok(Self { host, port })
+    }
+
+    /// Re-serialize to the wire selector. `parse(s).unwrap().to_wire() ==
+    /// s` for every `s` this parser accepts -- the property the proptest
+    /// below holds, and what makes the row's stored selector and the
+    /// string the human was shown the same string.
+    pub fn to_wire(&self) -> String {
+        match &self.host {
+            NetHost::Plain(h) => format!("{}{}:{}", Self::PREFIX, h, self.port),
+            NetHost::V6(h) => format!("{}[{}]:{}", Self::PREFIX, h, self.port),
+        }
+    }
+
+    /// The host exactly as the selector spelled it (no brackets).
+    pub fn host(&self) -> &str {
+        match &self.host {
+            NetHost::Plain(h) | NetHost::V6(h) => h,
+        }
+    }
+
+    /// The single port.
+    pub fn port(&self) -> NonZeroU16 {
+        self.port
     }
 }
 
@@ -271,33 +515,52 @@ impl ResourceRef {
 /// the served set is a property of *this build*, and it did not widen
 /// when the wire went from 1 to 2.
 ///
-/// The wire bitfield ([`Verb::VALID_MASK`]) is deliberately wider: D-017
-/// and D-018 define `observe_cursor`, `layout_arrange` and `layout_focus`
-/// from day one so the decided cursor and layout models are expressible
-/// before v0 freezes, and version 2 added `realm_launch` on exactly the
-/// same terms -- so a petition for one is a *recoverable* `unsupported`
-/// rather than an out-of-range bit that kills the connection.
+/// The wire bitfield ([`Verb::VALID_MASK`]) is deliberately wider, and six
+/// bits have been put on it ahead of anyone serving them: D-017 and D-018
+/// define `observe_cursor`, `layout_arrange` and `layout_focus` from day one
+/// so the decided cursor and layout models are expressible before v0 freezes,
+/// version 2 added `realm_launch`, P2.6.5 added `designate_file` and P2.7.2
+/// added `egress` -- so a
+/// petition for any of them is a *recoverable* `unsupported` rather than an
+/// out-of-range bit that kills the connection.
 ///
-/// **Three of those four are now served.** `layout_arrange` (16) and
+/// **Three of those six are now served.** `layout_arrange` (16) and
 /// `layout_focus` (32) joined at WS-E.1.4 (issue #210), and
 /// `realm_launch` (512) at WS-E.1.1 (issue #207): each has a facet
 /// interface, a chokepoint arm and consent-prompt copy naming the
 /// consequence in plain language, which is the whole of what "this core
-/// serves the verb" means. `observe_cursor` (8) is the one that stays
-/// out -- per-principal cursor *delivery* is M2's, and serving the verb
-/// would promise a capture widened with a cursor this core does not have.
+/// serves the verb" means.
+///
+/// <!-- vitrin-verb-set: unserved-verbs = observe_cursor, designate_file, egress -->
+/// **Three stay out**, for three different missing mechanisms.
+/// `observe_cursor` (8) because per-principal cursor *delivery* is M2's, so
+/// serving the verb would promise a capture widened with a cursor this core
+/// does not have; `designate_file` (64) because no picker mints a descriptor
+/// (P2.6.6) and no consent copy names what approving it costs (P2.6.8);
+/// `egress` (128) because the out-of-core mediating proxy a
+/// connection would be made through does not exist. Both of the newer two
+/// have facets -- `vitrin_powerbox` and `vitrin_egress` -- and this doc named
+/// egress's missing facet as half its reason until it landed: a facet is a
+/// request to ask
+/// through, and only a mechanism to answer with moves a bit out of this set.
+/// None of the three names is transcribed: the set
+/// is [`UNSERVED_VERB_BITS`], derived below, and `cargo xtask verb-sets
+/// --check` holds every surface that spells it out to this constant.
 ///
 /// **`designate_file` (64) joined the wire at P2.6.5 (issue #189) and is
 /// deliberately absent from this constant**, which is the whole of that
-/// issue's core-side deliverable. The verb has a facet interface
-/// (`vitrin_powerbox`) and nothing else: no picker mints a descriptor
+/// issue's core-side deliverable, and `egress` (128) joined at P2.7.2 (issue
+/// #196) on identical terms. Each verb has a facet interface
+/// (`vitrin_powerbox`, `vitrin_egress`) and nothing else: for the first, no
+/// picker mints a descriptor
 /// (P2.6.6), no chokepoint arm carries a designation, and no consent copy
-/// names what approving it costs (P2.6.8, Q13's rule). Leaving it out means
-/// [`UNSERVED_VERB_BITS`] picks it up by derivation and
+/// names what approving it costs (P2.6.8, Q13's rule); for the second, no
+/// proxy asks the chokepoint per connection (P2.7.3). Leaving both out means
+/// [`UNSERVED_VERB_BITS`] picks them up by derivation and
 /// [`crate::petitions::PetitionRegistry::admit`] resolves every petition
-/// naming it `unsupported` **whole** -- so the failure mode if someone
-/// forgets the rest of E2.6 is a refusal, never a grant this core cannot
-/// enforce.
+/// naming either `unsupported` **whole** -- so the failure mode if someone
+/// forgets the rest of E2.6 or E2.7 is a refusal, never a grant this core
+/// cannot enforce.
 ///
 /// **Moving `realm_launch` in is the single largest widening this
 /// constant has taken**, and it is worth naming here rather than only at
@@ -468,6 +731,26 @@ pub(crate) enum FocusCondition {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProvenanceRef {}
 
+/// `pinned_addrs`: the IP addresses the grant's `net:` host resolved to
+/// **at grant time** -- the addresses the human actually approved when
+/// they approved a name.
+///
+/// **Present-but-null until P2.7.4**, which resolves DNS in the
+/// out-of-core egress proxy and fills this column, after which the
+/// enforcement chokepoint refuses any connection to an address the pin
+/// does not contain -- including a literal-IP connection under a
+/// name-scoped grant. An empty enum, on the [`ProvenanceRef`] /
+/// [`FocusCondition`] precedent: a row today cannot fabricate a pin, and
+/// the null is type-enforced rather than conventional.
+///
+/// **The column is here rather than in the proxy on purpose.** A pin held
+/// in proxy memory is lost on a proxy restart, and a restarted proxy
+/// re-resolves -- so a DNS rebind would win simply by outlasting a
+/// process. In the row it survives the restart, is revoked with the row,
+/// and is auditable in the same journal as every other authority fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PinnedAddrs {}
+
 /// `issuer` (PRD Doc 2 section 5.2): which authority created the row.
 /// Version 1 has exactly the two consent paths of Phase 1 -- plus, in test
 /// builds only, the scripted stand-in below; all name a *core-side*
@@ -550,6 +833,10 @@ pub(crate) struct GrantRow {
     /// attenuation/revocation tree, `None` for every root grant --
     /// and every MVP grant is a root.
     pub parent_grant_id: Option<GrantId>,
+    /// Present-but-null until P2.7.4 (see [`PinnedAddrs`]): the addresses
+    /// this grant's `net:` host resolved to at grant time. `None` on every
+    /// non-egress row, and on every row this core can build today.
+    pub pinned_addrs: Option<PinnedAddrs>,
     /// When the row was created (the insert call's injected clock
     /// reading); the anchor `constraints.expiry` counts from.
     pub issued_at: Instant,
@@ -567,8 +854,8 @@ pub(crate) struct GrantRow {
 /// petition -- with wire defaults already resolved (`expiry_ms = 0` to
 /// `None`, `max_event_rate = 0` to the server's concrete default ceiling).
 /// The spec deliberately has no fields for `provenance_ref`,
-/// `parent_grant_id`, `focus_condition`, or `one_shot`: the MVP cannot
-/// state them, so no caller can smuggle one in.
+/// `parent_grant_id`, `focus_condition`, `one_shot`, or `pinned_addrs`:
+/// this core cannot state them, so no caller can smuggle one in.
 #[derive(Debug, Clone)]
 pub(crate) struct GrantSpec {
     pub principal_id: PrincipalIdentity,
@@ -871,10 +1158,13 @@ impl GrantTable {
                 one_shot: None,
             },
             persistence: spec.persistence,
-            // Present-but-null: filled by Phase 3 provenance (E3.7) and
-            // the version-2+ attenuation seam respectively.
+            // Present-but-null: filled by Phase 3 provenance (E3.7), the
+            // version-2+ attenuation seam, and P2.7.4's DNS pinning
+            // respectively. `GrantSpec` has no field for any of them, so
+            // no caller can smuggle one in through this path.
             provenance_ref: None,
             parent_grant_id: None,
+            pinned_addrs: None,
             issued_at,
             issuer: spec.issuer,
         };
@@ -1323,7 +1613,11 @@ mod tests {
         // sibling test is where that set is enumerated and held. This
         // comment names no count of them on purpose: it said
         // "`observe_cursor` is the one defined verb that stays out" and was
-        // false from the moment P2.6.5 (issue #189) added a second.
+        // false from the moment P2.6.5 (issue #189) added a second, and
+        // false again by one more the moment P2.7.2 (issue #196) added a
+        // third. **Both of those tasks left this constant untouched on
+        // purpose**: adding a bit to the IDL must not widen what this core
+        // claims to enforce.
         assert_eq!(
             SERVED_VERB_BITS,
             (Verb::OBSERVE
@@ -1340,8 +1634,8 @@ mod tests {
 
     #[test]
     fn the_staged_verbs_are_defined_on_the_wire_but_unserved() {
-        // The bits still staged: in-range (so naming it is never fatal)
-        // and unserved (so a petition for it resolves `unsupported`). Both
+        // The bits still staged: in-range (so naming one is never fatal)
+        // and unserved (so a petition for one resolves `unsupported`). Both
         // halves matter -- either alone would be a lie about what this core
         // does.
         //
@@ -1358,8 +1652,8 @@ mod tests {
         // serving the verb would promise a capture widened with a cursor
         // this core does not have. It is not a placeholder for "not got to
         // yet".
-        // `designate_file` JOINED it at P2.6.5 (issue #189), and this is the
-        // first time this list has grown. It is here for a reason that is
+        // `designate_file` JOINED it at P2.6.5 (issue #189), and that was the
+        // first time this list had grown. It is here for a reason that is
         // scheduled rather than open-ended: there is no picker to mint a
         // descriptor (P2.6.6) and no consent copy naming what approving it
         // costs (P2.6.8). Both must land before this bit may move into
@@ -1367,12 +1661,24 @@ mod tests {
         // "a deployment MUST NOT grant a verb it does not enforce" breach the
         // list exists to make visible.
         //
-        // A two-element list: this is a SET that has shrunk three times
-        // (D-018's two verbs, then `realm_launch` at WS-E.1.1), grown once,
-        // and will shrink again when the picker and cursor delivery land.
-        // Collapsing it to a straight-line assertion would hide that shape and
-        // make the next removal a rewrite rather than a deletion.
-        for verb in [Verb::OBSERVE_CURSOR, Verb::DESIGNATE_FILE] {
+        // **`egress` joined at P2.7.2 (issue #196)**, the second growth and
+        // for the mirror
+        // reason `realm_launch` left: the mechanism its refusal stands for
+        // does not exist. The out-of-core mediating proxy that would ask
+        // the chokepoint per connection is P2.7.3's. Its facet DOES exist --
+        // `vitrin_egress`, an interface of its own rather than a request on
+        // P2.6.5's filesystem powerbox, because `interface/@verb` is one
+        // value per interface -- and having a facet is not being served: a
+        // bit on the wire with no enforcement behind it is exactly what
+        // `unsupported` is for.
+        //
+        // A list, deliberately: this is a SET that has shrunk three times
+        // (D-018's two verbs, then `realm_launch` at WS-E.1.1) and grown
+        // twice, and will move again when cursor delivery, the picker and
+        // the egress proxy land. Collapsing it to a straight-line assertion
+        // would hide that shape and make the next movement a rewrite rather
+        // than an edit.
+        for verb in [Verb::OBSERVE_CURSOR, Verb::DESIGNATE_FILE, Verb::EGRESS] {
             assert!(
                 Verb::from_bits(verb.bits()).is_ok(),
                 "{verb:?} must decode: an out-of-range bit would be fatal, not `unsupported`"
@@ -1399,6 +1705,380 @@ mod tests {
         assert_eq!(SERVED_VERB_BITS & UNSERVED_VERB_BITS, 0);
     }
 
+    // -- the net: selector (P2.7.2) ----------------------------------------
+
+    /// Parse-and-round-trip, for a selector the grammar must accept.
+    fn net(selector: &str) -> NetSelector {
+        NetSelector::parse(selector)
+            .unwrap_or_else(|e| panic!("`{selector}` must parse, got {e:?}"))
+    }
+
+    #[test]
+    fn the_net_selector_accepts_exactly_one_host_and_one_port() {
+        let s = net("net:api.example.com:443");
+        assert_eq!(s.host(), "api.example.com");
+        assert_eq!(s.port().get(), 443);
+        assert_eq!(s.to_wire(), "net:api.example.com:443");
+
+        // A literal IPv4 host is a host like any other.
+        let s = net("net:192.0.2.7:8443");
+        assert_eq!(s.host(), "192.0.2.7");
+        assert_eq!(s.port().get(), 8443);
+
+        // IPv6 is bracketed, and the brackets survive the round trip --
+        // without them the final colon would not tell host from port.
+        let s = net("net:[2001:db8::1]:443");
+        assert_eq!(s.host(), "2001:db8::1");
+        assert_eq!(s.port().get(), 443);
+        assert_eq!(s.to_wire(), "net:[2001:db8::1]:443");
+    }
+
+    #[test]
+    fn the_net_grammar_refuses_every_form_that_would_widen_a_grant() {
+        // The forms that make a selector a *pattern* rather than an
+        // endpoint. Each is refused by the parser, so a blanket egress
+        // grant is inexpressible rather than refused by policy. (The
+        // proptest below is the non-vacuous half: it *generates* these
+        // shapes rather than listing them, so a parser that started
+        // accepting one is caught even for a spelling nobody wrote here.)
+        for bad in [
+            "net:*.example.com:443",    // wildcard host
+            "net:*:443",                // bare wildcard
+            "net:.example.com:443",     // leading dot: the any-subdomain spelling
+            "net:example..com:443",     // doubled dot: an empty label mid-name
+            "net:example.com.:443",     // trailing dot: the DNS root label
+            "net:.:443",                // nothing but the separator
+            "net:10.0.0.0/8:443",       // CIDR
+            "net:a.com:443,b.com:443",  // list (the comma is in the host)
+            "net:example.com:443-8443", // port range
+            "net:example.com:443,80",   // port list
+            "net::443",                 // empty host
+            "net:example.com:0",        // port 0 is not an endpoint
+            "net:example.com:65536",    // out of range
+            "net:example.com:-1",       // signed
+            "net:example.com:+443",     // signed
+            "net:example.com: 443",     // whitespace
+            "net:example.com",          // no port at all
+            "net:2001:db8::1:443",      // unbracketed IPv6: ambiguous colon
+            "net:[2001:db8::1:443",     // unclosed bracket
+            "net:[not-an-address]:443", // brackets are not a smuggling route
+            "net:",                     // nothing at all
+            "surface:main",             // a different prefix entirely
+            "example.com:443",          // no prefix
+        ] {
+            assert!(
+                NetSelector::parse(bad).is_err(),
+                "`{bad}` must not parse: the grammar is wildcard-free by \
+                 construction, and a parser that accepts a pattern makes \
+                 `covers` a guess"
+            );
+        }
+    }
+
+    #[test]
+    fn a_net_selector_covers_exactly_itself() {
+        // Acceptance, issue #196: exact match only. A wildcard-free
+        // grammar has no subsumption to express, and a `covers` that
+        // guessed one would be authority the human never approved.
+        let held = ResourceRef::Net(net("net:example.com:443"));
+
+        assert!(held.covers(&held.clone()));
+        assert!(!held.covers(&ResourceRef::Net(net("net:example.com:80"))));
+        assert!(!held.covers(&ResourceRef::Net(net("net:sub.example.com:443"))));
+        assert!(!held.covers(&ResourceRef::Net(net("net:example.com.evil.test:443"))));
+
+        // And it is symmetric in the way exact match is: neither direction
+        // subsumes the other.
+        let other = ResourceRef::Net(net("net:example.com:80"));
+        assert!(!other.covers(&held));
+
+        // Whole-realm authority is not egress authority, in either
+        // direction. Reading "the whole realm" as covering an endpoint
+        // would make every observe grant an egress grant.
+        assert!(!ResourceRef::WholeRealm.covers(&held));
+        assert!(!held.covers(&ResourceRef::WholeRealm));
+    }
+
+    #[test]
+    fn one_endpoint_can_have_several_selector_strings_and_none_covers_another() {
+        // The IDL's canonical-port rule reads, at a glance, like a
+        // guarantee that one endpoint has exactly one selector string. It
+        // is not one, and the IDL says so in as many words -- this test is
+        // what keeps the two in step. The host is stored verbatim, so every
+        // legal spelling of one host is its own selector.
+        //
+        // Levered by making `NetHost::V6` re-emit `Ipv6Addr::to_string()`:
+        // the round-trip assertion below goes red on the expanded literal,
+        // which is the property that would actually be lost.
+        let one_endpoint_many_spellings: &[&[&str]] = &[
+            // DNS is case-insensitive; these bytes are not.
+            &["net:Example.com:443", "net:example.com:443"],
+            // One IPv6 address, three legal literals.
+            &[
+                "net:[2001:db8::1]:443",
+                "net:[2001:0db8:0000:0000:0000:0000:0000:0001]:443",
+                "net:[2001:DB8::1]:443",
+            ],
+        ];
+
+        for spellings in one_endpoint_many_spellings {
+            for raw in *spellings {
+                // Each spelling is accepted and survives the round trip
+                // byte-identically: the row stores what the human was shown.
+                assert_eq!(
+                    net(raw).to_wire(),
+                    *raw,
+                    "`{raw}` must round-trip byte-identically; normalising it \
+                     would make the grant row hold a string nobody approved"
+                );
+            }
+            // ...and no spelling covers any other, which is what "errs
+            // narrow" means concretely: the wrong answer is a refusal.
+            for held in *spellings {
+                for want in *spellings {
+                    let covers = ResourceRef::Net(net(held)).covers(&ResourceRef::Net(net(want)));
+                    assert_eq!(
+                        covers,
+                        held == want,
+                        "`{held}`.covers(`{want}`) must be exact-match only: \
+                         two spellings of one endpoint are two selectors"
+                    );
+                }
+            }
+        }
+    }
+
+    // The component alphabets the selector generator draws from. Shared by
+    // the proptest and by `the_generator_really_emits_the_forbidden_forms`,
+    // which is what makes "the refusals are checked by generation" a fact
+    // rather than a claim: if a hostile form were dropped from these
+    // tables, the proptest would keep passing while testing less, and that
+    // sibling test is what goes red instead.
+    const PREFIX_FORMS: &[&str] = &["net:", "", "NET:", "net", "surface:", "node:", "net::"];
+    const HOST_FORMS: &[&str] = &[
+        // forms the grammar admits
+        "example.com",
+        "api.example.com",
+        "a",
+        "192.0.2.7",
+        "[2001:db8::1]",
+        "[::1]",
+        "Example.COM",
+        // forms it must refuse -- generated, not inspected
+        "*",
+        "*.example.com",
+        ".example.com",
+        "example..com",
+        "example.com.",
+        "10.0.0.0/8",
+        "192.0.2.0/24",
+        "a.com,b.com",
+        "",
+        " ",
+        "exa mple.com",
+        "2001:db8::1",
+        "[2001:db8::1",
+        "2001:db8::1]",
+        "[not-an-address]",
+        "exam\u{7f}ple.com",
+    ];
+    const PORT_FORMS: &[&str] = &[
+        // forms the grammar admits
+        "1", "80", "443", "8443", "65535", // forms it must refuse
+        "0", "65536", "99999", "443-8443", "443,80", "+443", "-1", "", " 443", "443 ", "0443",
+        "443a", "0x1bb",
+    ];
+
+    /// Every character class the grammar exists to keep out of an accepted
+    /// selector. A string containing one of these must never parse.
+    const WIDENING_CHARS: &[char] = &['*', '/', ','];
+
+    #[test]
+    fn the_generator_really_emits_the_forbidden_forms() {
+        // Non-vacuity for the proptest below. Its refusal property
+        // ("nothing accepted contains a wildcard, a CIDR or a comma")
+        // is worth exactly as much as the generator's willingness to emit
+        // those forms; a table that quietly lost them would leave a green
+        // property asserting nothing -- the failure mode this repo keeps
+        // finding. So pin that each is still in the alphabet.
+        for needle in ["*", "/", ","] {
+            assert!(
+                HOST_FORMS.iter().any(|h| h.contains(needle)),
+                "HOST_FORMS no longer emits any host containing `{needle}`, \
+                 so the proptest's refusal property tests nothing"
+            );
+        }
+        assert!(HOST_FORMS.contains(&""), "no empty host is generated");
+        // An empty label in each of its three positions. The trailing one
+        // is here because it was the one the parser missed while three
+        // separate comments said it did not: a generator that emits only
+        // the leading and doubled spellings tests two thirds of the rule.
+        for empty_label in [".example.com", "example..com", "example.com."] {
+            assert!(
+                HOST_FORMS.contains(&empty_label),
+                "`{empty_label}` is no longer generated, so the empty-label \
+                 rule is only partly exercised"
+            );
+        }
+        assert!(PORT_FORMS.contains(&"0"), "port 0 is not generated");
+        assert!(PORT_FORMS.contains(&"65536"), "port 65536 is not generated");
+        assert!(
+            PORT_FORMS.iter().any(|p| p.contains('-')),
+            "no port range is generated"
+        );
+        assert!(
+            PORT_FORMS.iter().any(|p| p.contains(',')),
+            "no port list is generated"
+        );
+    }
+
+    /// Everything that must hold of a selector string the parser
+    /// **accepted**. Written once and called from both the proptest and
+    /// the exhaustive sweep below, so the sampled half and the complete
+    /// half cannot drift into asserting different things.
+    ///
+    /// Panics on violation rather than returning: proptest catches the
+    /// panic and shrinks on it exactly as it does for `prop_assert!`.
+    fn assert_accept_side_properties(raw: &str, parsed: &NetSelector) {
+        // Byte-identical re-serialization: the row stores the string the
+        // human was shown, not a normalisation of it.
+        assert_eq!(
+            parsed.to_wire(),
+            raw,
+            "accepted `{raw}` and re-emitted it differently"
+        );
+        // Exactly one endpoint, and parsing is idempotent.
+        assert_eq!(NetSelector::parse(&parsed.to_wire()).as_ref(), Ok(parsed));
+        // ...and it is genuinely one pair, not a pattern.
+        assert!(!parsed.host().is_empty());
+        for c in WIDENING_CHARS {
+            assert!(
+                !raw.contains(*c),
+                "accepted `{raw}`, which contains `{c}` -- the grammar must \
+                 admit no wildcard, no CIDR and no list"
+            );
+        }
+        // An accepted selector covers itself and nothing wider.
+        let held = ResourceRef::Net(parsed.clone());
+        assert!(held.covers(&held.clone()));
+        assert!(!held.covers(&ResourceRef::WholeRealm));
+    }
+
+    proptest::proptest! {
+        /// Acceptance, issue #196: over *generated* selector strings,
+        /// every string the parser accepts round-trips to exactly one
+        /// `(host, port)` pair, re-serializes byte-identically, and
+        /// contains no wildcard, CIDR or comma.
+        ///
+        /// The refusals are checked **by generation**: the alphabets above
+        /// emit `*.example.com`, `10.0.0.0/8`, `a.com,b.com`, `443-8443`,
+        /// an empty host, port `0` and port `65536`, and the property is
+        /// stated over whatever the generator produced rather than over a
+        /// hand-listed table of bad strings.
+        ///
+        /// **Its accept side is nearly vacuous on its own** -- only a
+        /// small fraction of the cross product parses, so a 256-case run
+        /// exercises the round-trip property a handful of times and
+        /// occasionally not at all. The cross-product sweep below is the
+        /// non-vacuity guard: it walks every combination the alphabets
+        /// admit, counts the acceptances, fails if there are none, and
+        /// **asserts the fraction is small** rather than leaving a measured
+        /// pair of numbers in a comment that the next alphabet edit would
+        /// falsify.
+        #[test]
+        fn every_accepted_net_selector_round_trips_and_names_one_endpoint(
+            prefix in proptest::sample::select(PREFIX_FORMS),
+            host in proptest::sample::select(HOST_FORMS),
+            port in proptest::sample::select(PORT_FORMS),
+        ) {
+            let raw = format!("{prefix}{host}:{port}");
+            if let Ok(parsed) = NetSelector::parse(&raw) {
+                assert_accept_side_properties(&raw, &parsed);
+            }
+        }
+    }
+
+    #[test]
+    fn the_alphabet_cross_product_accepts_a_selector_and_every_one_holds() {
+        // Non-vacuity for the proptest's ACCEPT side, the mirror of what
+        // `the_generator_really_emits_the_forbidden_forms` does for its
+        // refuse side. The proptest draws 256 samples from a space in which
+        // only a small fraction parses, so a run can legitimately accept
+        // nothing at all and still pass -- a green property asserting
+        // nothing, the failure mode this repo keeps finding.
+        //
+        // Sweeping the whole cross product is both the guard and strictly
+        // more coverage: every accepted combination is checked on every
+        // run, not a sampled few.
+        //
+        // The fraction is MEASURED here and asserted, not written into a
+        // comment: an earlier draft stated "35 of 2772", which stopped
+        // being true the moment one form was added to one alphabet.
+        let total = PREFIX_FORMS.len() * HOST_FORMS.len() * PORT_FORMS.len();
+        let mut accepted = 0usize;
+        for prefix in PREFIX_FORMS {
+            for host in HOST_FORMS {
+                for port in PORT_FORMS {
+                    let raw = format!("{prefix}{host}:{port}");
+                    if let Ok(parsed) = NetSelector::parse(&raw) {
+                        accepted += 1;
+                        assert_accept_side_properties(&raw, &parsed);
+                    }
+                }
+            }
+        }
+        assert!(
+            accepted > 0,
+            "the alphabets no longer cross to a single selector the parser \
+             accepts ({accepted} of {total}), so the proptest's round-trip, \
+             idempotence and covers-itself properties assert nothing at all"
+        );
+        // ...and the sampled half really is nearly vacuous, which is the
+        // whole reason this sweep exists. If the alphabets are ever
+        // rebalanced so that most combinations parse, the proptest stops
+        // needing a guard -- and this assertion is where a human is told
+        // that, rather than the comment above quietly becoming false.
+        assert!(
+            accepted * 10 < total,
+            "{accepted} of {total} combinations now parse. The proptest's \
+             accept side is no longer nearly vacuous, so this sweep's \
+             stated reason for existing has changed -- rewrite it rather \
+             than deleting the assertion"
+        );
+    }
+
+    #[test]
+    fn pinned_addrs_is_null_on_every_row_this_core_can_build() {
+        // Acceptance, issue #196: the column is present-but-null **by
+        // construction**. Two independent things hold it, and the test
+        // asserts both because either alone can be undone without the
+        // other noticing.
+        //
+        // 1. `GrantSpec` has no field for it, so the one insert path
+        //    cannot be handed a value (checked here over the specs a test
+        //    can build, and over the row-`Debug` schema test above).
+        // 2. `PinnedAddrs` is an empty enum, so no value exists to hand
+        //    it. That is what makes the null type-enforced rather than
+        //    conventional -- and it is why this assertion reads as
+        //    tautological *today*: it stops being one the moment P2.7.4
+        //    gives the type a variant, which is exactly when a row could
+        //    start carrying an unaudited pin.
+        let t0 = t0();
+        let mut table = GrantTable::new();
+        for verbs in [
+            Verb::OBSERVE,
+            Verb::OBSERVE | Verb::ACTUATE_TEXT,
+            Verb::REALM_LAUNCH,
+        ] {
+            let id = table.insert(spec(DEMO, verbs, None), t0).unwrap();
+            let (row, _) = table.get(id, t0).unwrap();
+            assert!(
+                row.pinned_addrs.is_none(),
+                "a row built from today's GrantSpec carries a DNS pin no \
+                 human approved"
+            );
+        }
+    }
     // -- the published renderings of the served/unserved partition ---------
 
     /// The published spelling of every wire verb bit, plus the assertion that
@@ -1422,6 +2102,12 @@ mod tests {
             (Verb::LAYOUT_ARRANGE, "layout.arrange"),
             (Verb::LAYOUT_FOCUS, "layout.focus"),
             (Verb::DESIGNATE_FILE, "designate.file"),
+            // `egress` carries no underscore, so the replace-the-first-
+            // underscore rule has nothing to replace and the dotted name is
+            // the wire name unchanged. The IDL says so in as many words,
+            // which is exactly why this table is written out rather than
+            // derived: a rule with an unhandled case would have invented one.
+            (Verb::EGRESS, "egress"),
             (Verb::REALM_LAUNCH, "realm.launch"),
         ];
         assert_eq!(
@@ -1757,10 +2443,23 @@ mod tests {
             Verb::VALID_MASK
         );
         let names: Vec<&str> = reserved.iter().map(String::as_str).collect();
-        let gap = format!(
-            "because {} are allocated to verbs the IDL does not define yet",
-            names.join(" and ")
-        );
+        // The template agrees in NUMBER with the set it renders. It was
+        // written when the gap held 128 and 256 and hard-coded the plural;
+        // P2.7.2 took 128 for `egress`, leaving one bit and a sentence the
+        // book could only satisfy ungrammatically ("256 are allocated to
+        // verbs"). A gate that can only be satisfied by bad English is a gate
+        // people rewrite the prose around, so it renders both forms.
+        let gap = if names.len() == 1 {
+            format!(
+                "because {} is allocated to a verb the IDL does not define yet",
+                names[0]
+            )
+        } else {
+            format!(
+                "because {} are allocated to verbs the IDL does not define yet",
+                names.join(" and ")
+            )
+        };
         assert!(
             bullet.contains(&gap),
             "{BOOK}: the {MARKER:?} bullet does not say {gap:?}. The bits still outside \
@@ -2381,7 +3080,10 @@ mod tests {
         let debug = format!("{row:?}");
 
         // Every PRD Doc 2 section 5.2 field, by name, in the one Debug
-        // rendering -- the row shape is the schema, verbatim.
+        // rendering -- the row shape is the schema, verbatim -- plus the
+        // one column added since (`pinned_addrs`, P2.7.2), which is listed
+        // here for the same reason: a column the row carries and this list
+        // omits is a column nothing checks the nullity of.
         for field in [
             "grant_id",
             "principal_id",
@@ -2396,6 +3098,7 @@ mod tests {
             "persistence",
             "provenance_ref",
             "parent_grant_id",
+            "pinned_addrs",
             "issued_at",
             "issuer",
         ] {
@@ -2405,13 +3108,14 @@ mod tests {
             );
         }
 
-        // The MVP-unfillable fields are present and visibly null -- never
+        // The unfillable fields are present and visibly null -- never
         // omitted, never fabricated.
         for null_field in [
             "focus_condition: None",
             "one_shot: None",
             "provenance_ref: None",
             "parent_grant_id: None",
+            "pinned_addrs: None",
         ] {
             assert!(
                 debug.contains(null_field),

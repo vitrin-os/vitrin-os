@@ -118,8 +118,22 @@ _Static_assert(VITRIN_SHIM_SEAT_EVT_GESTURE_END_OPCODE < VITRIN_SEAT_EVENT_SLOTS
  * One of the six IS a core -> shim event carrying an fd -- `designation`, the
  * first in this protocol. It does not reach this file (it is addressed to
  * VITRIN_SESSION_ID, not to the seat), and this transport does not implement
- * receiving an fd at all; see `wire.h` for what P2.6.7 owes there. */
-_Static_assert(VITRIN_MESSAGE_COUNT == 54,
+ * receiving an fd at all; see `wire.h` for what P2.6.7 owes there.
+ *
+ * Re-pinned 54 -> 58 by P2.7.2 (issue #196), with the same check made against
+ * all four added messages: `vitrin_grant.get_egress` is a REQUEST on the grant
+ * object, and `vitrin_egress` contributes one request (`request_connect`) and
+ * two events (`connected`, `connect_failed`) on ITS OWN interface. None of the
+ * four is a `vitrin_shim_seat` event -- that interface's event list still ends
+ * at `gesture_end` (opcode 9), so `VITRIN_SEAT_EVENT_SLOTS` is still 10 and
+ * `delivered[]` is untouched.
+ *
+ * 54 is where P2.6.5 left this number and 52 is where P2.7.2 left it, because
+ * the two tasks appended in parallel and each measured only its own branch.
+ * The merge is the union of both appends, so the pin is 48 + 6 + 4 = 58 rather
+ * than either branch's figure -- which is exactly the arithmetic this assert
+ * exists to force someone to do out loud. */
+_Static_assert(VITRIN_MESSAGE_COUNT == 58,
 	"a message was appended to the IDL -- read the paragraph above before touching "
 	"delivered[]");
 

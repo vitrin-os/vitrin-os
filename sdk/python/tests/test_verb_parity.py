@@ -49,7 +49,14 @@ def _verb_entries() -> list[ET.Element]:
 
 
 def _dotted(wire_name: str) -> str:
-    """The IDL's naming rule: the first underscore becomes a dot."""
+    """The IDL's naming rule: the first underscore becomes a dot.
+
+    Degenerate for a wire name that has no underscore — there is nothing to
+    replace, so the dotted name is the wire name unchanged. `egress` (P2.7.2)
+    is the first such entry, and the IDL states the case in as many words
+    rather than leaving a transcriber to guess; `str.replace` already
+    implements it, so this function needs no branch, only the note.
+    """
     return wire_name.replace("_", ".", 1)
 
 
@@ -80,6 +87,7 @@ def test_verb_mask_covers_exactly_the_defined_bits() -> None:
     assert protocol.VERB_MASK == defined
 
 
+# vitrin-verb-set: unserved-verbs = observe_cursor, designate_file, egress
 def test_the_unserved_marker_is_actually_a_phrase_the_idl_uses() -> None:
     """The served/unserved split below is derived from a STRING MATCH.
 
@@ -92,14 +100,22 @@ def test_the_unserved_marker_is_actually_a_phrase_the_idl_uses() -> None:
 
     At wire version 2 the marked side is `observe_cursor`, `designate_file`
     (added by P2.6.5, and unserved by every deployment until its picker and
-    its consent copy exist) and `realm_launch` — the last of which stays out
+    its consent copy exist), `egress` (added by P2.7.2, and unserved by every
+    deployment until the out-of-core mediating proxy exists) and
+    `realm_launch` — the last of which stays out
     of the SERVED set for a reason about the version rather than the
     deployment (a version-1 connection cannot mint `vitrin_launcher` at all),
     and the IDL's own summary says so, which is why deriving from the IDL
     rather than from a second list is the point. No count is stated here: the
     assertions below are over the derived sets, and the one sentence that did
     state a count ("`observe_cursor` alone") went false the moment a second
-    verb landed.
+    verb landed, and would have gone false again on the third.
+
+    `egress`'s FACET exists as of P2.7.2's second half (`vitrin_egress`), as
+    `designate_file`'s does (`vitrin_powerbox`), and the distinction matters
+    here because "no facet" was the reason an earlier draft of this docstring
+    gave — a facet is a request to ask through, not a mechanism to answer
+    with, and only the second one moves a verb into the served set.
     """
     summaries = [(e.get("summary") or "") for e in _verb_entries()]
     marked = [s for s in summaries if UNSERVED_MARKER in s]

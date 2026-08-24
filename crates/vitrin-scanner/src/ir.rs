@@ -38,10 +38,17 @@ pub struct Interface {
     /// The interface's own `version` attribute (per-interface growth counter;
     /// distinct from the protocol-level version integer).
     pub version: u32,
-    /// `interface/@verb`, present only on `vitrin_view`, `vitrin_actuator_pointer`,
-    /// and `vitrin_actuator_text`: every request on the interface exercises this
-    /// grant verb. Carried through for a future capability-enforcement chokepoint
-    /// in a different crate; no enforcement logic here.
+    /// `interface/@verb`, present on every **facet** interface and on no other:
+    /// every request on the interface exercises this grant verb. Carried through
+    /// for the capability-enforcement chokepoint in a different crate; no
+    /// enforcement logic here.
+    ///
+    /// Which interfaces those are is deliberately **not** listed here. It was --
+    /// "`vitrin_view`, `vitrin_actuator_pointer` and `vitrin_actuator_text`" --
+    /// and the list was stale from the moment `vitrin_launcher` landed, then
+    /// staler again when the layout pair did. The set is generated instead, as
+    /// `vitrin_protocol::generated::FACET_VERBS`, and held to this attribute by
+    /// `cargo xtask verb-sets --check`.
     pub verb: Option<String>,
     pub summary: String,
     /// Requests in document order; opcode == index into this `Vec`.

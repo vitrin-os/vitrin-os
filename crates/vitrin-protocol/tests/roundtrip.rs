@@ -20,8 +20,9 @@
 //! test function nobody wrote.
 //!
 //! The fd-bearing messages (`vitrin_view.frame_ready`,
-//! `vitrin_shim_surface.attach`, and P2.6.5's designation pair
-//! `vitrin_powerbox.designated` / `vitrin_shim_session.designation`) get
+//! `vitrin_shim_surface.attach`, P2.6.5's designation pair
+//! `vitrin_powerbox.designated` / `vitrin_shim_session.designation`, and
+//! P2.7.2's `vitrin_egress.connected`) get
 //! their own hand-written `proptest!` blocks instead of the table, since they
 //! need a real disposable fd pair from `std::io::pipe()` rather than a pure
 //! value strategy. **Two different gates hold two different properties, and
@@ -77,8 +78,13 @@ type Launched = gen::vitrin_launcher::events::Launched;
 
 type GetLayoutFocus = gen::vitrin_grant::requests::GetLayoutFocus;
 type GetLayoutArrange = gen::vitrin_grant::requests::GetLayoutArrange;
+type GetEgress = gen::vitrin_grant::requests::GetEgress;
 type LayoutFocusFocus = gen::vitrin_layout_focus::requests::Focus;
 type SetFullscreen = gen::vitrin_layout_arrange::requests::SetFullscreen;
+
+type RequestConnect = gen::vitrin_egress::requests::RequestConnect;
+type Connected = gen::vitrin_egress::events::Connected;
+type ConnectFailed = gen::vitrin_egress::events::ConnectFailed;
 
 type ConsentStateEvent = gen::vitrin_consent::events::State;
 
@@ -278,8 +284,12 @@ impl_message!(
     Launched,
     GetLayoutFocus,
     GetLayoutArrange,
+    GetEgress,
     LayoutFocusFocus,
     SetFullscreen,
+    RequestConnect,
+    Connected,
+    ConnectFailed,
 );
 
 /// Exhaustiveness gate: the `impl_message!` table must cover every message
@@ -943,6 +953,32 @@ fn designation_fields() -> impl Strategy<
     )
 }
 
+fn get_egress() -> impl Strategy<Value = GetEgress> {
+    any_u32().prop_map(|egress| GetEgress { egress })
+}
+
+/// `request_connect`'s host bound is 253 bytes (the DNS name maximum, stated
+/// in the IDL in its own terms rather than derived from `resource`'s 256), and
+/// its port is a bare `uint` on the wire: the 1-65535 rule is *argument
+/// validation the decoder does not do*, so the codec must round-trip every
+/// `u32` here. Generating the full range rather than 1..=65535 is deliberate
+/// -- a strategy that only produced legal ports would leave the encoder's
+/// handling of an out-of-domain value untested, and the encoder is what a
+/// server uses to build the frame it then rejects.
+fn request_connect() -> impl Strategy<Value = RequestConnect> {
+    (bounded_string(253), any_u32()).prop_map(|(host, port)| RequestConnect { host, port })
+}
+
+/// Non-fd fields of `connected`, in field order; the fd itself is spliced in
+/// by the dedicated `proptest!` block below, exactly as `frame_ready`'s is.
+fn connected_fields() -> impl Strategy<Value = (String, u32)> {
+    (bounded_string(253), any_u32())
+}
+
+fn connect_failed() -> impl Strategy<Value = ConnectFailed> {
+    plain_enum(gen::vitrin_egress::Failure::ALL).prop_map(|reason| ConnectFailed { reason })
+}
+
 // ---------------------------------------------------------------------------
 // One `#[test]` per message, generated from the table below. Each expands to
 // exactly: generate an object_id and a value, run `assert_roundtrip`. Adding
@@ -1070,11 +1106,16 @@ roundtrip_test!(
     set_fullscreen()
 );
 
+roundtrip_test!(roundtrip_vitrin_grant_get_egress, get_egress());
+roundtrip_test!(roundtrip_vitrin_egress_request_connect, request_connect());
+// vitrin_egress.connected: fd-bearing, see dedicated block below.
+roundtrip_test!(roundtrip_vitrin_egress_connect_failed, connect_failed());
+
 // ---------------------------------------------------------------------------
-// The four fd-bearing messages in v0.xml (grep for an `fd`-typed arg):
-// `vitrin_view.frame_ready`, `vitrin_shim_surface.attach`, and the
+// The five fd-bearing messages in v0.xml (grep for an `fd`-typed arg):
+// `vitrin_view.frame_ready`, `vitrin_shim_surface.attach`, the
 // designation pair `vitrin_powerbox.designated` /
-// `vitrin_shim_session.designation`. Each gets a
+// `vitrin_shim_session.designation`, and `vitrin_egress.connected`. Each gets a
 // real, disposable fd pair from `std::io::pipe()` (stable since Rust 1.87;
 // this workspace pins its toolchain in `rust-toolchain.toml` and declares
 // `rust-version` in the workspace `Cargo.toml`) rather than skipping fd
@@ -1156,6 +1197,30 @@ proptest! {
             kind,
             mode,
             name,
+        };
+        assert_roundtrip(value, object_id, Some(OwnedFd::from(writer)));
+    }
+}
+
+proptest! {
+    #[test]
+    fn roundtrip_vitrin_egress_connected(
+        object_id in any::<u32>(),
+        (host, port) in connected_fields(),
+    ) {
+        // `connected` is the fifth fd-bearing message and the first one whose
+        // fd is a SOCKET rather than a buffer. That distinction is the
+        // interface's, not the codec's: `encode` never inspects the fd's
+        // value and the fd's bytes never enter the buffer, so a pipe end
+        // exercises this path exactly as a connected socket would. Using
+        // `std::io::pipe()` keeps this block byte-identical in shape to its
+        // four siblings above rather than opening a socketpair to prove
+        // something the codec cannot observe.
+        let (reader, writer) = std::io::pipe().expect("creating a disposable pipe for fd round-trip coverage");
+        let value = Connected {
+            fd: OwnedFd::from(reader),
+            host,
+            port,
         };
         assert_roundtrip(value, object_id, Some(OwnedFd::from(writer)));
     }

@@ -72,12 +72,16 @@ type GetLauncher = gen::vitrin_grant::requests::GetLauncher;
 type GetLayoutFocus = gen::vitrin_grant::requests::GetLayoutFocus;
 type GetLayoutArrange = gen::vitrin_grant::requests::GetLayoutArrange;
 type GetPowerbox = gen::vitrin_grant::requests::GetPowerbox;
+type GetEgress = gen::vitrin_grant::requests::GetEgress;
 type Resolved = gen::vitrin_grant::events::Resolved;
 type Refused = gen::vitrin_grant::events::Refused;
 type Launch = gen::vitrin_launcher::requests::Launch;
 type Launched = gen::vitrin_launcher::events::Launched;
 type LayoutFocus = gen::vitrin_layout_focus::requests::Focus;
 type LayoutSetFullscreen = gen::vitrin_layout_arrange::requests::SetFullscreen;
+type RequestConnect = gen::vitrin_egress::requests::RequestConnect;
+type Connected = gen::vitrin_egress::events::Connected;
+type ConnectFailed = gen::vitrin_egress::events::ConnectFailed;
 type ConsentStateEvent = gen::vitrin_consent::events::State;
 type CaptureFrame = gen::vitrin_view::requests::CaptureFrame;
 type FrameReady = gen::vitrin_view::events::FrameReady;
@@ -129,7 +133,8 @@ fn devnull_fd() -> OwnedFd {
 /// majority of message types the round-trip is a full equality check
 /// ([`DecodeMsg::decoded_eq`]); the fd-bearing types
 /// (`vitrin_view.frame_ready`, `vitrin_shim_surface.attach`,
-/// `vitrin_shim_session.designation`, `vitrin_powerbox.designated`) only
+/// `vitrin_shim_session.designation`, `vitrin_powerbox.designated`,
+/// `vitrin_egress.connected`) only
 /// derive `Debug` in the generated code (an `OwnedFd` field has no
 /// `PartialEq`), so their impl of [`DecodeMsg::decoded_eq`] is vacuously
 /// `true` -- the panic-freedom and "must decode again" checks below still
@@ -261,8 +266,11 @@ impl_decode_msg_no_fd!(
     Launched,
     GetLayoutFocus,
     GetLayoutArrange,
+    GetEgress,
     LayoutFocus,
     LayoutSetFullscreen,
+    RequestConnect,
+    ConnectFailed,
     SessionSelection,
     RequestSelection,
     OfferSelection,
@@ -274,14 +282,21 @@ impl_decode_msg_no_fd!(
     PowerboxRequestDir,
     PowerboxRefused,
 );
-// The four fd-bearing messages in v0.xml (grep for an `fd`-typed arg),
+// The five fd-bearing messages in v0.xml (grep for an `fd`-typed arg),
 // matching tests/roundtrip.rs's dedicated-block split. P2.6.5 (#189) took
-// this set from two to four; `roundtrip.rs`'s equivalent split was updated
+// this set from two to four and P2.7.2 (#196) to five; `roundtrip.rs`'s
+// equivalent split was updated
 // with the IDL and this one was not, which is how a message can be listed
 // as fd-less here while its generated `decode` demands an fd -- every call
 // to it dying at `FdCountMismatch` before reaching a single argument read,
 // with the fuzzer reporting no crash.
-impl_decode_msg_with_fd!(FrameReady, Attach, SessionDesignation, PowerboxDesignated);
+impl_decode_msg_with_fd!(
+    FrameReady,
+    Attach,
+    SessionDesignation,
+    PowerboxDesignated,
+    Connected
+);
 
 /// One panic-free-and-round-trips-if-it-decodes wrapper per message type,
 /// unified behind this shape so the fuzz target body is a single indexed
@@ -318,6 +333,18 @@ macro_rules! decoder_table {
 /// which compares this table against the IDL entry by entry rather than at three
 /// sampled points.
 ///
+/// **That reorder was incomplete, and P2.7.2's second half finished it.**
+/// `vitrin_shim_session`'s nine messages sat here as `create_surface`,
+/// `get_seat`, `selection`, `configure`, `request_selection`, `offer_selection`,
+/// `pointer_constraint`, `pointer_constraint_state`, `idle_inhibit` -- requests
+/// and events interleaved, where the IDL puts all five requests before all four
+/// events. Indices 24 through 29 therefore named a different message here than
+/// `fuzz/seed_corpus.py`'s IDL-derived table named, and nothing was red: the two
+/// tables are only ever compared *at the indices a checked-in seed selects*, and
+/// no seed selects one of those six. It was a trap armed for the next seed, not
+/// a live defect, and it is fixed here rather than left for that seed's author
+/// to debug.
+///
 /// Nothing may be written between the macro's parentheses but bare type names:
 /// `seed_corpus_reachability.rs` and `seed_corpus.py` both parse this invocation
 /// out of the source.
@@ -334,6 +361,7 @@ static DECODERS: &[Decoder] = decoder_table!(
     GetLayoutFocus,
     GetLayoutArrange,
     GetPowerbox,
+    GetEgress,
     Resolved,
     Refused,
     ConsentStateEvent,
@@ -376,6 +404,9 @@ static DECODERS: &[Decoder] = decoder_table!(
     PowerboxRequestDir,
     PowerboxDesignated,
     PowerboxRefused,
+    RequestConnect,
+    Connected,
+    ConnectFailed,
 );
 
 fuzz_target!(|data: &[u8]| {

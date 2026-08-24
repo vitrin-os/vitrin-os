@@ -798,10 +798,15 @@ mod tests {
         // its copy existed, and its copy exists here.
         //
         // WS-E.1.4 (issue #210) moved `layout_arrange` and `layout_focus`
-        // out on the same terms. `observe_cursor` stays, and for a reason
-        // that has not moved: per-principal cursor *delivery* is still M2's
-        // (D-017/D-019 both say so in as many words), so serving the verb
-        // would widen a capture with a cursor the core does not have.
+        // out on the same terms.
+        //
+        // vitrin-verb-set: unserved-verbs = observe_cursor, designate_file, egress
+        //
+        // Three verbs are pinned here. `observe_cursor` stays, and for a
+        // reason that has not moved: per-principal cursor *delivery* is
+        // still M2's (D-017/D-019 both say so in as many words), so serving
+        // the verb would widen a capture with a cursor the core does not
+        // have.
         //
         // **Re-pinned by P2.6.5 (issue #189) in the other direction** — the
         // first time this pin has *grown*. `designate_file` (64) is appended
@@ -813,9 +818,31 @@ mod tests {
         // petition can ever carry to a prompt, which is the exact failure the
         // second assertion in this test forbids. When P2.6.8 writes the copy,
         // this pin shrinks again and a line goes in above, in one change.
+        //
+        // **`egress` (128) JOINED the pin at P2.7.2 (issue #196)**, the
+        // second growth, and again
+        // this tripwire firing exactly as designed: the IDL gained a bit and
+        // this line went red until a human classified it. It is classified
+        // **unserved**, and there is no catalogue line above for it, because
+        // the mechanism the verb names does not exist: the out-of-core
+        // mediating proxy is P2.7.3's. Prompt copy for authority no code
+        // enforces would be the exact lie the catalogue exists to prevent.
+        //
+        // **Its facet landed and this pin did not move**, which is the
+        // distinction worth having in writing here. P2.7.2's second half
+        // added `vitrin_egress` — an interface of its own rather than a
+        // request on P2.6.5's filesystem powerbox, since `interface/@verb` is
+        // one value per interface — so the verb now has a request to be
+        // exercised through and still has nothing to answer with. A facet
+        // changes what the wire can express; only a mechanism changes what
+        // this core can enforce, and only the second moves a bit out of
+        // `UNSERVED_VERB_BITS`. The same is true of `designate_file` and
+        // `vitrin_powerbox`. `egress` leaves this pin when P2.7.3 lands
+        // the proxy and P2.6.8's Q13 copy review clears its line, not
+        // before.
         assert_eq!(
             crate::grants::UNSERVED_VERB_BITS,
-            (Verb::OBSERVE_CURSOR | Verb::DESIGNATE_FILE).bits(),
+            (Verb::OBSERVE_CURSOR | Verb::DESIGNATE_FILE | Verb::EGRESS).bits(),
             "the IDL defines a verb this module has not classified as served \
              or unserved (D-017/D-018)"
         );

@@ -114,7 +114,7 @@ are labelled as what they are.
 What exists today, on `main`:
 
 - **Protocol spec v0** — [protocol/vitrin-v0.xml](protocol/vitrin-v0.xml)
-  (15 interfaces at wire version 2, wire format, error taxonomy; the source of truth), its
+  (16 interfaces at wire version 2, wire format, error taxonomy; the source of truth), its
   RELAX NG schema [protocol/vitrin-v0.rng](protocol/vitrin-v0.rng), and a
   prose page per interface under [docs/protocol/](docs/protocol/00-conventions.md)
   kept in lockstep with every landing PR.
@@ -939,6 +939,7 @@ nothing until the grant resolves. Where prose and IDL disagree, **the IDL's
 | [`vitrin_layout_focus`](docs/protocol/17-vitrin_layout_focus.md) | Focus facet (since wire version 2) — bind the output to the granted realm and send the human's own input there, one act |
 | [`vitrin_layout_arrange`](docs/protocol/18-vitrin_layout_arrange.md) | Arrangement facet (since wire version 2) — fill the output, or compose at the app's own size; `place`, `resize`, `raise` and stacking are absent rather than refused |
 | [`vitrin_powerbox`](docs/protocol/13-vitrin_powerbox.md) | Designation facet (since wire version 2) — ask the human to pick one file or one directory subtree and have the **descriptor** delivered to the realm; no path crosses the wire in either direction. **Vocabulary only so far**: no deployment serves the verb, and `vitrind` does not answer `get_powerbox` at all yet — it kills the connection with `invalid_opcode` until the picker lands |
+| [`vitrin_egress`](docs/protocol/19-vitrin_egress.md) | Egress facet (since wire version 2) — one outbound connection to the single `host:port` the grant names, delivered as a socket fd. **No deployment serves the `egress` verb** and this core implements none of the interface's messages: the out-of-core mediating proxy does not exist |
 
 ## Roadmap
 

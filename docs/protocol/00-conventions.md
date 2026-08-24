@@ -24,9 +24,14 @@ version-1 signature is byte-identical at version 2:
   `unsupported` by **every** deployment so far, and the one addition here that
   also puts an fd-bearing event on the shim connection
   (`vitrin_shim_session.designation`);
+- the `egress` verb bit, the structural mint `vitrin_grant.get_egress` and the
+  [`vitrin_egress`](19-vitrin_egress.md) interface it mints, through which that
+  verb is exercised — a verb **no deployment
+  serves** either, because the out-of-core proxy behind the facet does not
+  exist;
 - the `layout_held` entry on `vitrin_grant.outcome`.
 
-Those four are the version-2 additions that mint an **interface page**, which
+Those five are the version-2 additions that mint an **interface page**, which
 is why they are the ones listed beside the page index above. They are **not** the
 whole of version 2 — the cross-realm clipboard, the pointer constraint, the idle
 inhibit and the seat's relative-motion and gesture events all landed at version 2
@@ -56,6 +61,7 @@ Interface pages:
 - [16 — vitrin_launcher](16-vitrin_launcher.md) *(since version 2)*
 - [17 — vitrin_layout_focus](17-vitrin_layout_focus.md) *(since version 2)*
 - [18 — vitrin_layout_arrange](18-vitrin_layout_arrange.md) *(since version 2)*
+- [19 — vitrin_egress](19-vitrin_egress.md) *(since version 2; served by no deployment)*
 
 The gaps are deliberate: pages 12, 14 and 15 are allocated to interfaces that
 have not landed yet (`docs/plan/02-phase-2-semantic-epochs.md` §5), and taking
@@ -63,6 +69,9 @@ an allocated number would be the collision that registry exists to prevent.
 Page **13** was allocated to the powerbox by that registry before this page
 existed, and P2.6.5 took **that** number rather than the next free one, which
 is the rule working the way `16`, `17` and `18` already showed it working.
+Page **19** is the same rule once more: `vitrin_egress` landed before pages 12,
+14 and 15, and took its allocated number rather than the lowest free one,
+because a page number is a permanent address and not a queue position.
 
 ---
 
@@ -305,6 +314,42 @@ creation still refuses it. See
 defining a verb before serving it is structural rather than cosmetic, and for
 why "unserved" is a statement about a deployment rather than about the wire.
 
+**Two more verbs sit in that staged posture and are governed by no part of
+this
+section**, named here because the enumeration above is the one a reader
+checks a claim about "which verbs are unserved" against.
+
+**`designate_file`** (64, added at P2.6.5) is refused `unsupported` by *every*
+deployment, and for a reason with a scheduled end: no core-drawn picker mints
+a descriptor (P2.6.6) and no consent copy names what approving it costs
+(P2.6.8). Its facet exists —
+[`vitrin_powerbox`](13-vitrin_powerbox.md) landed with the bit.
+
+**`egress`** (128,
+added at P2.7.2) is refused `unsupported` by *every* deployment — not because
+of what a deployment declines, but because the out-of-core mediating proxy an
+outbound connection would be made through does not exist. Its facet does:
+[`vitrin_egress`](19-vitrin_egress.md) landed in the same task's second half,
+so the request to ask through is on the wire and the mechanism to answer with
+is not. Its authority is named by
+the [`net:` resource selector](04-vitrin_grant.md#the-net-resource-prefix):
+`covers` is exact match, so no accepted selector can ever name more than one
+endpoint and a blanket egress grant is inexpressible rather than refused.
+
+Having a facet is not being served, and both of those two are the proof: a
+facet is a request to ask through, a mechanism is what answers.
+
+<!-- vitrin-verb-set: unserved-verbs = observe_cursor, designate_file, egress | count: three -->
+So the count this enumeration exists to answer is **three**: `observe_cursor`,
+`designate_file`
+and `egress` are the verbs no deployment serves today, and `layout_arrange`,
+`layout_focus` and `realm_launch` have each left that posture. That count is
+not a sentence anyone has to remember: `cargo xtask verb-sets --check`
+derives the set from the IDL and from the reference core's `SERVED_VERB_BITS`
+and fails on every surface still enumerating the old one — as it did on this
+very paragraph, which said "two" while a parallel branch was landing the
+third.
+
 ---
 
 ## 2. Wire format
@@ -367,6 +412,18 @@ Notes:
 Every `string` argument documents a maximum byte length. A violation is fatal
 `invalid_argument`.
 
+This table is a **closed registry**, and it went stale the way closed registries
+do: the egress facet added two `string` arguments and neither reached it, so a
+section opening with the word *every* listed fifteen of seventeen. It is now
+**held to the IDL mechanically** — `cargo xtask protocol-tables --check` derives
+`(interface.message, argument, max bytes)` from every `string` argument in
+`protocol/vitrin-v0.xml` and fails naming any row this table has that the IDL
+does not, or the IDL has that this table does not. The rows are still **typed by
+hand, not generated**: the parenthetical reasoning in the third column is prose
+no tool can produce, and losing it would cost more than the typing does. What
+the gate removes is the possibility of the set disagreeing, which is the part
+that was ever wrong.
+
 | Interface.message | Argument | Max bytes |
 |---|---|---|
 | `vitrin_handshake.hello` | `identity` | 2048 (the SPIFFE-ID maximum: a 255-byte trust domain plus path) |
@@ -386,6 +443,8 @@ Every `string` argument documents a maximum byte length. A violation is fatal
 | `vitrin_shim_seat.text` | `text` | 4096 |
 | `vitrin_launcher.launched` | `realm` | 64 (same bound as every other realm id, so it passes back through `get_realm` unchanged) |
 | `vitrin_powerbox.designated` | `name` | 255 (the same basename, delivered to the asking agent) |
+| `vitrin_egress.request_connect` | `host` | 253 (the DNS name maximum, stated in its own terms rather than derived from `request_grant`'s 256-byte `resource` — and deliberately the **looser** of the two, so a 251-byte host fits here and fits in no `net:` selector, is therefore accepted by the decoder and refused `not_granted` by the chokepoint, which is the fail-closed direction) |
+| `vitrin_egress.connected` | `host` | 253 (the echo, byte-identical to the request's and bounded identically; an IPv6 literal carries **no** brackets in either, since the port is its own argument and two spellings of one endpoint under one selector is the thing that bound exists to prevent) |
 
 ### 2.4 The one-fd-per-message invariant
 
@@ -544,8 +603,14 @@ as a wire code):
 ### 5.3 Recoverable errors
 
 Recoverable failures are delivered as ordinary events and never close the
-connection. There are two petition/use moments, one **human-answer** moment,
-and the shim fallback path.
+connection. There are **five** classes, and what separates them is *who
+decided*: two are this server's own answers about a grant (at petition time and
+at use time), the third is the **human's** answer to a designation ask this
+server had already admitted, the fourth is the **far end's** non-answer to a
+use this server had already admitted, and the fifth is the shim's
+buffer-import fallback. The third and fourth are the newest and are the ones a
+reader is most likely to fold into the second; the paragraphs on them say why
+that folding is the expensive mistake.
 
 **Petition outcomes** — `vitrin_grant.resolved(outcome, verbs, persistence,
 expiry_ms)`, sent **exactly once per grant, ever**. On `granted` the trailing
@@ -553,11 +618,17 @@ arguments carry the *effective* authority the human chose (which may be
 narrower than requested); on any other outcome they are zero.
 
 **Use-time refusals** — `vitrin_grant.refused(verb, code, retry_after_ms)` from
-the single enforcement chokepoint, covering capture, actuation and launch
-alike. `retry_after_ms` is greater than zero only for `rate_limited`.
+the single enforcement chokepoint, covering capture, actuation, launch, the
+layout verbs, **designation** and egress alike — **six** classes, a closed list
+grouped by facet shape rather than by verb, and whose **three** past lapses are
+recorded at [`vitrin_grant.refusal`](04-vitrin_grant.md#refusal); the third and
+worst is the one where the list called itself closed while omitting
+designation.
+`retry_after_ms` is greater than zero only for `rate_limited`.
 Which codes a given use can draw is not uniform: `preempted` and
-`consent_held` are attention-shaped (actuation and the layout verbs),
-`capacity` is launch-only, and a launch is
+`consent_held` are attention-shaped (actuation and the layout verbs; never
+egress; **undecided for designation**, which P2.6.6 answers when it builds the
+picker), `capacity` is launch-only, and a launch is
 never refused `no_surface` (a vacant realm is the state `realm_launch` exists
 to leave). The single voice is the invariant; the applicable set is per-verb
 and is stated on each facet's page. One code is also **conditional**:
@@ -578,6 +649,27 @@ because "the human said no" and "your grant expired" are the two things an
 agent most needs to tell apart. See
 [`vitrin_powerbox`](13-vitrin_powerbox.md#refused).
 
+**Transport non-answers** — `vitrin_egress.connect_failed(reason)` *(since 2)*,
+delivered on the [egress facet](19-vitrin_egress.md#connect_failed) and
+deliberately **neither** an outcome nor a refusal. It is reached only after the
+chokepoint **admitted** the use — the grant is live, the verb is in its
+effective set, and the endpoint is covered — and the far end then did not
+answer. What distinguishes it from a refusal is not severity but authorship:
+every code in [`refusal`](04-vitrin_grant.md#refusal) names something *this
+server decided* about a grant, and a host that is down decided nothing, so
+there is no honest code for it — `not_granted` would be the worst available
+rounding, because an agent that hears it correctly stops asking. Keeping the two
+apart is wrong in both directions when blurred: an agent that reads a transport
+failure as a lost authority abandons work it is permitted to do, and one that
+reads a refusal as a transient failure retries forever against a wall. It
+carries **no `retry_after_ms`** — a token bucket has a known refill time and a
+down host has none. The ordering is normative (the chokepoint answers first), so
+this class is unreachable for a principal whose grant does not cover the
+endpoint; [§6.1](#61-reply-bearing-requests) states the same argument as a
+question about terminal sets. **Nothing serves it today**: `egress` is refused
+`unsupported` by every deployment, and the reference core dispatches
+`vitrin_egress` not at all.
+
 **Shim fallback** — `vitrin_shim_surface.buffer_done(buffer_id, status)` with a
 non-`released` status is the recoverable dmabuf-import-fallback path
 (shim-side).
@@ -586,6 +678,25 @@ non-`released` status is the recoverable dmabuf-import-fallback path
 
 Each recoverable code maps to exactly one distinct typed SDK exception (or
 success), so a blocking SDK can translate the wire directly.
+
+**Two of the five classes are mapped here, and the other three are not — say so
+rather than let the tables imply a completeness they do not have.** `outcome`
+and `refusal` are below. The **shim fallback**'s `buffer_done` status is on a
+shim connection, which no agent SDK speaks. **The human's answer**
+([`vitrin_powerbox.refusal`](13-vitrin_powerbox.md#refusal)) and **the transport
+non-answer** ([`vitrin_egress.failure`](19-vitrin_egress.md#failure)) have **no
+mapping at all yet**, and both are gaps rather than decisions: the Python SDK
+implements no part of either facet
+([`vitrin_os.protocol`](../../sdk/python/src/vitrin_os/protocol.py) names both
+as absent), so there is nothing to map them onto. When they are mapped, the one
+thing this section already fixes is that neither may land in the `refusal`
+table — the whole point of both classes is that neither is an authority answer.
+
+*This paragraph said "two of the **four**" and named only `connect_failed`
+until the P2.6.5 and P2.7.2 branches were merged. It was written on the second
+of those, where four was the true count, and the class it omits is the one the
+first branch added — the same mechanism the [`refusal`](04-vitrin_grant.md#refusal)
+enum's own lapses record.*
 
 | `outcome` | SDK result |
 |---|---|
@@ -643,13 +754,23 @@ mint**. This classification, together with the ordering guarantee (§4), is what
 lets the SDK stay single-threaded and blocking.
 
 The structural mints are `get_realm`, `create_surface`, `get_seat`, and (since
-version 2) `get_launcher`, `get_layout_focus`, `get_layout_arrange` and
-`get_powerbox` — **seven**: the
+version 2) `get_launcher`, `get_layout_focus`, `get_layout_arrange`,
+`get_powerbox` and `get_egress` — **eight**: the
 request only mints an object, so it is neither
 reply-bearing nor refusable — no terminal event, no wire acknowledgement. A
 malformed mint is a fatal object-graph error; a mint whose target is unknown
 or vacant surfaces that on first *use* (e.g. petitions resolving
 `unavailable`, or an inert facet refusing `not_granted`), never at mint time.
+
+`get_egress` ([`vitrin_grant`](04-vitrin_grant.md#get_egress)) is the newest
+and is a mint like the other seven in every structural respect, including the
+one that reads oddest: no deployment serves the `egress` verb, so *every*
+facet it mints refuses `not_granted` on first use — and the mint is still
+always legal, because minting is not an authority oracle. A separate and
+larger gap belongs to the reference core rather than to this document: it
+dispatches neither `get_egress` nor `vitrin_egress`'s own request at all, so
+`vitrind` answers both `invalid_opcode` today where this section says the mint
+is unrefusable. See [`vitrin_egress`](19-vitrin_egress.md#nothing-serves-this-interface-read-this-section-first).
 
 ### 6.1 Reply-bearing requests
 
@@ -662,6 +783,7 @@ or vacant surfaces that on first *use* (e.g. petitions resolving
 | `vitrin_launcher.launch` *(since 2)* | `vitrin_launcher.launched` **or** `vitrin_grant.refused(realm_launch, …)` |
 | `vitrin_powerbox.request_file` *(since 2)* | `vitrin_powerbox.designated` **or** `vitrin_powerbox.refused` **or** `vitrin_grant.refused(designate_file, …)` |
 | `vitrin_powerbox.request_dir` *(since 2)* | the same three |
+| `vitrin_egress.request_connect` *(since 2)* | `vitrin_egress.connected` **or** `vitrin_grant.refused(egress, …)` **or** `vitrin_egress.connect_failed` — three, see below |
 
 **Exactly-one-terminal rule.** Every reply-bearing request receives **exactly
 one** terminal event, in request order (petition resolution excepted — §4), and
@@ -672,14 +794,77 @@ system: `fd` arguments have no null form, so failure must be a distinct event.
 "no realm" value that would not also be a legal id, so failure is again a
 distinct event rather than a sentinel string.
 
-**The powerbox pair is the first three-way one-of in this protocol**, and it
-is a widening of the exactly-one-terminal rule rather than an exception to it:
-exactly one of the three arrives, in request order, never coalesced. The third
-arm exists because there are genuinely two answerers — the chokepoint decides
-whether the grant may ask, the human decides what to designate — and collapsing
-them would make "the human said no" indistinguishable from "your grant
-expired". `designated`'s own one-of pairing is then forced by the type system
-exactly as `frame_ready`'s is: an `fd` argument has no null form.
+**The rule is exactly-one *terminal*, not one-of-two *events*, and the
+three-way rows are where the difference shows.** The rows above already carry
+terminal sets of three different sizes: `sync` and `request_grant` have exactly
+one terminal each, `capture_frame` and `launch` one **of two**, and the
+powerbox pair and `request_connect` one **of three**. Every one of them obeys
+the same rule —
+one request, one terminal, drawn from that row's set. So this paragraph is
+**not widened** by the powerbox or the egress facet: what the rule bounds is
+how many terminals
+a request receives, which is still exactly one, and never how many the set it
+is drawn from holds. The powerbox pair reached three first, and for a reason of
+its own — two answerers, the chokepoint and the human — where
+`request_connect`'s third arm is the far end's non-answer. Same arity, two
+unrelated arguments, and neither is an exception to the rule.
+
+**Why there is a third here**, in short — the full argument is
+[`vitrin_egress`](19-vitrin_egress.md#three-terminals-not-two)'s.
+`vitrin_grant.refused` is the enforcement chokepoint's voice, and every code in
+[`refusal`](04-vitrin_grant.md#refusal) names something a server **decided**
+about a grant. A host that is down decided nothing, so routing it through
+`refused` would make that event stop meaning *"authority was withheld"* — the
+one thing it has to keep meaning. `connect_failed` therefore exists to keep
+**"you may not"** and **"it did not work"** apart, and the ordering is
+normative: the chokepoint answers first, so `connect_failed` is unreachable for
+a principal whose grant does not cover the endpoint.
+
+**The seam this opens, named rather than discovered later.** Three-terminal
+requests are a **family of three** — `request_file`, `request_dir`,
+`request_connect` — against two on `capture_frame` and `launch` and one apiece
+on `sync` and `request_grant`. The general
+rule that follows is: a later reply-bearing request whose failure is **not the
+server's decision** adds *its own* terminal event on *its own* facet, and never
+a new code in `refusal`. What it may not do is deliver a *second* terminal for
+one request — that is the part of this rule that has not moved.
+`designated`'s own one-of pairing is forced by the type system
+exactly as `frame_ready`'s and `connected`'s are: an `fd` argument has no null
+form.
+
+**This table and the counts over it are hand-kept, and that is a decision with
+a reason rather than an unbuilt tool.** `cargo xtask protocol-tables --check`
+derives the interface page headers and [§2.3](#23-per-argument-string-bounds)'s
+bounds from the IDL precisely because those are IDL *structure*. **Which events
+terminate a given request is not in the IDL at all** — no attribute pairs an
+event to the request it answers, and three of the terminals above
+(`vitrin_principal.bound`, `vitrin_grant.resolved`, `vitrin_grant.refused`)
+live on a different interface from the request they terminate. The nearest
+heuristic
+— *"events on a `@verb`-bearing facet, plus one for the chokepoint arm"* —
+gives the right answer for all four verbed facets today and is already
+*scheduled* to break: [§7.4](#74-growth-rules-wayland-style)'s **capture
+streaming** row adds a frame-push event to `vitrin_view`, after which the
+heuristic reads `capture_frame` as three. A gate that goes green on a wrong
+answer is worse than no gate, so this is checked by review, and the count
+sentences here are where the next stale claim will appear.
+**One already did, and its opposite did too.** *"Clients handle three terminals
+on this one request and at most two anywhere else"* was written on the egress
+branch and was false the moment the powerbox landed. It stood on **six**
+surfaces: that sentence in four (the IDL, [`vitrin_egress`](19-vitrin_egress.md#three-terminals-not-two),
+here, and the §7.4 row), plus the IDL's separate *"this interface's one
+departure from every other reply-bearing request in this document"*, plus
+[`vitrin_grant`](04-vitrin_grant.md#growth)'s growth row — which said *"new to
+this protocol"* and contrasted only with `capture_frame` and `launch`. The
+sixth was found a round after the other five, and by reading the growth lists
+rather than by grepping the phrasings the first five shared: a superlative
+does not have to reuse any of its own words to be the same claim.
+The mirror-image failure is in the same merge: *"the powerbox pair is the first
+three-way one-of in this protocol"* was **true** on `main` and was dropped by
+the resolution rather than carried across; the paragraph above restores it as
+*"the powerbox pair reached three first"*. A parallel branch breaks a
+superlative in both directions — by falsifying one, and by discarding one that
+still holds.
 
 ### 6.2 Fire-and-forget requests
 
@@ -713,13 +898,13 @@ serial and has no verdict event ([`vitrin_shim_session`](09-vitrin_shim_session.
 so there is no answer to coalesce and none to hold stricter.
 
 This list is a **closed enumeration**, and it has now gone stale twice.
-`selection` above records the first. The second is this edit: `focus`,
+`selection` above records the first. The second is a later edit: `focus`,
 `set_fullscreen` and `idle_inhibit` all landed at version 2 without arriving
-here, and are added after the fact rather than in the change that shipped them.
-What would catch the next omission without inventing a tool: §6's three classes
-partition every `<request>` in `protocol/vitrin-v0.xml`, of which there are
-**twenty-six** — seven
-reply-bearing ([§6.1](#61-reply-bearing-requests)), seven structural mints
+here, and were added after the fact rather than in the change that shipped
+them. What would catch the next omission without inventing a tool: §6's three
+classes partition every `<request>` in `protocol/vitrin-v0.xml`, of which there
+are **twenty-eight** — eight
+reply-bearing ([§6.1](#61-reply-bearing-requests)), eight structural mints
 ([§6](#6-delivery-classification)), and the **twelve** named above. Those counts
 are stated as numbers *and* as lists for the same reason the version table's
 enum count is ([§7.3](#73-version-semantics)): counting `<request name=` in
@@ -728,10 +913,30 @@ for a reader to notice a drop, and nothing in CI does it for them.
 
 P2.6.5 moved all three counts (23 → 26 requests, 5 → 7 reply-bearing, 6 → 7
 mints) **in the change that shipped the messages**, which is what the paragraph
-above asks for and what the two recorded staleness incidents did not do. The
-fire-and-forget twelve did not move: `request_file` and `request_dir` are
-reply-bearing and `get_powerbox` is a mint, so nothing was appended to the list
+above asks for and what the two recorded staleness incidents did not do.
+
+**The third staleness was not in this list — it was in the other two classes,
+and it is why the numbers above moved again.** The egress facet added two
+requests, `vitrin_grant.get_egress` and `vitrin_egress.request_connect`, and on
+the branch that carried them neither reached §6: the mint list said six,
+[§6.1](#61-reply-bearing-requests)'s table had no `request_connect` row, and
+the total said twenty-three — in a section that declares itself closed. Merging
+that branch with P2.6.5's took the counts to **28 requests, 8 reply-bearing, 8
+mints**, which is the arithmetic neither branch could do alone. The
+fire-and-forget twelve are the one count that has not moved through any of
+this: `request_file`, `request_dir` and `request_connect` are reply-bearing and
+`get_powerbox` and `get_egress` are mints, so nothing was appended to the list
 above.
+
+The same shape a third time, so the sentence above about nothing in CI doing
+this for the reader is a live cost rather than a caveat.
+`cargo xtask verb-sets --check` — landed with the egress facet — holds every
+enumeration of the **verb** sets in this repository, and holds **none** of the
+three request counts in this paragraph. Extending it to them was considered and
+is not done here: the three classes are a human judgement about each request's
+delivery contract, not something derivable from the IDL, so a tool could check
+the total against `<request name=` but could not check the split. Until
+somebody writes that, the total is the number to recount.
 
 ### 6.3 Non-error, legal-but-noteworthy cases
 
@@ -865,22 +1070,35 @@ offering a lower integer — convergence by descending reoffer, bounded by the
 client's own maximum.
 
 **The two versions, and what separates them.** Version 1 is the original wire.
-Version 2 appends the `realm_launch` and `designate_file` verb bits and these
-messages, and nothing
-else:
+Version 2 appends the `realm_launch`, `designate_file` and `egress` verb bits
+and these
+messages, and nothing else:
 
 | interface | message |
 |---|---|
 | `vitrin_principal` | event `attention` |
-| `vitrin_grant` | requests `get_launcher`, `get_layout_focus`, `get_layout_arrange`, `get_powerbox` |
+| `vitrin_grant` | requests `get_launcher`, `get_layout_focus`, `get_layout_arrange`, `get_powerbox`, `get_egress` |
 | `vitrin_launcher` | request `launch`, event `launched` |
 | `vitrin_layout_focus` | request `focus` |
 | `vitrin_layout_arrange` | request `set_fullscreen` |
 | `vitrin_powerbox` | requests `request_file`, `request_dir`; events `designated`, `refused` |
+| `vitrin_egress` | request `request_connect`, events `connected`, `connect_failed` |
 | `vitrin_shim_session` | events `request_selection`, `offer_selection`, `pointer_constraint_state`, `designation`; requests `selection`, `pointer_constraint`, `idle_inhibit` |
 | `vitrin_shim_seat` | events `relative_motion`, `gesture_begin`, `gesture_swipe_update`, `gesture_pinch_update`, `gesture_end` |
 
-Plus, at the same version and for the same reason, eleven enums that carry
+`egress` (128) appended **no message at all** when the bit landed, and it is
+listed above with
+`realm_launch` rather than beside them for that reason: a verb bit is not
+version-gated (see below), so it is a version-2 addition to the *bitfield*
+without being a version-2 addition to any signature. Its facet arrived
+separately, in the same task's second half, and the table above carries it —
+`vitrin_grant.get_egress` and the three messages of
+[`vitrin_egress`](19-vitrin_egress.md). Both halves are version 2; a client
+that negotiated version 1 sees neither the mint nor the facet, and may still
+name the verb in a petition and be answered `unsupported`. `designate_file`
+(64) did not take that shape: its bit and its facet landed together at P2.6.5.
+
+Plus, at the same version and for the same reason, twelve enums that carry
 arguments of those messages and are defined nowhere else:
 `vitrin_shim_session.selection_status`,
 `vitrin_shim_session.pointer_constraint_kind`,
@@ -891,8 +1109,9 @@ arguments of those messages and are defined nowhere else:
 `vitrin_shim_seat.gesture_state`,
 `vitrin_layout_arrange.mode`,
 `vitrin_powerbox.mode`,
-`vitrin_powerbox.kind` and
-`vitrin_powerbox.refusal`. Enum entries carry no `since` of their own
+`vitrin_powerbox.kind`,
+`vitrin_powerbox.refusal` and
+`vitrin_egress.failure`. Enum entries carry no `since` of their own
 (see [§7.4](#74-growth-rules-wayland-style)), so the version a new enum belongs
 to is recorded here or nowhere.
 
@@ -959,16 +1178,21 @@ connection may petition for `realm_launch` (512) and is answered rather than
 killed — `unsupported` there, because version 1 cannot mint the
 [`vitrin_launcher`](16-vitrin_launcher.md) facet at all. A recoverable answer
 standing where a fatal `invalid_argument` would otherwise fall is the entire
-reason a bit is defined **before it is served** (§5.1's razor: a well-formed
+reason a bit is defined **before it is served** — and `egress` (128) is the
+same staging carried one step further, in two moves rather than one: the bit
+landed with no message at all, its facet landed next, and *every* deployment
+still answers `unsupported` at every version because the proxy behind the
+facet does not exist (§5.1's razor: a well-formed
 request the deployment will not serve is recoverable). `realm_launch` was that
 staging's worked example, and a briefer one than the argument implies: the bit
 went on the wire in **WS-E.1.1**'s protocol half (#225), the reference core
 refused every petition naming it `unsupported`, and WS-E.1.1's core half (#207)
-served it two PRs later. It is served now — `observe_cursor` and
-`designate_file` are the bits left standing in that posture — and the rule the
-example stood for did not move with
-it: a deployment that does not serve a defined verb answers `unsupported`,
-never a killed connection.
+served it two PRs later. It is served now — `observe_cursor`,
+`designate_file` and `egress` are
+the bits left standing in that posture, for three different missing mechanisms
+and none of them a missing facet any more — and the rule the example stood
+for did not move with it: a deployment that does not serve a defined verb
+answers `unsupported`, never a killed connection.
 
 `designate_file` (64) is the staging's second worked example and the one with a
 **scheduled** end rather than an open-ended one: the bit landed at P2.6.5 with
@@ -979,6 +1203,14 @@ can be told what approving it costs). The reference core makes that fail
 closed rather than by promise: `SERVED_VERB_BITS` does not list the bit, and
 the unserved set is *derived* from the wire mask, so a verb nobody classified
 is refused.
+
+`egress` (128) is the third worked example, and its end is scheduled too but on
+a different mechanism: the bit landed at P2.7.2's first half with **no message
+at all**, its facet landed in the same task's second half, and what is still
+missing is the out-of-core mediating proxy a connection would be made through
+(P2.7.3). A facet is a request to ask through, not a mechanism to answer with,
+so gaining one narrowed the reason without ending it. The same
+`SERVED_VERB_BITS` omission makes it fail closed here.
 
 > **Implementation status, stated rather than implied.** The rule above binds
 > the *protocol*. The shipped core does not yet implement it: `vitrind`
@@ -1069,7 +1301,22 @@ The dialect adds exactly two attributes beyond the Wayland shape:
 | Attribute | Where | Why |
 |---|---|---|
 | `protocol/@version` (`positiveInteger`) | root element | single source of truth for the `hello` version integer |
-| `interface/@verb` ∈ {`observe`, `actuate_pointer`, `actuate_text`, `realm_launch`, `layout_arrange`, `layout_focus`, `designate_file`} | `vitrin_view`, `vitrin_actuator_pointer`, `vitrin_actuator_text`, `vitrin_launcher`, `vitrin_layout_arrange`, `vitrin_layout_focus`, `vitrin_powerbox` | declares that **every request on the interface exercises the named grant verb**; the scanner derives the enforcement chokepoint's `(interface, opcode) → required-verb` table from it |
+| `interface/@verb` ∈ {`observe`, `actuate_pointer`, `actuate_text`, `layout_arrange`, `layout_focus`, `designate_file`, `egress`, `realm_launch`} | `vitrin_view`, `vitrin_actuator_pointer`, `vitrin_actuator_text`, `vitrin_launcher`, `vitrin_layout_focus`, `vitrin_layout_arrange`, `vitrin_powerbox`, `vitrin_egress` | declares that **every request on the interface exercises the named grant verb**; the scanner derives the enforcement chokepoint's `(interface, opcode) → required-verb` table from it |
+<!-- vitrin-verb-set: facet-verbs = observe, actuate_pointer, actuate_text, layout_arrange, layout_focus, designate_file, egress, realm_launch -->
+<!-- vitrin-verb-set: facet-interfaces = vitrin_view, vitrin_actuator_pointer, vitrin_actuator_text, vitrin_launcher, vitrin_layout_focus, vitrin_layout_arrange, vitrin_powerbox, vitrin_egress -->
+
+Both halves of that row went stale at WS-E.1.4 — which added
+`vitrin_layout_focus` and `vitrin_layout_arrange` and left the row reading four
+values and four interfaces — and stayed that way until issue #196's third
+review, fifteen lines above a paragraph on the same page that contradicted it.
+So neither half is transcribed by hand any more: `cargo xtask verb-sets
+--check` derives both from `interface/@verb` and fails when this row falls
+behind. It did exactly that on the very next change, which added
+`vitrin_egress`: the gate named this row, the two markers under it and three
+other surfaces, and none of them could be satisfied by rewording. It did it
+once more when that change was merged with the one that added
+`vitrin_powerbox`, which is the case a hand-transcribed row is least likely to
+survive: two branches each appending one interface, neither wrong on its own.
 
 `@verb` is the codegen chokepoint: one attribute per capability interface
 generates the single-site authority check, so there is no second enforcement
@@ -1078,30 +1325,71 @@ location to keep in sync.
 The `@verb` value set is **closed by the schema**, so widening it is a
 **dialect** change: `protocol/vitrin-v0.rng` moves in the same commit as the
 IDL, and `xmllint --relaxng` gates the pair. The set tracks the
-*facet-bearing* verbs, not the whole `verb` bitfield — `observe_cursor` has no
-interface to annotate, because it widens what `capture_frame` composites
-rather than adding a request, so naming it here is rejected by the schema
-(`protocol/test-mutations.sh` covers both directions: an invented verb name
-and a real-but-facetless one).
+*facet-bearing* verbs, not the whole `verb` bitfield, so it is **shorter than
+the bitfield by one**:
 
-**One value per interface has already decided a change nobody has written
-yet, and it is named here rather than left to be discovered.**
+<!-- vitrin-verb-set: facetless-verbs = observe_cursor | count: one -->
+
+- **`observe_cursor` has no interface to annotate, by construction.** It
+  widens what `capture_frame` composites rather than adding a request, so
+  there is nothing for the attribute to sit on and there never will be.
+
+It was shorter by **two** until the egress facet landed. `egress` had no
+interface *yet* — P2.7.2's first half put the verb bit on the wire with no
+message at all — and its second half added
+[`vitrin_egress`](19-vitrin_egress.md), an interface of its own for the reason
+[`vitrin_grant`'s `net:` prefix](04-vitrin_grant.md#the-net-resource-prefix)
+gives, and the schema's value set gained `egress` in that same commit.
+`designate_file` never entered this list at all: P2.6.5 landed the bit and
+[`vitrin_powerbox`](13-vitrin_powerbox.md) in one change. The
+distinction between the two kinds of absence — by construction versus not yet —
+is the whole reason this list is prose and not a bare count.
+
+Naming `observe_cursor` here is rejected by the schema, and
+`protocol/test-mutations.sh` covers both directions: an invented verb name and
+a real-but-facetless one. Its facetless case is pinned on `observe_cursor`
+rather than on whichever verb is currently waiting for a facet, and that is
+deliberate — the case was pinned on `layout_arrange` until that verb gained an
+interface, at which point the mutated document became legal and the case
+reported the schema as broken when the schema was right. `xmllint` can only see
+one direction of the pairing
+— an IDL using a name the schema omits — so `cargo xtask verb-sets --check`
+holds the other, and fails if the schema ever admits a verb no interface
+declares.
+
+**One value per interface decided a change before anybody wrote it, and the
+outcome is now in the tree rather than a prediction.**
 `docs/plan/02-phase-2-semantic-epochs.md` E2.7 (P2.7.2) was drafted as
 `request_connect` on [`vitrin_powerbox`](13-vitrin_powerbox.md), exercising
 the `egress` verb — on an interface that already declares `designate_file`.
-This attribute cannot express that. **So `egress` takes a facet of its own,
+This attribute cannot express that. **So `egress` took a facet of its own,
 exactly as the layout pair was forced to**, and the plan's "one facet, not
 two" line — written before this attribute's consequence was weighed — is
 corrected under E2.7's own issue rather than here. The rule decided it; the
 plan only recorded a draft.
 
-`layout_arrange` and `layout_focus` were in that facetless list until they
-gained one each. They are **two** interfaces rather than one, and this
+`layout_arrange`, `layout_focus` and `egress` were in that facetless list
+until they gained one each. The layout pair are **two** interfaces rather than
+one, and this
 attribute is why: `@verb` is one value per interface, so a single combined
 layout facet could name only one of them and the other's requests would reach
 the chokepoint with no verb to check them against. D-018(3) requires the two
 to be independently attenuable, and one attribute per interface is how the
 dialect makes that structural rather than conventional.
+
+**The same rule split the powerbox**, and it is the second time this attribute
+has forced a decomposition someone had planned as one interface: a
+`vitrin_powerbox` carrying `request_file`, `request_dir` **and**
+`request_connect` cannot declare both `designate_file` and `egress`, so
+[`vitrin_egress`](19-vitrin_egress.md) is its own interface and the powerbox
+(page 13, landed at P2.6.5) carries the filesystem half alone. A proposal
+for one facet covering two verbs is wrong on sight.
+
+**A verb having a facet does not make it served.** `egress` has one here and no
+deployment answers a petition naming it, because the mediating proxy behind
+the facet does not exist. This attribute's value set is about which verbs have
+a request to be exercised through; the served set is a property of a
+deployment and lives in the reference core, not on the wire.
 
 ### 8.3 Scanner lints
 
@@ -1149,9 +1437,11 @@ record of *how* it arrived, which is what a later seam copies.
 | capture streaming | new `since="2"` sibling messages on `vitrin_view` (a subscription request and its frame-push event, appended after the poll pair) | `capture_frame`/`frame_ready` stay valid forever; refusals still voice through `vitrin_grant.refused`, and each pushed frame carries one fd, so the one-fd rule holds |
 | realm enumeration events | new `since="2"` events on `vitrin_realm` | `vitrin_realm` is authority-free and carries no version-0 events; multi-realm phases add enumeration/lifecycle here instead of re-plumbing addressing |
 | drag intents | new `since="2"` sibling requests on `vitrin_actuator_pointer` | intent-level motion (drag with duration/easing, interpolated server-side) is added beside `move`/`button`/`scroll`, which stay valid forever |
+| ~~**egress vocabulary and facet**~~ **(both landed, version 2; the verb is served by nobody)** | one appended `verb` entry (`egress` = 128, from the repo-wide registry) plus a normative grammar for the `net:HOST:PORT` value of `request_grant`'s **existing** `resource` argument, landed with **no new message at all**; then, separately, the facet: a `since="2"` structural mint `vitrin_grant.get_egress` and the [`vitrin_egress`](19-vitrin_egress.md) interface it mints | The bit appends without touching existing bits, and a verb bit is not version-gated, so a version-1 connection naming it is answered `unsupported` rather than killed. The prefix needs no message because `resource` was type-prefixed and growable from day one; an unserved prefix already resolved `unsupported`, so defining one changes no existing client's behaviour. **This row is the worked example of vocabulary landing before its facet** — the first in this document — and of what that does and does not buy: while the facet was absent, `egress` was a verb no request exercised, which is why every deployment refused it; now the facet is present and **every deployment still refuses it**, because the out-of-core proxy behind it does not exist. A facet is a request to ask through, not a mechanism to answer with, and the refusal reason narrowing without going away is the shape to expect from staged verbs generally. The grammar is **wildcard-free by construction** (one host, one port; no `*`, no CIDR, no list, no range), so a blanket egress grant is *inexpressible* rather than refused by a policy someone can relax; that in turn is what makes `covers` **exact match** rather than a subsumption rule the server would have to invent — and exact match is in turn what makes "wildcard-free" hold whatever the host string contains, since no accepted selector can name more than one endpoint. **Three things this row states that nothing implements**, named so the row is not read as a description of behaviour: the address pin (the addresses a name resolved to at grant time belong in the **grant row** rather than in the proxy, so a proxy restart cannot re-resolve away from what the human approved — but there is no proxy, no resolver, and the row's `pinned_addrs` column is present-but-null; P2.7.3 and P2.7.4 own it); host validation (the parser enforces a denylist of the wildcard-bearing punctuation, not "a DNS name or an IP literal"; see [the `net:` prefix](04-vitrin_grant.md#the-net-resource-prefix) for the full gap list); and **the facet's four messages themselves**, which the reference core does not dispatch at all — sending one to `vitrind` today is `invalid_opcode`, not the recoverable refusal this document specifies. **One tension this row previously left open and no longer does**: `interface/@verb` is one value per interface — the rule that forced the layout facet to be *two* interfaces — so a single `vitrin_powerbox` carrying both `designate_file` and `egress` requests cannot declare both. Same rule, same answer, now executed: `egress` has a **separate facet interface** of its own, and `vitrin_powerbox` will carry the filesystem half |
+| **a third terminal on a reply-bearing request** *(landed with the egress facet)* | a new event on the **facet**, beside the existing `connected`/`vitrin_grant.refused` pair — never a new code in `vitrin_grant.refusal` | `request_connect` is answered by one of **three** terminals, because a connection can fail without any server deciding anything. It is the **second** request family to need three, not the first: `request_file`/`request_dir` (the **powerbox facet** row further down) got there one task earlier, on the unrelated argument that a designation has *two answerers*. The row as first written said no other reply-bearing request offered more than two, which was false on the day it landed — the two facets were on parallel branches. The [exactly-one-terminal rule](#61-reply-bearing-requests) is untouched: three is the size of the set the one terminal is drawn from. `refusal` is the enforcement chokepoint's voice and every code in it names something a server decided about a grant; a host that is down decided nothing, and `not_granted` would be the worst available rounding, since an agent that hears it correctly stops asking. The seam generalizes: a later reply-bearing request whose failure is not the server's decision adds its own terminal on its own facet, and `refusal` stays what it is |
 | `actuate_key` verb | new appended entry in the `verb` bitfield + a later key-actuation facet | version-0 verb bits are untouched; a new power-of-two bit and its facet are additive — see the landed `realm_launch` row for the shape, including that the bit's *value* comes from the repo-wide allocation registry rather than from the next unused-looking power of two |
 | serving `observe_cursor` | no new message: the verb bit already exists and widens what the *existing* `frame_ready` composites for a grant that holds it | version 0 refuses the verb `unsupported`, so beginning to serve it changes no signature and no version-0 client's behavior (a client that never petitions for it sees nothing new) |
-| **powerbox facet** *(landed at version 2)* | one `since="2"` structural mint on `vitrin_grant` (`get_powerbox`), a new [`vitrin_powerbox`](13-vitrin_powerbox.md) interface carrying reply-bearing `request_file`/`request_dir` with terminals `designated` + `refused`, a new `designate_file` verb bit (64), two new **defined** resource prefixes (`file:`, `dir:`) in `request_grant`'s existing type-prefixed vocabulary — defined, not served: they resolve `unsupported` in every deployment today, exactly as the verb they select for does — and one fd-bearing `since="2"` event on [`vitrin_shim_session`](09-vitrin_shim_session.md#designation-since-2) (`designation`) | `request_grant`'s five `new_id` arguments are frozen, so the facet is minted on the grant — the route the launcher and the layout pair already took. The verb bit appends without touching existing bits (64 came from the repo-wide registry, not from the next unused-looking power of two). **Adding a prefix breaks no client at any version**, because an unserved prefix already resolves `unsupported` recoverably (`outcome` entry 4), so nothing existing changes behaviour; `request_grant`'s signature is untouched, and the vocabulary was documented from day one as growing "by version without a new request". The three enums are new and defined nowhere else. **Three costs this column cannot argue away.** First, the wire gains a **three-way** one-of terminal ([§6.1](#61-reply-bearing-requests)) — additive, but a widening of the exactly-one-terminal rule rather than an instance of it. Second, and the one that will be misread if left unstated: **a delivered fd is kernel authority the core cannot recall**, so PRD P2's "revocation is immediate and transitive" is FALSE for designations already made. Revocation stops future designations and kills the grant row; the payload keeps every descriptor already handed over until its realm dies. That residue is *inherent* to handing out descriptors at all, no attenuation of a designation grant removes it, and E3.7's durable designation grants multiply rather than reduce it. Third, **the same cost the idle-inhibition row above names, and sharper here**: appending to a version that already shipped means the integer `2` no longer names one message set, so a client built against this IDL that sends `get_powerbox` to any already-shipped version-2 `vitrind` — *including the one built from the commit that landed this row* — is killed with `invalid_opcode`, with nothing on the wire naming a version mismatch as the cause. Within [§7.4](#74-growth-rules-wayland-style)'s letter, an exception to [§7.3](#73-version-semantics)'s semantics, taken knowingly and owed to P2.1.2's version matrix ([D-042](../plan/20-decision-log.md)(4)) |
+| **powerbox facet** *(landed at version 2)* | one `since="2"` structural mint on `vitrin_grant` (`get_powerbox`), a new [`vitrin_powerbox`](13-vitrin_powerbox.md) interface carrying reply-bearing `request_file`/`request_dir` with terminals `designated` + `refused`, a new `designate_file` verb bit (64), two new **defined** resource prefixes (`file:`, `dir:`) in `request_grant`'s existing type-prefixed vocabulary — defined, not served: they resolve `unsupported` in every deployment today, exactly as the verb they select for does — and one fd-bearing `since="2"` event on [`vitrin_shim_session`](09-vitrin_shim_session.md#designation-since-2) (`designation`) | `request_grant`'s five `new_id` arguments are frozen, so the facet is minted on the grant — the route the launcher and the layout pair already took. The verb bit appends without touching existing bits (64 came from the repo-wide registry, not from the next unused-looking power of two). **Adding a prefix breaks no client at any version**, because an unserved prefix already resolves `unsupported` recoverably (`outcome` entry 4), so nothing existing changes behaviour; `request_grant`'s signature is untouched, and the vocabulary was documented from day one as growing "by version without a new request". The three enums are new and defined nowhere else. **Three costs this column cannot argue away.** First, the wire gains a **three-way** one-of terminal ([§6.1](#61-reply-bearing-requests)) — the first in this protocol, and `vitrin_egress.request_connect` is now the second. This row first called that *"a widening of the exactly-one-terminal rule rather than an instance of it"*; §6.1 has since sharpened the framing and this row follows it. The rule bounds how many terminals a request **receives** — still exactly one — and never how many the set it is drawn from holds, so nothing widened. Second, and the one that will be misread if left unstated: **a delivered fd is kernel authority the core cannot recall**, so PRD P2's "revocation is immediate and transitive" is FALSE for designations already made. Revocation stops future designations and kills the grant row; the payload keeps every descriptor already handed over until its realm dies. That residue is *inherent* to handing out descriptors at all, no attenuation of a designation grant removes it, and E3.7's durable designation grants multiply rather than reduce it. Third, **the same cost the idle-inhibition row above names, and sharper here**: appending to a version that already shipped means the integer `2` no longer names one message set, so a client built against this IDL that sends `get_powerbox` to any already-shipped version-2 `vitrind` — *including the one built from the commit that landed this row* — is killed with `invalid_opcode`, with nothing on the wire naming a version mismatch as the cause. Within [§7.4](#74-growth-rules-wayland-style)'s letter, an exception to [§7.3](#73-version-semantics)'s semantics, taken knowingly and owed to P2.1.2's version matrix ([D-042](../plan/20-decision-log.md)(4)) |
 | ~~layout facet~~ **(landed, version 2)** | **two** `since="2"` structural mints on `vitrin_grant` — `get_layout_focus` and `get_layout_arrange` — minting [`vitrin_layout_focus`](17-vitrin_layout_focus.md) and [`vitrin_layout_arrange`](18-vitrin_layout_arrange.md) | `request_grant`'s five `new_id` arguments are frozen, so neither facet could be co-minted. This row said "a layout facet" singular and **understated the seam**: `@verb` is one value per interface, so one facet could declare only one of the two verbs, and D-018(3) requires them independently attenuable. Corrected here rather than silently, because the row was the record |
 | **human attention signal** *(landed, version 2)* | one `since="2"` argument-free event `attention` on [`vitrin_principal`](02-vitrin_principal.md#attention), and **no verb bit** | Appended to the one object whose scope is the connection, which is the subject's scope: the event is about the *human*, not about this principal's authority. Purely additive — a version-1 connection never receives it, and no signature changed. **No verb bit is allocated, positively**: a grantable "receive the human's attention key" verb would put a delegation framing on a signal that delegates nothing, and delivery is instead filtered to principals already holding a layout verb, which is what keeps the wire silent for everyone else rather than opening a keystroke-timing oracle. It makes `preempted` *conditional* for the two layout verbs — the first conditional refusal code in this protocol, and the cost is stated at [`vitrin_grant.refusal`](04-vitrin_grant.md#refusal) rather than left to be discovered |
 | **cross-realm clipboard** *(landed, version 2)* | three `since="2"` messages on [`vitrin_shim_session`](09-vitrin_shim_session.md) — the `request_selection` event, the `selection` request, the `offer_selection` event — plus the `selection_status` enum, and **no verb bit** | Appended to the shim bootstrap rather than to a facet of its own, because a facet needs a structural mint and the *core* is the party that asks: it must be able to ask a shim that has done nothing but read `configure`. Purely additive — a version-1 shim never sees the events and never sends the request. **No verb bit, positively**: the human at the keyboard is not a wire principal in version 1, so a `clipboard` verb would name a principal that is not the actor ([D-024](../plan/20-decision-log.md)(3)); the agent-facing verb is E3.5's and is not foreclosed, since `offer_selection` is addressed to a realm and says nothing about who asked. There is deliberately **no `selection_changed` event**: the core pulls, so an ordinary in-app copy is never a cross-realm event. `data`'s `(max N bytes)` token is part of an immutable signature, so raising the 61440-byte cap is a **new message**, never an edit to this one |
@@ -1173,7 +1463,14 @@ named here so their absence is understood as a decision, not an omission:
 - **Epochs** — no compare-and-swap staleness detection; out-of-view coordinates
   are clamped, and stale-observation detection is a later phase's epoch
   mechanism.
-- **Network** — the protocol is local (Unix domain sockets); no remoting.
+- **Network** — the protocol is local (Unix domain sockets); no remoting. The
+  `egress` verb bit (128) and the [`vitrin_egress`](19-vitrin_egress.md) facet
+  are **not** a counter-example and are named here so they are not read as
+  one: they grant a realm's outbound reach to one `host:port`
+  through an out-of-core proxy, and say nothing about carrying *this
+  protocol* over a network. Nor is the verb served by any deployment — the
+  proxy does not exist — so what is on the wire today is the vocabulary and
+  the request shape, with nothing behind them.
 - **Multi-realm** — version 1 serves exactly one well-known realm (`realm-0`).
   Version 2 raises the *count*: a deployment may serve `realm-0` plus further
   realms up to a limit of its own choosing (see

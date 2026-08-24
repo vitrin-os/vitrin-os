@@ -66,7 +66,7 @@ unknown message never desynchronises the fd stream. If the header's
 
 | Class | Reaches the core by | Interfaces |
 |---|---|---|
-| **Agent principal** | Connecting to the core's listening socket and authenticating | `vitrin_handshake`, `vitrin_principal`, `vitrin_realm`, `vitrin_grant`, `vitrin_consent`, `vitrin_view`, `vitrin_actuator_*`, `vitrin_launcher`, `vitrin_layout_*` |
+| **Agent principal** | Connecting to the core's listening socket and authenticating | `vitrin_handshake`, `vitrin_principal`, `vitrin_realm`, `vitrin_grant`, `vitrin_consent`, `vitrin_view`, `vitrin_actuator_*`, `vitrin_launcher`, `vitrin_layout_*`, `vitrin_egress` |
 | **Shim** | Inheriting a socketpair from the core across `fork`/`exec` | `vitrin_shim_session`, `vitrin_shim_surface`, `vitrin_shim_seat` |
 
 The classes are mutually unreachable. A message using the other class's
@@ -95,6 +95,7 @@ authentication, because the core created both ends itself.
 | `vitrin_layout_focus` | Focus facet (since wire version 2) — bind the output to the granted realm and send the human's own input there, one act |
 | `vitrin_layout_arrange` | Arrangement facet (since wire version 2) — fill the output, or compose at the app's own size; `place`, `resize`, `raise` and stacking are absent rather than refused |
 | `vitrin_powerbox` | Designation facet (since wire version 2) — ask the human to pick one file or one directory subtree and have the **descriptor** delivered to the realm; no path crosses the wire in either direction. **Vocabulary only so far**: no deployment serves the verb, and `vitrind` does not answer `get_powerbox` at all yet — it kills the connection with `invalid_opcode` until the picker lands |
+| `vitrin_egress` | Egress facet (since wire version 2) — one outbound connection to the single `host:port` the grant names, handed back as a socket fd. **No deployment serves the `egress` verb**, and this core implements none of the interface's messages: the out-of-core mediating proxy does not exist |
 
 Each has a prose page under
 [`docs/protocol/`](https://github.com/vitrin-os/vitrin-os/tree/main/docs/protocol).
@@ -181,19 +182,32 @@ Version 0 is frozen for Phase 1 — **not forever**. The wire integer is now
 **2**, and it appends:
 
 - the `realm_launch` verb, and `vitrin_principal`'s `attention` event;
-- four structural mints on `vitrin_grant` — `get_launcher`,
-  `get_layout_focus`, `get_layout_arrange`, `get_powerbox`;
-- the four interfaces they mint — `vitrin_launcher` (`launch`/`launched`),
+- five structural mints on `vitrin_grant` — `get_launcher`,
+  `get_layout_focus`, `get_layout_arrange`, `get_powerbox`, `get_egress`;
+- the five interfaces they mint — `vitrin_launcher` (`launch`/`launched`),
   `vitrin_layout_focus` (`focus`), `vitrin_layout_arrange`
   (`set_fullscreen`), `vitrin_powerbox` (`request_file`, `request_dir`,
-  `designated`, `refused`) — and the `vitrin_layout_arrange.mode`,
-  `vitrin_powerbox.mode`, `.kind` and `.refusal` enums;
+  `designated`, `refused`), `vitrin_egress` (`request_connect`, `connected`,
+  `connect_failed`) — and the `vitrin_layout_arrange.mode`,
+  `vitrin_powerbox.mode`, `.kind` and `.refusal`, and
+  `vitrin_egress.failure` enums;
 - the `designate_file` verb, the `file:`/`dir:` resource prefixes, and
   `vitrin_shim_session.designation` — the powerbox vocabulary, refused
   `unsupported` by every deployment until the core-drawn picker and its
   consent copy exist, and **not yet implemented by this core at all**:
-  `get_powerbox` is the one message in the list above that `vitrind` has no
-  handler for, so sending it is fatal `invalid_opcode` rather than a mint;
+  `vitrind` has no dispatch arm for `get_powerbox` **or for either request on
+  the facet it mints**, so sending any of them is fatal `invalid_opcode`
+  rather than a mint or a refusal;
+- the `egress` verb (128, at P2.7.2) and the `net:HOST:PORT` value its
+  authority is named with. That half landed as **a verb bit and a `resource`
+  grammar, and no message at all**; its facet followed separately. Every
+  deployment still refuses the verb `unsupported`, because the out-of-core
+  proxy a connection would be made through does not exist — a facet is a
+  request to ask through, not a mechanism to answer with. `get_egress` and
+  `vitrin_egress.request_connect` are unhandled on the same terms, so the
+  **five** requests this core does not dispatch are the two mints and the
+  three facet requests behind them — not the two mints alone, which is what
+  this list said while the two facets were landing on parallel branches;
 - the `capacity` refusal code and the `layout_held` outcome;
 - on `vitrin_shim_session`, the cross-realm clipboard, the pointer
   constraints and the idle inhibit (`request_selection`, `offer_selection`,

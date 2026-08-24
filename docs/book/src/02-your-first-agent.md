@@ -94,12 +94,33 @@ from vitrin_os import Verb
 verbs = Verb.OBSERVE | Verb.ACTUATE_POINTER
 ```
 
-Four more verbs exist in the enum. `LAYOUT_ARRANGE` and `LAYOUT_FOCUS` are
-**served** — a grant can carry them, and `grant.focus()` and
-`grant.set_fullscreen()` exercise them. `OBSERVE_CURSOR` and `REALM_LAUNCH`
-are defined and resolve `unsupported`: whether a verb is served is a property
-of the *deployment*, not of the protocol, so read `unsupported` as "not here,
-not now" rather than "not in this protocol".
+<!-- vitrin-verb-set: all-verbs = observe, actuate_pointer, actuate_text, observe_cursor, layout_arrange, layout_focus, designate_file, egress, realm_launch | count: nine -->
+
+The enum has **nine** members, and the petition above asked for three of
+them: `OBSERVE`, `ACTUATE_POINTER` and `ACTUATE_TEXT`. Three more are
+**served** by this core on the same terms — `LAYOUT_ARRANGE`, `LAYOUT_FOCUS`
+and `REALM_LAUNCH`, exercised by `grant.set_fullscreen()`, `grant.focus()` and
+`grant.launch()`.
+
+<!-- vitrin-verb-set: unserved-verbs = observe_cursor, designate_file, egress -->
+
+The remaining three — `OBSERVE_CURSOR`, `DESIGNATE_FILE` and `EGRESS` — are
+defined and resolve
+`unsupported`: the first because per-principal cursor delivery does not exist
+yet, the second because no core-drawn file picker and no consent copy for it
+exist yet, the third because the out-of-core proxy an outbound connection
+would be
+made through does not exist. `DESIGNATE_FILE` and `EGRESS` both have a facet
+on the wire
+(`vitrin_powerbox` and `vitrin_egress`), which is worth knowing only so it is
+not mistaken for
+evidence either verb works: a facet is the request you would ask through, and
+there is nothing behind it to answer.
+
+Whether a verb is served is a property of the *deployment*, not of the
+protocol — a deployment that will not host process creation refuses
+`REALM_LAUNCH` even though this one serves it — so read `unsupported` as "not
+here, not now" rather than "not in this protocol".
 
 The SDK carries every defined bit either way, for a precise reason: an
 out-of-range verb bit is a **fatal** `invalid_argument` that kills the

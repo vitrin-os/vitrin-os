@@ -23,16 +23,21 @@
  *     callable from an external C translation unit, not merely syntactically
  *     present: a plain zero-argument request, a string-and-scalar-heavy
  *     request, a bitfield-and-enum-heavy event, and fd-bearing messages in
- *     both directions -- vitrin_view.frame_ready, vitrin_shim_surface.attach
- *     and, since P2.6.5, vitrin_shim_session.designation, the first fd-bearing
- *     core -> shim event this protocol has defined.
+ *     both directions -- vitrin_view.frame_ready, vitrin_shim_surface.attach,
+ *     vitrin_shim_session.designation (P2.6.5, the first fd-bearing
+ *     core -> shim event this protocol has defined), vitrin_powerbox.designated
+ *     and vitrin_egress.connected (P2.7.2).
  *
  *     This set is REPRESENTATIVE and is not claimed to be exhaustive;
  *     exhaustiveness is the two _Static_assert'd lists' job, not this one's.
  *     It is also NAMED rather than counted, deliberately: the line above read
  *     "both of the two fd-bearing messages" until the IDL defined more than
  *     two, and nothing said so -- the same closed-count failure the message
- *     list below records for itself.
+ *     list below records for itself. The IDL now defines five fd-bearing
+ *     messages -- the two named above plus the three named in the sentence
+ *     before them -- and this file calls all five, which is a fact about
+ *     today rather than a rule: the next one appended is representative only
+ *     if someone adds a call for it.
  *
  * "Every message" is asserted, not trusted: VITRIN_EVERY_MESSAGE below is
  * counted at compile time and _Static_assert'd against the generated
@@ -42,8 +47,11 @@
  * exactly what happened when version 2 added get_launcher, launch and
  * launched: the file kept compiling while type-checking 29 of 32 messages.
  * (It fired as designed when version 2 later added the two layout mints and
- * their two facet requests -- 32 to 36; and again at P2.6.5's powerbox --
- * 48 to 54.)
+ * their two facet requests -- 32 to 36; again at P2.6.5's powerbox --
+ * 48 to 54; and again for P2.7.2's egress facet -- `vitrin_grant.get_egress`
+ * plus vitrin_egress's three messages, 54 to 58. The last two were authored
+ * in parallel against 48, so the merge that brought them together had to add
+ * both appends rather than take either branch's total.)
  * It mirrors crates/vitrin-protocol/tests/roundtrip.rs's
  * `every_idl_message_is_in_the_roundtrip_table`, which gates the Rust
  * round-trip table on the same generated constant.
@@ -89,6 +97,7 @@ static int sink = 0;
     X(vitrin_grant_req_get_layout_focus)                                     \
     X(vitrin_grant_req_get_layout_arrange)                                   \
     X(vitrin_grant_req_get_powerbox)                                         \
+    X(vitrin_grant_req_get_egress)                                           \
     X(vitrin_grant_evt_resolved)                                             \
     X(vitrin_grant_evt_refused)                                              \
     X(vitrin_consent_evt_state)                                              \
@@ -130,7 +139,10 @@ static int sink = 0;
     X(vitrin_powerbox_req_request_file)                                      \
     X(vitrin_powerbox_req_request_dir)                                       \
     X(vitrin_powerbox_evt_designated)                                        \
-    X(vitrin_powerbox_evt_refused)
+    X(vitrin_powerbox_evt_refused)                                           \
+    X(vitrin_egress_req_request_connect)                                     \
+    X(vitrin_egress_evt_connected)                                           \
+    X(vitrin_egress_evt_connect_failed)
 
 /* The exhaustiveness gate, in two halves, because a count alone is not a set.
  *
@@ -193,7 +205,8 @@ _Static_assert((int)vitrin_messages_listed == (int)VITRIN_MESSAGE_COUNT,
     X(vitrin_layout_arrange_mode)                                            \
     X(vitrin_powerbox_mode)                                                  \
     X(vitrin_powerbox_kind)                                                  \
-    X(vitrin_powerbox_refusal)
+    X(vitrin_powerbox_refusal)                                               \
+    X(vitrin_egress_failure)
 
 enum { vitrin_enums_listed = 0 VITRIN_EVERY_ENUM(VITRIN_COUNT_ONE) };
 enum { VITRIN_EVERY_ENUM(VITRIN_NAME_ONE) vitrin_enum_names_end };
@@ -431,6 +444,52 @@ static void call_other_fd_bearing_message(void) {
     sink += (decoded.kind == msg.kind) ? 1 : 0;
 }
 
+/* Encodes then decodes vitrin_egress.connected: an fd-bearing message that
+ * also carries a variable-length string in the same struct. That combination
+ * is why it is called here rather than left to
+ * the type-check above: the fd is out-of-band, so the generator must emit no
+ * bytes for it while still placing `host` at the offset immediately after the
+ * frame header, and a decode that mis-accounted for the fd would read `host`'s
+ * length prefix from the wrong offset -- which encode-then-decode catches and
+ * a function-pointer assignment does not.
+ *
+ * This comment said "the only one that carries an fd and a variable-length
+ * string in the same struct" while P2.6.5 was landing two more of exactly that
+ * shape on a parallel branch -- vitrin_shim_session.designation, called below,
+ * and vitrin_powerbox.designated, which is not. The uniqueness claim is
+ * dropped rather than re-counted: what earns this call its place is the shape,
+ * not being alone in it. */
+static void call_fd_and_string_message(void) {
+    static const uint8_t host_bytes[] = "example.invalid";
+    vitrin_egress_evt_connected_t msg;
+    uint8_t buf[128];
+    int32_t written;
+    uint32_t object_id_out;
+    vitrin_egress_evt_connected_t decoded;
+    vitrin_decode_status_t st;
+    int dummy_fd = 5;
+
+    msg.fd = dummy_fd;
+    msg.host.len = (uint32_t)(sizeof(host_bytes) - 1);
+    msg.host.data = host_bytes;
+    msg.port = 443;
+
+    written = vitrin_egress_evt_connected_encode(&msg, 11, buf, sizeof(buf));
+    sink += (written > 0) ? 1 : 0;
+
+    /* HAS_FD is true for this message: fd < 0 (absent) must be rejected. */
+    st = vitrin_egress_evt_connected_decode(buf, (size_t)written, -1,
+                                             &object_id_out, &decoded);
+    sink += (st == VITRIN_DECODE_ERR_FD_MISMATCH) ? 1 : 0;
+
+    st = vitrin_egress_evt_connected_decode(buf, (size_t)written, dummy_fd,
+                                             &object_id_out, &decoded);
+    sink += (st == VITRIN_DECODE_OK) ? 1 : 0;
+    sink += (decoded.fd == dummy_fd) ? 1 : 0;
+    sink += (decoded.host.len == msg.host.len) ? 1 : 0;
+    sink += (decoded.port == msg.port) ? 1 : 0;
+}
+
 /* Encodes then decodes vitrin_shim_session.designation: the FIRST fd-bearing
  * core -> shim event this protocol has ever defined (P2.6.5, issue #189), and
  * the reason it is called here rather than only type-checked. Every other fd
@@ -487,6 +546,7 @@ int main(void) {
     call_enum_and_bitfield_message();
     call_fd_bearing_message();
     call_other_fd_bearing_message();
+    call_fd_and_string_message();
     call_core_to_shim_fd_bearing_message();
     return sink >= 0 ? 0 : 1;
 }

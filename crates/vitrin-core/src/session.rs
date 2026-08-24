@@ -10624,7 +10624,8 @@ mod tests {
         // bootstrap object, on the shim connection class, which no principal
         // can address at all. None is a request on either layout interface,
         // none adds an arrangement this scene cannot honour, and none allocates
-        // a verb bit (`Verb::VALID_MASK` is still 575). D-018(2) invariant 2 is
+        // a verb bit (`Verb::VALID_MASK` was unchanged by it). D-018(2)
+        // invariant 2 is
         // untouched. What they do add is a cross-realm channel the human drives
         // with two physical chords; that is D-024, not this invariant.
         // Re-pinned 40 -> 45 by WS-E.4.2 (issue #222), decision taken rather
@@ -10634,9 +10635,9 @@ mod tests {
         // schema forbids from defining any request at all (B2), on the shim
         // connection class no principal can address. None is a request on
         // either layout interface, none adds an arrangement this scene cannot
-        // honour, and none allocates a verb bit (`Verb::VALID_MASK` is still
-        // 575). D-018(2) invariant 2 is untouched. What they do add is a
-        // pairing obligation on the core -- one `gesture_end` per
+        // honour, and none allocates a verb bit (`Verb::VALID_MASK` was
+        // unchanged by it). D-018(2) invariant 2 is untouched. What they do
+        // add is a pairing obligation on the core -- one `gesture_end` per
         // `gesture_begin` delivered, on every path input is taken away; that
         // is D-032, not this invariant.
         // Re-pinned 45 -> 47 by WS-E.4.2's second half (issue #222), and this
@@ -10648,8 +10649,8 @@ mod tests {
         // object, on the shim connection class no principal can address.
         // Neither is a request on either layout interface, neither adds an
         // arrangement this scene cannot honour, and neither allocates a verb
-        // bit (`Verb::VALID_MASK` is still 575) -- so D-018(2) invariant 2's
-        // first half is untouched.
+        // bit (`Verb::VALID_MASK` was unchanged by it) -- so D-018(2)
+        // invariant 2's first half is untouched.
         // Its SECOND half is the one worth stating: a pointer constraint
         // changes what the APP is told, never what the core believes. The
         // core's own hit test still decides which surface an input event
@@ -10665,8 +10666,8 @@ mod tests {
         // object, on the shim connection class no principal can address. It is
         // not a request on either layout interface, it adds no arrangement this
         // scene cannot honour, and it allocates no verb bit
-        // (`Verb::VALID_MASK` is still 575) -- so invariant 2's first half is
-        // untouched.
+        // (`Verb::VALID_MASK` was unchanged by it) -- so invariant 2's first
+        // half is untouched.
         // Its second half, in the form #222 put it: an idle inhibit changes
         // what the CORE does with its own panel, and nothing at all about what
         // the app is told or what the core believes about geometry, focus or
@@ -10687,8 +10688,8 @@ mod tests {
         // consent stack, which composites at the OUTPUT stage above every
         // principal's content and is therefore not something an arrangement
         // can reach in the first place (invariant 3).
-        // This addition DOES allocate a verb bit -- `designate_file` (64), so
-        // `Verb::VALID_MASK` moves 575 -> 639, the first time this comment has
+        // This addition DOES allocate a verb bit -- `designate_file` (64) --
+        // the first time this comment has
         // had to write that. Invariant 2 survives it for a reason that is
         // stated rather than assumed: the verb adds no request that arranges,
         // stacks, or routes anything. It hands out file descriptors. It is
@@ -10696,9 +10697,31 @@ mod tests {
         // and P2.6.8's consent copy exist, so no grant can carry it today --
         // and `SERVED_VERB_BITS` deliberately does not list it, which is what
         // makes that fail closed rather than by promise.
+        //
+        // Re-pinned 54 -> 58 by P2.7.2's second half (issue #196), and the
+        // decision was taken rather than waved through because this addition
+        // too involves a verb. The four added messages are
+        // `vitrin_grant.get_egress` (a structural mint) and the three on the
+        // new `vitrin_egress` facet -- `request_connect`, `connected` and
+        // `connect_failed`. None is a request on either layout interface, and
+        // none adds an arrangement this scene cannot honour.
+        // Invariant 2's first half needs the closer look. The addition puts a
+        // FACET on the `egress` verb bit, but it allocates no bit -- P2.7.2's
+        // FIRST half appended 128, taking `Verb::VALID_MASK` to 767 alongside
+        // P2.6.5's 64 -- and it does not make the verb served:
+        // `SERVED_VERB_BITS` still
+        // excludes `egress`, so no petition naming it resolves `granted`, so
+        // this core never grants a verb whose requests it cannot carry out.
+        // That is exactly what invariant 2 forbids and exactly what staying
+        // unserved avoids. The proxy that would make the verb servable, and
+        // the core dispatch for these four opcodes, are P2.7.3's.
+        //
+        // 58 is 48 + 6 + 4: the two appends were authored in parallel against
+        // 48, so the merge that brought them together carries both rather than
+        // either branch's total.
         assert_eq!(
             vitrin_protocol::generated::MESSAGE_COUNT,
-            54,
+            58,
             "a message was added to the IDL. If it is a request on \
              vitrin_layout_arrange or vitrin_layout_focus, D-018(2) invariant 2 is at \
              stake: this scene shows one realm, unstacked and unoverlapped, so it cannot \

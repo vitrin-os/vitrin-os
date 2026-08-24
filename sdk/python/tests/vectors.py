@@ -102,9 +102,13 @@ GOLDEN_FRAME_READY = bytes(
 # independent implementation (decision D8), and a vector transcribed from the
 # transcription it is supposed to check would agree with it by construction.
 #
-# The object ids are chosen so the three pinned structural mints and the three
-# uses form one coherent trace: grant 4 mints launcher 11, layout_focus 12 and
-# layout_arrange 13, and the three use-vectors are addressed to those ids.
+# The object ids are chosen so the three structural mints THIS SDK ENCODES and
+# the three uses form one coherent trace: grant 4 mints launcher 11,
+# layout_focus 12 and layout_arrange 13, and the three use-vectors are
+# addressed to those ids. vitrin_grant carries two further mints --
+# `get_powerbox` (opcode 3, P2.6.5) and `get_egress` (opcode 4, P2.7.2) --
+# with no vector here, because messages.py has no codec for either to check;
+# see that module's docstring for why.
 # ---------------------------------------------------------------------------
 
 # vitrin_grant.get_launcher{launcher: 11} on grant object 4 -- request 0.

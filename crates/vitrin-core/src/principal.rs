@@ -1133,17 +1133,30 @@ impl PrincipalServer {
                                 Err(PrincipalViolation::UnknownOpcode { object_id, opcode }.into())
                             }
                         },
-                        // vitrin_grant carries four requests as of P2.6.5,
+                        // vitrin_grant carries FIVE requests as of P2.7.2,
                         // all since="2" structural mints, and THIS CORE
-                        // SERVES ONLY THE FIRST THREE. The fourth,
-                        // `get_powerbox` (opcode 3), is on the wire with no
-                        // arm here, so it falls to the catch-all below and
-                        // is answered fatal invalid_opcode -- a version-2
-                        // conformance gap owed by P2.6.6, not a decision.
-                        // It is pinned by
+                        // SERVES ONLY THE FIRST THREE. Two are on the wire
+                        // with no arm here, so they fall to the catch-all
+                        // below and are answered fatal invalid_opcode --
+                        // version-2 conformance gaps owed by a later task,
+                        // not decisions:
+                        //
+                        // * `get_powerbox` (opcode 3), owed by P2.6.6
+                        //   together with the picker;
+                        // * `get_egress` (opcode 4), owed by P2.7.3
+                        //   together with the out-of-core mediating proxy
+                        //   and the `vitrin_egress` object kind.
+                        //
+                        // Each is pinned by its own test below --
                         // `get_powerbox_is_defined_at_version_2_and_this_core_answers_it_fatally`
-                        // below, which goes red the moment an arm lands and
-                        // names the four texts that must move with it.
+                        // and
+                        // `get_egress_is_defined_by_the_idl_and_still_refused_by_this_core`
+                        // -- each of which goes red the moment its arm lands
+                        // and names the texts that must move with it.
+                        // Nothing today can reach either usefully anyway:
+                        // `designate_file` and `egress` are both outside
+                        // `SERVED_VERB_BITS`, so no grant resolves granted
+                        // carrying them.
                         //
                         // Every other opcode on a grant, and every opcode at
                         // all on vitrin_consent (which defines no requests
@@ -5272,27 +5285,56 @@ pub(crate) mod tests {
     fn a_consent_defines_no_requests_and_a_grant_defines_no_mint_past_the_idl() {
         let _fd = crate::capture::tests::fd_lock();
         // vitrin_consent defines no requests at any version. vitrin_grant
-        // defines four, all since=2 structural mints: opcode 0
+        // defines five, all since=2 structural mints: opcode 0
         // `get_launcher`, 1 `get_layout_focus`, 2 `get_layout_arrange`, 3
-        // `get_powerbox`. Everything PAST them on either object is grammar
-        // (invalid_opcode), never an authority judgement -- including
-        // opcode 0 on the consent object, which is `get_launcher`'s
-        // opcode on the *other* interface and must not be routed by
-        // number alone.
+        // `get_powerbox`, 4 `get_egress`. Everything PAST them on either
+        // object is grammar (invalid_opcode), never an authority judgement --
+        // including opcode 0 on the consent object, which is `get_launcher`'s
+        // opcode on the *other* interface and must not be routed by number
+        // alone.
         //
-        // The grant's probes are 4 and 9, one past the last DEFINED mint
-        // and well past it. They moved 3 -> 4 when P2.6.5 appended
-        // `get_powerbox` at opcode 3, exactly as 1 and 2 stopped being
-        // invalid when WS-E.1.4 appended the layout mints; this test going
-        // red on an append is what an append-only opcode space should do.
+        // **THE PROBE IS DERIVED FROM THE GENERATED OPCODES, NOT WRITTEN
+        // DOWN**, and that is a correction rather than a flourish. This test
+        // has been wrong twice for one reason: its probe was a literal that
+        // named the opcode the IDL was about to define. It read 3 until
+        // P2.6.5 appended `get_powerbox` there, and it read 4 on the parallel
+        // P2.7.2 branch until this merge put `get_egress` at 4 -- each time a
+        // green test claiming an opcode was undefined that the IDL had just
+        // defined. A literal cannot notice an append; `mints.len()` cannot
+        // miss one.
         //
-        // Opcode 3 is deliberately NOT probed here any more. It is defined
+        // Opcodes 3 and 4 are deliberately NOT probed here. They are defined
         // by the IDL and unserved by this core, which is a different fact
-        // from "undefined", and conflating the two is what let the old
-        // probe keep passing while the IDL grew under it. It has its own
-        // test below.
+        // from "undefined", and conflating the two is exactly what let the
+        // old probes keep passing while the IDL grew under them. Each has its
+        // own test below.
+        let mints = [
+            grant::requests::GetLauncher::OPCODE,
+            grant::requests::GetLayoutFocus::OPCODE,
+            grant::requests::GetLayoutArrange::OPCODE,
+            grant::requests::GetPowerbox::OPCODE,
+            grant::requests::GetEgress::OPCODE,
+        ];
+        // The mints occupy 0..len with no hole, which is what makes "one past
+        // the last" the FIRST undefined opcode rather than merely an
+        // undefined one. Asserted rather than assumed: a hole would make the
+        // probe below silently stop being the first.
+        for (i, opcode) in mints.iter().enumerate() {
+            assert_eq!(
+                usize::from(*opcode),
+                i,
+                "vitrin_grant's mints are no longer contiguous from 0, so \
+                 `mints.len()` is no longer the first undefined opcode"
+            );
+        }
+        let first_undefined = u8::try_from(mints.len()).expect("opcode fits in a u8");
         let verifier = demo_verifier();
-        for (object_id, opcode) in [(4u32, 4u8), (4, 9), (5, 0), (5, 1)] {
+        for (object_id, opcode) in [
+            (4u32, first_undefined),
+            (4, first_undefined + 4),
+            (5, 0),
+            (5, 1),
+        ] {
             let (mut server, mut core, mut client, mut shared) = setup();
             bind_with_realm(&mut server, &mut core, &mut client, &verifier, &mut shared);
             client
@@ -5368,6 +5410,73 @@ pub(crate) mod tests {
         assert_eq!(grant::requests::GetPowerbox::OPCODE, 3);
         assert_eq!(
             grant::requests::GetPowerbox::SINCE,
+            vitrin_protocol::generated::PROTOCOL_VERSION,
+            "the gap only matters because this core negotiates the very \
+             version that defines the request"
+        );
+    }
+
+    #[test]
+    fn get_egress_is_defined_by_the_idl_and_still_refused_by_this_core() {
+        let _fd = crate::capture::tests::fd_lock();
+        // THIS TEST PINS A DIVERGENCE, NOT A CONFORMANCE.
+        //
+        // `vitrin_grant.get_egress` is opcode 4, `since="2"`, and the IDL says
+        // a structural mint is always legal on a live grant and refuses at
+        // USE. This binary has no dispatch arm for it (see the comment on the
+        // `ObjectKind::Grant` match), so a well-formed get_egress is answered
+        // fatal `invalid_opcode` and the connection dies -- which is not what
+        // the IDL says the server does. P2.7.3 closes it, together with the
+        // out-of-core proxy and the `vitrin_egress` object kind.
+        //
+        // IT IS OPCODE 4 AND NOT 3, and the number is asserted below rather
+        // than only written here. `get_egress` was drafted as the fourth mint
+        // at opcode 3 while P2.6.5 was landing `get_powerbox` at the same
+        // number on another branch. Powerbox shipped first and keeps 3;
+        // opcodes are immutable once shipped, so the unshipped one moved.
+        //
+        // The frame below is fully encoded rather than a bare header, so the
+        // refusal cannot be blamed on a malformed payload: the opcode is the
+        // whole reason.
+        //
+        // Nothing reachable is lost by the gap today -- `egress` is outside
+        // `SERVED_VERB_BITS`, so no petition naming it resolves `granted` and
+        // a minted facet would confer nothing -- but "harmless" is not
+        // "correct", and this assertion is what makes the divergence go red
+        // the moment P2.7.3 serves the mint, instead of leaving it to be
+        // noticed.
+        let verifier = demo_verifier();
+        let (mut server, mut core, mut client, mut shared) = setup();
+        bind_with_realm(&mut server, &mut core, &mut client, &verifier, &mut shared);
+        client
+            .send_message(&petition_frame().encode(3), None)
+            .unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        expect_consent_state(&mut client, 5, ConsentState::Queued);
+        client
+            .send_message(&grant::requests::GetEgress { egress: 9 }.encode(4), None)
+            .unwrap();
+        expect_violation(
+            process_n(&mut server, &mut core, &verifier, &mut shared, 1),
+            "invalid_opcode",
+        );
+        expect_error(&mut client, WireError::InvalidOpcode);
+        assert!(
+            !server.objects.contains_key(&9),
+            "the refused mint allocates nothing"
+        );
+        // Stated as constants so a renumbered opcode or a version bump cannot
+        // leave the prose above pointing at nothing -- and so the 3-vs-4
+        // collision this merge resolved cannot silently come back.
+        assert_eq!(grant::requests::GetEgress::OPCODE, 4);
+        assert_eq!(
+            grant::requests::GetPowerbox::OPCODE,
+            3,
+            "get_powerbox shipped first and keeps opcode 3; get_egress is the \
+             one that moved"
+        );
+        assert_eq!(
+            grant::requests::GetEgress::SINCE,
             vitrin_protocol::generated::PROTOCOL_VERSION,
             "the gap only matters because this core negotiates the very \
              version that defines the request"

@@ -389,6 +389,100 @@ pub mod requests {
             Ok((header.object_id, GetPowerbox { powerbox }))
         }
     }
+
+    /// Request `get_egress` (opcode 4) on `vitrin_grant`.
+    ///
+    /// mint the egress facet for this grant
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct GetEgress {
+        /// the egress facet, born inert (confers nothing until this grant is granted with egress, which no deployment does yet) (new_id: vitrin_egress)
+        pub egress: u32,
+    }
+
+    impl GetEgress {
+        pub const OPCODE: u8 = 4;
+        pub const HAS_FD: bool = false;
+        /// First protocol version at which this message is defined (`message/@since`);
+        /// this opcode is not defined on a connection whose negotiated version is
+        /// lower, where using it is fatal `invalid_opcode`.
+        pub const SINCE: u32 = 2;
+
+        /// Encode into a complete frame (header + argument payload). The fd
+        /// argument, if this message has one, is not written here -- send it
+        /// out-of-band via `SCM_RIGHTS` alongside these bytes.
+        pub fn encode(&self, object_id: u32) -> Vec<u8> {
+            let mut out = Vec::new();
+            crate::wire::FrameHeader {
+                object_id,
+                size: 0,
+                opcode: Self::OPCODE,
+                fd_count: Self::HAS_FD as u8,
+            }
+            .encode_with_placeholder_size(&mut out);
+            crate::wire::write_uint(&mut out, self.egress);
+            crate::wire::patch_size(&mut out);
+            out
+        }
+
+        /// Decode a complete frame (header + argument payload) plus, iff
+        /// `Self::HAS_FD`, the fd received alongside it out-of-band. Returns the
+        /// frame's `object_id` (routing data the caller's dispatcher needs)
+        /// alongside the decoded message.
+        ///
+        /// `docs/protocol/00-conventions.md` 2.4/5.2 define `fd_violation` as two
+        /// independent disjuncts, both checked here: the header's own `fd_count`
+        /// byte disagreeing with this message's signature, and the out-of-band
+        /// `fd` parameter disagreeing with it. A hostile or buggy peer can make
+        /// either one lie without the other, so neither check substitutes for
+        /// the other.
+        ///
+        /// The header's `opcode` and `size` fields are validated in the same
+        /// defense-in-depth spirit: the dispatcher already selected this message
+        /// type by opcode and delimited the frame by size, but a dispatcher bug
+        /// (or a header whose size field lies about the delivered byte count,
+        /// fatal `oversized` per conventions 2.1) must surface as an error here,
+        /// not as a silently mis-decoded message.
+        pub fn decode(
+            bytes: &[u8],
+            fd: Option<std::os::fd::OwnedFd>,
+        ) -> Result<(u32, Self), crate::error::DecodeError> {
+            if fd.is_some() != Self::HAS_FD {
+                return Err(crate::error::DecodeError::FdCountMismatch {
+                    expected: Self::HAS_FD as u8,
+                    actual: fd.is_some() as u8,
+                });
+            }
+            let header = crate::wire::FrameHeader::decode(bytes)?;
+            if header.opcode != Self::OPCODE {
+                return Err(crate::error::DecodeError::OpcodeMismatch {
+                    expected: Self::OPCODE,
+                    actual: header.opcode,
+                });
+            }
+            if header.size as usize != bytes.len() {
+                return Err(crate::error::DecodeError::SizeMismatch {
+                    declared: header.size,
+                    actual: bytes.len(),
+                });
+            }
+            if header.fd_count != Self::HAS_FD as u8 {
+                return Err(crate::error::DecodeError::FdCountMismatch {
+                    expected: Self::HAS_FD as u8,
+                    actual: header.fd_count,
+                });
+            }
+            #[allow(unused_mut)]
+            let mut pos = crate::wire::HEADER_LEN;
+            let egress = crate::wire::read_uint(bytes, &mut pos)?;
+            if pos != bytes.len() {
+                return Err(crate::error::DecodeError::TrailingBytes {
+                    consumed: pos,
+                    total: bytes.len(),
+                });
+            }
+            Ok((header.object_id, GetEgress { egress }))
+        }
+    }
 }
 
 pub mod events {
@@ -651,12 +745,32 @@ impl Verb {
     pub const LAYOUT_FOCUS: Verb = Verb(32);
     /// designate one file or one directory subtree to the granted realm, through the vitrin_powerbox facet; the human picks in a core-drawn picker and what crosses the wire is a file descriptor, never a path, so this is authority to ASK for a designation rather than authority over any named file; a delivered fd is kernel authority the core cannot recall, so revocation stops future designations and kills the grant row while the payload keeps every fd already handed over until its realm dies - PRD P2's revocation is immediate and transitive is FALSE for designations already made; refused unsupported in version 1, which cannot mint the facet at all, and by every deployment until the picker (P2.6.6) and its consent copy (P2.6.8) exist
     pub const DESIGNATE_FILE: Verb = Verb(64);
-    /// launch the realm template this grant addresses into a new realm instance, through the vitrin_launcher facet; the template names the program and no command ever crosses the wire, so this is authority over an operator-written template rather than over an arbitrary command; bits 128 and 256 are allocated to verbs not yet defined here and were skipped rather than reused, as 64 was until designate_file landed on it; refused unsupported in version 1, which cannot mint the facet at all, and by any deployment that does not serve it
+    /// open one outbound connection to the single host:port named by this grant's net: resource selector, through an out-of-core mediating proxy that asks the enforcement chokepoint per connection and holds no grant of its own; exercised through the vitrin_egress facet, which is a separate interface of its own rather than a request on the filesystem powerbox, since interface/@verb is one value per interface; the selector's grammar is wildcard-free, so a blanket egress grant is inexpressible rather than refused, and one selector covers exactly itself - though not every spelling of one endpoint is one selector, since the host is compared byte-exactly and kept as presented; SPECIFIED BUT NOT IMPLEMENTED ANYWHERE YET: a DNS name is to resolve only in the proxy and the addresses it resolved to at grant time are to be pinned into the grant row, so that a connection to an unpinned address is refused not_granted even under a name-scoped grant - no proxy, no resolver and no pinned column with a value exist today; the dotted SDK name is egress unchanged, the wire name carrying no underscore to replace; refused unsupported in version 1 and by every deployment at version 2 - the facet exists now, so what is missing is the proxy behind it rather than a request to ask through
+    pub const EGRESS: Verb = Verb(128);
+    /// launch the realm template this grant addresses into a new realm instance, through the vitrin_launcher facet; the template names the program and no command ever crosses the wire, so this is authority over an operator-written template rather than over an arbitrary command; bit 256 is allocated to a verb not yet defined here and was skipped rather than reused, as 64 was until designate_file landed on it and 128 was until egress did; refused unsupported in version 1, which cannot mint the facet at all, and by any deployment that does not serve it
     pub const REALM_LAUNCH: Verb = Verb(512);
 
     /// Union of every defined entry's bits; a wire value with any other
     /// bit set is invalid.
-    pub const VALID_MASK: u32 = 1 | 2 | 4 | 8 | 16 | 32 | 64 | 512;
+    pub const VALID_MASK: u32 = 1 | 2 | 4 | 8 | 16 | 32 | 64 | 128 | 512;
+
+    /// Every defined entry as `(wire name, bit value)`, in IDL document
+    /// order. `VALID_MASK` is the union of the values here; this constant
+    /// adds the *names*, so a partition of the bitfield (served vs.
+    /// unserved, facet-bearing vs. facetless) can be derived by name
+    /// instead of transcribed into a list a human has to remember to
+    /// update.
+    pub const ENTRIES: &'static [(&'static str, u32)] = &[
+        ("observe", 1),
+        ("actuate_pointer", 2),
+        ("actuate_text", 4),
+        ("observe_cursor", 8),
+        ("layout_arrange", 16),
+        ("layout_focus", 32),
+        ("designate_file", 64),
+        ("egress", 128),
+        ("realm_launch", 512),
+    ];
 
     /// Decode a wire value, rejecting any bit outside `VALID_MASK`.
     pub fn from_bits(value: u32) -> Result<Self, crate::error::DecodeError> {

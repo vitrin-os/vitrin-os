@@ -195,16 +195,19 @@ Version 0 is frozen for Phase 1 — **not forever**. The wire integer is now
   `vitrin_shim_session.designation` — the powerbox vocabulary, refused
   `unsupported` by every deployment until the core-drawn picker and its
   consent copy exist, and **not yet implemented by this core at all**:
-  `get_powerbox` is one of the two messages in the list above that `vitrind`
-  has no handler for, so sending it is fatal `invalid_opcode` rather than a
-  mint;
+  `vitrind` has no dispatch arm for `get_powerbox` **or for either request on
+  the facet it mints**, so sending any of them is fatal `invalid_opcode`
+  rather than a mint or a refusal;
 - the `egress` verb (128, at P2.7.2) and the `net:HOST:PORT` value its
   authority is named with. That half landed as **a verb bit and a `resource`
   grammar, and no message at all**; its facet followed separately. Every
   deployment still refuses the verb `unsupported`, because the out-of-core
   proxy a connection would be made through does not exist — a facet is a
-  request to ask through, not a mechanism to answer with. `get_egress` is the
-  other message `vitrind` has no handler for;
+  request to ask through, not a mechanism to answer with. `get_egress` and
+  `vitrin_egress.request_connect` are unhandled on the same terms, so the
+  **five** requests this core does not dispatch are the two mints and the
+  three facet requests behind them — not the two mints alone, which is what
+  this list said while the two facets were landing on parallel branches;
 - the `capacity` refusal code and the `layout_held` outcome;
 - on `vitrin_shim_session`, the cross-realm clipboard, the pointer
   constraints and the idle inhibit (`request_selection`, `offer_selection`,

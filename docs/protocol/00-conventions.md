@@ -679,17 +679,24 @@ non-`released` status is the recoverable dmabuf-import-fallback path
 Each recoverable code maps to exactly one distinct typed SDK exception (or
 success), so a blocking SDK can translate the wire directly.
 
-**Two of the four classes are mapped here, and the other two are not — say so
+**Two of the five classes are mapped here, and the other three are not — say so
 rather than let the tables imply a completeness they do not have.** `outcome`
 and `refusal` are below. The **shim fallback**'s `buffer_done` status is on a
-shim connection, which no agent SDK speaks. `connect_failed`'s
-[`failure`](19-vitrin_egress.md#failure) enum has **no mapping at all yet**, and
-that is a gap rather than a decision: the Python SDK implements no part of the
-egress facet ([`vitrin_os.protocol`](../../sdk/python/src/vitrin_os/protocol.py)
-names it as absent), so there is nothing to map it onto. When it is mapped, the
-one thing this section already fixes is that it must **not** land in the
-`refusal` table — the whole point of the third class is that it is not an
-authority answer.
+shim connection, which no agent SDK speaks. **The human's answer**
+([`vitrin_powerbox.refusal`](13-vitrin_powerbox.md#refusal)) and **the transport
+non-answer** ([`vitrin_egress.failure`](19-vitrin_egress.md#failure)) have **no
+mapping at all yet**, and both are gaps rather than decisions: the Python SDK
+implements no part of either facet
+([`vitrin_os.protocol`](../../sdk/python/src/vitrin_os/protocol.py) names both
+as absent), so there is nothing to map them onto. When they are mapped, the one
+thing this section already fixes is that neither may land in the `refusal`
+table — the whole point of both classes is that neither is an authority answer.
+
+*This paragraph said "two of the **four**" and named only `connect_failed`
+until the P2.6.5 and P2.7.2 branches were merged. It was written on the second
+of those, where four was the true count, and the class it omits is the one the
+first branch added — the same mechanism the [`refusal`](04-vitrin_grant.md#refusal)
+enum's own lapses record.*
 
 | `outcome` | SDK result |
 |---|---|
@@ -843,10 +850,15 @@ answer is worse than no gate, so this is checked by review, and the count
 sentences here are where the next stale claim will appear.
 **One already did, and its opposite did too.** *"Clients handle three terminals
 on this one request and at most two anywhere else"* was written on the egress
-branch and was false the moment the powerbox landed. It stood on **five**
+branch and was false the moment the powerbox landed. It stood on **six**
 surfaces: that sentence in four (the IDL, [`vitrin_egress`](19-vitrin_egress.md#three-terminals-not-two),
 here, and the §7.4 row), plus the IDL's separate *"this interface's one
-departure from every other reply-bearing request in this document"*.
+departure from every other reply-bearing request in this document"*, plus
+[`vitrin_grant`](04-vitrin_grant.md#growth)'s growth row — which said *"new to
+this protocol"* and contrasted only with `capture_frame` and `launch`. The
+sixth was found a round after the other five, and by reading the growth lists
+rather than by grepping the phrasings the first five shared: a superlative
+does not have to reuse any of its own words to be the same claim.
 The mirror-image failure is in the same merge: *"the powerbox pair is the first
 three-way one-of in this protocol"* was **true** on `main` and was dropped by
 the resolution rather than carried across; the paragraph above restores it as

@@ -1166,10 +1166,21 @@ rules](00-conventions.md) guarantee.
   landed — see [`get_egress`](#get_egress)'s implementation-status note. The
   powerbox row above is the second: `get_powerbox` is unimplemented too, and
   the two gaps are separately owned (P2.6.6 and P2.7.3).
-- **A third terminal on a reply-bearing request — new at version 2, and new to
-  this protocol.** [`vitrin_egress.request_connect`](19-vitrin_egress.md) is
+- **A third terminal on a reply-bearing request — new at version 2, and the
+  SECOND request family to need three rather than the first.**
+  [`vitrin_egress.request_connect`](19-vitrin_egress.md) is
   answered by `connected`, by [`refused`](#refused), *or* by
   `connect_failed` — where `capture_frame` and `launch` each have exactly two.
+  [`request_file`](13-vitrin_powerbox.md#request_file) and `request_dir` (the
+  powerbox row above, P2.6.5) got there one task earlier, on the unrelated
+  argument that a designation has **two answerers**; `request_connect`'s third
+  arm is the far end's non-answer. Three-terminal requests are therefore a
+  family of three, and this bullet said *"new to this protocol"* with only
+  `request_connect` beside it until the two parallel branches were merged. It
+  is the sixth carrier of that superlative;
+  [§6.1](00-conventions.md#61-reply-bearing-requests) holds the record of all
+  six, and this one shares no wording with the other five, which is why it
+  outlived the sweep that fixed them.
   The seam it opens is general: a future reply-bearing request whose failure
   is not the server's decision adds its own terminal on its own facet rather
   than a code in [`refusal`](#refusal), which stays the chokepoint's voice and

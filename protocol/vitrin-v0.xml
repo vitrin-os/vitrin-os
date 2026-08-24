@@ -630,13 +630,20 @@
         durable rungs (until_revoked, always) exist in the enum from day
         one but resolve "unsupported" in version 1, pending provenance
         verification in a later phase. verbs obeys the same rule: a bit a
-        deployment does not serve (observe_cursor and egress everywhere;
-        whichever others a given deployment declines) is in-range, so
-        naming one is
-        never fatal, and such
+        deployment does not serve is in-range, so naming one is never
+        fatal, and such
         a petition resolves "unsupported" WHOLE - the server never quietly
         drops an unserved bit and grants the remainder, because an agent
-        must never believe it holds authority nothing enforces. A petition
+        must never believe it holds authority nothing enforces.
+        <!-- vitrin-verb-set: unserved-verbs = observe_cursor, designate_file, egress | count: three -->
+        THREE bits are in that posture at EVERY deployment today -
+        observe_cursor, designate_file and egress, for three unrelated
+        missing mechanisms named in the verb enum - and whichever others a
+        given deployment declines are its own business rather than the
+        wire's. That list read "observe_cursor and egress" until the
+        P2.6.5 and P2.7.2 branches were merged, each having seen only its
+        own new bit, which is why it now carries the marker that derives
+        the set instead of a list a reader has to trust. A petition
         naming layout_arrange has one further admission-time answer,
         "layout_held", when the verb is already SPOKEN FOR for the output -
         by a live grant carrying it, or by another petition that is still

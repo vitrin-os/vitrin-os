@@ -265,10 +265,14 @@ there:
 - `verbs` uses the bitfield [`vitrin_grant.verb`](./04-vitrin_grant.md#verb)
   (`observe` = 1, `actuate_pointer` = 2, `actuate_text` = 4,
   `observe_cursor` = 8, `layout_arrange` = 16, `layout_focus` = 32,
-  `designate_file` = 64, `egress` = 128, `realm_launch` = 512). Three of them —
+  `designate_file` = 64, `egress` = 128, `realm_launch` = 512).
+  <!-- vitrin-verb-set: unserved-verbs = observe_cursor, designate_file, egress | count: three -->
+  Three of them —
   `observe_cursor`, `designate_file` and `egress` — are
   [defined but unserved](./04-vitrin_grant.md#defined-but-unserved): in range,
-  so naming one is never fatal, and refused `unsupported` whole. The values are **not** consecutive
+  so naming one is never fatal, and refused `unsupported` whole. The IDL's own
+  sentence on this named only two of the three until the P2.6.5 and P2.7.2
+  branches were merged; both sides carry the marker now. The values are **not** consecutive
   bits and must be transcribed rather than counted: 256 is allocated
   to a verb this document does not define yet, and 64 and 128 were too until
   `designate_file` and `egress` landed on them.

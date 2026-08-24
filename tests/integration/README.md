@@ -488,10 +488,11 @@ have**. `run.sh`'s three-way partition (issue #288) globs
 milestone, property or supporting gate; this file is matched by neither that
 glob nor `unittest discover -p 'test_*.py'`, so the partition check has nothing
 to say about it and no green `run.sh` includes it. That is deliberate: it
-asserts the state of an **open** question ([#311](https://github.com/vitrin-os/vitrin-os/issues/311),
-routed here by D-038), and the three lists are a partition of *gates*. If #311
-is decided and the decision has a property, that property gets a `test_*.py`
-gate and this file is superseded.
+asserts the state of the tree behind a **decision** question ([#311](https://github.com/vitrin-os/vitrin-os/issues/311),
+routed here by D-038), and the three lists are a partition of *gates*. #311 was
+answered by **D-046** on 2026-08-24, and that answer **builds nothing** — so it
+has no property to gate yet and this file is not superseded. When one is built,
+that property gets a `test_*.py` gate and this file is.
 
 `$PWD/` on the shim path is not decoration: the core refuses a relative
 `command` outright, because it would resolve against the child's working
@@ -517,7 +518,10 @@ last of four that evening, the one the pushed code produced — all three arms,
 test green. **This is a measurement of one box on one date, not an answer to
 #311**: D-038's three questions (grant vs mount vs bind-of-an-fd; operator
 declaration vs consent; one-way or not) are an owner decision, and nothing here
-decides them.
+decides them. They were taken on **2026-08-24** — D-046, an inherited descriptor
+on an operator's declaration *and* a human's consent, carrying the layout verbs
+and `realm_launch` and never `observe` or either actuation verb — and no figure
+in this table moved, because the decision builds nothing.
 
 | | `default` | `default --landlock=off` | `off` |
 |---|---|---|---|

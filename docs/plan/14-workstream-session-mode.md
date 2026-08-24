@@ -2581,8 +2581,16 @@ The limit set follows.
   line typed into a terminal that must be somewhere the human can reach.** The
   eventual shape #211's decision 2 names — the shell running *as a realm*,
   drawing through its own shim — needs no new protocol and does need that
-  realm to reach the core socket, which is a confinement question nobody has
-  answered. Published in `docs/book/src/limits.md`.
+  realm to reach the core socket. That was a confinement question nobody had
+  answered until [D-046](20-decision-log.md#d-046--a-shell-realm-reaches-the-core-socket-through-a-descriptor-the-core-mints-and-passes-down-the-spawn-path-it-already-has-the-authority-is-an-operators-declaration-and-a-humans-consent-and-what-the-connection-may-carry-is-fenced-structurally-rather-than-by-consent)
+  (2026-08-24, #311) answered it: the core mints the principal connection and
+  passes it down the existing spawn path as an inherited descriptor — no mount,
+  no ruleset edit — on an operator's `realm.toml` declaration **and** a human's
+  consent at `while_running`, carrying `layout_focus`, `layout_arrange` and
+  `realm_launch` and structurally never `observe` or either actuation verb.
+  **The limit itself is unchanged**: that decision builds nothing, so a
+  principal still cannot draw and this bullet still describes the session
+  anyone runs today. Published in `docs/book/src/limits.md`.
 
 - <!-- limit-not-on-page: layout-arrange-is-single-holder -- no surface
   carries it: it is a restriction on a second tool rather than on the human's

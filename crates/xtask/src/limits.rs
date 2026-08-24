@@ -2340,6 +2340,64 @@ pub const CLAIMS: &[Claim] = &[
             },
         ],
     },
+    // The one claim on this page whose subject is a DECISION rather than a
+    // shipped behaviour, and the two halves of it a machine can hold are not
+    // the interesting half. What a shell realm may reach is decided (D-046,
+    // 2026-08-24) and built nowhere, so no code asserts it and none can: the
+    // evidence rows below hold the two facts about *this build* that the page
+    // leans on while saying so, and nothing holds "it is still unbuilt" --
+    // which is stated here rather than left as a gap a reader might mistake
+    // for coverage.
+    Claim {
+        id: "shell-realm-reaches-one-more-thing-than-an-app-realm",
+        says: "A shell realm may reach exactly one thing an app realm may not -- a principal \
+               connection the core mints and passes down the existing spawn path as an \
+               inherited descriptor, with no mount, no named socket and no Landlock rule -- \
+               and what that connection may carry is fenced to layout_focus, layout_arrange \
+               and realm_launch, with observe and both actuation verbs refused regardless of \
+               consent. The authority is an operator's realm.toml declaration AND a human's \
+               consent, at while_running, because this build has no durable rung to grant. \
+               Decided in D-046; built nowhere.",
+        issue: "#311 is the decision this claim publishes, and the commit that adds this row \
+                closes it -- so do not read the id as naming open work. #304 is the \
+                shell-as-a-realm work it unblocks; #194 owns the connected-apps surface the \
+                page says does not exist. Only the first is the tracking issue.",
+        surfaces: &[
+            Anchor {
+                path: LIMITS,
+                needle: "what a shell realm may reach that an app realm may not",
+            },
+            Anchor {
+                path: LIMITS,
+                needle: "regardless of what a human approves",
+            },
+        ],
+        evidence: &[
+            Evidence::Contains {
+                path: "crates/vitrin-core/src/grants.rs",
+                needle: "pub(crate) enum ProvenanceRef {}",
+                means: "the durable rungs are still STRUCTURALLY unreachable in this build: a \
+                        durable row needs a ProvenanceRef value and the type is uninhabited, \
+                        which is why the page says the shell is consented once per core start \
+                        and the card's remember-me is rendered disabled. If this type gains a \
+                        constructor (P2.6.8/#192 plans to put one behind a `provenance` \
+                        feature that does not exist yet), the rung sentence stops being forced \
+                        by the type system and has to be re-argued rather than reworded.",
+            },
+            Evidence::Contains {
+                path: "crates/vitrin-core/src/grants.rs",
+                needle: "pub(crate) const SERVED_VERB_BITS: u32 = 1 | 2 | 4 | 16 | 32 | 512;",
+                means: "the three verbs the page fences IN (layout_arrange 16, layout_focus 32, \
+                        realm_launch 512) and the three it fences OUT (observe 1, \
+                        actuate_pointer 2, actuate_text 4) are all six SERVED by this core, \
+                        which is what makes D-046's fence a new connection-scoped refusal \
+                        rather than a restatement of what the core already declines. If this \
+                        constant moves, the fence is being drawn across a different set and \
+                        the page has to be re-read -- in particular, a verb LEAVING this set \
+                        would make the page promise a shell an authority no deployment serves.",
+            },
+        ],
+    },
 ];
 
 // ---------------------------------------------------------------------------
@@ -3117,6 +3175,11 @@ pub const COVERED_CLAIMS: &[&str] = &[
     // nothing. Swapping in "the rows are current" instead would have put a
     // claim with a shelf life on four surfaces.
     "kernel-matrix-rows-are-held-to-this-builds-floor",
+    // #311's, and the first row here whose subject is a decision rather than a
+    // behaviour: what a shell realm may reach is decided (D-046) and built
+    // nowhere, so the two evidence rows hold the facts about this build that
+    // the published paragraph leans on and nothing holds the un-builtness.
+    "shell-realm-reaches-one-more-thing-than-an-app-realm",
 ];
 
 /// Every derived value this gate covers. Same contract as [`COVERED_CLAIMS`],

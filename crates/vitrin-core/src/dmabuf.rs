@@ -1958,14 +1958,39 @@ mod gpu_tests {
             ),
             "shm buffer released promptly, got {shm_release:?}"
         );
-        assert_eq!(scene.compose((W, H).into()), frame_rgba(7, W, H));
+        // **The shm fallback attaches at the CONFIGURED size, not the
+        // output's** (issue #304), and both numbers below follow from that.
+        // `MockShim::attach_frame` sizes its memfd from the `configure` it
+        // received, and since #304 that carries `ViewGeometry::usable()` --
+        // the output minus the rows the core reserves. So this frame is
+        // `W x uh`, it lands *whole* at `reserved_top` with no crop, and the
+        // realm view is the reserved rows of matte followed by all of it.
+        // (The dmabuf frames above differ on purpose: `gbm_frame` allocates
+        // the full `W x H` regardless of the configure, so those centre-crop
+        // by `CONTENT_TOP` instead.)
+        //
+        // Both assertions previously read `frame_rgba(7, W, H)` and
+        // `W * H * 4` -- the pre-inset shape, in which a client filled the
+        // view. Nothing caught it: this test is `#[ignore]`d behind a real
+        // GPU, so neither CI nor any review round ever executed these lines.
+        let geom = crate::view::ViewGeometry::new((W, H), 0);
+        let (uw, uh) = geom.usable();
+        let mut expected_shm = LETTERBOX_RGBA.repeat(geom.reserved_top() as usize * W as usize);
+        expected_shm.extend_from_slice(&frame_rgba(7, uw, uh));
+        assert_eq!(
+            scene.compose(geom),
+            expected_shm,
+            "the shm fallback must compose the configured-size frame below the rows the \
+             core reserves, not a full-view frame at the origin"
+        );
         assert_eq!(
             (
                 server.copy_meter().copies(),
                 server.copy_meter().pixel_bytes()
             ),
-            (1, u64::from(W) * u64::from(H) * 4),
-            "the shm fallback copies exactly once"
+            (1, u64::from(uw) * u64::from(uh) * 4),
+            "the shm fallback copies exactly once, and copies the frame the app was \
+             configured for"
         );
         server
             .presented(99, &mut |frame| core.send_message(frame, None))

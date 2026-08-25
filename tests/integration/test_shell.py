@@ -114,8 +114,14 @@ REALM_WH = (640, 480)
 #: 160x160 green square on a black field and flips its WHOLE surface red, once
 #: and irreversibly, on the first click that lands INSIDE the square. One-way
 #: is why every realm below gets exactly one click: a second would prove
-#: nothing. The square is centred, so at a 640x480 realm view its centre is
-#: (320, 240) — the coordinate every physical click here uses.
+#: nothing. The square is centred in the app's SURFACE, and since #304 inset
+#: the realm view that surface is 640x472 placed 8 rows down in a 640x480
+#: view — so the square's centre sits at view (320, 244) and it spans view
+#: rows [164, 324). (`test_real_actuation.py` measures the same square at view
+#: y 243 on the same geometry.) (320, 240) is 4 rows above that centre and
+#: comfortably inside the square, which is all this coordinate needs to be;
+#: it is left unchanged so the click these tests send is the click they always
+#: sent.
 TARGET = "00ff00"
 HIT = "ff0000"
 CLICK_AT = (320, 240)
@@ -449,8 +455,12 @@ class RealShellSwitchesRealms(_ShellGate):
         # hold window is open — because an untested command path in a
         # five-command program is most of the program. `fullscreen` is asserted
         # only to be SERVED rather than refused: the two modes are
-        # indistinguishable while the output and the realm are the same size,
-        # which every headless run is, and the IDL says so in as many words.
+        # indistinguishable while the output's USABLE view and the realm are
+        # the same size, which every headless run is, and the IDL says so in
+        # as many words. (Usable view, not output: issue #304 inset the realm
+        # view, so a realm spawned into an unresized output sits at
+        # `ViewGeometry::usable()` and never at the output's own size. The
+        # equality still holds; the thing it is against changed.)
         self.assertTrue(shell.send("list").startswith("ok list "), shell.dump())
         self.assertEqual(shell.send("fullscreen on"), "ok fullscreen on", shell.dump())
         self.assertEqual(shell.send("fullscreen off"), "ok fullscreen off", shell.dump())

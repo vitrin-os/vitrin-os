@@ -714,8 +714,12 @@ class ConsentInjector:
         of the post-inset property, appended after those on the same rule.
         `view_reserved` says the realm view's reserved rows -- `band_h +
         strip_h`, the rows the core keeps above the client -- are the core's
-        own matte, so a confined app cannot address them at all rather than
-        merely being overdrawn there. `band_over_matte` says the band was then
+        own matte, so an app that commits the size it was configured with
+        cannot address them at all rather than merely being overdrawn there.
+        (One that ignores its `configure` and commits a much taller buffer is
+        centre-cropped back into them, and this field reads that honestly and
+        goes to 0 -- it is a reading of the composite, not a core invariant.)
+        `band_over_matte` says the band was then
         drawn over them. **Read them as a pair**: since the inset, an app
         cannot move the band's rows of the view, so a build whose band never
         composited would report `band_changes == 0` and `band_uniform == 1`

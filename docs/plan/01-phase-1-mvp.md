@@ -410,8 +410,9 @@ something that cannot observe the colour it would have to match. **Until #304
 "its whole surface" included the band's rows** — the app was configured at the
 output's size and the band overdrew it — and the gate's capture claim was that
 those rows carried exactly the app's own colour. Since #304 the app is
-configured at `ViewGeometry::usable()` and cannot address those rows at all,
-so the claim is the stronger one that replaced it: the rows the core reserves
+configured at `ViewGeometry::usable()` and — so long as it commits the size it
+was told — cannot address those rows at all, so the claim is the stronger one
+that replaced it: the rows the core reserves
 are ONE colour in **both** capture artifacts (the agent's `observe()` frame and
 `--capture-dump`), the same colour in both, **byte-identical before and after
 the repaint**, none of the colours the app paints, and carrying a channel below
@@ -446,10 +447,24 @@ refusals=0, band_over_matte=0` — every older band criterion passing, and the
 `3` traceable to the core's own background and consent scrim showing through an
 absent band rather than to the client. So the reply carries two more fields and
 the gate asserts both: `view_reserved` (the realm view's reserved rows are the
-core's own matte, so the app has no way to address them) and `band_over_matte`
-(a band was drawn over that matte). **`band_over_matte` is now the only
-criterion in this gate that a session with no trusted band on the screen
-fails.**
+core's own matte, so an app committing the size it was told has no way to
+address them) and `band_over_matte` (a band was drawn over that matte).
+**`band_over_matte` is now the only criterion in this gate that a session with
+no trusted band on the screen fails.**
+
+**One bound on `view_reserved`, stated here because a plan document that
+overclaims is how the next reader inherits it.** `Scene::compose` clips a
+surface against the *whole* view rather than the usable rectangle, so an app
+that ignores its `configure` and commits a buffer more than
+`2 * reserved_top()` rows taller is centre-cropped back into the reserved rows
+and the band overdraws it there as it always did. `view_reserved` reads the
+composite it is handed and goes false in that case, which is honest and is not
+a core regression; `band_witness.rs`'s
+`a_client_that_ignores_its_configure_can_still_reach_the_reserved_rows` drives
+it against the real compositor and asserts `band_over_matte` still holds. So
+the property is structural for a cooperating client and the overdraw it always
+was for an overflowing one — and issue #85's claim is unchanged either way,
+because the band is composited last over whatever reached those rows.
 
 The gap between "every composite it evaluated" and "every composite of the
 session" is closed by code, not by the gate: `BandWitness::observe` is called

@@ -88,10 +88,26 @@ capture-side proof was *"those rows are exactly the colour the app painted"*.
 Since #304 the app is configured at `ViewGeometry::usable()` -- the output
 minus the rows the core reserves along the top edge -- and `Scene::compose`
 fills the reserved rows with `LETTERBOX_RGBA`, the core's own matte, before it
-blits the client's buffer below them. **A confined app can no longer address
-those rows at all.** That is strictly stronger than "it painted there and was
-covered", and every clause below is rewritten to assert the stronger thing
-rather than to accept the weaker one.
+blits the client's buffer below them. **An app that commits the size it was
+configured with can no longer address those rows at all.** That is strictly
+stronger than "it painted there and was covered", and every clause below is
+rewritten to assert the stronger thing rather than to accept the weaker one.
+
+**The qualifier is exact, and stating it is what keeps this section honest.**
+`Scene::compose` clips a surface against the *whole* view rather than the
+usable rectangle -- deliberately, and it says so in its own words: an app that
+ignores its `configure` is centre-cropped rather than refused. Commit a buffer
+more than `2 * reserved_top()` rows taller than the usable view and the crop
+begins above row 0, putting client bytes back in the reserved rows exactly as
+before the inset -- where the band overdraws them exactly as before.
+`band_witness.rs`'s
+`a_client_that_ignores_its_configure_can_still_reach_the_reserved_rows` drives
+that against the real compositor and watches `view_reserved` go false while
+`band_over_matte` holds. `click-target` commits what it is told, which is why
+this gate asserts `view_reserved == 1`; read that as a reading of this
+session's composite, not as an invariant of the core alone. For a cooperating
+client the property is structural, for an overflowing one it is the overdraw
+it always was, and neither is weaker than what this gate proved before #304.
 
 Nothing was relaxed to make the gate green. Precisely:
 

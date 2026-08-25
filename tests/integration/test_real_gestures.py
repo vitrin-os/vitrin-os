@@ -107,9 +107,12 @@ from vitrin_os import errors  # noqa: E402
 REALM_SIZE = "640x480"
 
 #: The centre of that view. `gesture-probe`'s surface is centred by the same
-#: `layout::place` the router hit-tests with, so the centre is inside it under
-#: any surface size the shim configures — and the pointer must be over the
-#: surface before a gesture is the app's at all (`InputRouter::route_into`).
+#: `ViewGeometry::place` the router hit-tests with, so the centre is inside it
+#: under any surface size the shim configures — and the pointer must be over
+#: the surface before a gesture is the app's at all (`InputRouter::route_into`).
+#: Since #304 that centring is inside the USABLE rectangle, so the surface's
+#: own centre sits `reserved_top() / 2` rows below this point; it stays inside
+#: the surface for every size the shim configures, which is the usable view.
 CENTRE = (320.0, 240.0)
 
 #: `realm-0` sorts first, so it is the realm the output binds to at startup.

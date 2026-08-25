@@ -182,17 +182,29 @@ every use of the facet *everywhere* — the defined-but-unserved staging
 behaving exactly as designed, not a defect. Refusing at mint time would leak
 what a grant holds; that is why the mint never answers an authority question.
 
-**The reference core does not implement this request yet.** `vitrind`
-negotiates exactly version 2 and has no dispatch arm for this opcode, so
-`get_powerbox` sent to it is answered with fatal `invalid_opcode` and the
-connection dies — not the mint-then-refuse above, and not the
-`resource_exhausted` cap either, since no cap is reached by a request nothing
-handles. It is the first mint this IDL has declared without a core arm, it is a
-conformance gap in that implementation rather than a property of the request,
-and it closes in **P2.6.6** with the picker. `crates/vitrin-core/src/principal.rs`
-pins it with a test that asserts the fatal answer, so the arm cannot land
-without this paragraph and its two siblings (the IDL's, and
-[page 13's](13-vitrin_powerbox.md#served-status)) going with it.
+**The reference core is now such a server** (issue #322). `vitrind`
+dispatches this opcode: the mint succeeds, the facet enters the object table
+bound to this grant, nothing is put on the wire in answer, and every
+[`request_file`](13-vitrin_powerbox.md#request_file) and
+[`request_dir`](13-vitrin_powerbox.md#request_dir) asked through it draws
+`refused(designate_file, not_granted)` — recoverable, connection intact. Only
+the object-graph rules can fail the mint, fatally: a `new_id` that breaks the
+id rules (`invalid_object`), or the per-connection live-object cap
+(`resource_exhausted`). What is still absent is the picker (**P2.6.6**) and the
+consent copy (**P2.6.8**) that would let a petition naming `designate_file`
+resolve `granted` at all — an absence in the *verb*, not in this request.
+
+> **It was not, until issue #322, and the record is kept because the failure
+> mode is generic.** This request reached the wire with no dispatch arm behind
+> it, so a conformant version-2 client that minted the facet was answered
+> fatal `invalid_opcode` and disconnected for sending a documented request of
+> the version that core negotiates. A paragraph here said so, a paragraph in
+> the IDL said so, and a core test pinned the fatal answer; none of the three
+> made the arm land, because prose that describes a defect is not a check that
+> closes it. What replaced them is structural: a core test derives this
+> interface's mint opcodes from generated code and fails on any one of them no
+> arm dispatches, so a later mint cannot land vocabulary-only the way this one
+> did.
 
 ### get_egress
 
@@ -232,15 +244,18 @@ the terms `get_launcher` was defined on before any deployment served
 that refuses on first use leaks nothing.
 
 > **Implementation status, stated rather than implied.** The reference core
-> does not implement this request. `vitrind`'s grant-object dispatch has no
-> arm for it, so sending it today is answered `invalid_opcode` and the
-> connection dies — not "always legal" and not "refuses at use". The gap is
-> between this page and the shipped binary, and P2.7.3 closes it alongside the
-> proxy. It is the **second** such gap on this interface, not the first;
-> `get_powerbox` above carries the other, and the two are separately owned.
-> `crates/vitrin-core/src/principal.rs` pins this one with a test of its own
-> that asserts the fatal answer *and* the opcode, so neither the gap nor the
-> 3-vs-4 resolution can quietly come back.
+> implements this request (issue #322): `vitrind`'s grant-object dispatch
+> mints the facet, answers nothing on the wire, and refuses every
+> [`request_connect`](19-vitrin_egress.md#request_connect) asked through it
+> `not_granted` — "always legal" at the mint, "refuses at use" at the
+> chokepoint, exactly as this page describes. Nothing about the **verb** moved
+> with it: `egress` is served by nobody, and P2.7.3 still owns the proxy that
+> would change that. Until #322 this and `get_powerbox` were the two mints on
+> this interface a reader could not assume the shipped binary answered — both
+> were on the wire with no arm behind them, so both were answered fatal
+> `invalid_opcode` and the connection died. One change closed both, together
+> with the two facets' own requests, because a mint whose object serves no
+> request moves the identical defect one interface down.
 
 ## Events
 
@@ -537,13 +552,17 @@ ask through; it is not a mechanism to answer with.
 Three implementation gaps, named here so this section is a *complete* list
 rather than a list that reads complete:
 
-- **The reference core implements none of the facet's messages.** `vitrind`'s
-  grant-object dispatch has no arm for `get_egress`, and no object kind for
-  `vitrin_egress`, so sending either today is answered `invalid_opcode` and
-  the connection dies — where this page says the mint is always legal and the
-  use refuses recoverably. That is a gap between the spec and the shipped
-  binary, not a second reading of the spec, and it is P2.7.3's to close along
-  with the proxy.
+- **The reference core implements the facet's messages and none of the
+  comparison behind them.** Since issue #322 `vitrind` mints `vitrin_egress`
+  and decodes `request_connect` — enforcing the `port` domain fatally and the
+  `host` bound in the decoder — and then refuses `not_granted` at the
+  chokepoint, because `egress` is in no served set. The endpoint the request
+  names is decoded and **dropped**: the narrowing comparison this section
+  specifies, request endpoint against the grant's `net:` selector, has nothing
+  to run against while no grant row can carry the bit. P2.7.3 owes the
+  comparison and the proxy *in one change* — serving the verb without the
+  comparison would turn a grant over one endpoint into reach to every
+  endpoint.
 - **The parser for this grammar is never called.** It exists
   (`crates/vitrin-core/src/grants.rs`, `NetSelector`) and nothing in the
   admission path reaches it — a `net:` petition is refused like any other

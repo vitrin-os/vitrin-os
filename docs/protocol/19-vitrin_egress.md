@@ -27,16 +27,34 @@ Two separate statements, and they are not the same statement:
    out-of-core mediating proxy a connection would be made through. This
    interface is a *request to ask through*; it is not a *mechanism to answer
    with*, and landing one does not land the other.
-2. **The reference core implements none of these messages at all.**
-   `vitrind`'s dispatch has no arm for `get_egress` and no object kind for
-   this interface, so sending either message today is answered
-   `invalid_opcode` and the connection dies — where this page says the mint is
-   always legal and the use refuses recoverably. That is a gap between this
-   specification and the shipped binary, not a second reading of the
-   specification. **P2.7.3 owns it**, together with the proxy.
+2. **The reference core implements these messages**, which is the weaker of
+   the two statements and buys exactly one thing: an answer instead of a dead
+   socket. Since issue #322 `vitrind` dispatches
+   [`get_egress`](04-vitrin_grant.md#get_egress) and
+   [`request_connect`](#request_connect) — the mint is always legal and
+   silent, the request's grammar is checked (a `port` outside 1–65535 is fatal
+   `invalid_argument`; the `host` bound is the decoder's), and the use is then
+   refused [`refused(egress, not_granted)`](04-vitrin_grant.md#refused),
+   recoverably. The endpoint the request names is decoded and **dropped**: the
+   narrowing comparison [below](#why-this-request-names-an-endpoint-at-all)
+   has nothing to run against while no grant row can carry the bit, and
+   **P2.7.3 owes that comparison in the same change as the proxy** — serving
+   the verb without it would turn a grant over one endpoint into reach to
+   every endpoint. Neither [`connected`](#connected) nor
+   [`connect_failed`](#connect_failed) is reachable in that build, because
+   both belong to a use the chokepoint admitted.
+
+   > Until issue #322 there was no arm for either message, so both were
+   > answered `invalid_opcode` and the connection died — where this page says
+   > the mint is always legal and the use refuses recoverably. Prose in three
+   > places described that gap and none of it closed it; what closed it, and
+   > keeps it closed, is a core test that derives `vitrin_grant`'s mint
+   > opcodes from generated code and fails on any that no arm dispatches.
 
 Everything below describes the wire contract. Where it uses the present
-tense, it is stating what a conforming server does, not what `vitrind` does.
+tense, it is stating what a conforming server does — which for the mint, the
+grammar and the refusal is now also what `vitrind` does, and for everything
+past the chokepoint's `not_granted` is not.
 
 The staging is the same one `realm_launch` used, carried one step further: the
 verb bit landed with no message at all, the facet landed next, and the
@@ -296,7 +314,11 @@ nothing else.
   one. The obvious implementation refuses every non-launch use when the realm
   has no live view; `egress` joining that arm would be a bug, and it is named
   here because the reference core's existing chokepoint has exactly that
-  shape.
+  shape. Since issue #322 that core carries the exemption as a **named
+  predicate** listing all three exempt use classes (launch, designation,
+  egress) with the clause behind each, rather than as an inline test for
+  `launch` alone — which is the shape that would have swept this verb into the
+  refusing arm without anyone reading the sentence that forbids it.
 - **Never `preempted` or `consent_held`.** Both are attention-shaped. An
   outbound socket neither reaches the human's realm nor is visible to the
   human, so a hand on the input has nothing to say about it.
@@ -434,7 +456,11 @@ sees those bytes.
 
 The mint succeeds whatever the grant holds; the refusal comes at use. This is
 **every** exchange on **every** deployment today, because no deployment serves
-the verb.
+the verb — and since issue #322 it is exactly what the reference core does,
+rather than the shape a conforming server would have. The same three lines
+against a still-**pending** grant give the same answer: minting before
+resolution is legal, and "use while pending, through an ungranted facet" is
+what `not_granted` names.
 
 ### 3. The far end is down
 

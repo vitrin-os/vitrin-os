@@ -991,7 +991,7 @@ impl HeadlessState {
     /// ships.
     ///
     /// **No descriptor, no pixels, and nothing that moves with the session
-    /// secret.** The reply is [`BandReport`]'s ten ASCII fields and nothing
+    /// secret.** The reply is [`BandReport`]'s fifteen ASCII fields and nothing
     /// else; the argument that this is a stricter rule than "no pixels", and
     /// the near-miss that motivates it, are in [`super::band_witness`]. There
     /// is deliberately no fail-closed table here because there is nothing to

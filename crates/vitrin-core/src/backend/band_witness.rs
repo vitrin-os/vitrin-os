@@ -14,6 +14,47 @@
 //!   those rows on the human-visible output, and never reaches the capture
 //!   path at all. This needs no secret to check: it is an *invariance*
 //!   statement, and this module measures it.
+//!
+//!   **Since issue #304 that half is stronger, and this module had to be
+//!   taught the difference.** The app is now *configured* at
+//!   [`crate::view::ViewGeometry::usable`] — the output minus the reserved
+//!   rows — so it is not merely overdrawn in the band's rows, it has no way
+//!   to address them: [`crate::scene::Scene::compose`] fills them with
+//!   [`crate::scene::LETTERBOX_RGBA`] and places the client's buffer below.
+//!   The old statement ("it painted there and the band covered it anyway") is
+//!   a consequence of the new one, not the other way round.
+//!
+//!   That strengthening cost the counters their self-sufficiency, which is
+//!   the trap worth naming: with the client unable to reach those rows of the
+//!   view, **nothing the client does can move them**, so a build whose
+//!   [`ConsentSurface::composite_trust_band`] were made a no-op would leave
+//!   the output's band rows holding the matte — uniform, fully opaque, and
+//!   unmoved by any repaint — and `band_changes == 0` and
+//!   `band_uniform == true` are then satisfied by a session with no trusted
+//!   band on the screen at all.
+//!
+//!   Both directions of `band_changes` are degenerate now, and it is worth
+//!   being exact about which: a **zero** is guaranteed by the inset rather
+//!   than earned by the band; a **rise**, on a bandless build, comes from the
+//!   *core's* own composition showing through — the empty-scene background
+//!   before a client attaches, a consent scrim — never from the app. Measured
+//!   on the shipped binary: with the composite deleted,
+//!   `tests/integration/test_real_trust_band.py`'s first reading was
+//!   `band_changes=3, band_uniform=1, tracks_view=1, view_reserved=1`, and
+//!   the `3` was already `1` at four composites before any petition. A
+//!   criterion that only fires when something unrelated moves is not the
+//!   criterion.
+//!
+//!   Inheriting a stronger property while a gate criterion quietly stops
+//!   discriminating is how a check comes to stop checking. So the
+//!   strengthening is *asserted* rather than assumed, by a field for each
+//!   half: [`BandReport::view_reserved`] (the client cannot reach those rows)
+//!   and [`BandReport::band_over_matte`] (the band still drew over them
+//!   last). `a_no_op_band_over_a_reserved_view_survives_both_old_counters` is
+//!   the in-process pin — it feeds client repaints and nothing else, so it
+//!   isolates the client's contribution the real session cannot — and it
+//!   asserts the old counters passing so the reason the fields exist cannot
+//!   be read as decoration.
 //! - **The positive half.** A human at a real screen, having learned the
 //!   colour off the band, can tell a genuine prompt's frame from a forgery.
 //!   That needs an eye and a display; there is no automatable form of it, and
@@ -37,6 +78,16 @@
 //! > [`TrustedIndicator::generate`] scales each channel into `[64, 255]`, so
 //! > `S` has at most `192³ ≈ 7.1 M` values; the app recovers the session
 //! > secret by search.
+//!
+//! [`BandReport::band_over_matte`] is the nearest thing to that shape this
+//! module exports, and the distinction is the whole reason it is safe: it
+//! compares the band against [`crate::scene::LETTERBOX_RGBA`], a constant in
+//! this crate's own source, **not** against bytes the client chose. The
+//! client picked `C` in the oracle above; it cannot pick the matte. And the
+//! floor makes the answer a constant rather than a bit: every channel of a
+//! mintable indicator is in `[64, 255]` and the matte's are `0x0f, 0x0f,
+//! 0x14`, so the field is `true` for every legal session. A same-uid attacker
+//! reading it learns what the source already told them.
 //!
 //! So the rule here is: **every field this module exports must be a constant
 //! function of the run, independent of the *value* of the indicator.** Then a
@@ -74,9 +125,11 @@
 //!   other realm it would read `false` forever and mean nothing.
 //! - [`BandReport::probe_changes`] and [`BandReport::probe_fnv`] digest the
 //!   bound realm's rows below the band.
-//! - [`BandReport::band_changes`] and [`BandReport::band_uniform`] are about
-//!   the output's band rows, which belong to no realm at all — they are the
-//!   core's own overdraw.
+//! - [`BandReport::band_changes`], [`BandReport::band_uniform`] and
+//!   [`BandReport::band_over_matte`] are about the output's band rows, which
+//!   belong to no realm at all — they are the core's own overdraw.
+//! - [`BandReport::view_reserved`] is about **the bound realm's** view again:
+//!   the rows that realm's app was configured out of.
 //!
 //! Before this the assertion was about "the realm view" with one realm to
 //! mean, so it was true by having nothing to be ambiguous about.
@@ -169,8 +222,19 @@ pub(crate) struct BandReport<'a> {
     /// Composites (after the first) at which the human-visible output's band
     /// rows differed, byte for byte, from the previous composite's.
     ///
-    /// **Zero in a correct session, always.** This is the property: the band's
-    /// rows are invariant under everything the client does.
+    /// **Zero in a correct session, always.** This was the property: the
+    /// band's rows are invariant under everything the client does.
+    ///
+    /// **It stopped being a statement about the client when the realm view was
+    /// inset** (issue #304). The client no longer owns those rows of the view,
+    /// so nothing it does can raise this counter — the zero is guaranteed by
+    /// the inset rather than earned by the band, and a build whose band never
+    /// composited at all reports it too. What can still raise it is the core's
+    /// own composition changing beneath an absent band. So the field is kept
+    /// as the statement "the core holds these rows constant", which is worth
+    /// having, and [`Self::band_over_matte`] is what says the constant is a
+    /// drawn band. The pair is what a reader must take together; neither alone
+    /// is the property any more.
     pub band_changes: u64,
     /// Composites (after the first) at which the **realm view's** probe strip
     /// — the [`TRUST_BAND_HEIGHT`] rows immediately *below* the band — changed.
@@ -241,10 +305,63 @@ pub(crate) struct BandReport<'a> {
     /// own `--capture-dump` read and check that this witness was evaluated on
     /// the frame the harness is looking at.
     pub probe_fnv: u64,
+    /// At the latest composite: every pixel of the **realm view's** reserved
+    /// rows — `band_h + strip_h`, the rows
+    /// [`crate::view::ViewGeometry::reserved_top`] keeps — is exactly
+    /// [`crate::scene::LETTERBOX_RGBA`], the core's own matte.
+    ///
+    /// **The structural half of the property** (issue #304). Before the realm
+    /// view was inset, the app was configured at the output's full height, so
+    /// the client's own pixels really were in those rows of its view and the
+    /// band's whole job was to cover them. Now the app is configured at
+    /// [`crate::view::ViewGeometry::usable`] and
+    /// [`crate::scene::Scene::compose`] fills the reserved rows with the matte
+    /// before it blits anything, so a confined client has no way to address
+    /// them at all — which is strictly stronger than "it is covered", and this
+    /// is where that strength is asserted rather than assumed.
+    ///
+    /// It fails, loudly, on the regression that would silently restore the old
+    /// weaker world: a `configure` that went back to carrying the output's
+    /// full height, or a placement that stopped translating by
+    /// `reserved_top()`, puts client bytes back in these rows and reads
+    /// `false` here.
+    ///
+    /// Secret-independent, like every other field: the comparison is against a
+    /// compile-time core constant, and the indicator is not one of its inputs.
+    pub view_reserved: bool,
+    /// At the latest composite: **no** pixel of the human-visible output's
+    /// band rows is [`crate::scene::LETTERBOX_RGBA`] — something was painted
+    /// over the matte those rows arrive carrying.
+    ///
+    /// **The temporal half of the property**, and the reason it had to be
+    /// added with the inset. [`Self::band_changes`] used to carry it by
+    /// itself: with the client owning those rows of the view, a
+    /// `composite_trust_band` made a no-op let the client's repaint through
+    /// and the counter rose. With [`Self::view_reserved`] true those rows are
+    /// a core-owned constant that no client can move, so a band that never
+    /// drew leaves them constant *and* uniform — `band_changes == 0` and
+    /// `band_uniform == true` are both satisfied by a build with no band at
+    /// all. **This is the only field a no-op band fails**, and it was measured
+    /// that way against the shipped binary rather than argued: see the module
+    /// docs for the reading that sabotage produced.
+    ///
+    /// **Why this is not the brute-force oracle the module docs reject.** That
+    /// oracle was *"the band's rows equal the realm view's rows beneath
+    /// them"*, and it leaked because the client chose the right-hand side: the
+    /// bit was exactly `S == C` for a candidate colour `C` the app painted.
+    /// Here the right-hand side is `LETTERBOX_RGBA`, a constant in this
+    /// crate's source that no client and no peer of this channel contributes a
+    /// byte to. Its value is `[0x0f, 0x0f, 0x14, 0xff]` and
+    /// [`TrustedIndicator::generate`] scales every channel into `[64, 255]`,
+    /// so a mintable indicator can never equal it: this field is `true` for
+    /// **every** legal session and carries zero bits about which one. That is
+    /// the same floor `tests/integration/test_real_trust_band.py` already
+    /// leans on, used in the same safe direction.
+    pub band_over_matte: bool,
 }
 
 impl std::fmt::Display for BandReport<'_> {
-    /// The channel's wire form: thirteen space-separated ASCII fields, no
+    /// The channel's wire form: fifteen space-separated ASCII fields, no
     /// payload, no descriptor. Rendered here rather than at the call site so
     /// the one place the report becomes bytes is the one place to audit.
     ///
@@ -253,7 +370,9 @@ impl std::fmt::Display for BandReport<'_> {
     /// bound. WS-E.2.3's two strip fields are appended **after** it for the
     /// same reason it was appended after the digest: every position an existing
     /// reader indexes stays where it was, and a harness that has not been taught
-    /// about the strip reads the same numbers it read before.
+    /// about the strip reads the same numbers it read before. #304's
+    /// [`BandReport::view_reserved`] and [`BandReport::band_over_matte`] are
+    /// appended after those, on the same rule.
     ///
     /// **Why it cannot turn this line into a payload**, stated as the two
     /// separate facts it actually rests on:
@@ -271,7 +390,8 @@ impl std::fmt::Display for BandReport<'_> {
     ///   64 rather than the 7 bytes `realm-0` happens to occupy.
     ///
     /// Sixty-five bytes (the id plus its separator) is more than half the
-    /// channel's 128-byte budget, so `the_wire_form_is_eleven_scalar_fields`
+    /// channel's 128-byte budget, so
+    /// [`the_band_reply_fits_the_channel_at_the_longest_legal_realm_id`]
     /// measures the line at the **loader's** maximum rather than at a
     /// fixture's, and records what is left over for the counters.
     ///
@@ -280,11 +400,13 @@ impl std::fmt::Display for BandReport<'_> {
     /// with *or* without a realm id (137 bytes for the first ten fields
     /// alone), and that is stated rather than papered over: what makes the
     /// bound hold is that they count this session's composites, and the test
-    /// pins the headroom that leaves.
+    /// derives the ceiling that leaves and asserts a reply at it still fits.
+    ///
+    /// [`the_band_reply_fits_the_channel_at_the_longest_legal_realm_id`]: tests::the_band_reply_fits_the_channel_at_the_longest_legal_realm_id
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} {} {} {} {} {} {} {} {} {:016x} {} {} {}",
+            "{} {} {} {} {} {} {} {} {} {:016x} {} {} {} {} {}",
             self.composites,
             self.band_changes,
             self.probe_changes,
@@ -298,6 +420,8 @@ impl std::fmt::Display for BandReport<'_> {
             self.realm.unwrap_or("-"),
             self.strip_h,
             self.strip_changes,
+            u8::from(self.view_reserved),
+            u8::from(self.band_over_matte),
         )
     }
 }
@@ -337,6 +461,8 @@ pub(crate) struct BandWitness {
     refusals: u64,
     tracks_view: bool,
     band_uniform: bool,
+    view_reserved: bool,
+    band_over_matte: bool,
     band_h: u32,
     strip_h: u32,
     view_w: u32,
@@ -365,6 +491,8 @@ impl BandWitness {
             // be mistaken for a passing one.
             tracks_view: false,
             band_uniform: false,
+            view_reserved: false,
+            band_over_matte: false,
             band_h: 0,
             strip_h: 0,
             view_w: 0,
@@ -475,6 +603,20 @@ impl BandWitness {
         self.band_uniform = band_bytes > 0
             && band[3] == 0xff
             && band.chunks_exact(4).all(|pixel| pixel == &band[..4]);
+        // #304's two halves. `view[..strip_end]` is exactly the rows
+        // `ViewGeometry::reserved_top` keeps — the band's plus the strip's —
+        // so this is "the client cannot address them", read off the same
+        // buffer the capture path serves. `band` is the human-visible
+        // output's band rows, so the second is "and something was drawn over
+        // the matte they arrive carrying". Neither mentions the indicator.
+        self.view_reserved = strip_end > 0
+            && view[..strip_end]
+                .chunks_exact(4)
+                .all(|pixel| pixel == crate::scene::LETTERBOX_RGBA);
+        self.band_over_matte = band_bytes > 0
+            && band
+                .chunks_exact(4)
+                .all(|pixel| pixel != crate::scene::LETTERBOX_RGBA);
     }
 
     pub(crate) fn report(&self) -> BandReport<'_> {
@@ -486,6 +628,8 @@ impl BandWitness {
             strip_changes: self.strip_changes,
             tracks_view: self.tracks_view,
             band_uniform: self.band_uniform,
+            view_reserved: self.view_reserved,
+            band_over_matte: self.band_over_matte,
             refusals: self.refusals,
             band_h: self.band_h,
             strip_h: self.strip_h,
@@ -504,13 +648,41 @@ mod tests {
     const W: u32 = 40;
     const H: u32 = 24;
 
-    /// A realm view filled with one colour — a confined app painting its whole
-    /// surface, which is the strongest counterfeit available to something that
-    /// cannot see the colour it would have to match.
+    /// A realm view filled with one colour, **band rows included** — the
+    /// pre-#304 shape, when an app was configured at the output's full height
+    /// and really could paint the rows the band would cover.
+    ///
+    /// **No longer what `Scene::compose` produces**, and kept deliberately:
+    /// the counters' arithmetic is still specified over "the client's bytes
+    /// moved in the band's rows", and this is the only fixture that can put
+    /// them there. Every test whose subject is the *shipping* view shape uses
+    /// [`composed_view`] instead, and the two are contrasted by
+    /// [`the_witness_tells_a_reserved_view_from_a_client_painted_one`].
     fn client_view(rgb: [u8; 3]) -> Vec<u8> {
         [rgb[0], rgb[1], rgb[2], 0xff]
             .repeat(W as usize * H as usize)
             .to_vec()
+    }
+
+    /// A realm view of the shape [`crate::scene::Scene::compose`] actually
+    /// produces since issue #304: the reserved rows are the core's matte, and
+    /// the client's colour starts at
+    /// [`crate::view::ViewGeometry::reserved_top`].
+    ///
+    /// `strip_h` rows of strip on top of the band's, so the same fixture
+    /// serves a `--status`-off session (`0`) and a `--status`-on one.
+    fn composed_view(rgb: [u8; 3], strip_h: u32) -> Vec<u8> {
+        let reserved = (TRUST_BAND_HEIGHT + strip_h).min(H);
+        let mut view = crate::scene::LETTERBOX_RGBA.repeat((W * reserved) as usize);
+        view.extend_from_slice(
+            &[rgb[0], rgb[1], rgb[2], 0xff].repeat((W * (H - reserved)) as usize),
+        );
+        assert_eq!(
+            view.len(),
+            (W * H * 4) as usize,
+            "fixture must be a whole frame"
+        );
+        view
     }
 
     /// The real human-visible composite: the shared overlay step both backends
@@ -923,6 +1095,165 @@ mod tests {
         assert_eq!(report.band_h, TRUST_BAND_HEIGHT);
     }
 
+    /// **The two halves of the post-#304 property, over the view shape
+    /// `Scene::compose` actually emits**: the client cannot address the
+    /// reserved rows, and the band is drawn over the matte they carry.
+    ///
+    /// This is the real-app gate's scenario translated to the shipping
+    /// geometry — a confined app repainting everything it owns, twice — and
+    /// it is the positive control for
+    /// [`a_no_op_band_over_a_reserved_view_survives_both_old_counters`]: same
+    /// views, real band, both new fields true.
+    #[test]
+    fn a_reserved_view_keeps_the_client_out_of_the_bands_rows_entirely() {
+        let mut witness = BandWitness::new();
+        let indicator = TrustedIndicator::for_test();
+        for rgb in [[0x00, 0x00, 0x00], [0xff, 0x00, 0x00], [0x00, 0xff, 0x00]] {
+            let view = composed_view(rgb, 0);
+            let output = human_visible(&view, indicator);
+            witness.observe(&view, &output, W, H, 0, Some(&bound()));
+        }
+        let report = witness.report();
+        assert_eq!(report.composites, 3);
+        assert_eq!(report.band_changes, 0, "client content reached the band");
+        assert!(
+            report.view_reserved,
+            "the realm view's reserved rows must be the core's matte: the app is configured \
+             at `usable()`, so nothing of its own can be in them"
+        );
+        assert!(
+            report.band_over_matte,
+            "the band must still be drawn over that matte -- `view_reserved` alone would be \
+             satisfied by a build with no band at all"
+        );
+        assert!(report.band_uniform);
+        assert_eq!(
+            report.probe_changes, 2,
+            "the client's own rows -- now the FIRST rows it has -- must be seen changing"
+        );
+        assert!(report.tracks_view);
+        assert_eq!(report.refusals, 0);
+    }
+
+    /// **Why [`BandReport::band_over_matte`] had to be added** (issue #304),
+    /// and it is written as the demonstration rather than asserted in a
+    /// comment: the exact sabotage `test_real_trust_band.py` names first — a
+    /// `composite_trust_band` made a no-op — **passes both counters that used
+    /// to catch it** once the realm view is inset.
+    ///
+    /// The two `assert!`s on the old fields are the point of the test and must
+    /// not be softened into `let _ =`: if a later change makes `band_changes`
+    /// discriminate here again, this test goes red and says the new fields'
+    /// justification has moved.
+    #[test]
+    fn a_no_op_band_over_a_reserved_view_survives_both_old_counters() {
+        let mut witness = BandWitness::new();
+        for rgb in [[0x00, 0x00, 0x00], [0xff, 0x00, 0x00], [0x00, 0xff, 0x00]] {
+            // The output IS the view: what `human_visible_from_view` would
+            // return with the band's composite deleted.
+            let view = composed_view(rgb, 0);
+            witness.observe(&view, &view, W, H, 0, Some(&bound()));
+        }
+        let report = witness.report();
+        assert_eq!(
+            report.band_changes, 0,
+            "PRE-#304 this sabotage raised this counter, because the client owned these rows \
+             of its own view; it no longer can, so the matte sits there unchanged"
+        );
+        assert!(
+            report.band_uniform,
+            "...and the matte is one fully opaque colour, so uniformity passes too"
+        );
+        assert!(
+            report.tracks_view,
+            "...and an unpainted band tracks the view perfectly, as it always did"
+        );
+        assert!(
+            report.view_reserved,
+            "the view is the shipping shape: this sabotage is about the band, not the inset"
+        );
+        assert!(
+            !report.band_over_matte,
+            "THE FIELD THIS TEST EXISTS FOR: with every older criterion passing, only \
+             `band_over_matte` distinguishes a session with a trusted band from one without"
+        );
+    }
+
+    /// The structural half is a real reading of the pixels, not a constant:
+    /// the same witness reports `view_reserved` false on a view whose reserved
+    /// rows carry client bytes.
+    ///
+    /// That is the shape a reverted inset produces — a `configure` carrying the
+    /// output's full height, or a placement that stopped translating by
+    /// `reserved_top()` — so this is the regression `view_reserved` is for.
+    #[test]
+    fn the_witness_tells_a_reserved_view_from_a_client_painted_one() {
+        let indicator = TrustedIndicator::for_test();
+        for (view, want, what) in [
+            (
+                composed_view([0x11, 0x22, 0x33], 0),
+                true,
+                "the shipping shape",
+            ),
+            (client_view([0x11, 0x22, 0x33]), false, "the pre-#304 shape"),
+        ] {
+            let mut witness = BandWitness::new();
+            let output = human_visible(&view, indicator);
+            witness.observe(&view, &output, W, H, 0, Some(&bound()));
+            assert_eq!(
+                witness.report().view_reserved,
+                want,
+                "view_reserved must read {want} over {what}"
+            );
+            // The band is drawn either way: this field is about the view, and
+            // a reader must not be able to confuse the two halves.
+            assert!(witness.report().band_over_matte);
+        }
+    }
+
+    /// With `--status` on, the reserved rows are the band's **and** the
+    /// strip's — `ViewGeometry::reserved_top()` — and `view_reserved` is about
+    /// all of them.
+    ///
+    /// Written because the tempting implementation checks only the band's
+    /// rows, which would leave a client able to paint the strip's rows of its
+    /// own view while this still read `true`.
+    #[test]
+    fn view_reserved_covers_the_strips_rows_too_when_a_strip_is_up() {
+        const STRIP_H: u32 = 6;
+        let indicator = TrustedIndicator::for_test();
+
+        let good = composed_view([0x11, 0x22, 0x33], STRIP_H);
+        let mut witness = BandWitness::new();
+        witness.observe(
+            &good,
+            &human_visible(&good, indicator),
+            W,
+            H,
+            STRIP_H,
+            Some(&bound()),
+        );
+        assert!(witness.report().view_reserved);
+        assert_eq!(witness.report().strip_h, STRIP_H);
+
+        // The band's rows reserved, the strip's rows client-painted: exactly
+        // what a band-only check would wave through.
+        let band_only = composed_view([0x11, 0x22, 0x33], 0);
+        let mut witness = BandWitness::new();
+        witness.observe(
+            &band_only,
+            &human_visible(&band_only, indicator),
+            W,
+            H,
+            STRIP_H,
+            Some(&bound()),
+        );
+        assert!(
+            !witness.report().view_reserved,
+            "a view whose strip rows carry client bytes is not a reserved view"
+        );
+    }
+
     /// **The gate's discriminating power, pinned in-process** (plan §5 D12
     /// item 4: where a criterion is a computed metric, pin the metric against
     /// one input it must accept and one from the class it claims to reject).
@@ -932,6 +1263,13 @@ mod tests {
     /// frame in those rows. Modelled by handing the witness the realm view as
     /// the human-visible output — which is what `human_visible_from_view`
     /// would return if `composite_trust_band` were a no-op.
+    ///
+    /// **The view it feeds is the pre-#304 shape and this test says so**, so
+    /// that what it pins is not mistaken for the shipping case: it pins the
+    /// *arithmetic* — client bytes that move in the band's rows are counted —
+    /// over a frame `Scene::compose` no longer emits. The shipping case is
+    /// [`a_no_op_band_over_a_reserved_view_survives_both_old_counters`], where
+    /// this same sabotage passes `band_changes` and is caught elsewhere.
     #[test]
     fn a_band_that_did_not_overdraw_the_client_is_counted_as_a_change() {
         let mut witness = BandWitness::new();
@@ -1173,37 +1511,56 @@ mod tests {
         // A zero digest rather than the FNV offset basis: nothing was hashed,
         // and a report that opened with the digest of the empty string would be
         // indistinguishable from one taken over an empty probe strip.
+        assert!(!report.view_reserved);
+        assert!(!report.band_over_matte);
         assert_eq!(
             report.to_string(),
-            "0 0 0 0 0 0 0 0 0 0000000000000000 - 0 0"
+            "0 0 0 0 0 0 0 0 0 0000000000000000 - 0 0 0 0"
         );
     }
 
-    /// The wire form is thirteen fields of bounded ASCII, so the reply cannot
+    /// The wire form is fifteen fields of bounded ASCII, so the reply cannot
     /// become a pixel channel by accident: `MAX_LINE` is 128 bytes and a
     /// 640x480 band is 20 480. The eleventh is the bound realm's id, itself
     /// length-bounded by the loader; the twelfth and thirteenth are WS-E.2.3's
     /// strip height and strip-changed counter, appended after it so every
-    /// position an existing reader indexes stays where it was.
+    /// position an existing reader indexes stays where it was; the fourteenth
+    /// and fifteenth are #304's `view_reserved` and `band_over_matte`, two
+    /// single-digit booleans appended on the same rule.
     ///
-    /// **Measured at the loader's maximum, not at `realm-0`'s length.** The
-    /// bound that matters is 64 bytes over `[A-Za-z0-9._-]`, and this test
-    /// used to render a 7-byte fixture and conclude the line fits — which
-    /// checked 7 of the 65 bytes the field can actually contribute out of a
-    /// 128-byte budget. See [`BandReport`]'s `Display` for the two facts the
-    /// no-payload claim really rests on.
+    /// **The count is in the name and the name must not go stale.** This test
+    /// was `..._is_thirteen_scalar_fields` and #304's two fields made that a
+    /// number the reply no longer had: a test whose name states a count is a
+    /// published claim, and renaming it is part of moving the wire form rather
+    /// than an afterthought. The fields are read **by index** below rather
+    /// than off the end of the line, because the previous shape asserted the
+    /// strip pair with `ends_with(" 0 0")` — an assertion that stops being
+    /// about the strip the moment anything is appended after it, and would
+    /// have passed here by reading #304's two booleans instead.
     #[test]
-    fn the_wire_form_is_thirteen_scalar_fields() {
-        let report = run(TrustedIndicator::for_test(), &[client_view([1, 2, 3])]);
+    fn the_wire_form_is_fifteen_scalar_fields() {
+        // The SHIPPING view shape, so the two #304 fields carry the values a
+        // correct session reports rather than the pre-inset fixture's.
+        let report = run(TrustedIndicator::for_test(), &[composed_view([1, 2, 3], 0)]);
         let line = report.to_string();
-        assert_eq!(line.split(' ').count(), 13, "{line}");
-        assert!(
-            line.contains(&format!(" {} ", crate::realm::WELL_KNOWN_REALM_ID)),
-            "the report must name the realm it is about: {line}"
+        let fields: Vec<&str> = line.split(' ').collect();
+        assert_eq!(fields.len(), 15, "{line}");
+        assert_eq!(
+            fields[10],
+            crate::realm::WELL_KNOWN_REALM_ID,
+            "the report must name the realm it is about, in the eleventh field: {line}"
         );
-        assert!(
-            line.ends_with(" 0 0"),
-            "a session with `--status` off reports a zero-height strip that never changed: \
+        assert_eq!(
+            (fields[11], fields[12]),
+            ("0", "0"),
+            "a session with `--status` off reports a zero-height strip that never changed, \
+             in the twelfth and thirteenth fields: {line}"
+        );
+        assert_eq!(
+            (fields[13], fields[14]),
+            ("1", "1"),
+            "#304's two fields are the fourteenth and fifteenth: the client cannot reach the \
+             reserved rows of its own view, and the band was drawn over the matte they carry: \
              {line}"
         );
         assert!(line.is_ascii());
@@ -1214,11 +1571,24 @@ mod tests {
     }
 
     /// **The reply still fits the channel at the longest realm id the loader
-    /// accepts**, and here is exactly how much room that leaves.
+    /// accepts**, and here is exactly how much room that leaves — re-derived
+    /// for #304's two extra fields rather than left standing at the old
+    /// number.
     ///
     /// The id is checked against the real validator rather than assumed legal,
     /// so a future tightening or loosening of the rule moves this test rather
     /// than silently invalidating the arithmetic below.
+    ///
+    /// **What changed, and why the answer is a digit budget rather than a
+    /// headroom.** The previous shape measured one minimal fixture and
+    /// asserted `headroom >= 16` — a number about *that* reply, not about any
+    /// reply the channel carries, so it said nothing about a session whose
+    /// counters had actually run. #304 appended `view_reserved` and
+    /// `band_over_matte`, two single-digit booleans and their separators, and
+    /// the reply grew by exactly four bytes. Widening `MAX_LINE` to absorb
+    /// them was refused: the bound is re-derived instead, and stated as the
+    /// thing that actually constrains the line — how many decimal digits the
+    /// nine variable-width numeric fields may share.
     #[test]
     fn the_band_reply_fits_the_channel_at_the_longest_legal_realm_id() {
         const MAX_ID: usize = 64;
@@ -1234,7 +1604,7 @@ mod tests {
 
         let mut witness = BandWitness::new();
         let realm = crate::grants::RealmId::new(&longest);
-        let view = client_view([1, 2, 3]);
+        let view = composed_view([1, 2, 3], 0);
         witness.observe(
             &view,
             &human_visible(&view, TrustedIndicator::for_test()),
@@ -1245,7 +1615,7 @@ mod tests {
         );
         let line = witness.report().to_string();
         assert!(line.is_ascii());
-        assert_eq!(line.split(' ').count(), 13, "{line}");
+        assert_eq!(line.split(' ').count(), 15, "{line}");
         assert!(
             line.contains(&format!(" {longest} ")),
             "the report must name the realm it is about: {line}"
@@ -1259,32 +1629,91 @@ mod tests {
             line.len()
         );
 
-        // What is left over, named rather than implied. The realm field eats
-        // 65 bytes of the budget; the five `u64` counters and the four `u32`
-        // geometry fields share what remains, and they are the only fields
-        // without a short bound. This is a real constraint, not a formality:
-        // at their type maximum the first ten fields alone are 137 bytes and
-        // would overflow the line with no realm id at all. What keeps the
-        // bound true is that they count *this session's* composites -- and
-        // nothing a peer of this channel, or a confined client, can inflate.
-        //
-        // **Sixteen, and the number is measured rather than modelled.** The
-        // old justification budgeted "~7 digits of `composites` and as many of
-        // `probe_changes`" -- two counters -- and WS-E.2.3 added a third
-        // (`strip_changes`) without revisiting it, so the stated model no
-        // longer described the reply it guards. Raising the threshold to match
-        // the model turns this assertion red on the real longest-legal reply,
-        // which is the honest way of finding out that the model, not the
-        // threshold, was the stale half: the counters share the residue rather
-        // than each claiming a private seven digits, because a session cannot
-        // composite 10^7 frames and also probe 10^7 times and also repaint the
-        // strip 10^7 times within one run.
-        let headroom = budget - line.len();
+        // **The bound, derived rather than eyeballed.** Everything on the line
+        // except the nine numeric fields is fixed-width once the realm id is
+        // at its maximum: 14 separators, four single-digit booleans, a 16-digit
+        // hex digest and 64 bytes of realm id. Whatever the budget has left
+        // over is the total number of decimal digits those nine may share --
+        // `composites`, `band_changes`, `probe_changes`, `refusals`,
+        // `strip_changes`, `band_h`, `view_w`, `view_h` and `strip_h`. That is
+        // the real constraint: at their `u64` maximum the counters alone would
+        // overflow the line with no realm id at all, and what keeps the bound
+        // true is that they count *this session's* composites -- nothing a peer
+        // of this channel, or a confined client, can inflate.
+        const SEPARATORS: usize = 14;
+        const BOOLEANS: usize = 4;
+        const DIGEST: usize = 16;
+        let fixed = SEPARATORS + BOOLEANS + DIGEST + MAX_ID;
+        // `< budget`, not `<=`, so the ceiling is the largest total that still
+        // satisfies the assertion above.
+        let digit_budget = budget - fixed - 1;
+        assert_eq!(
+            digit_budget, 24,
+            "the nine variable-width numeric fields share {digit_budget} digits at the longest \
+             legal realm id. This number is the wire form's real bound and it MOVED with #304: \
+             it was 28 before `view_reserved` and `band_over_matte` were appended (two booleans \
+             and two separators), and a change that moves it again is a change to what the \
+             channel can carry, not a formality"
+        );
+
+        // **What that budget buys, asserted on a rendered reply rather than
+        // modelled in a comment** -- the half the old `headroom >= 16` never
+        // did. This is the geometry every session on this channel actually
+        // runs (`--headless`, `--status` off, `tests/integration`'s 640x480)
+        // with its counters at a million composites, which is about five hours
+        // at 60 Hz.
+        let ceiling = BandReport {
+            realm: Some(&longest),
+            composites: 1_000_000,
+            band_changes: 0,
+            probe_changes: 999_999,
+            strip_changes: 0,
+            tracks_view: true,
+            band_uniform: true,
+            view_reserved: true,
+            band_over_matte: true,
+            refusals: 0,
+            band_h: TRUST_BAND_HEIGHT,
+            strip_h: 0,
+            view_w: 640,
+            view_h: 480,
+            probe_fnv: u64::MAX,
+        };
+        let at_ceiling = ceiling.to_string();
         assert!(
-            headroom >= 16,
-            "only {headroom} bytes are left for the three counters at the longest realm id; \
-             they share this residue rather than each claiming it, so a reply that fails \
-             here means a FOURTH field was added, not that a counter grew"
+            at_ceiling.len() < budget,
+            "a million-composite session at this channel's own geometry must still fit at the \
+             longest legal realm id: {} of {budget} bytes -- {at_ceiling}",
+            at_ceiling.len()
+        );
+
+        // ...and the other direction, because "it fits" without a boundary is
+        // the kind of claim that quietly stops being true. The line does NOT
+        // fit forever: pinning where it stops is what keeps the sentence above
+        // from being read as universal.
+        //
+        // A 4K output with a 20-row strip spends 11 of the 24 digits on
+        // geometry alone, leaving 13 for five counters -- so the same session
+        // overflows somewhere around a thousand composites, which is seconds.
+        // **#304 did not create this cliff; it moved it four bytes closer**,
+        // and no session this channel exists in can reach it: the channel is
+        // gated on the `consent-injector` feature plus `--headless`, and the
+        // one suite that opens it runs 640x480 under the realm id `realm-0`.
+        // Recorded here rather than fixed, because fixing it means either
+        // widening `MAX_LINE` -- which is the channel bending to suit the
+        // reply -- or shortening the reply, and neither belongs in #304.
+        let past_ceiling = BandReport {
+            view_w: 3840,
+            view_h: 2160,
+            strip_h: crate::status::MAX_HEIGHT,
+            ..ceiling
+        };
+        assert!(
+            past_ceiling.to_string().len() >= budget,
+            "the boundary this test pins has moved: a 4K, `--status`-on session at a million \
+             composites now fits at the longest legal realm id, where it did not before. That \
+             is a real improvement, but it means the sentence above about where the reply \
+             stops fitting is stale -- re-derive it rather than deleting this assertion"
         );
     }
 }

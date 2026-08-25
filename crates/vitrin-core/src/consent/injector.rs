@@ -195,7 +195,7 @@ pub(crate) enum Request {
     /// framebuffer as a sealed memfd.
     Describe,
     /// Read the trusted-band witness (issue #139):
-    /// [`crate::backend::band_witness::BandReport`] rendered as ten scalar
+    /// [`crate::backend::band_witness::BandReport`] rendered as fifteen scalar
     /// fields.
     ///
     /// **It carries no authority and no pixels, and it is the one request on

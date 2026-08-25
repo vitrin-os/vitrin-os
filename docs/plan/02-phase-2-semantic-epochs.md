@@ -904,6 +904,51 @@ The plan stays valid fully serialized for a single maintainer in rung order M2.1
 
 Recommended serial order: **P2.6.1 → P2.6.2 (+P2.6.3/P2.6.4/P2.7.1) → P2.1.1 → P2.1.2 → Track A/B to ★P2.1.9 → E2.2 → E2.3 → powerbox/egress to ★P2.6.9/★P2.7.6 → E2.4/E2.5 → E2.8 → E2.9.** Track D (IME) is the only track deferrable wholesale without stalling anything else, and it carries an explicit effort cap — so it is the correct schedule shock absorber, never the semantic spine.
 
+**This order is superseded from P2.1.1 onward — see "The serial order, corrected" immediately below, which restates it rather than replacing it.**
+
+#### The serial order, corrected
+
+> **REALIGNED 2026-08-25 BY D-047 decision 3 (the owner's), settled the same day.**
+> The order above stands as written and is the record of what this decomposition
+> recommended before Track C ran. Its first bracket — `P2.6.1 → P2.6.2
+> (+P2.6.3/P2.6.4/P2.7.1)` — was executed and is spent. **Everything after that
+> bracket is superseded**, and this block is the standing order.
+
+**The contradiction this resolves, stated because both sentences shipped.** The order
+above sends the semantic spine first and puts *powerbox/egress to ★P2.6.9/★P2.7.6*
+last, which would close M2b's rungs before M2a's. §4's re-cut says the opposite in as
+many words — *"M2a ships first, and that is the executed order rather than a
+preference."* Both landed on 2026-08-25, ninety lines apart, in the same document. The
+realignment corrected §4's rungs and left this line standing; that was an oversight,
+not a decision, and it is corrected here rather than in §4 because **decision 3 is the
+owner's and §4 is its faithful record.**
+
+**Standing serial order, from today:**
+
+**M2a first** — `#189/#196 remainders → #190 → #191 → #192 → ★#193` and
+`#197 → #198 → #199 → ★#200`, with `#335` (P2.6.11) and `#194` (P2.6.10) taken
+anywhere they fit. **Then M2b** — `#323 (P2.1.1) → #324 (P2.1.2) → Track A/B to
+★#331/★#332 → E2.2 → E2.3 → E2.4/E2.5 → E2.8 → E2.9`. Track D (IME) is still the only
+track deferrable wholesale, and still the correct shock absorber rather than the
+semantic spine.
+
+**Why, in the terms §3 already uses.** The inversion's premise was that Track C
+*should* go first; it did, and it is four of sixteen built while the semantic spine has
+not started. M2a's two demos are the nearest releasable thing this phase has, WS-C's
+second announcement beat is keyed to them ([12-workstream-community.md](12-workstream-community.md)),
+and E2.6 is the only producer of C1–C5 that is decomposed at all.
+
+**The cost, which is real and is not smoothed over here.** **P2.1.1 and P2.1.2 are the
+two hard freezes this section names**, and deferring them means E2.2, E2.4, E2.5 and
+every SDK surface keep designing against a schema that does not exist — the exact
+rework this section's serialization points were written to prevent. WS-D
+([13-workstream-agent-integration.md](13-workstream-agent-integration.md)) waits on the
+same tree. And **P2.6.12 (#336) is blocked on #325/#326**, so M2a ships with the
+confinement claim §4 records: measured against a realm with accessibility **off**, and
+bounded until E2.1 lands regardless of which order is taken. Choosing M2a first does
+not escape that bound; it accepts it and dates it.
+
+
 One consequence no epic states on its own: **E2.1 reverses `GTK_A11Y=none` and `NO_AT_BRIDGE=1`**, set precisely because a11y activation cost ~20 s. This sentence named four sites and there are **nine**, in three classes — the count was wrong and is corrected here rather than in a block, because nothing was ever decided about it:
 
 - **Four inherit the setting from a harness** — `shim/docs/firefox.md`, `shim/tests/acceptance/firefox_bringup.sh`, `shim/tests/acceptance/seat_input_replay.sh` and `crates/xtask/src/main.rs`, which is the original enumeration.

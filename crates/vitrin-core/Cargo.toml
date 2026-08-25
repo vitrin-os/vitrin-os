@@ -452,19 +452,23 @@ dead-man-injector = []
 #      BandWitness` as a field on `HeadlessOutput`, updated on EVERY composite
 #      from the two buffers `HeadlessOutput::present` already holds (the realm
 #      view and the human-visible output), plus a `band` request on that same
-#      socket that reports its ten ASCII counters. What it turns on, stated so
+#      socket that reports its fifteen ASCII fields. What it turns on, stated so
 #      this block is a complete answer to "what does an instrumented build
-#      expose": running counts of composites evaluated, of composites at which
-#      the human-visible band's rows changed (zero in a correct session -- the
-#      property), of composites at which the realm view's rows just BELOW the
-#      band changed, of composites refused for a malformed buffer; three
-#      latest-composite scalars (the band's height and the view's dimensions);
-#      two latest-composite booleans (the output below the band tracks the
-#      realm view; the band's rows are one opaque colour); and an FNV-1a-64
-#      digest of those realm-view rows below the band. No descriptor, no
-#      pixels. Each `band` request costs one extra composite, because
-#      `answer_band` recomposites first so the reply describes the frame on the
-#      virtual display now.
+#      expose": FIVE running counts -- composites evaluated, composites at
+#      which the human-visible band's rows changed (zero in a correct session
+#      -- the property), composites at which the realm view's rows just BELOW
+#      the band changed, composites at which the status strip's rows changed,
+#      and composites refused for a malformed buffer; FOUR latest-composite
+#      scalars (the band's height, the status strip's height, and the view's
+#      dimensions); FOUR latest-composite booleans (the output below the band
+#      and the strip tracks the realm view; the band's rows are one opaque
+#      colour; the realm view's reserved rows are the core's own matte, so the
+#      client cannot address them at all; and the band was drawn over that
+#      matte rather than left showing it); an FNV-1a-64 digest of those
+#      realm-view rows below the band; and the bound realm's id from
+#      `realm.toml`. No descriptor, no pixels. Each `band` request costs one
+#      extra composite, because `answer_band` recomposites first so the reply
+#      describes the frame on the virtual display now.
 #
 # (4) rides #138's channel rather than opening a second one because it is a
 # READ that confers nothing: it adds no authority to a socket that already

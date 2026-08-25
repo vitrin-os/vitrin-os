@@ -73,34 +73,129 @@ grounds, any one of which is fatal.
 # What this gate proves, end to end, against `click-target`
 
 `click-target` paints black with a centred green square and, on a landed
-pointer click, repaints its **whole surface** red -- top rows included. That is
-the strongest counterfeit a confined app can attempt against a colour it cannot
-observe: own every pixel of the rows the band occupies, and change them.
+pointer click, repaints its **whole surface** red. That is the strongest
+counterfeit a confined app can attempt against a colour it cannot observe:
+change every pixel it owns, as fast and as completely as it is able.
 
-1. **The capture path never carries the band.** The band's rows, read out of
+# WHAT ISSUE #304 CHANGED HERE, AND WHY THIS GATE IS NOT WEAKER FOR IT
+
+Until #304 the app was **configured at the output's size**, so the band's rows
+were rows of the app's own surface: it painted them, and the band overdrew
+them on the way to the human. This gate's counterfeit was literally *"own
+every pixel of the rows the band occupies, and change them"*, and its
+capture-side proof was *"those rows are exactly the colour the app painted"*.
+
+Since #304 the app is configured at `ViewGeometry::usable()` -- the output
+minus the rows the core reserves along the top edge -- and `Scene::compose`
+fills the reserved rows with `LETTERBOX_RGBA`, the core's own matte, before it
+blits the client's buffer below them. **An app that commits the size it was
+configured with can no longer address those rows at all.** That is strictly
+stronger than "it painted there and was covered", and every clause below is
+rewritten to assert the stronger thing rather than to accept the weaker one.
+
+**The qualifier is exact, and stating it is what keeps this section honest.**
+`Scene::compose` clips a surface against the *whole* view rather than the
+usable rectangle -- deliberately, and it says so in its own words: an app that
+ignores its `configure` is centre-cropped rather than refused. Commit a buffer
+more than `2 * reserved_top()` rows taller than the usable view and the crop
+begins above row 0, putting client bytes back in the reserved rows exactly as
+before the inset -- where the band overdraws them exactly as before.
+`band_witness.rs`'s
+`a_client_that_ignores_its_configure_can_still_reach_the_reserved_rows` drives
+that against the real compositor and watches `view_reserved` go false while
+`band_over_matte` holds. `click-target` commits what it is told, which is why
+this gate asserts `view_reserved == 1`; read that as a reading of this
+session's composite, not as an invariant of the core alone. For a cooperating
+client the property is structural, for an overflowing one it is the overdraw
+it always was, and neither is weaker than what this gate proved before #304.
+
+Nothing was relaxed to make the gate green. Precisely:
+
+- The old capture claim *"the band's rows carry the colour the app painted"*
+  existed to prove **the indicator is not in this artifact**. That conclusion
+  is unchanged and proved the same way -- the rows carry ONE colour whose
+  minimum channel is below `INDICATOR_CHANNEL_FLOOR`, which no mintable
+  indicator can be. What changed is only *which* sub-floor colour it is, and
+  the gate no longer needs to know: it reads the rows, requires them uniform,
+  requires them sub-floor, and requires them to be **none of the colours the
+  app paints** -- which the old form could not require, because back then they
+  were the app's colour.
+- The old claim *"the app owns those rows and changes them"* is replaced by
+  the fact that made it obsolete, asserted rather than assumed: the reserved
+  rows of the capture are **byte-identical before and after** a whole-surface
+  repaint that demonstrably changed everything else, and the core's own
+  witness reports `view_reserved == 1`.
+- **One criterion stopped being a statement about the client, and is replaced
+  rather than dropped.** `band_changes == 0` used to mean *"the app's own
+  repaint did not reach these rows"*: the app owned them in its view, so a
+  band that stopped overdrawing let the app's colour through and the counter
+  rose. Post-inset the app cannot move those rows of the view **at all**, so
+  nothing it does can raise that counter -- the zero is now guaranteed by the
+  inset rather than earned by the band, and it says nothing about whether a
+  band was drawn. `band_uniform == 1` goes the same way: the matte is one
+  fully opaque colour, so an unpainted band is uniform. `band_over_matte` is
+  the replacement and this gate asserts it.
+
+  **Measured, not reasoned.** With `composite_trust_band` made an
+  unconditional `return` in the shipped binary, this gate's first witness
+  reading came back `band_changes=3, band_uniform=1, tracks_view=1,
+  view_reserved=1, refusals=0, band_over_matte=0` -- every band criterion
+  except the new one passing, and the run failing on `band_over_matte`. The
+  `3` is worth reading carefully rather than as a save: it is not the client
+  reaching those rows, which it cannot. It is the **core's own** composition
+  showing through an absent band -- the empty-scene background before the
+  client attached (the counter was already `1` at four composites, before any
+  petition) and the consent scrim going up and down. So in a session whose
+  core happens to composite something else into those rows, `band_changes`
+  catches this sabotage by accident of the sequence; in one that does not, it
+  reports a clean zero over a display with no trusted band on it. A criterion
+  that only fires when something unrelated moves is not the criterion.
+
+  The in-process demonstration isolates exactly that: `band_witness.rs`'s
+  `a_no_op_band_over_a_reserved_view_survives_both_old_counters` feeds the
+  witness client repaints and nothing else, and requires `band_changes == 0`,
+  `band_uniform == true` and `tracks_view == true` to **pass** while
+  `band_over_matte` fails -- so the new field's justification cannot be read
+  as decoration.
+
+## What this gate proves, end to end, against `click-target`
+
+1. **The capture path never carries the band.** The reserved rows, read out of
    two independently transported artifacts of the same instant -- the agent's
-   own `observe()` frame and the core-internal `--capture-dump` -- are
-   *exactly* the colour the app painted, every pixel, before and after the
-   repaint. Both of the app's colours have a channel below 64, and every
-   channel of every mintable indicator is at or above 64
+   own `observe()` frame and the core-internal `--capture-dump` -- are ONE
+   colour, the same colour in both artifacts, unchanged across the repaint,
+   not either of the colours the app paints, and with a channel below 64.
+   Every channel of every mintable indicator is at or above 64
    (`indicator.rs::a_generated_indicator_is_opaque_and_visible`), so this is
    certainty rather than a 1-in-7-million coincidence. Artifact A's check is
-   `_settle`'s own loop condition -- it returns only a frame whose band rows
-   are exactly the app's colour, over `SETTLE_READS` consecutive identical
-   reads -- so that is where a capture-path regression fails, with the
-   two-cause diagnostic. The assertions restating it in the test body are
-   deliberate restatements, not independent evidence, and say so.
-2. **The app's rendering never reaches the band on the human-visible output.**
-   The core-side witness reports `band_changes == 0` over every composite *it
-   evaluated*, which includes composites it was not asked for (see 3) and the
-   composite at which the app repainted its whole surface red -- `probe_changes`
-   rising is what says the witness saw that repaint. That the set it
-   evaluated is *every* composite of the session is a fact about where
+   `_settle`'s own loop condition -- it returns only a frame whose reserved
+   rows are one non-app colour and whose client rows are exactly the colour
+   this phase is about, over `SETTLE_READS` consecutive identical reads -- so
+   that is where a capture-path regression fails, with the three-cause
+   diagnostic. The assertions restating it in the test body are deliberate
+   restatements, not independent evidence, and say so.
+2. **The app cannot address the band's rows of its own view.** The core-side
+   witness reports `view_reserved == 1`: the realm view's reserved rows are
+   exactly `LETTERBOX_RGBA`, compared against the core's own compile-time
+   constant rather than against anything the client chose. The harness half of
+   the same property is the byte-identity of those rows across the repaint.
+   This is the clause #304 added, and it is the one that makes "the app cannot
+   forge the band" structural instead of a race the band happens to win.
+3. **The band's rows on the human-visible output never move, and the band is
+   really there.** The witness reports `band_changes == 0` over every composite
+   *it evaluated*, which includes composites it was not asked for (see 4) and
+   the composite at which the app repainted its whole surface red --
+   `probe_changes` rising is what says the witness saw that repaint. That the
+   set it evaluated is *every* composite of the session is a fact about where
    `BandWitness::observe` is called -- from `HeadlessOutput::present`, the
    backend's single composition path -- and rests on reading that code, not on
    this gate. What the gate rules out is the weaker and more likely mistake: a
-   witness that only ever looks when asked.
-3. **...and that zero is not vacuous.** An absence is equally true of a witness
+   witness that only ever looks when asked. **Read this one narrowly**: since
+   the inset it is no longer a statement about the app, which cannot address
+   those rows to begin with -- it is a statement that the core keeps them
+   constant, and it is `band_over_matte == 1` that says the constant is a
+   drawn band rather than the matte.
+4. **...and that zero is not vacuous.** An absence is equally true of a witness
    that never looked -- the P1.9.8 lesson, restated in plan §5 D12. So the same
    reply carries the counterweights, all cross-checked:
    - `probe_changes` **increases** across the click, so the witness does see
@@ -111,16 +206,20 @@ observe: own every pixel of the rows the band occupies, and change them.
      its own and a bare "it went up" would be satisfied by a witness wired only
      into the reply path. The second composite is one the witness saw without
      being asked -- one of the session's;
-   - `probe_fnv` -- a digest of *realm-view* pixels just below the band --
-     equals the digest this harness computes over its own `--capture-dump` read
-     of the same instant, and differs between the two samples. So the witness
-     was evaluated on the frame the harness is holding, not on a stale or
-     synthetic one;
+   - `probe_fnv` -- a digest of *realm-view* pixels just below the reserved
+     rows, which since #304 are the app's FIRST rows rather than its ninth --
+     equals the digest this harness computes over its own `--capture-dump`
+     read of the same instant, and differs between the two samples. So the
+     witness was evaluated on the frame the harness is holding, not on a stale
+     or synthetic one;
    - `tracks_view == 1`: the human-visible frame below the band is
      byte-identical to the realm view. A frozen or erased output framebuffer
      would hold its band rows constant too, and fails here;
    - `band_uniform == 1`: the band's rows are one fully opaque colour, so a
-     band blended with or partly overdrawn by client content fails;
+     band blended with or partly overdrawn by client content fails. **On its
+     own this no longer distinguishes a band from a matte** -- see
+     `band_over_matte` above -- and it is kept because it still catches the
+     partial overdraw and the alpha blend;
    - `refusals == 0`: no composite went unmeasured.
 
 # What this gate does NOT prove
@@ -172,12 +271,24 @@ breakages were applied to the real binary and each turned this gate red on a
 different assertion:
 
 - **`composite_trust_band` made a no-op** (the band never overdraws the
-  client): `first["band_changes"] == 0` fails with `1 != 0`, naming the
-  property.
+  client). Before #304 this failed `first["band_changes"] == 0` with `1 != 0`,
+  naming the property. **Re-run on the shipped binary after the inset**
+  (2026-08-25): the run fails on `first["band_over_matte"] == 1` with
+  `0 != 1`, and the reading it fails on is `band_changes=3, band_uniform=1,
+  tracks_view=1, view_reserved=1, refusals=0`. `band_changes` is non-zero for
+  a reason that is not the property -- the core's own background and consent
+  scrim showing through an absent band, not the client, which can no longer
+  reach those rows -- so this sabotage is now caught by `band_over_matte` and
+  incidentally by a counter that has stopped being about the app. See the
+  #304 section above.
 - **The human-visible frame composited into `view_framebuffer` too** (the
   P1.7.1 fork folded, so the band reaches the capture path): the phase-1 settle
-  fails, reporting 5120 of 5120 band-row pixels off-colour across 1 distinct
-  colour — the whole band, in one colour that is not the app's.
+  fails on cause 2 of its three -- the reserved rows are one colour whose
+  channels are all at or above the indicator floor, which the matte's are not.
+- **The realm view no longer inset** (a `configure` carrying the output's full
+  height, or a placement that stopped translating by `reserved_top()`): the
+  phase-1 settle fails on cause 1, client bytes being in the reserved rows,
+  and `view_reserved == 1` fails in the witness.
 - **`BandWitness::observe` stubbed out** (a witness that stops looking): the
   band's height comes back 0 and the run fails before it believes any zero.
 - **`probe_fnv` computed over a synthetic buffer** (a witness reading something
@@ -187,8 +298,14 @@ different assertion:
 Where the criterion is a computed metric, it is additionally pinned in-process
 and binary-free, as plan §5 D12 requires: `band_witness.rs`'s
 `a_band_that_did_not_overdraw_the_client_is_counted_as_a_change` feeds the
-witness the exact frame pair a no-op `composite_trust_band` produces and
-requires `band_changes == 1`, and
+witness the exact frame pair a no-op `composite_trust_band` produces on a
+PRE-#304 view and requires `band_changes == 1`;
+`a_no_op_band_over_a_reserved_view_survives_both_old_counters` feeds it the
+same sabotage over the SHIPPING view shape and requires the two old counters
+to pass and `band_over_matte` to fail, which is the whole reason the field was
+added; `the_witness_tells_a_reserved_view_from_a_client_painted_one` requires
+`view_reserved` to read false on a client-painted view, so it is a reading of
+pixels rather than a constant; and
 `an_erased_human_visible_frame_is_refused_by_tracks_view` requires the
 frozen-framebuffer reading — which satisfies `band_changes == 0` perfectly — to
 be rejected by `tracks_view` instead.
@@ -366,6 +483,27 @@ def _off_colour_xrgb(frame, y0: int, y1: int, rgb: tuple[int, int, int]) -> int:
     )
 
 
+def _colours_rgba(rows: bytes) -> set[tuple[int, int, int]]:
+    """The SET of colours in a raw-RGBA row block.
+
+    Returned as a set rather than a count so a caller can ask "is it one
+    colour, and is that colour sub-floor" without ever printing it. The
+    printing discipline matters: on a build whose capture path had started
+    carrying the band, this set holds the session secret, so every diagnostic
+    below reports its SIZE and derived booleans and never a channel value.
+    """
+    return {(rows[i], rows[i + 1], rows[i + 2]) for i in range(0, len(rows), 4)}
+
+
+def _colours_xrgb(frame, y0: int, y1: int) -> set[tuple[int, int, int]]:
+    """The same set over a wire frame (`B, G, R, X` per pixel)."""
+    packed = packed_xrgb(frame)
+    rows = packed[y0 * frame.width * 4 : y1 * frame.width * 4]
+    return {
+        (rows[i + 2], rows[i + 1], rows[i]) for i in range(0, len(rows), 4)
+    }
+
+
 class RealTrustBand(IntegrationTest):
     """Issue #139: a confined app repaints its whole surface, band rows and
     all, and reaches neither the band on the human's display nor the band's
@@ -403,6 +541,14 @@ class RealTrustBand(IntegrationTest):
         #: change to `TRUST_BAND_HEIGHT` cannot leave this measuring the wrong
         #: rows while still passing.
         self.band_h = 0
+        #: The rows the core keeps above the client -- `ViewGeometry::
+        #: reserved_top()`, the band's plus the status strip's (issue #304).
+        #: Also read from the core, as `band_h + strip_h`, rather than being
+        #: assumed equal to `band_h`: this session passes no `--status`, so
+        #: the two are equal here, and deriving it from the reply is what
+        #: makes that an asserted fact instead of a coincidence this file
+        #: depends on silently.
+        self.reserved_h = 0
         for colour in (self.BACKGROUND, self.HIT):
             self.assertTrue(
                 min(colour) < INDICATOR_CHANNEL_FLOOR,
@@ -506,24 +652,53 @@ class RealTrustBand(IntegrationTest):
         app_pid = descendant_named(core.pid, "click-target", timeout=15.0)
         self.assertIsNotNone(app_pid, "the C shim never fork/exec'd click-target")
 
+    def _probe_rows(self, frame: bytes) -> bytes:
+        """The app's OWN topmost rows of the realm view.
+
+        Since #304 the client's first row is `reserved_h`, so these are rows
+        `[reserved_h, 2 * reserved_h)` -- the same rows `BandWitness`'s
+        `probe_fnv` digests, which is why the digest cross-check and this
+        settle are statements about one region rather than two.
+        """
+        return _rgba_rows(frame, REALM_WH[0], self.reserved_h, 2 * self.reserved_h)
+
+    def _reserved_rows(self, frame: bytes) -> bytes:
+        """The rows the core keeps above the client, in the realm view."""
+        return _rgba_rows(frame, REALM_WH[0], 0, self.reserved_h)
+
     def _settle(self, want: tuple[int, int, int]) -> bytes:
-        """Block until the realm view is a settled frame whose band rows are
-        exactly `want`, and return it.
+        """Block until the realm view is a settled frame whose CLIENT rows are
+        exactly `want` and whose RESERVED rows are one colour that is not
+        `want`, and return it.
 
         Two jobs in one loop. It is the P1.9.8 settle -- N identical reads, so
         the later "nothing moved" evidence is not taken against a still-moving
         app -- and it is also the barrier that says the app has actually
         painted the state this phase of the test is about.
+
+        **What the loop condition became under #304, and why it is stronger.**
+        It used to be *"rows `[0, band_h)` are exactly the colour the app
+        painted"*, which was a statement about the app owning those rows. The
+        app cannot own them any more, so that condition is unsatisfiable and
+        keeping it would have meant relaxing the gate. It is replaced by two
+        conditions, neither of which the old one implied: the app's own
+        topmost rows carry the colour this phase is about (so the app really
+        has painted, exactly as before), and the reserved rows above them are
+        a SINGLE colour that is not the app's (so the core's matte is there,
+        and nothing of the client's is). The floor check that turns this into
+        "the indicator is not in this artifact" is in
+        `_assert_reserved_is_not_an_indicator`, called on the frame this
+        returns.
         """
         deadline = time.monotonic() + SETTLE_TIMEOUT
         stable = 0
         last: bytes | None = None
         while time.monotonic() < deadline:
             frame = _read_dump(self.dump_path, REALM_WH)
-            band_ok = (
-                _off_colour_rgba(_rgba_rows(frame, REALM_WH[0], 0, self.band_h), want) == 0
-            )
-            if band_ok and frame == last:
+            client_ok = _off_colour_rgba(self._probe_rows(frame), want) == 0
+            reserved = _colours_rgba(self._reserved_rows(frame))
+            reserved_ok = len(reserved) == 1 and want not in reserved
+            if client_ok and reserved_ok and frame == last:
                 stable += 1
                 if stable >= SETTLE_READS:
                     return frame
@@ -531,26 +706,70 @@ class RealTrustBand(IntegrationTest):
                 stable = 0
             last = frame
             time.sleep(SETTLE_INTERVAL)
-        rows = _rgba_rows(last, REALM_WH[0], 0, self.band_h) if last else b""
-        off = _off_colour_rgba(rows, want) if last else -1
-        total = REALM_WH[0] * self.band_h
-        # The COUNT of distinct colours, never their values. On a build whose
-        # capture path had started carrying the band, printing what is in those
-        # rows would print the session secret into a CI log -- which is the
-        # thing this whole gate is arranged not to do, and a diagnostic is no
-        # excuse for doing it.
-        distinct = len({rows[i : i + 4] for i in range(0, len(rows), 4)})
+        probe = self._probe_rows(last) if last else b""
+        off = _off_colour_rgba(probe, want) if last else -1
+        total = REALM_WH[0] * self.reserved_h
+        # The COUNT of distinct colours and derived BOOLEANS, never a channel
+        # value. On a build whose capture path had started carrying the band,
+        # printing what is in those rows would print the session secret into a
+        # CI log -- which is the thing this whole gate is arranged not to do,
+        # and a diagnostic is no excuse for doing it.
+        reserved = _colours_rgba(self._reserved_rows(last)) if last else set()
+        sub_floor = all(min(c) < INDICATOR_CHANNEL_FLOOR for c in reserved)
+        carries_app_colour = bool(reserved & {self.BACKGROUND, self.HIT})
         self.fail(
-            f"the realm view never settled with band rows == {want} within "
-            f"{SETTLE_TIMEOUT:.0f}s: {off} of {total} band-row pixels were off-colour on the "
-            f"last read, across {distinct} distinct colour(s), and it did not repeat "
-            f"{SETTLE_READS} times.\nTwo causes, and those numbers tell them apart. If nearly "
-            "all of the band's rows are off-colour in ONE colour, the human-visible band has "
-            "reached the CAPTURE path -- the P1.7.1 fork has been folded, and that is the "
-            "failure this gate exists for. If the frame simply never stopped moving, the app "
-            "did not settle; without a settled frame every later assertion here would be about "
-            "a moving target."
+            f"the realm view never settled within {SETTLE_TIMEOUT:.0f}s. On the last read: "
+            f"{off} of {total} of the app's own topmost rows were off-colour against {want}; "
+            f"the {self.reserved_h} reserved rows above them held {len(reserved)} distinct "
+            f"colour(s), every channel below the indicator floor: {sub_floor}, at least one of "
+            f"them a colour this app paints: {carries_app_colour}. It did not repeat "
+            f"{SETTLE_READS} times.\nThree causes, and those numbers tell them apart.\n"
+            "  1. The reserved rows hold MORE THAN ONE colour, or a colour the app paints: "
+            "client bytes are in rows the core reserves. The realm-view inset has been "
+            "reverted or half-reverted -- a `configure` carrying the output's full height, or "
+            "a placement that stopped translating by `reserved_top()` (issue #304).\n"
+            "  2. The reserved rows hold ONE colour and `sub_floor` is FALSE: that colour can "
+            "be a mintable indicator, so the human-visible band has reached the CAPTURE path "
+            "-- the P1.7.1 fork has been folded, and that is the failure this gate exists "
+            "for.\n"
+            "  3. Neither, and the app's own rows never stopped moving: the app did not "
+            "settle; without a settled frame every later assertion here would be about a "
+            "moving target."
         )
+
+    def _assert_reserved_is_not_an_indicator(
+        self, colours: set[tuple[int, int, int]], artifact: str
+    ) -> tuple[int, int, int]:
+        """The reserved rows are one core-owned colour no indicator can be.
+
+        Returns that colour so callers can compare artifacts against each
+        other. **Never puts it in a failure message**: if this build had gone
+        wrong in the one direction that matters, this value is the session
+        secret.
+        """
+        self.assertEqual(
+            len(colours),
+            1,
+            f"{artifact}: the {self.reserved_h} rows the core reserves must be one flat "
+            f"colour -- its own matte -- and they hold {len(colours)}. More than one means "
+            "client content is in rows the app is no longer configured for (issue #304)",
+        )
+        rgb = next(iter(colours))
+        self.assertTrue(
+            rgb not in (self.BACKGROUND, self.HIT),
+            f"{artifact}: the reserved rows carry a colour this app paints, so the app is "
+            "reaching rows it is not configured for -- the realm-view inset is reverted or "
+            "half-applied",
+        )
+        self.assertTrue(
+            min(rgb) < INDICATOR_CHANNEL_FLOOR,
+            f"{artifact}: the reserved rows carry one colour whose every channel is at or "
+            f"above {INDICATOR_CHANNEL_FLOOR}, which is exactly the range a minted indicator "
+            "lives in. The colour is deliberately NOT printed: on the build this assertion "
+            "catches, it is the session secret. The trusted band has reached the capture "
+            "path (the P1.7.1 fork folded)",
+        )
+        return rgb
 
     # -- agent-side helpers -------------------------------------------------
 
@@ -627,7 +846,43 @@ class RealTrustBand(IntegrationTest):
             "constant for free, which is exactly the vacuous reading this refuses",
         )
         self.assertEqual(
-            report["band_uniform"], 1, "the band's rows are not one opaque colour"
+            report["band_uniform"],
+            1,
+            "the band's rows are not one opaque colour. NOTE this no longer distinguishes a "
+            "band from an unpainted matte on its own -- see `band_over_matte` below -- and it "
+            "is kept because it still catches a partial overdraw and an alpha blend",
+        )
+        # -- issue #304's two halves ---------------------------------------
+        #
+        # The structural one, and it is the core's own reading of the same
+        # rows this harness reads off `--capture-dump`: the realm view's
+        # reserved rows are exactly `LETTERBOX_RGBA`, compared against a
+        # compile-time constant in the core's source rather than against
+        # anything a client chose. Two independent readers, one property.
+        self.assertEqual(
+            report["view_reserved"],
+            1,
+            "the realm view's reserved rows are not the core's own matte: the app is "
+            "addressing rows it is not configured for. That is the pre-#304 world, in which "
+            "the band's whole job was to cover the app's pixels rather than the app having "
+            "no way to reach them",
+        )
+        # ...and the temporal one, which is the criterion the inset made
+        # necessary. `band_changes == 0` and `band_uniform == 1` above are BOTH
+        # satisfied by a build whose `composite_trust_band` is a no-op, because
+        # the matte those rows arrive carrying is constant and uniform. This is
+        # the only assertion in this gate that a session with no trusted band
+        # at all fails.
+        self.assertEqual(
+            report["band_over_matte"],
+            1,
+            "the human-visible output's band rows still carry the core's matte somewhere: "
+            "nothing was drawn over them. THIS IS THE ASSERTION THAT SAYS A TRUSTED BAND WAS "
+            "DRAWN. `band_uniform` and `tracks_view` pass on this build -- an unpainted band "
+            "is one opaque colour and tracks the view perfectly -- and `band_changes` cannot "
+            "be moved by the app at all since the realm view was inset, so a zero there is "
+            "the inset's doing rather than the band's (issue #304, and `band_witness.rs`'s "
+            "`a_no_op_band_over_a_reserved_view_survives_both_old_counters`)",
         )
         # This session runs WITHOUT `--status` (WS-E.2.3, issue #215): the
         # status strip is opt-in precisely so that this gate's byte-for-byte
@@ -643,6 +898,11 @@ class RealTrustBand(IntegrationTest):
             "region than this gate thinks",
         )
         self.assertEqual(report["strip_changes"], 0)
+        # `band_h`, not `reserved_h`: the witness digests the `band_h` rows
+        # immediately below the band, and with `--status` off (asserted above)
+        # those are the same rows `_probe_rows` reads. Spelled the witness's
+        # way so this cross-check keeps agreeing with `BandWitness::observe`
+        # rather than with this file's convenience.
         probe = _rgba_rows(dump, REALM_WH[0], self.band_h, 2 * self.band_h)
         self.assertEqual(
             report["probe_fnv"],
@@ -663,9 +923,25 @@ class RealTrustBand(IntegrationTest):
         # The band's height comes from the core, once, and every later
         # assertion is expressed in it: a gate that hard-coded 8 would silently
         # measure the wrong rows if the constant ever moved.
-        self.band_h = injector.band()["band_h"]
+        opening = injector.band()
+        self.band_h = opening["band_h"]
         self.assertGreater(self.band_h, 0, "a zero-height band is not a band")
         self.assertLess(self.band_h, REALM_WH[1])
+        # ...and so do the rows the core RESERVES above the client, which is
+        # what #304 made a different number from `band_h` in general. This
+        # session passes no `--status`, so `strip_h` is 0 and the two coincide
+        # -- asserted rather than assumed, because a future default that
+        # turned the strip on would otherwise leave every row index below
+        # measuring the wrong region while still passing.
+        self.assertEqual(
+            opening["strip_h"],
+            0,
+            "this session did not pass `--status`, so the rows the core reserves are the "
+            "band's and nothing else; a non-zero strip height means every row index in this "
+            "gate is about the wrong region",
+        )
+        self.reserved_h = self.band_h + opening["strip_h"]
+        self.assertLess(2 * self.reserved_h, REALM_WH[1])
 
         # A real petition raises a real prompt; answering it is a precondition,
         # not a claim -- #138's gate is what proves the consent path. Doing it
@@ -681,32 +957,41 @@ class RealTrustBand(IntegrationTest):
         injector.await_lowered(petition)
         grant.await_consent()
 
-        # == Phase 1: the app owns the band's rows in its own composition ==
+        # == Phase 1: the app paints everything it has, and it has no band ==
         before = self._settle(self.BACKGROUND)
         first = self._witness(injector, before)
         self.assertGreater(first["composites"], 0, "the witness saw no composite at all")
         self.assertEqual(
             first["band_changes"],
             0,
-            "client content reached the trusted band's rows on the human-visible output",
+            "the trusted band's rows on the human-visible output moved between composites. "
+            "Since the realm view was inset (#304) the app cannot be the cause, so this is "
+            "the CORE changing what it paints there -- an overlay reaching above the band, or "
+            "a band that stopped being drawn on every frame",
         )
 
-        # Capture half, artifact A: the core-internal realm view. The band's
-        # rows are the app's black, every pixel -- so the genuine band, whose
-        # every channel is >= INDICATOR_CHANNEL_FLOOR, is not among them.
+        # Capture half, artifact A: the core-internal realm view. The reserved
+        # rows are one core-owned colour that no mintable indicator can be, and
+        # the app's own topmost rows are its black -- so the app really has
+        # painted, and the genuine band, whose every channel is
+        # >= INDICATOR_CHANNEL_FLOOR, is in neither region.
         #
-        # DELIBERATELY REDUNDANT, and not independent evidence: this restates
-        # `_settle`'s own loop exit condition on the frame `_settle` returned,
-        # so it cannot fail here. `_settle` is where artifact A is actually
-        # checked, and where a capture-path regression is reported with the
-        # diagnostic that tells the two causes apart. It is restated at the
-        # point of use so a reader of this phase sees the claim being made,
-        # rather than having to reconstruct it from a helper's postcondition.
+        # PARTLY REDUNDANT, and it says which part: the uniformity and the
+        # "not the app's colour" half restate `_settle`'s own loop exit
+        # condition on the frame `_settle` returned, so they cannot fail here.
+        # The FLOOR check is not in that loop and is real evidence at this
+        # point -- it is what turns "one flat colour" into "not the trusted
+        # indicator". `_settle` is where a capture-path regression is reported
+        # with the three-cause diagnostic; this is where the claim is made in
+        # the reader's sight.
+        matte = self._assert_reserved_is_not_an_indicator(
+            _colours_rgba(self._reserved_rows(before)), "the core-internal capture"
+        )
         self.assertEqual(
-            _off_colour_rgba(_rgba_rows(before, REALM_WH[0], 0, self.band_h), self.BACKGROUND),
+            _off_colour_rgba(self._probe_rows(before), self.BACKGROUND),
             0,
-            "the core-internal capture's band rows are not the app's own colour: the "
-            "human-visible band has reached the capture path",
+            "the core-internal capture's first CLIENT rows are not the app's own colour, so "
+            "this phase's later evidence would be about a frame the app had not painted",
         )
 
         # Capture half, artifact B: the agent's own frame off the wire, through
@@ -714,17 +999,40 @@ class RealTrustBand(IntegrationTest):
         frame, cx, cy = self._locate_target(grant)
         self.assertEqual((frame.width, frame.height), REALM_WH)
         self.assertEqual(
-            _off_colour_xrgb(frame, 0, self.band_h, self.BACKGROUND),
+            self._assert_reserved_is_not_an_indicator(
+                _colours_xrgb(frame, 0, self.reserved_h), "the agent's captured frame"
+            ),
+            matte,
+            # The colours themselves are never printed; `assertEqual` on two
+            # tuples would print them, so this message carries the whole
+            # diagnostic and the values are compared only for equality. If they
+            # differ, at most one of them can be an indicator and BOTH have
+            # already passed the sub-floor check above, so neither is.
+            "the two capture artifacts disagree about what is in the reserved rows. They are "
+            "two transports of one composition -- `vitrin_view.frame_ready` and "
+            "`--capture-dump` -- so a disagreement means one of them is not serving the realm "
+            "view",
+        )
+        self.assertEqual(
+            _off_colour_xrgb(frame, self.reserved_h, 2 * self.reserved_h, self.BACKGROUND),
             0,
             "the agent's captured frame carries something other than the app's own colour in "
-            "the band's rows: `vitrin_view.frame_ready` is delivering the human-visible output",
+            "the app's own topmost rows: `vitrin_view.frame_ready` is delivering the "
+            "human-visible output",
         )
 
         # == Phase 2: the counterfeit attempt =================================
         #
-        # A landed click repaints click-target's WHOLE surface red, band rows
-        # included. That is the most a confined app can do against a colour it
-        # has never observed: own every pixel of those rows and change them.
+        # A landed click repaints click-target's WHOLE surface red. That is the
+        # most a confined app can do against a colour it has never observed:
+        # change every pixel it owns, at once.
+        #
+        # **Before #304 "every pixel it owns" INCLUDED the band's rows**, and
+        # the property was that the band overdrew them anyway. It no longer
+        # does -- the app is configured at the usable view -- so the assertions
+        # after the flip test the stronger fact that replaced it: the reserved
+        # rows are byte-identical across a repaint that changed everything
+        # else.
         grant.pointer.click(cx, cy)
         flipped = self._await_flip(grant)
         after = self._settle(self.HIT)
@@ -738,9 +1046,12 @@ class RealTrustBand(IntegrationTest):
         self.assertEqual(
             second["band_changes"],
             0,
-            "the app's whole-surface repaint reached the trusted band's rows on the "
-            "human-visible output: a confined app can paint over the one reference a human "
-            "checks a consent prompt against (issue #85)",
+            "the trusted band's rows on the human-visible output moved across the app's "
+            "whole-surface repaint. Two candidate causes and they are not equally likely: the "
+            "inset has been reverted, so a confined app can once again paint over the one "
+            "reference a human checks a consent prompt against (issue #85) -- `view_reserved` "
+            "in the same reading tells you if it has -- or the core changed what it composites "
+            "into those rows",
         )
 
         # ...and the counterweights, so that zero is not an absence over
@@ -775,28 +1086,66 @@ class RealTrustBand(IntegrationTest):
             "the probe digest did not move across the repaint",
         )
 
-        # Capture half again, after the repaint: both artifacts, both exactly
-        # the app's red. The first of the two is the same deliberate restatement
-        # of `_settle`'s exit condition as in phase 1 -- it cannot fail here;
-        # the second, over the agent's own frame, is the independent one.
+        # **THE ASSERTION THAT REPLACES "THE APP PAINTED THERE AND WAS
+        # COVERED", and it is stronger than what it replaces.** The app has
+        # just repainted its whole surface -- `assertNotEqual(before, after)`
+        # above and `probe_changes` rising both say the realm view really
+        # moved -- and the reserved rows of that same view are byte-identical
+        # to what they were. Not "the same colour": the same bytes. A confined
+        # app changing every pixel it has cannot move one of them, because it
+        # is not configured for them (issue #304). Byte identity is checked
+        # rather than colour equality so a single stray pixel fails, and the
+        # bytes are compared, never printed.
         self.assertEqual(
-            _off_colour_rgba(_rgba_rows(after, REALM_WH[0], 0, self.band_h), self.HIT),
-            0,
-            "the core-internal capture's band rows are not the app's own colour after the "
-            "repaint",
+            self._reserved_rows(before),
+            self._reserved_rows(after),
+            f"the core-internal capture's {self.reserved_h} reserved rows changed across the "
+            "app's whole-surface repaint. The app is reaching rows it is not configured for: "
+            "the realm-view inset is reverted or half-applied, and the trusted band is back "
+            "to racing a client for those pixels instead of owning them",
+        )
+        # ...and the same two artifacts again, after the repaint: the reserved
+        # rows still one non-indicator colour, the app's own rows now its red.
+        # The first of each pair restates `_settle`'s exit condition on the
+        # frame it returned and cannot fail here; the floor check and the
+        # agent-transport reads are the independent ones.
+        self.assertEqual(
+            self._assert_reserved_is_not_an_indicator(
+                _colours_rgba(self._reserved_rows(after)),
+                "the core-internal capture, after the repaint",
+            ),
+            matte,
+            "the reserved rows carry a different colour after the repaint than before it",
         )
         self.assertEqual(
-            _off_colour_xrgb(flipped, 0, self.band_h, self.HIT),
+            _off_colour_rgba(self._probe_rows(after), self.HIT),
             0,
-            "the agent's captured frame's band rows are not the app's own colour after the "
-            "repaint",
+            "the core-internal capture's first CLIENT rows are not the app's own colour after "
+            "the repaint",
+        )
+        self.assertEqual(
+            self._assert_reserved_is_not_an_indicator(
+                _colours_xrgb(flipped, 0, self.reserved_h),
+                "the agent's captured frame, after the repaint",
+            ),
+            matte,
+            "the agent's transport carries a different colour in the reserved rows after the "
+            "repaint than the core-internal capture did before it",
+        )
+        self.assertEqual(
+            _off_colour_xrgb(flipped, self.reserved_h, 2 * self.reserved_h, self.HIT),
+            0,
+            "the agent's captured frame's first CLIENT rows are not the app's own colour "
+            "after the repaint",
         )
 
         print(
             f"\n[real-trust-band] {second['composites']} composites, "
-            f"{second['probe_changes']} client repaints of the rows below the band, "
-            f"0 changes to the band's own {self.band_h} rows; both capture artifacts carried "
-            "only the app's colours there, before and after a whole-surface counterfeit."
+            f"{second['probe_changes']} client repaints of the rows below the reserved ones, "
+            f"0 changes to the band's own {self.band_h} rows; the app's whole-surface "
+            f"counterfeit moved not one byte of the {self.reserved_h} rows it is not "
+            "configured for, in either capture artifact, and the core's own witness reported "
+            "the band drawn over the matte in both readings."
         )
 
 

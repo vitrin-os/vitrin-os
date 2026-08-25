@@ -199,10 +199,16 @@ static bool toplevel_wants_activated(struct vitrin_toplevel *t) {
 	return front_toplevel(t->shim) == t;
 }
 
-/* The realm view fills the output, so "maximized" and "fullscreen" and "the
- * window" are all the same rectangle. Sending it on the initial commit is
- * required by xdg-shell: the client cannot attach a buffer until it has been
- * configured once. */
+/* One realm, one window, one rectangle: this shim composites a single
+ * toplevel at the realm-view size the core configured it with, so
+ * "maximized" and "fullscreen" and "the window" are all that same rectangle.
+ * It is NOT necessarily the output's size and this shim has no way to know
+ * whether it is -- the core may reserve rows of its own along the top edge
+ * (a trusted band, a status strip) and subtract them before sending
+ * `configure`, which the IDL states as a deployment property a shim never
+ * computes. `s->cfg` is the numbers we were given. Sending a size on the
+ * initial commit is required by xdg-shell: the client cannot attach a buffer
+ * until it has been configured once. */
 static void configure_to_view(struct vitrin_toplevel *t) {
 	struct vitrin_shim *s = t->shim;
 	wlr_xdg_toplevel_set_size(t->toplevel, s->cfg.width, s->cfg.height);

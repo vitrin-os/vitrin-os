@@ -276,7 +276,15 @@ pub(crate) fn render_once(size: Size<i32, Physical>) -> Result<Vec<u8>, Box<dyn 
     let buffer_size: Size<i32, Buffer> = (size.w, size.h).into();
     let mut framebuffer = renderer.create_buffer(Fourcc::Abgr8888, buffer_size)?;
 
-    let pixels = Scene::new().compose(size.w as u32, size.h as u32);
+    // **One of the three production sites that build a `ViewGeometry`**
+    // (`the_view_geometry_has_one_derivation`). An empty scene has no client
+    // to reserve rows for and this harness has no status strip, so `0` is the
+    // honest strip height rather than a shortcut: what it composes is the
+    // deterministic background of the whole output.
+    let pixels = Scene::new().compose(crate::view::ViewGeometry::new(
+        (size.w as u32, size.h as u32),
+        0,
+    ));
     composite(&mut renderer, &mut framebuffer, size, &pixels)?;
     readback(&mut renderer, &mut framebuffer, size)
 }
@@ -817,7 +825,17 @@ impl HeadlessState {
         // makes the presence tap's `note` and the chokepoint's `owns_target`
         // read one timeline. `route_physical_turn` pushes it into the tap.
         let now = std::time::Instant::now();
+        // **Two different sizes, and they stopped being the same value under
+        // issue #304.** `intake` clamps a pointer position into the OUTPUT,
+        // which is the space the injector's peer names coordinates in and the
+        // space the consent card is drawn in; the router maps that position
+        // into SURFACE coordinates and therefore needs the geometry, because
+        // the app's first row is below the rows the core reserves. This is the
+        // same split `NestedState::route_physical_inputs` makes with the host
+        // window's size and `Presenter::view_geometry`, and it is spelled the
+        // same way here so the two backends cannot drift.
         let view = session::Presenter::view_size(&self.view);
+        let geom = session::Presenter::view_geometry(&self.view);
         for parsed in batch.unwrap_or_default() {
             let Some(request) = parsed else {
                 injector.reject("unknown request");
@@ -836,7 +854,7 @@ impl HeadlessState {
                 &self.view.scenes,
                 None,
                 inputs,
-                view,
+                geom,
                 now,
             );
             injector.ack(produced);
@@ -973,7 +991,7 @@ impl HeadlessState {
     /// ships.
     ///
     /// **No descriptor, no pixels, and nothing that moves with the session
-    /// secret.** The reply is [`BandReport`]'s ten ASCII fields and nothing
+    /// secret.** The reply is [`BandReport`]'s fifteen ASCII fields and nothing
     /// else; the argument that this is a stricter rule than "no pixels", and
     /// the near-miss that motivates it, are in [`super::band_witness`]. There
     /// is deliberately no fail-closed table here because there is nothing to
@@ -1178,6 +1196,10 @@ impl session::Presenter for HeadlessView {
         (size.w.max(0) as u32, size.h.max(0) as u32)
     }
 
+    fn status_height(&self) -> u32 {
+        self.output.status.height()
+    }
+
     /// Never called in production: this backend's virtual output is fixed at
     /// construction and has no resize event to raise one. Implemented rather
     /// than made to panic because "the output never resizes" is a property of
@@ -1221,14 +1243,12 @@ impl session::Presenter for HeadlessView {
         if self.scenes.focused() == Some(realm) {
             return self.latest_frame_rgba().ok();
         }
-        let (w, h) = (
-            self.output.size.w.max(0) as u32,
-            self.output.size.h.max(0) as u32,
-        );
+        let geom = session::Presenter::view_geometry(self);
+        let (w, h) = geom.output();
         if w == 0 || h == 0 {
             return None;
         }
-        Some(self.scenes.scene(realm)?.compose(w, h))
+        Some(self.scenes.scene(realm)?.compose(geom))
     }
 
     /// Take the router's agent-owned position for the sprite (D-019) — but
@@ -1658,6 +1678,24 @@ impl HeadlessView {
 }
 
 impl HeadlessOutput {
+    /// This output's [`crate::view::ViewGeometry`] (issue #304).
+    ///
+    /// **One of the three production sites that build one**, and the reason it
+    /// is not simply `session::Presenter::view_geometry` is
+    /// [`crate::lifecycle::RetainedOutput::scrub_retained_frame`]: the scrub
+    /// composites through [`Self::present`] holding only this struct, with no
+    /// `HeadlessView` and therefore no `Presenter` in reach. The two inputs are
+    /// the same two the trait's provided method names — the output's size and
+    /// [`crate::status::StatusStrip::height`] — and
+    /// `the_view_geometry_has_one_derivation` holds the set of sites that may
+    /// state them.
+    fn geometry(&self) -> crate::view::ViewGeometry {
+        crate::view::ViewGeometry::new(
+            (self.size.w.max(0) as u32, self.size.h.max(0) as u32),
+            self.status.height(),
+        )
+    }
+
     /// (Re)composite both retained images from `scene`.
     ///
     /// The single composition path: [`HeadlessView::redraw`] calls it with
@@ -1682,8 +1720,9 @@ impl HeadlessOutput {
             &RealmId,
         >,
     ) -> Result<(), Box<dyn Error>> {
-        let (w, h) = (self.size.w.max(0) as u32, self.size.h.max(0) as u32);
-        let view = scene.compose(w, h);
+        let geom = self.geometry();
+        let (w, h) = geom.output();
+        let view = scene.compose(geom);
         composite(
             &mut self.renderer,
             &mut self.view_framebuffer,
@@ -1898,8 +1937,10 @@ mod tests {
     // attached. The test pattern is also, specifically, not excluded by a
     // green-pixel count alone: it contains a full-height green colour bar
     // and a green corner marker. What only click-target produces is the
-    // conjunction below: black corners AND a single green region whose
-    // bounding box is exactly the square's edge.
+    // conjunction below: a black field filling the USABLE rectangle, the
+    // reserved rows above it left as the core's matte, AND a single green
+    // region whose bounding box is exactly the square's edge, centred in
+    // that usable rectangle.
 
     /// click-target's `TARGET_SIZE`.
     const CLICK_TARGET_EDGE: u32 = 160;
@@ -1909,74 +1950,155 @@ mod tests {
     const CLICK_TARGET_FG: [u8; 4] = [0x00, 0xff, 0x00, 0xff];
 
     /// What a candidate realm view looks like, measured against
-    /// click-target's rendering. Kept as a struct rather than a bare
-    /// `bool` so a timeout can say *how far off* the closest frame was --
-    /// "0 green pixels, corners not black" and "25600 green pixels in a
-    /// 160x160 box but corners not black" are very different bugs.
+    /// click-target's rendering **at the view's real geometry** (issue
+    /// #304). Kept as a struct rather than a bare `bool` so a timeout can
+    /// say *how far off* the closest frame was -- "0 green pixels, the
+    /// field never arrived" and "25600 green pixels in a 160x160 box but
+    /// off-centre" are very different bugs.
+    ///
+    /// # Why this is not four corners any more
+    ///
+    /// Before the inset the app was configured at the output's size and its
+    /// buffer covered the view, so "all four corners of the view are the
+    /// app's black field" was a sound way to say *the app's own rendering
+    /// reached the realm view*. It is not sound now, and it is not merely
+    /// stale: the app is configured at
+    /// [`ViewGeometry::usable`](crate::view::ViewGeometry::usable) and its
+    /// buffer is placed below
+    /// [`ViewGeometry::reserved_top`](crate::view::ViewGeometry::reserved_top),
+    /// so the view's top corners are
+    /// [`LETTERBOX_RGBA`](crate::scene::LETTERBOX_RGBA) on a perfectly
+    /// correct frame.
+    ///
+    /// **Relaxing the corner check to accept the matte would have made it a
+    /// rubber stamp** -- an all-matte view with no app in it would pass, and
+    /// running the occlusion proof against an app-less realm view is exactly
+    /// what the wait below exists to prevent. So the property is restated at
+    /// the post-inset geometry and made *stronger* than four samples:
+    ///
+    /// * the reserved rows are the matte -- **every** pixel of them;
+    /// * the usable rectangle contains **nothing but** click-target's two
+    ///   colours, so the app's field really does fill it edge to edge;
+    /// * the square is the right size, solid, and centred in the **usable**
+    ///   rectangle rather than in the output.
+    ///
+    /// Every number comes from the [`ViewGeometry`](crate::view::ViewGeometry)
+    /// the shim was configured with, so the next change to what the core
+    /// reserves moves this with it and no literal `472` or `8` appears here.
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
     struct ClickTargetSignature {
-        /// All four corners are click-target's black field.
-        corners_are_field: bool,
+        /// Every pixel of the reserved rows is the core's letterbox matte.
+        reserved_rows_are_letterbox: bool,
+        /// The usable rectangle holds only click-target's two colours: its
+        /// field reached the view whole, with no matte showing through.
+        field_fills_usable: bool,
         /// Pixels exactly equal to click-target's green.
         target_pixels: u32,
         /// Bounding box of those pixels, `(w, h)`; `(0, 0)` if there are none.
         target_box: (u32, u32),
+        /// Top-left of that box **in output coordinates**; `None` if there
+        /// are no green pixels at all.
+        target_origin: Option<(u32, u32)>,
     }
 
     impl ClickTargetSignature {
-        fn of(view: &[u8], w: u32, h: u32) -> Self {
+        fn of(view: &[u8], geom: crate::view::ViewGeometry) -> Self {
+            let (w, h) = geom.output();
+            let top = geom.reserved_top();
             let at = |x: u32, y: u32| -> [u8; 4] {
                 let o = (y as usize * w as usize + x as usize) * test_pattern::BYTES_PER_PIXEL;
                 view[o..o + test_pattern::BYTES_PER_PIXEL]
                     .try_into()
                     .unwrap()
             };
-            let corners_are_field = [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)]
-                .into_iter()
-                .all(|(x, y)| at(x, y) == CLICK_TARGET_BG);
+            let reserved_rows_are_letterbox = (0..top)
+                .flat_map(|y| (0..w).map(move |x| (x, y)))
+                .all(|(x, y)| at(x, y) == crate::scene::LETTERBOX_RGBA);
+            let mut field_fills_usable = true;
             let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0u32, 0u32);
             let mut target_pixels = 0u32;
-            for y in 0..h {
+            for y in top..h {
                 for x in 0..w {
-                    if at(x, y) == CLICK_TARGET_FG {
-                        target_pixels += 1;
-                        x0 = x0.min(x);
-                        y0 = y0.min(y);
-                        x1 = x1.max(x);
-                        y1 = y1.max(y);
+                    match at(x, y) {
+                        CLICK_TARGET_FG => {
+                            target_pixels += 1;
+                            x0 = x0.min(x);
+                            y0 = y0.min(y);
+                            x1 = x1.max(x);
+                            y1 = y1.max(y);
+                        }
+                        CLICK_TARGET_BG => {}
+                        // Anything else in the usable rectangle -- the matte
+                        // showing through, the empty-scene test pattern, a
+                        // half-painted frame -- means this is not the app's
+                        // own field.
+                        _ => field_fills_usable = false,
                     }
                 }
             }
-            let target_box = if target_pixels == 0 {
-                (0, 0)
+            let (target_box, target_origin) = if target_pixels == 0 {
+                ((0, 0), None)
             } else {
-                (x1 - x0 + 1, y1 - y0 + 1)
+                ((x1 - x0 + 1, y1 - y0 + 1), Some((x0, y0)))
             };
             Self {
-                corners_are_field,
+                reserved_rows_are_letterbox,
+                field_fills_usable,
                 target_pixels,
                 target_box,
+                target_origin,
             }
         }
 
-        /// True only for a frame click-target itself could have drawn.
+        /// Where click-target's square lands in output coordinates, for a
+        /// view of this geometry.
+        ///
+        /// Derived, deliberately, **without asking
+        /// [`ViewGeometry::place`](crate::view::ViewGeometry::place)**:
+        /// the app centres the square in its own
+        /// buffer (`shim/tests/click_target.c`), and the core drops that
+        /// buffer by the reserved rows. Restating the arithmetic here rather
+        /// than calling the production placement is the same discipline
+        /// `shim.rs`'s fixtures take -- an expectation that asked the
+        /// placement function would agree with a broken one. What it does
+        /// take from [`ViewGeometry`](crate::view::ViewGeometry) is the two
+        /// inputs, so a change to what the core reserves still moves it.
+        fn centred_in_usable(geom: crate::view::ViewGeometry) -> (u32, u32) {
+            let (uw, uh) = geom.usable();
+            (
+                (uw - CLICK_TARGET_EDGE) / 2,
+                geom.reserved_top() + (uh - CLICK_TARGET_EDGE) / 2,
+            )
+        }
+
+        /// True only for a frame click-target itself could have drawn, at
+        /// this view's geometry.
         ///
         /// The square must be solid (every pixel of a `TARGET_SIZE`-edge
         /// box) and nothing outside it may be that green, which the
         /// count-equals-area check enforces jointly with the bounding box:
         /// a stray green pixel elsewhere grows the box, and a hole in the
-        /// square lowers the count.
-        fn is_click_target(self) -> bool {
-            self.corners_are_field
+        /// square lowers the count. The origin check adds what the box's
+        /// *size* cannot say -- that it is where a client configured for the
+        /// usable rectangle would have put it.
+        fn is_click_target(self, geom: crate::view::ViewGeometry) -> bool {
+            self.reserved_rows_are_letterbox
+                && self.field_fills_usable
                 && self.target_box == (CLICK_TARGET_EDGE, CLICK_TARGET_EDGE)
                 && self.target_pixels == CLICK_TARGET_EDGE * CLICK_TARGET_EDGE
+                && self.target_origin == Some(Self::centred_in_usable(geom))
         }
 
         /// The more app-like of two observations, for the timeout message.
         fn better_of(self, other: Self) -> Self {
-            if (other.corners_are_field, other.target_pixels)
-                > (self.corners_are_field, self.target_pixels)
-            {
+            let rank = |s: Self| {
+                (
+                    s.reserved_rows_are_letterbox,
+                    s.field_fills_usable,
+                    s.target_pixels,
+                )
+            };
+            if rank(other) > rank(self) {
                 other
             } else {
                 self
@@ -2215,13 +2337,19 @@ mod tests {
         let retained = state.latest_frame_rgba().expect("readback");
         assert_eq!(
             retained,
-            state.bound_scene().compose(VW, VH),
+            state.bound_scene().compose((VW, VH).into()),
             "retained framebuffer must be the shared Scene::compose output"
         );
 
-        // The client's shm bytes appear in the view, centered 1:1, matte
-        // around them (the letterbox decision).
-        let (ox, oy) = (((VW - SW) / 2) as usize, ((VH - SH) / 2) as usize);
+        // The client's shm bytes appear in the view, centered 1:1 inside the
+        // USABLE rectangle (issue #304), matte around them (the letterbox
+        // decision).
+        let geom: crate::view::ViewGeometry = (VW, VH).into();
+        let (uw, uh) = geom.usable();
+        let (ox, oy) = (
+            ((uw - SW) / 2) as usize,
+            (geom.reserved_top() + (uh - SH) / 2) as usize,
+        );
         for row in 0..SH as usize {
             let dst = ((oy + row) * VW as usize + ox) * test_pattern::BYTES_PER_PIXEL;
             let src = row * SW as usize * test_pattern::BYTES_PER_PIXEL;
@@ -2319,12 +2447,12 @@ mod tests {
             .scenes
             .scene(&bound)
             .expect("bound scene")
-            .compose(VW, VH);
+            .compose((VW, VH).into());
         let want_hidden = state
             .scenes
             .scene(&hidden)
             .expect("hidden scene")
-            .compose(VW, VH);
+            .compose((VW, VH).into());
         // Diagnosed rather than dumped: two view-sized buffers in an
         // `assert_eq!` message is a wall of bytes nobody reads, and the fact
         // that matters is *whose* pixels came back.
@@ -2415,7 +2543,11 @@ mod tests {
         let headless_capture = state.latest_frame_rgba().expect("headless readback");
         // Nested capture: the bare scene composed on the CPU, from the SAME
         // scene object that fed the headless readback above.
-        let nested_capture = capture_pixels(state.bound_scene(), size).expect("a nonzero view");
+        let nested_capture = capture_pixels(
+            state.bound_scene(),
+            (size.w.max(0) as u32, size.h.max(0) as u32).into(),
+        )
+        .expect("a nonzero view");
 
         // The P1.3.8 requirement: same scene, same pixels, byte for byte.
         assert_eq!(
@@ -2423,7 +2555,7 @@ mod tests {
             "nested and headless captures must be byte-identical for the same scene"
         );
         // ...and both are exactly the one shared composition.
-        assert_eq!(nested_capture, state.bound_scene().compose(VW, VH));
+        assert_eq!(nested_capture, state.bound_scene().compose((VW, VH).into()));
 
         // Overlay excluded on the nested side too: a prompt on the
         // human-visible composition changes it, but the nested capture is
@@ -2437,8 +2569,7 @@ mod tests {
             &mut no_lock(),
             &super::super::blank::BlankSurface::for_test(),
             &mut no_status(),
-            VW,
-            VH,
+            (VW, VH).into(),
             false,
         );
         assert_ne!(
@@ -2603,7 +2734,7 @@ mod tests {
         );
         assert_eq!(
             view,
-            state.bound_scene().compose(VW, VH),
+            state.bound_scene().compose((VW, VH).into()),
             "the capture source must be exactly Scene::compose -- the overlay \
              composites at the output stage, above this"
         );
@@ -2755,7 +2886,7 @@ mod tests {
              docs/book/src/limits.md rather than quietly fixed here"
         );
         assert!(
-            view == state.bound_scene().compose(VW, VH),
+            view == state.bound_scene().compose((VW, VH).into()),
             "the capture source must be exactly Scene::compose -- the lock composites at the \
              output stage, above this"
         );
@@ -2950,7 +3081,7 @@ mod tests {
         );
         assert_eq!(
             view,
-            state.bound_scene().compose(VW, VH),
+            state.bound_scene().compose((VW, VH).into()),
             "the capture source must be exactly Scene::compose -- the sprite composites \
              at the output stage, above this"
         );
@@ -3102,9 +3233,11 @@ mod tests {
         );
         assert_eq!(
             view,
-            state.bound_scene().compose(VW, VH),
-            "the capture source must be exactly Scene::compose -- the strip composites at the \
-             output stage, above this"
+            state
+                .bound_scene()
+                .compose(crate::session::Presenter::view_geometry(&state)),
+            "the capture source must be exactly Scene::compose at this session's own geometry \
+             -- the strip composites at the output stage, above this"
         );
         assert_eq!(
             ground(&view),
@@ -3360,9 +3493,22 @@ mod tests {
     /// meson setup shim/build shim && meson compile -C shim/build
     /// VITRIN_C_SHIM_BIN=$PWD/shim/build/vitrin-shim cargo test -p vitrin-core c_shim
     /// ```
+    ///
+    /// **A plain `cargo test --workspace` does not exercise this test**, and
+    /// that sentence is load-bearing rather than a restatement of the
+    /// paragraph above: the workspace run leaves `VITRIN_C_SHIM_BIN` unset, so
+    /// this skips, prints its marker and is counted as a test that ran. Issue
+    /// #304 shipped a geometric expectation broken in exactly this body
+    /// through **three** review rounds on that strength — each ran the
+    /// workspace command, each reported green, and GitHub was the first
+    /// machine to start a shim. If you change anything about where a client's
+    /// pixels land, the line above is the one that checks it. `CONTRIBUTING.md`
+    /// §"Running the tests" carries the same warning for anyone who never
+    /// opens this file.
     #[test]
     fn c_shim_consent_prompt_occludes_the_human_visible_output_but_never_the_real_apps_capture() {
         use crate::consent::tests::prompt_fixture;
+        use crate::scene::LETTERBOX_RGBA;
         use crate::shim::{ShimConfig, ShimServer};
 
         // The same probe as `crate::shim::tests::c_shim_conforms_to_the_real_core`,
@@ -3437,10 +3583,16 @@ mod tests {
         )
         .expect("the C shim must spawn");
 
+        // **One geometry value, shared by the shim's `configure` and by the
+        // expectation below** (issue #304). The app is told
+        // `geom.usable()` -- the output minus the rows the core reserves --
+        // so an expectation phrased against `VW x VH` would be describing a
+        // frame this session cannot produce. Binding it once is what keeps
+        // the two from drifting apart again.
+        let geom: crate::view::ViewGeometry = (VW, VH).into();
         let mut server = ShimServer::new(ShimConfig {
             realm: "realm-0".into(),
-            width: VW,
-            height: VH,
+            geom,
         });
         let size: Size<i32, Physical> = (VW as i32, VH as i32).into();
         let event_loop: EventLoop<'static, HeadlessView> =
@@ -3490,6 +3642,12 @@ mod tests {
         // wait below blocks on a signature only click-target's rendering
         // produces, so the human-visible/capture split further down is
         // checked against real app pixels or not at all.
+        //
+        // Since issue #304 that signature is measured **at `geom`**: the
+        // app fills the usable rectangle, not the output, and the rows the
+        // core reserves above it are the matte. See
+        // `ClickTargetSignature`'s own docs for why the pre-inset corner
+        // check could not simply be relaxed to accept the matte.
         let deadline = std::time::Instant::now() + crate::spawn::tests::DEADLINE;
         let mut commits = 0u32;
         let mut best = ClickTargetSignature::default();
@@ -3502,9 +3660,14 @@ mod tests {
                 panic!(
                     "the C shim closed the connection after {commits} commit(s) without \
                      click-target's content ever reaching the realm view (best seen: \
-                     {best:?}); expected a solid {CLICK_TARGET_BG:?} field with one \
-                     centred {CLICK_TARGET_EDGE}x{CLICK_TARGET_EDGE} {CLICK_TARGET_FG:?} \
-                     square"
+                     {best:?}); expected the {:?} reserved rows to be \
+                     {LETTERBOX_RGBA:?}, the usable {:?} rectangle to be a solid \
+                     {CLICK_TARGET_BG:?} field, and one \
+                     {CLICK_TARGET_EDGE}x{CLICK_TARGET_EDGE} {CLICK_TARGET_FG:?} square \
+                     at {:?}",
+                    geom.reserved_top(),
+                    geom.usable(),
+                    ClickTargetSignature::centred_in_usable(geom),
                 );
             };
             let conn = spawned.connection_mut();
@@ -3517,8 +3680,8 @@ mod tests {
                 commits += 1;
                 state.redraw().expect("composite the shim's commit");
                 let view = state.latest_frame_rgba().expect("readback");
-                let seen = ClickTargetSignature::of(&view, VW, VH);
-                if seen.is_click_target() {
+                let seen = ClickTargetSignature::of(&view, geom);
+                if seen.is_click_target(geom) {
                     break view;
                 }
                 best = best.better_of(seen);
@@ -3532,12 +3695,17 @@ mod tests {
             assert!(
                 std::time::Instant::now() < deadline,
                 "click-target's content never reached the realm view within {:?} \
-                 ({commits} commit(s) composed; best seen: {best:?}). Expected a solid \
-                 {CLICK_TARGET_BG:?} field with one centred \
-                 {CLICK_TARGET_EDGE}x{CLICK_TARGET_EDGE} {CLICK_TARGET_FG:?} square \
-                 (shim/tests/click_target.c). Proceeding would run the consent-occlusion \
-                 proof against a realm view with no app in it.",
-                crate::spawn::tests::DEADLINE
+                 ({commits} commit(s) composed; best seen: {best:?}). Expected the {:?} \
+                 rows the core reserves to be {LETTERBOX_RGBA:?}, the usable {:?} \
+                 rectangle to be a solid {CLICK_TARGET_BG:?} field, and one \
+                 {CLICK_TARGET_EDGE}x{CLICK_TARGET_EDGE} {CLICK_TARGET_FG:?} square at \
+                 {:?} (shim/tests/click_target.c, centred in the rectangle the app was \
+                 configured for). Proceeding would run the consent-occlusion proof \
+                 against a realm view with no app in it.",
+                crate::spawn::tests::DEADLINE,
+                geom.reserved_top(),
+                geom.usable(),
+                ClickTargetSignature::centred_in_usable(geom),
             );
         };
         done.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -3649,8 +3817,7 @@ mod tests {
                     &mut no_lock(),
                     &super::super::blank::BlankSurface::for_test(),
                     &mut no_status(),
-                    VW,
-                    VH,
+                    (VW, VH).into(),
                     false
                 ),
                 "retained output must be the shared compose (prompt_up = {prompt_up})"
@@ -3737,8 +3904,7 @@ mod tests {
                 &mut no_lock(),
                 &super::super::blank::BlankSurface::for_test(),
                 &mut no_status(),
-                VW,
-                VH,
+                (VW, VH).into(),
                 false
             ),
             "after a scrub the human-visible image must still be the shared \
@@ -3831,8 +3997,7 @@ mod tests {
             .expect("headless state under pixman"),
             server: Some(ShimServer::new(ShimConfig {
                 realm: "realm-0".into(),
-                width: W,
-                height: H,
+                geom: (W, H).into(),
             })),
             router: crate::input::InputRouter::detached(crate::input::NoopHook),
             start: Instant::now(),
@@ -3941,19 +4106,26 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         // Animated end-to-end, tear-free: each presented readback of the
-        // retained framebuffer is byte-exact frame k.
+        // retained framebuffer is the reserved rows as matte followed by
+        // byte-exact frame k. The mock renders at the size `configure` gave it,
+        // which since issue #304 is the USABLE view, so the composite is the
+        // inset observed through a real event loop.
         assert_eq!(state.presented.len(), FRAMES as usize);
+        let geom: crate::view::ViewGeometry = (W, H).into();
+        let (uw, uh) = geom.usable();
         for (k, frame) in state.presented.iter().enumerate() {
+            let mut expected =
+                crate::scene::LETTERBOX_RGBA.repeat((W * geom.reserved_top()) as usize);
+            expected.extend_from_slice(&frame_rgba(k as u32, uw, uh));
             assert_eq!(
-                frame,
-                &frame_rgba(k as u32, W, H),
-                "presented frame {k} must be the exact generator output"
+                frame, &expected,
+                "presented frame {k} must be the exact generator output, below the reserved rows"
             );
         }
         // After shim death the scene composes the deterministic background.
         assert!(state.server.is_none(), "server forgotten on disconnect");
         assert_eq!(
-            state.headless.bound_scene().compose(W, H),
+            state.headless.bound_scene().compose((W, H).into()),
             test_pattern::render(W, H),
             "shim death must drop the surface from the scene"
         );

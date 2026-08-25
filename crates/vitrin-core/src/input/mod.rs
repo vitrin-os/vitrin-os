@@ -86,9 +86,13 @@
 //! about (the IDL deliberately leaves letterbox-vs-reconfigure open). The
 //! router therefore compensates for it at routing time: host-window/view
 //! coordinates are translated by the same deterministic
-//! [`layout::place`] placement the compositor painted with, so that (0, 0)
-//! on the wire is always the top-left of the app content the shim
-//! forwarded — the origin of the shim's own view space. A click on the
+//! [`ViewGeometry::place`] placement the compositor painted with, so that
+//! (0, 0) on the wire is always the top-left of the app content the shim
+//! forwarded — the origin of the shim's own view space. Since issue #304
+//! that placement starts below the rows the core reserves for the trusted
+//! band and the status strip, so the translation carries the inset too and
+//! a pointer over the band maps outside the app rather than into its first
+//! row. A click on the
 //! letterbox matte is *not* a click in the app: pointer events outside the
 //! placed surface rectangle are dropped, except during an implicit grab
 //! (below). With no committed surface there is nothing to point at, and
@@ -301,7 +305,7 @@ use vitrin_protocol::generated::vitrin_shim_seat as seat;
 use vitrin_protocol::generated::vitrin_shim_seat::{GestureKind, GestureState, KeyState, Origin};
 use vitrin_protocol::Fixed;
 
-use crate::scene::layout;
+use crate::view::ViewGeometry;
 
 /// **Pointer constraints** (WS-E.4.2, issue #222): the record a shim's
 /// `pointer_constraint` ask makes, the derived state its `pointer_constraint_state`
@@ -1599,7 +1603,7 @@ impl RealmSeat {
 
     /// Whether the last known pointer position lies over the placed
     /// surface rectangle (never true with no position or no surface).
-    fn pointer_over_surface(&self, view: (u32, u32), surface: Option<(u32, u32)>) -> bool {
+    fn pointer_over_surface(&self, view: ViewGeometry, surface: Option<(u32, u32)>) -> bool {
         let (Some(pointer), Some(surface)) = (self.pointer, surface) else {
             return false;
         };
@@ -2310,7 +2314,7 @@ impl<H: PreemptionHook> InputRouter<H> {
     pub fn route_physical(
         &mut self,
         input: SeatInput,
-        view: (u32, u32),
+        view: ViewGeometry,
         surface: Option<(u32, u32)>,
     ) -> Option<SeatDelivery> {
         debug_assert_eq!(
@@ -2355,7 +2359,7 @@ impl<H: PreemptionHook> InputRouter<H> {
         &mut self,
         realm: &crate::grants::RealmId,
         input: SeatInput,
-        view: (u32, u32),
+        view: ViewGeometry,
         surface: Option<(u32, u32)>,
     ) -> Option<SeatDelivery> {
         debug_assert_eq!(
@@ -2398,7 +2402,7 @@ impl<H: PreemptionHook> InputRouter<H> {
         seats: &mut std::collections::BTreeMap<crate::grants::RealmId, RealmSeat>,
         realm: Option<&crate::grants::RealmId>,
         input: SeatInput,
-        view: (u32, u32),
+        view: ViewGeometry,
         surface: Option<(u32, u32)>,
     ) -> Option<SeatDelivery> {
         // Position is recorded before gating: where the pointer *is* is a
@@ -2721,12 +2725,17 @@ impl<H: PreemptionHook> InputRouter<H> {
 }
 
 /// View coordinates → surface-local coordinates, through the same
-/// deterministic placement the compositor paints with ([`layout::place`]:
-/// centered, 1:1, negative when the surface is center-cropped). Router and
-/// scene can never disagree about where the surface is, because they ask
-/// the same function.
-fn surface_local(point: (f64, f64), view: (u32, u32), surface: (u32, u32)) -> (f64, f64) {
-    let placement = layout::place(view, surface);
+/// deterministic placement the compositor paints with
+/// ([`ViewGeometry::place`]: centered and 1:1 inside the *usable* rectangle,
+/// negative when the surface is center-cropped). Router and scene can never
+/// disagree about where the surface is, because they ask the same function.
+///
+/// **This is one of the three placement consumers issue #304 threaded**: a
+/// pointer at the top of the output is over the trusted band or the status
+/// strip, not over the app's first row, and before the inset the router said
+/// otherwise.
+fn surface_local(point: (f64, f64), view: ViewGeometry, surface: (u32, u32)) -> (f64, f64) {
+    let placement = view.place(surface);
     (point.0 - placement.x as f64, point.1 - placement.y as f64)
 }
 
@@ -3515,10 +3524,10 @@ pub(crate) mod tests {
     fn route_host<H: PreemptionHook>(
         router: &mut InputRouter<H>,
         event: &InputEvent<SyntheticHost>,
-        view: (u32, u32),
+        view: ViewGeometry,
         surface: Option<(u32, u32)>,
     ) -> Option<SeatDelivery> {
-        let mut inputs = intake_physical(event, (view.0 as i32, view.1 as i32));
+        let mut inputs = intake_physical(event, (view.output().0 as i32, view.output().1 as i32));
         assert_eq!(
             inputs.len(),
             1,
@@ -3691,8 +3700,8 @@ pub(crate) mod tests {
         // the real wire, origin=physical.
         let _fd = crate::capture::tests::fd_lock();
         let (server, _scene, mut core, mut mock) = wire_setup();
-        let view = (VIEW_W, VIEW_H);
-        let surface = Some(view);
+        let view: ViewGeometry = (VIEW_W, VIEW_H).into();
+        let surface = Some(view.usable());
         let mut router = router();
 
         // KEY_H (scancode 35) is layout-dependent — dropped with no host
@@ -3997,7 +4006,7 @@ pub(crate) mod tests {
     fn route_by_origin<H: PreemptionHook>(
         router: &mut InputRouter<H>,
         input: SeatInput,
-        view: (u32, u32),
+        view: ViewGeometry,
         surface: Option<(u32, u32)>,
     ) -> Option<SeatDelivery> {
         match input.origin() {
@@ -4008,6 +4017,20 @@ pub(crate) mod tests {
 
     fn motion(x: f64, y: f64) -> SeatInputKind {
         SeatInputKind::Motion { x, y }
+    }
+
+    /// A pointer position over the app's own pixel `(x, y)`, expressed in view
+    /// coordinates.
+    ///
+    /// Since issue #304 the app's origin is [`ViewGeometry::reserved_top`] rows
+    /// down — the trusted band's rows, plus the status strip's when `--status`
+    /// is on — so a test that means "somewhere inside the surface" says so here
+    /// instead of hard-coding a view coordinate that used to be inside the app
+    /// and is now over the core's own chrome. Only valid for a surface placed
+    /// at the usable rectangle's origin, which is what an app committing the
+    /// size `configure` gave it does.
+    fn over(view: ViewGeometry, x: f64, y: f64) -> SeatInputKind {
+        motion(x, y + f64::from(view.reserved_top()))
     }
 
     fn press() -> SeatInputKind {
@@ -4057,7 +4080,7 @@ pub(crate) mod tests {
     fn the_agent_pointer_follows_the_emulated_origin_and_nothing_else() {
         let mut router = router();
         let realm = test_realm();
-        let view = (64, 48);
+        let view: ViewGeometry = (64, 48).into();
         let surface = Some((64, 48));
         assert_eq!(router.agent_pointer(&realm), None, "nothing has moved yet");
 
@@ -4107,69 +4130,96 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn exact_fit_motion_is_the_identity_mapping() {
-        // The steady state of single-maximized: surface == view, placement
-        // zero — wire coordinates equal view coordinates, matching the
-        // IDL's realm-view-pixel flows number for number.
+    fn exact_fit_motion_subtracts_only_the_reservation() {
+        // The steady state of single-maximized **since issue #304**: the app
+        // commits the size `configure` gave it, which is the USABLE view, so
+        // the placement is `(0, reserved_top)` and wire coordinates equal view
+        // coordinates shifted by the rows the core keeps. Before the inset the
+        // app was configured at the output's full height and this mapping was
+        // the identity; the shift is not a change of rule but the same
+        // `ViewGeometry::place` the compositor paints with.
         let mut router = router();
+        let view: ViewGeometry = (64u32, 48u32).into();
+        let inset = f64::from(view.reserved_top());
+        assert!(inset > 0.0, "every session reserves the band's rows");
         let out = router
-            .route_physical(phys(motion(10.25, 47.5)), (64, 48), Some((64, 48)))
+            .route_physical(phys(motion(10.25, inset + 7.5)), view, Some(view.usable()))
             .expect("inside the surface");
-        assert_motion(&out, 10.25, 47.5);
+        assert_motion(&out, 10.25, 7.5);
         assert_eq!(out.origin(), Origin::Physical);
+
+        // ...and the app's own origin is the first row it was configured for.
+        let origin = router
+            .route_physical(phys(motion(0.0, inset)), view, Some(view.usable()))
+            .expect("the app's top-left pixel");
+        assert_motion(&origin, 0.0, 0.0);
+
+        // A pointer ON the reserved rows is over the core's chrome, not the
+        // app: it maps to a negative surface coordinate and is dropped.
+        assert!(
+            router
+                .route_physical(phys(motion(0.0, inset - 1.0)), view, Some(view.usable()))
+                .is_none(),
+            "the trusted band is not the app"
+        );
     }
 
     #[test]
     fn letterboxed_motion_subtracts_the_placement_offset() {
-        // View 100x80, surface 40x20: placed at (30, 30) — the same
-        // placement the compositor paints (scene::layout::place).
+        // Output 100x80 with the band's 8 rows reserved, so the usable view is
+        // 100x72; surface 40x20 is centred in THAT — placed at (30, 8 + 26) —
+        // the same placement the compositor paints (`ViewGeometry::place`).
         let mut router = router();
-        let view = (100, 80);
+        let view: ViewGeometry = (100, 80).into();
         let surface = Some((40, 20));
+        let (ox, oy) = (30.0, f64::from(view.reserved_top()) + (72.0 - 20.0) / 2.0);
+        assert_eq!((ox, oy), (30.0, 34.0), "the fixture's own arithmetic");
 
         // Top-left surface pixel.
-        let out = router.route_physical(phys(motion(30.0, 30.0)), view, surface);
+        let out = router.route_physical(phys(motion(ox, oy)), view, surface);
         assert_motion(&out.expect("surface origin"), 0.0, 0.0);
         // Bottom-right interior point.
-        let out = router.route_physical(phys(motion(69.5, 49.5)), view, surface);
+        let out = router.route_physical(phys(motion(ox + 39.5, oy + 19.5)), view, surface);
         assert_motion(&out.expect("inside"), 39.5, 19.5);
         // One pixel past the right edge: matte, not app.
         assert!(router
-            .route_physical(phys(motion(70.0, 40.0)), view, surface)
+            .route_physical(phys(motion(ox + 40.0, oy + 6.0)), view, surface)
             .is_none());
         // Just left of the placed rectangle: matte.
         assert!(router
-            .route_physical(phys(motion(29.5, 40.0)), view, surface)
+            .route_physical(phys(motion(ox - 0.5, oy + 6.0)), view, surface)
             .is_none());
     }
 
     #[test]
     fn center_cropped_motion_adds_the_crop_offset() {
-        // View 40x30, surface 60x50: placement (-10, -10) — the negative-
-        // offset case. The view's origin shows surface pixel (10, 10), and
-        // every view point lies over the surface.
+        // Output 40x30, usable 40x22 after the band's 8 rows, surface 60x50:
+        // placement (-10, 8 + (22 - 50) / 2) = (-10, -6) — the negative-offset
+        // case. The view's origin shows surface pixel (10, 6), and every view
+        // point lies over the surface.
         let mut router = router();
-        let view = (40, 30);
+        let view: ViewGeometry = (40, 30).into();
         let surface = Some((60, 50));
 
         let out = router.route_physical(phys(motion(0.0, 0.0)), view, surface);
-        assert_motion(&out.expect("crop origin"), 10.0, 10.0);
+        assert_motion(&out.expect("crop origin"), 10.0, 6.0);
         let out = router.route_physical(phys(motion(39.0, 29.0)), view, surface);
-        assert_motion(&out.expect("crop interior"), 49.0, 39.0);
+        assert_motion(&out.expect("crop interior"), 49.0, 35.0);
     }
 
     #[test]
     fn mixed_letterbox_and_crop_axes_map_independently() {
-        // View 100x20, surface 40x50 (the #19 mixed case): x letterboxed
-        // (+30), y center-cropped (-15).
+        // Output 100x20, usable 100x12 after the band's 8 rows, surface 40x50
+        // (the #19 mixed case): x letterboxed (+30), y center-cropped
+        // (8 + (12 - 50) / 2 = -11).
         let mut router = router();
-        let view = (100, 20);
+        let view: ViewGeometry = (100, 20).into();
         let surface = Some((40, 50));
 
         let out = router.route_physical(phys(motion(30.0, 0.0)), view, surface);
-        assert_motion(&out.expect("placed origin"), 0.0, 15.0);
+        assert_motion(&out.expect("placed origin"), 0.0, 11.0);
         let out = router.route_physical(phys(motion(69.0, 19.0)), view, surface);
-        assert_motion(&out.expect("placed interior"), 39.0, 34.0);
+        assert_motion(&out.expect("placed interior"), 39.0, 30.0);
         // Left of the placed rectangle: matte on the x axis.
         assert!(router
             .route_physical(phys(motion(29.0, 10.0)), view, surface)
@@ -4190,8 +4240,13 @@ pub(crate) mod tests {
         // a protocol-track amendment rather than rounding away real host
         // precision here.
         let mut router = router();
+        // An output of 10x18 leaves a 10x10 usable view after the band's rows,
+        // so the app's own origin is at y = 8 and the fractions below are
+        // measured from it.
+        let view: ViewGeometry = (10u32, 18u32).into();
+        let inset = f64::from(view.reserved_top());
         let out = router
-            .route_physical(phys(motion(0.5, 0.25)), (10, 10), Some((10, 10)))
+            .route_physical(phys(motion(0.5, inset + 0.25)), view, Some(view.usable()))
             .expect("inside");
         match out.kind() {
             SeatDeliveryKind::Motion { x, y } => {
@@ -4209,8 +4264,8 @@ pub(crate) mod tests {
         // does not leak either. Keys still flow (focus is held on the app
         // shim-side).
         let mut router = router();
-        let view = (100, 80);
-        let surface = Some((40, 20)); // placed at (30, 30)
+        let view: ViewGeometry = (100, 80).into();
+        let surface = Some((40, 20)); // placed at (30, 34): centred in the usable view
 
         assert!(router
             .route_physical(phys(motion(5.0, 5.0)), view, surface)
@@ -4239,8 +4294,8 @@ pub(crate) mod tests {
     #[test]
     fn implicit_grab_holds_the_pointer_through_an_off_surface_drag() {
         let mut router = router();
-        let view = (100, 80);
-        let surface = Some((40, 20)); // placed at (30, 30)
+        let view: ViewGeometry = (100, 80).into();
+        let surface = Some((40, 20)); // placed at (30, 34): centred in the usable view
 
         // Move onto the surface and press: both delivered.
         assert!(router
@@ -4254,7 +4309,7 @@ pub(crate) mod tests {
         // grab, with out-of-bounds (here negative) surface-local
         // coordinates — the wire's fixed is signed for exactly this.
         let out = router.route_physical(phys(motion(0.0, 0.0)), view, surface);
-        assert_motion(&out.expect("grabbed motion"), -30.0, -30.0);
+        assert_motion(&out.expect("grabbed motion"), -30.0, -34.0);
         // Scroll during the grab flows too.
         assert!(router
             .route_physical(phys(scroll()), view, surface)
@@ -4282,8 +4337,8 @@ pub(crate) mod tests {
         // release for a button the app never saw pressed, and the app
         // must never be left holding a stranded button.
         let mut router = router();
-        let view = (100, 80);
-        let surface = Some((40, 20)); // placed at (30, 30)
+        let view: ViewGeometry = (100, 80).into();
+        let surface = Some((40, 20)); // placed at (30, 34): centred in the usable view
         let button = |code, state| SeatInputKind::Button {
             button: code,
             state,
@@ -4326,7 +4381,7 @@ pub(crate) mod tests {
         // deliveries. Keys and text still route; the shim owns that
         // judgement.
         let mut router = router();
-        let view = (100, 80);
+        let view: ViewGeometry = (100, 80).into();
 
         assert!(router
             .route_physical(phys(motion(10.0, 10.0)), view, None)
@@ -4418,12 +4473,12 @@ pub(crate) mod tests {
             consume: Rc::clone(&consume),
         });
         assert!(router.bind_to(&test_realm()).is_none());
-        let view = (64, 48);
-        let surface = Some((64, 48));
+        let view: ViewGeometry = (64, 48).into();
+        let surface = Some(view.usable());
 
         // Delivering: observe precedes gate.
         assert!(router
-            .route_physical(phys(motion(1.0, 1.0)), view, surface)
+            .route_physical(phys(over(view, 1.0, 1.0)), view, surface)
             .is_some());
         assert_eq!(
             log.borrow().as_slice(),
@@ -4435,7 +4490,7 @@ pub(crate) mod tests {
         log.borrow_mut().clear();
         consume.set(true);
         assert!(router
-            .route_physical(phys(motion(2.0, 2.0)), view, surface)
+            .route_physical(phys(over(view, 2.0, 2.0)), view, surface)
             .is_none());
         assert!(router
             .route_emulated(&test_realm(), SeatInput::emulated(scroll()), view, surface)
@@ -4460,7 +4515,7 @@ pub(crate) mod tests {
             consume: Rc::clone(&consume),
         });
         assert!(router.bind_to(&test_realm()).is_none());
-        let view = (64, 48);
+        let view: ViewGeometry = (64, 48).into();
         let surface = Some((64, 48));
 
         // Pointer on the surface; a grab-holder consumes the press.
@@ -4498,8 +4553,8 @@ pub(crate) mod tests {
             consume: Rc::clone(&consume),
         });
         assert!(router.bind_to(&test_realm()).is_none());
-        let view = (100, 80);
-        let surface = Some((40, 20)); // placed at (30, 30)
+        let view: ViewGeometry = (100, 80).into();
+        let surface = Some((40, 20)); // placed at (30, 34): centred in the usable view
 
         // Press delivered on the surface: implicit grab begins.
         assert!(router
@@ -4555,8 +4610,8 @@ pub(crate) mod tests {
         // invokes alongside `Scene::clear_surface`.
         let mut router = router();
         let realm = test_realm();
-        let view = (100, 80);
-        let surface = Some((40, 20)); // placed at (30, 30)
+        let view: ViewGeometry = (100, 80).into();
+        let surface = Some((40, 20)); // placed at (30, 34): centred in the usable view
 
         assert!(router
             .route_physical(phys(motion(35.0, 35.0)), view, surface)
@@ -4628,7 +4683,7 @@ pub(crate) mod tests {
     fn a_siblings_death_leaves_the_bound_realms_held_key_alone() {
         use crate::grants::RealmId;
         let mut router = InputRouter::detached(NoopHook);
-        let view = (100, 80);
+        let view: ViewGeometry = (100, 80).into();
         let surface = Some((40, 20));
         let bound = RealmId::new("browser");
         let sibling = RealmId::new("realm-0");
@@ -4719,15 +4774,15 @@ pub(crate) mod tests {
                 Origin::Emulated => SeatInput::emulated(kind),
             };
             let mut router = router();
-            let view = (64, 48);
-            let surface = Some((64, 48));
+            let view: ViewGeometry = (64, 48).into();
+            let surface = Some(view.usable());
 
             let deliver = |router: &mut InputRouter<NoopHook>, kind| {
                 route_by_origin(router, wrap(kind), view, surface)
                     .expect("routable by construction")
             };
 
-            let bytes = deliver(&mut router, motion(7.0, 9.0)).encode(SEAT_ID);
+            let bytes = deliver(&mut router, over(view, 7.0, 9.0)).encode(SEAT_ID);
             let (oid, ev) = seat::events::Motion::decode(&bytes, None).unwrap();
             assert_eq!((oid, ev.origin), (SEAT_ID, origin));
             assert_eq!((ev.x, ev.y), (Fixed::from_f64(7.0), Fixed::from_f64(9.0)));
@@ -4786,8 +4841,8 @@ pub(crate) mod tests {
                 Origin::Emulated => "emulated",
             };
             let mut router = router();
-            let view = (64, 48);
-            let surface = Some((64, 48));
+            let view: ViewGeometry = (64, 48).into();
+            let surface = Some(view.usable());
             let mut deliver = |kind| {
                 route_by_origin(&mut router, wrap(kind), view, surface)
                     .expect("routable by construction")
@@ -4796,7 +4851,7 @@ pub(crate) mod tests {
             // Ordered as the router tolerates (a press leaves an implicit grab
             // the rest ride), mirroring the encode test above.
             for (kind, label) in [
-                (motion(1.0, 2.0), "motion"),
+                (over(view, 1.0, 2.0), "motion"),
                 (press(), "button"),
                 (scroll(), "scroll"),
                 (
@@ -4830,10 +4885,10 @@ pub(crate) mod tests {
         let _fd = crate::capture::tests::fd_lock();
         let (mut rec, path) = crate::recorder::tests::scratch_recorder("seat-delivery-funnel");
         let mut router = router();
-        let view = (64, 48);
-        let surface = Some((64, 48));
+        let view: ViewGeometry = (64, 48).into();
+        let surface = Some(view.usable());
         let motion_delivery = router
-            .route_physical(SeatInput::physical(motion(1.0, 2.0)), view, surface)
+            .route_physical(SeatInput::physical(over(view, 1.0, 2.0)), view, surface)
             .expect("motion routes");
         let button_delivery = router
             .route_physical(SeatInput::physical(press()), view, surface)
@@ -4866,8 +4921,7 @@ pub(crate) mod tests {
         let (mut core, shim) = Connection::pair().expect("socketpair");
         let server = ShimServer::new(ShimConfig {
             realm: "realm-0".into(),
-            width: VIEW_W,
-            height: VIEW_H,
+            geom: (VIEW_W, VIEW_H).into(),
         });
         server
             .send_configure(&mut |frame| core.send_message(frame, None))
@@ -4904,8 +4958,11 @@ pub(crate) mod tests {
         let _fd = crate::capture::tests::fd_lock();
         let (server, _scene, mut core, mut mock) = wire_setup();
         let mut router = router();
-        let view = (VIEW_W, VIEW_H);
-        let surface = Some((VIEW_W, VIEW_H)); // steady state: surface fills the view
+        let view: ViewGeometry = (VIEW_W, VIEW_H).into();
+        // Steady state: the surface is the size `configure` gave it, so it
+        // fills the usable view and its origin is `reserved_top()` rows down.
+        let surface = Some(view.usable());
+        let inset = f64::from(view.reserved_top());
 
         let mut send_all = |inputs: Vec<SeatInput>, router: &mut InputRouter<NoopHook>| {
             for input in inputs {
@@ -4923,7 +4980,10 @@ pub(crate) mod tests {
         // generic intake (synthetic host backend), so the physical tag is
         // bound where nested-mode input enters the core.
         send_all(
-            intake_physical(&motion_ev(10.0, 20.0), (VIEW_W as i32, VIEW_H as i32)),
+            intake_physical(
+                &motion_ev(10.0, 20.0 + inset),
+                (VIEW_W as i32, VIEW_H as i32),
+            ),
             &mut router,
         );
         send_all(
@@ -5014,8 +5074,7 @@ pub(crate) mod tests {
         let (mut core, shim) = Connection::pair().expect("socketpair");
         let server = ShimServer::new(ShimConfig {
             realm: "realm-0".into(),
-            width: VIEW_W,
-            height: VIEW_H,
+            geom: (VIEW_W, VIEW_H).into(),
         });
         server
             .send_configure(&mut |frame| core.send_message(frame, None))
@@ -5033,7 +5092,7 @@ pub(crate) mod tests {
                     keysym: 0xff1b,
                     state: KeyState::Pressed,
                 }),
-                (VIEW_W, VIEW_H),
+                (VIEW_W, VIEW_H).into(),
                 None,
             )
             .expect("keys route");
@@ -5259,9 +5318,9 @@ pub(crate) mod tests {
     fn a_prompt_consumes_physical_input_for_every_realm_not_only_the_bound_one() {
         let mut rig = Grabbed::new();
         let (mut registry, petition) = pending_petition();
-        let view = (900, 700);
-        let surface_size = Some(view);
-        rig.grab.borrow_mut().set_view(view);
+        let view: ViewGeometry = (900, 700).into();
+        let surface_size = Some(view.usable());
+        rig.grab.borrow_mut().set_view(view.output());
         let a = test_realm();
         let b = crate::grants::RealmId::new("realm-b");
 
@@ -5348,9 +5407,9 @@ pub(crate) mod tests {
         // whose output is the only thing that can reach a shim seat.
         let mut rig = Grabbed::new();
         let (mut registry, petition) = pending_petition();
-        let view = (900, 700);
-        let surface_size = Some(view);
-        rig.grab.borrow_mut().set_view(view);
+        let view: ViewGeometry = (900, 700).into();
+        let surface_size = Some(view.usable());
+        rig.grab.borrow_mut().set_view(view.output());
 
         // Before the prompt: ordinary routing.
         assert!(rig
@@ -5403,9 +5462,9 @@ pub(crate) mod tests {
         // not, which is the short-circuit the wrapper documents.
         let mut rig = Grabbed::new();
         let (mut registry, petition) = pending_petition();
-        let view = (900, 700);
-        let surface_size = Some(view);
-        rig.grab.borrow_mut().set_view(view);
+        let view: ViewGeometry = (900, 700).into();
+        let surface_size = Some(view.usable());
+        rig.grab.borrow_mut().set_view(view.output());
         rig.raise_awake(petition, &mut registry);
 
         let gated_before = rig.spy.gated.get();
@@ -5448,9 +5507,9 @@ pub(crate) mod tests {
         // that answers the prompt is not.
         let mut rig = Grabbed::new();
         let (mut registry, petition) = pending_petition();
-        let view = (900, 700);
-        let surface_size = Some(view);
-        rig.grab.borrow_mut().set_view(view);
+        let view: ViewGeometry = (900, 700).into();
+        let surface_size = Some(view.usable());
+        rig.grab.borrow_mut().set_view(view.output());
 
         // A drag begins in the app.
         assert!(rig
@@ -5508,9 +5567,9 @@ pub(crate) mod tests {
 
         let mut rig = Grabbed::new();
         let (mut registry, petition) = pending_petition();
-        let view = (900, 700);
-        let surface_size = Some(view);
-        rig.grab.borrow_mut().set_view(view);
+        let view: ViewGeometry = (900, 700).into();
+        let surface_size = Some(view.usable());
+        rig.grab.borrow_mut().set_view(view.output());
 
         // The human is holding Shift when the prompt appears.
         assert!(rig
@@ -5558,15 +5617,15 @@ pub(crate) mod tests {
 
         let mut rig = Grabbed::new();
         let (mut registry, petition) = pending_petition();
-        let view = (900, 700);
-        let surface_size = Some(view);
-        rig.grab.borrow_mut().set_view(view);
+        let view: ViewGeometry = (900, 700).into();
+        let surface_size = Some(view.usable());
+        rig.grab.borrow_mut().set_view(view.output());
         rig.raise_awake(petition, &mut registry);
 
         // Aim at Deny, using the same placement the compositor draws with.
         let card = rig
             .surface
-            .card_origin(view.0, view.1)
+            .card_origin(view.output().0, view.output().1)
             .expect("a prompt is up");
         let rendered = crate::consent::render::rasterize(
             registry.prompt_content(petition).as_ref().expect("pending"),
@@ -5624,9 +5683,9 @@ pub(crate) mod tests {
         let (server, _scene, mut core, mut mock) = wire_setup();
         let mut rig = Grabbed::new();
         let (mut registry, petition) = pending_petition();
-        let view = (VIEW_W, VIEW_H);
-        let surface_size = Some(view);
-        rig.grab.borrow_mut().set_view(view);
+        let view: ViewGeometry = (VIEW_W, VIEW_H).into();
+        let surface_size = Some(view.usable());
+        rig.grab.borrow_mut().set_view(view.output());
 
         let now = std::time::Instant::now();
         let identity =
@@ -5683,7 +5742,15 @@ pub(crate) mod tests {
                         grant_wire_id: 10,
                         grant_row: Some(row),
                         principal: &identity,
-                        kind: UseKind::Pointer(SeatInputKind::Motion { x: 5.0, y: 6.0 }),
+                        // View coordinates -- what an agent reads off a
+                        // capture -- so the row it names must be one the app
+                        // actually has: the app's origin is
+                        // `reserved_top()` rows down (issue #304), and the
+                        // wire assertion below is the surface-local answer.
+                        kind: UseKind::Pointer(SeatInputKind::Motion {
+                            x: 5.0,
+                            y: 6.0 + f64::from(view.reserved_top()),
+                        }),
                     },
                     grants,
                     registry,
@@ -5842,9 +5909,9 @@ pub(crate) mod tests {
         // real grab*, not a stand-in.
         let mut rig = Guarded::new();
         let (mut registry, petition) = pending_petition();
-        let view = (900, 700);
-        let surface = Some(view);
-        rig.grab.borrow_mut().set_view(view);
+        let view: ViewGeometry = (900, 700).into();
+        let surface = Some(view.usable());
+        rig.grab.borrow_mut().set_view(view.output());
 
         let t0 = rig.now.get();
         rig.grab
@@ -5902,8 +5969,8 @@ pub(crate) mod tests {
         // forged chord release. Driven through `route`, so the flood takes
         // the real path an admitted actuation takes.
         let mut rig = Guarded::new();
-        let view = (900, 700);
-        let surface = Some(view);
+        let view: ViewGeometry = (900, 700).into();
+        let surface = Some(view.usable());
         let t0 = rig.now.get();
 
         assert!(rig
@@ -5955,9 +6022,9 @@ pub(crate) mod tests {
         // pairing exception at once.
         let mut rig = Guarded::new();
         let (mut registry, petition) = pending_petition();
-        let view = (900, 700);
-        let surface = Some(view);
-        rig.grab.borrow_mut().set_view(view);
+        let view: ViewGeometry = (900, 700).into();
+        let surface = Some(view.usable());
+        rig.grab.borrow_mut().set_view(view.output());
         let t0 = rig.now.get();
 
         // 1. The tap's press, no prompt up: withheld.
@@ -6042,8 +6109,8 @@ pub(crate) mod tests {
         // test could not tell the chord and the tap apart at all.
         let _fd = crate::capture::tests::fd_lock();
         let (server, _scene, mut core, mut mock) = wire_setup();
-        let view = (VIEW_W, VIEW_H);
-        let surface = Some(view);
+        let view: ViewGeometry = (VIEW_W, VIEW_H).into();
+        let surface = Some(view.usable());
         let host_view = (VIEW_W as i32, VIEW_H as i32);
 
         let deadman = Rc::new(RefCell::new(crate::deadman::DeadManSwitch::new(
@@ -6183,8 +6250,8 @@ pub(crate) mod tests {
             NoopHook,
         ));
         assert!(router.bind_to(&test_realm()).is_none());
-        let view = (64, 48);
-        let surface = Some(view);
+        let view: ViewGeometry = (64, 48).into();
+        let surface = Some(view.usable());
         let t0 = now.get();
 
         assert!(router
@@ -6241,8 +6308,8 @@ pub(crate) mod tests {
             NoopHook,
         ));
         assert!(router.bind_to(&test_realm()).is_none());
-        let view = (64, 48);
-        let surface = Some(view);
+        let view: ViewGeometry = (64, 48).into();
+        let surface = Some(view.usable());
 
         // Two ordinary keys go down and are delivered, then the chord goes
         // down and is withheld by the gate.
@@ -6366,8 +6433,8 @@ pub(crate) mod tests {
     #[test]
     fn a_focus_drain_never_speaks_for_an_agents_held_key() {
         let mut router = router();
-        let view = (64, 48);
-        let surface = Some(view);
+        let view: ViewGeometry = (64, 48).into();
+        let surface = Some(view.usable());
         const AGENT_KEY: u32 = 0xffe1; // Shift_L, an agent holding a modifier
         const HUMAN_KEY: u32 = 0x062; // 'b'
 
@@ -6458,9 +6525,10 @@ pub(crate) mod tests {
         let mut router = InputRouter::detached(NoopHook);
         let a = crate::grants::RealmId::new("realm-a");
         let b = crate::grants::RealmId::new("realm-b");
-        let view = (100, 80);
-        // A fills its view; B is letterboxed, placed at (30, 30).
-        let surface_a = Some((100, 80));
+        let view: ViewGeometry = (100, 80).into();
+        // A fills its usable view -- the size `configure` gave it; B is
+        // letterboxed inside the same rectangle, placed at (30, 34).
+        let surface_a = Some(view.usable());
         let surface_b = Some((40, 20));
         assert!(router.bind_to(&a).is_none());
 
@@ -6468,14 +6536,14 @@ pub(crate) mod tests {
         let to_b = router
             .route_emulated(&b, SeatInput::emulated(motion(35.0, 35.0)), view, surface_b)
             .expect("an agent's motion must reach the realm its grant names");
-        assert_motion(&to_b, 5.0, 5.0);
+        assert_motion(&to_b, 5.0, 1.0);
         assert_eq!(to_b.origin(), Origin::Emulated);
 
         // The human, in the same round, into the bound realm through A's.
         let to_a = router
             .route_physical(phys(motion(35.0, 35.0)), view, surface_a)
             .expect("the human's motion must reach the bound realm");
-        assert_motion(&to_a, 35.0, 35.0);
+        assert_motion(&to_a, 35.0, 35.0 - f64::from(view.reserved_top()));
         assert_eq!(to_a.origin(), Origin::Physical);
 
         // Neither realm's pointer state is the other's: the agent's sprite
@@ -6531,8 +6599,8 @@ pub(crate) mod tests {
     #[test]
     fn a_binding_change_drains_the_humans_held_presses_and_only_the_humans() {
         let mut router = InputRouter::detached(NoopHook);
-        let view = (64, 48);
-        let surface = Some(view);
+        let view: ViewGeometry = (64, 48).into();
+        let surface = Some(view.usable());
         let a = crate::grants::RealmId::new("realm-a");
         let b = crate::grants::RealmId::new("realm-b");
         const HUMAN_KEY: u32 = 0xffe3; // Control_L
@@ -6777,13 +6845,13 @@ pub(crate) mod tests {
         assert!(Rc::ptr_eq(&router.presence(), &presence));
         assert!(router.bind_to(&test_realm()).is_none());
         let bound = test_realm();
-        let view = (64, 48);
-        let surface = Some((64, 48));
+        let view: ViewGeometry = (64, 48).into();
+        let surface = Some(view.usable());
 
         // A delivered physical motion is observed and recorded at the
         // clock cell's injected instant.
         assert!(router
-            .route_physical(phys(motion(2.0, 2.0)), view, surface)
+            .route_physical(phys(over(view, 2.0, 2.0)), view, surface)
             .is_some());
         assert!(presence.borrow().owns_target(Some(&bound), t0));
         assert!(!presence
@@ -6796,7 +6864,7 @@ pub(crate) mod tests {
         clock.set(t1);
         consume.set(true);
         assert!(router
-            .route_physical(phys(motion(3.0, 3.0)), view, surface)
+            .route_physical(phys(over(view, 3.0, 3.0)), view, surface)
             .is_none());
         assert!(presence.borrow().owns_target(Some(&bound), t1));
 
@@ -6848,8 +6916,8 @@ pub(crate) mod tests {
     fn a_realm_the_human_has_left_is_not_owned_by_the_human_whether_it_was_switched_or_died() {
         let t0 = std::time::Instant::now();
         let much_later = t0 + PHYSICAL_HOLD_WINDOW * 4;
-        let view = (64, 48);
-        let surface = Some((64, 48));
+        let view: ViewGeometry = (64, 48).into();
+        let surface = Some(view.usable());
         let (a, b) = (
             crate::grants::RealmId::new("realm-a"),
             crate::grants::RealmId::new("realm-b"),
@@ -6860,7 +6928,7 @@ pub(crate) mod tests {
         let mut router = InputRouter::new(Rc::clone(&presence), Rc::new(Cell::new(t0)), NoopHook);
         assert!(router.bind_to(&a).is_none());
         assert!(router
-            .route_physical(phys(motion(2.0, 2.0)), view, surface)
+            .route_physical(phys(over(view, 2.0, 2.0)), view, surface)
             .is_some());
         assert!(router
             .route_physical(phys(press()), view, surface)
@@ -6882,7 +6950,7 @@ pub(crate) mod tests {
         let mut router = InputRouter::new(Rc::clone(&presence), Rc::new(Cell::new(t0)), NoopHook);
         assert!(router.bind_to(&a).is_none());
         assert!(router
-            .route_physical(phys(motion(2.0, 2.0)), view, surface)
+            .route_physical(phys(over(view, 2.0, 2.0)), view, surface)
             .is_some());
         assert!(router
             .route_physical(phys(press()), view, surface)
@@ -6935,7 +7003,7 @@ pub(crate) mod tests {
         const UNSHIFTED: u32 = 0x0061; // `a`, what the release resolved to
 
         let mut router = router();
-        let view = (100u32, 80u32);
+        let view: ViewGeometry = (100u32, 80u32).into();
         let surface = Some((100u32, 80u32));
 
         let down = router
@@ -6993,7 +7061,7 @@ pub(crate) mod tests {
     #[test]
     fn pairing_by_scancode_still_drops_a_release_whose_own_press_was_never_delivered() {
         let mut router = router();
-        let view = (100u32, 80u32);
+        let view: ViewGeometry = (100u32, 80u32).into();
         let surface = Some((100u32, 80u32));
 
         assert!(router
@@ -7143,7 +7211,7 @@ pub(crate) mod tests {
         let mut keymap = CoreKeymap::from_text(include_str!("../../tests/fixtures/keymap-us.xkb"))
             .expect("the us fixture compiles");
         let mut router = router();
-        let view = (100u32, 80u32);
+        let view: ViewGeometry = (100u32, 80u32).into();
         let surface = Some((100u32, 80u32));
 
         let route = |keymap: &mut CoreKeymap, router: &mut InputRouter<NoopHook>, evdev, state| {
@@ -7237,7 +7305,7 @@ pub(crate) mod tests {
             consume: Rc::new(Cell::new(false)),
         });
         assert!(router.bind_to(&test_realm()).is_none());
-        let view = (64, 48);
+        let view: ViewGeometry = (64, 48).into();
         let surface = Some((64, 48));
         // A pointer-position-less class hit-tests against the stored
         // pointer, so put the pointer on the app first -- the same
@@ -7445,7 +7513,7 @@ pub(crate) mod tests {
     #[test]
     fn a_realm_switch_mid_gesture_ends_it_cancelled_and_owes_the_app_nothing_after() {
         let mut router = router();
-        let view = (64, 48);
+        let view: ViewGeometry = (64, 48).into();
         let surface = Some((64, 48));
         assert!(route_host(&mut router, &motion_ev(10.0, 10.0), view, surface).is_some());
         assert!(route_host(&mut router, &swipe_begin_ev(4), view, surface).is_some());
@@ -7490,9 +7558,10 @@ pub(crate) mod tests {
     #[test]
     fn the_gesture_drain_reads_the_kind_back_off_the_record_it_delivered() {
         let mut router = router();
-        let view = (64, 48);
-        let surface = Some((64, 48));
-        assert!(route_host(&mut router, &motion_ev(1.0, 1.0), view, surface).is_some());
+        let view: ViewGeometry = (64, 48).into();
+        let surface = Some(view.usable());
+        let inset = f64::from(view.reserved_top());
+        assert!(route_host(&mut router, &motion_ev(1.0, 1.0 + inset), view, surface).is_some());
         assert!(route_host(&mut router, &pinch_begin_ev(2), view, surface).is_some());
 
         let owed = router.end_physical_gesture(&test_realm());
@@ -7532,7 +7601,7 @@ pub(crate) mod tests {
             consume: Rc::clone(&consume),
         });
         assert!(router.bind_to(&test_realm()).is_none());
-        let view = (64, 48);
+        let view: ViewGeometry = (64, 48).into();
         let surface = Some((64, 48));
         assert!(route_host(&mut router, &motion_ev(5.0, 5.0), view, surface).is_some());
 
@@ -7579,7 +7648,7 @@ pub(crate) mod tests {
             consume: Rc::clone(&consume),
         });
         assert!(router.bind_to(&test_realm()).is_none());
-        let view = (64, 48);
+        let view: ViewGeometry = (64, 48).into();
         let surface = Some((64, 48));
         assert!(route_host(&mut router, &motion_ev(5.0, 5.0), view, surface).is_some());
         assert!(route_host(&mut router, &swipe_begin_ev(3), view, surface).is_some());
@@ -7605,7 +7674,7 @@ pub(crate) mod tests {
     #[test]
     fn unpaired_gesture_events_are_dropped_and_a_second_begin_is_refused() {
         let mut router = router();
-        let view = (64, 48);
+        let view: ViewGeometry = (64, 48).into();
         let surface = Some((64, 48));
         assert!(route_host(&mut router, &motion_ev(5.0, 5.0), view, surface).is_some());
 
@@ -7664,7 +7733,7 @@ pub(crate) mod tests {
     #[test]
     fn relative_motion_and_gestures_are_dropped_when_the_pointer_is_on_the_matte() {
         let mut router = router();
-        let view = (64, 48);
+        let view: ViewGeometry = (64, 48).into();
         let surface = Some((32, 24)); // centred, so (2, 2) is matte
         assert!(
             route_host(&mut router, &motion_ev(2.0, 2.0), view, surface).is_none(),
@@ -7683,7 +7752,7 @@ pub(crate) mod tests {
     #[test]
     fn one_realms_gesture_is_untouched_by_another_realms_drain_or_death() {
         let mut router = router();
-        let view = (64, 48);
+        let view: ViewGeometry = (64, 48).into();
         let surface = Some((64, 48));
         let other = crate::grants::RealmId::new("realm-1");
         assert!(route_host(&mut router, &motion_ev(5.0, 5.0), view, surface).is_some());
@@ -7712,7 +7781,7 @@ pub(crate) mod tests {
     #[test]
     fn the_gesture_drain_leaves_an_emulated_gesture_alone() {
         let mut router = router();
-        let view = (64, 48);
+        let view: ViewGeometry = (64, 48).into();
         let surface = Some((64, 48));
         assert!(route_host(&mut router, &motion_ev(5.0, 5.0), view, surface).is_some());
         assert!(router
@@ -7744,7 +7813,7 @@ pub(crate) mod tests {
     fn arm_constraint<H: PreemptionHook>(
         router: &InputRouter<H>,
         realm: &crate::grants::RealmId,
-        view: (u32, u32),
+        view: ViewGeometry,
         surface: Option<(u32, u32)>,
     ) {
         let table = router.constraints();
@@ -7770,7 +7839,10 @@ pub(crate) mod tests {
             output: OutputGates::default(),
             surface,
             view,
-            pointer: Some((view.0 as f64 / 2.0, view.1 as f64 / 2.0)),
+            pointer: Some((
+                f64::from(view.output().0) / 2.0,
+                f64::from(view.output().1) / 2.0,
+            )),
         });
         assert!(
             owed.iter().any(|v| v.realm == *realm),
@@ -7793,7 +7865,7 @@ pub(crate) mod tests {
     #[test]
     fn an_active_pointer_constraint_stops_absolute_motion_and_keeps_relative_motion() {
         let mut router = router();
-        let view = (100, 80);
+        let view: ViewGeometry = (100, 80).into();
         let surface = Some((40, 20));
         // Establish the pointer over the surface first: without a position the
         // relative arm would be dropped by the matte rule for its own reasons,
@@ -7843,7 +7915,7 @@ pub(crate) mod tests {
     #[test]
     fn a_locked_app_cannot_confine_an_agents_actuation() {
         let mut router = router();
-        let view = (100, 80);
+        let view: ViewGeometry = (100, 80).into();
         let surface = Some((40, 20));
         assert!(router
             .route_physical(phys(motion(50.0, 40.0)), view, surface)
@@ -7857,7 +7929,7 @@ pub(crate) mod tests {
             surface,
         );
         let delivered = delivered.expect("an agent's absolute motion is not the app's to stop");
-        assert_motion(&delivered, 22.0, 12.0);
+        assert_motion(&delivered, 22.0, 8.0);
         assert_eq!(delivered.origin(), Origin::Emulated);
     }
 
@@ -7873,7 +7945,7 @@ pub(crate) mod tests {
     #[test]
     fn a_realms_death_forgets_its_pointer_constraint_and_leaves_a_siblings_alone() {
         let mut router = InputRouter::detached(NoopHook);
-        let view = (100, 80);
+        let view: ViewGeometry = (100, 80).into();
         let surface = Some((40, 20));
         let bound = test_realm();
         let sibling = crate::grants::RealmId::new("browser");
@@ -7966,7 +8038,7 @@ pub(crate) mod tests {
             std::rc::Rc::clone(&now),
             NoopHook,
         ));
-        let view = (100, 80);
+        let view: ViewGeometry = (100, 80).into();
         let surface = Some((40, 20));
         assert!(router.bind_to(&test_realm()).is_none());
         assert!(router
@@ -8013,7 +8085,7 @@ pub(crate) mod tests {
     #[test]
     fn an_active_constraint_freezes_the_position_the_core_hit_tests_with() {
         let mut router = router();
-        let view = (100, 80);
+        let view: ViewGeometry = (100, 80).into();
         let surface = Some((40, 20));
         assert!(router
             .route_physical(phys(motion(50.0, 40.0)), view, surface)

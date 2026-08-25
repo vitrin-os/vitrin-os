@@ -170,8 +170,9 @@ impl RealmScenes {
         self.bound.as_ref()
     }
 
-    /// Drain the **bound** realm's pending damage into `view` coordinates —
-    /// [`Scene::take_damage_view`] for whichever realm the output shows.
+    /// Drain the **bound** realm's pending damage into `geom`'s view
+    /// coordinates — [`Scene::take_damage_view`] for whichever realm the
+    /// output shows.
     ///
     /// A named method rather than a `bound_mut()` accessor on purpose: the
     /// output's only mutable need on a scene is this one-shot presentation
@@ -179,11 +180,14 @@ impl RealmScenes {
     /// to show is exactly the shape of access decision 1 is about. `None`
     /// with nothing bound, which the callers already treat as "the whole view
     /// changed" — the conservative direction.
-    pub fn take_bound_damage(&mut self, view: (u32, u32)) -> Option<super::DamageRect> {
+    pub fn take_bound_damage(
+        &mut self,
+        geom: crate::view::ViewGeometry,
+    ) -> Option<super::DamageRect> {
         // Two disjoint field borrows, not a clone: this runs on the nested
         // backend's per-redraw path.
         let bound = self.bound.as_ref()?;
-        self.scenes.get_mut(bound)?.scene.take_damage_view(view)
+        self.scenes.get_mut(bound)?.scene.take_damage_view(geom)
     }
 
     /// Bind the output to `realm`, minting its scene if it has none.
@@ -318,24 +322,36 @@ mod tests {
     #[test]
     fn every_realm_composes_its_own_pixels_whichever_is_bound() {
         let (w, h) = (32, 24);
+        let geom: crate::view::ViewGeometry = (w, h).into();
+        let (uw, uh) = geom.usable();
         let mut scenes = RealmScenes::new((w, h));
-        commit(&mut scenes, "realm-a", w, h);
-        commit(&mut scenes, "realm-b", w / 2, h / 2);
+        // A commits the size `configure` gave it -- the usable view (issue
+        // #304) -- so its own buffer is what the view holds below the reserved
+        // rows. B is half that, and letterboxed inside the same rectangle.
+        commit(&mut scenes, "realm-a", uw, uh);
+        commit(&mut scenes, "realm-b", uw / 2, uh / 2);
 
         let view_of = |scenes: &RealmScenes, id: &str| {
             scenes
                 .scene(&realm(id))
                 .unwrap_or_else(|| panic!("{id} has a scene"))
-                .compose(w, h)
+                .compose(geom)
         };
         let a = view_of(&scenes, "realm-a");
         let b = view_of(&scenes, "realm-b");
         assert!(a != b, "the fixtures must actually differ");
-        assert_same_view(&a, &client_pixels(w, h), "A's view is A's own buffer");
+        let mut a_expected =
+            crate::scene::LETTERBOX_RGBA.repeat((w * geom.reserved_top()) as usize);
+        a_expected.extend_from_slice(&client_pixels(uw, uh));
+        assert_same_view(
+            &a,
+            &a_expected,
+            "A's view is the reserved rows, then A's own buffer",
+        );
 
         scenes.bind(&realm("realm-a"));
         assert_same_view(
-            &scenes.bound().compose(w, h),
+            &scenes.bound().compose(geom),
             &a,
             "A bound: the output is A",
         );
@@ -344,7 +360,7 @@ mod tests {
 
         scenes.bind(&realm("realm-b"));
         assert_same_view(
-            &scenes.bound().compose(w, h),
+            &scenes.bound().compose(geom),
             &b,
             "B bound: the output is B",
         );
@@ -361,14 +377,14 @@ mod tests {
         let before = scenes
             .scene(&realm("realm-a"))
             .expect("A has a scene")
-            .compose(w, h);
+            .compose((w, h).into());
         commit(&mut scenes, "realm-b", w, h);
         commit(&mut scenes, "realm-b", w / 2, h / 2);
         assert_same_view(
             &scenes
                 .scene(&realm("realm-a"))
                 .expect("A still has a scene")
-                .compose(w, h),
+                .compose((w, h).into()),
             &before,
             "B's commits moved A's view",
         );
@@ -384,7 +400,7 @@ mod tests {
         commit(&mut scenes, "realm-a", w, h);
         assert!(scenes.focused().is_none());
         assert_same_view(
-            &scenes.bound().compose(w, h),
+            &scenes.bound().compose((w, h).into()),
             &test_pattern::render(w, h),
             "an unbound output",
         );

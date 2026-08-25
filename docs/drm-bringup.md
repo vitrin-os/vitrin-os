@@ -678,9 +678,15 @@ Then, having **moved the pointer at least once** — see the warning below, whic
 cost two runs on 2026-08-13 before the rung was executed:
 
 **`gesture-probe` maps fullscreen, so there is nothing to aim at.** It fills the
-whole output (`2560x1600` on this panel) with flat slate blue (`0xff2050a0`,
-`shim/tests/gesture_probe.c:570`), so the pointer is over its surface wherever
-it is and **there is no letterbox matte in this configuration**. What still
+whole *usable* view (`2560x1592` on this panel — the output minus the trusted
+band's 8 rows, since issue #304 inset the realm view) with flat slate blue
+(`0xff2050a0`, `shim/tests/gesture_probe.c:570`), so the pointer is over its
+surface anywhere below the band and **there is no letterbox matte beside or
+below it in this configuration**. The panel still looks exactly as it did
+before the inset — the band's 8 rows are drawn over the reserved rows on the
+way to the human, so what you see is 8 rows of band above a full-width slate
+blue field, same as when the app painted those rows and the band covered them.
+What still
 matters is that the pointer **moves**: `pointer_enter` is delivered on the first
 motion, not on map, and a run whose SUMMARY reads `enter=0 motion=0` tested
 nothing no matter what else you did in it. Wiggle the cursor first, and treat

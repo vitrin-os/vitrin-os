@@ -1419,7 +1419,7 @@ mod tests {
             router.bind_to(&realm).is_none(),
             "the first bind leaves no previous realm owed a release"
         );
-        let view = (100, 100);
+        let view: crate::view::ViewGeometry = (100u32, 100u32).into();
         let surface = Some((100, 100));
 
         let down = router.route_physical(press(0xffe1), view, surface);
@@ -1674,7 +1674,7 @@ mod tests {
         ));
         let realm = crate::grants::RealmId::new("realm-0");
         assert!(router.bind_to(&realm).is_none());
-        let view = (640, 480);
+        let view: crate::view::ViewGeometry = (640u32, 480u32).into();
 
         // The session locks. From here on the lock consumes everything.
         screen.borrow_mut().raise(LockCause::Chord);
@@ -1684,7 +1684,7 @@ mod tests {
         // nothing is being consumed at all: an ordinary key reaches no app.
         assert!(
             router
-                .route_physical(press(0x61), view, Some(view))
+                .route_physical(press(0x61), view, Some(view.usable()))
                 .is_none(),
             "the lock must be consuming physical input for this test to mean anything"
         );
@@ -1695,7 +1695,11 @@ mod tests {
         // conditional.
         assert!(
             router
-                .route_physical(crate::input::tests::chord_press(), view, Some(view))
+                .route_physical(
+                    crate::input::tests::chord_press(),
+                    view,
+                    Some(view.usable())
+                )
                 .is_none(),
             "the chord's press does not reach the app while locked"
         );
@@ -1779,7 +1783,7 @@ mod tests {
         ));
         let realm = crate::grants::RealmId::new("realm-0");
         assert!(router.bind_to(&realm).is_none());
-        let view = (640, 480);
+        let view: crate::view::ViewGeometry = (640u32, 480u32).into();
 
         // The screen goes dark on the idle timer, with the session UNLOCKED --
         // Decision 1's shape: idle blanks, it does not lock.
@@ -1802,7 +1806,7 @@ mod tests {
         // being consumed: an ordinary key is eaten by the wake and reaches no app.
         assert!(
             router
-                .route_physical(press(0x61), view, Some(view))
+                .route_physical(press(0x61), view, Some(view.usable()))
                 .is_none(),
             "the wake must be consuming physical input for this test to mean anything"
         );
@@ -1818,7 +1822,11 @@ mod tests {
         // THE property: the press that wakes the screen still arms the switch.
         assert!(
             router
-                .route_physical(crate::input::tests::chord_press(), view, Some(view))
+                .route_physical(
+                    crate::input::tests::chord_press(),
+                    view,
+                    Some(view.usable())
+                )
                 .is_none(),
             "the chord's press is consumed as a wake and reaches no app"
         );
@@ -2223,7 +2231,7 @@ mod tests {
             InputRouter::detached(lock_gate(Rc::clone(&screen), Rc::clone(&now), NoopHook));
         let realm = crate::grants::RealmId::new("realm-0");
         assert!(router.bind_to(&realm).is_none());
-        let view = (100, 100);
+        let view: crate::view::ViewGeometry = (100u32, 100u32).into();
         let surface = Some((100, 100));
 
         // Shift goes down while the screen is lit: the app is holding it.

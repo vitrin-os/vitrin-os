@@ -1094,7 +1094,7 @@ mod tests {
         let mut delivered = 0;
         for input in crate::input::physical_key(evdev, None, state) {
             if router
-                .route_physical(input, (640, 480), Some((640, 480)))
+                .route_physical(input, (640u32, 480u32).into(), Some((640, 480)))
                 .is_some()
             {
                 delivered += 1;

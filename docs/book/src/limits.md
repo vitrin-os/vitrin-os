@@ -1619,7 +1619,8 @@ battery, and a clock. There is no tray, no notifications, no workspace
 switcher, and no click targets — it is not interactive at all, because a
 principal cannot receive physical input (above) and the core does not want
 another core-owned gesture for a status bar (it already owns eight; they are
-enumerated under `principal-has-no-hotkey` below). Four further limits belong with it:
+enumerated under `principal-has-no-hotkey` below). Three further limits belong
+with it:
 
 - **The strip is unspoofable in pixels but is not self-authenticating.** It
   always wins the composite, so a confined app cannot cover it — but an app
@@ -1629,12 +1630,6 @@ enumerated under `principal-has-no-hotkey` below). Four further limits belong wi
   proves itself, the strip only inherits position from it. This makes the
   indicator story three rules where there was one, and a human who cannot state
   the rule cannot apply it.
-- <!-- limit: status-strip-overdraws-the-view -->
-  **Every app loses rows while the strip is on.** The realm view is *not* inset
-  — the app is not configured smaller, its top rows are overdrawn, exactly as
-  the band's 8 rows already are. Issue #215 asks for the inset and it is
-  unimplemented; `--status` is off by default so no session pays for a strip it
-  did not ask for.
 - **The clock is UTC unless you say otherwise, and there is no DST.** The core
   carries no timezone database — a `tzfile` parser and a recurring read of
   `/usr/share/zoneinfo` is authority the TCB is not taking for a cosmetic field
@@ -1778,12 +1773,16 @@ genuine wedge; it is documented, asserted
 ([`tests/integration/test_shell.py`](https://github.com/vitrin-os/vitrin-os/blob/main/tests/integration/test_shell.py)),
 and not solved.
 
-**`set_fullscreen` is a no-op whenever the output and the realm are the same
-size.** The two modes differ only in whether the realm's view size tracks the
-output's, so while they are equal — which is the ordinary case for a realm
-spawned into an output that has not resized — switching between them changes
-nothing you can see. It is honest and it is surprising; the IDL says so in as
-many words.
+**`set_fullscreen` is a no-op whenever the realm's view is already the output's
+usable size.** The two modes differ only in whether the realm's view size
+tracks the output's, so while they are equal — which is the ordinary case for a
+realm spawned into an output that has not resized — switching between them
+changes nothing you can see. It is honest and it is surprising; the IDL says so
+in as many words. **The size they are equal to is the output's *usable* view,
+not the output**: the core reserves the top rows of every frame for the trusted
+band, and for the status strip when `--status` is on, and an app is configured
+for what is left. This bullet said "the output and the realm are the same size"
+until that inset shipped, which named a condition that no longer occurs at all.
 
 **Captures do tell realms apart, and that is enforced rather than
 incidental.** An agent's capture is of the realm its **grant names**, never

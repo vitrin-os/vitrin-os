@@ -336,10 +336,20 @@ class RealLayoutFocus(IntegrationTest):
         """`set_fullscreen` is served, and honest about doing nothing here.
 
         The two modes differ only in whether the realm's view size *tracks*
-        the output's, so while the output and the realm are the same size —
-        which is exactly a realm spawned into an output that has not resized,
-        i.e. every headless CI run — switching between them changes nothing
-        observable. The IDL says so in as many words.
+        the output's, so while the output's **usable view** and the realm are
+        the same size — which is exactly a realm spawned into an output that
+        has not resized, i.e. every headless CI run — switching between them
+        changes nothing observable. The IDL says so in as many words.
+
+        *Usable view, not output.* Issue #304 inset the realm view: a shim is
+        configured at `ViewGeometry::usable()`, the output minus the rows the
+        core reserves for the trusted band and, when `--status` is on, the
+        status strip. So "the output and the realm are the same size" — what
+        this docstring said until the inset shipped, and what the IDL clause it
+        quotes said — is a condition that no longer occurs at all. The
+        equality that makes the two modes indistinguishable is against the
+        usable view, and it still holds on every headless run, which is why
+        this test asserts exactly what it did before.
 
         What this asserts is therefore what CI *can* assert: the request is
         served rather than refused, and it does not corrupt the realm's view.

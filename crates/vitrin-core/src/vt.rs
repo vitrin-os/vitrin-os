@@ -978,7 +978,7 @@ mod tests {
         ));
         let realm = crate::grants::RealmId::new("realm-0");
         assert!(router.bind_to(&realm).is_none());
-        let view = (640, 480);
+        let view: crate::view::ViewGeometry = (640u32, 480u32).into();
 
         // The session locks. From here the lock consumes every physical event.
         screen.borrow_mut().raise(LockCause::Chord);
@@ -988,18 +988,26 @@ mod tests {
         // assertions below cannot pass vacuously.
         assert!(
             router
-                .route_physical(physical(0x61, KeyState::Pressed), view, Some(view))
+                .route_physical(physical(0x61, KeyState::Pressed), view, Some(view.usable()))
                 .is_none(),
             "the lock must be consuming physical input for this test to mean anything"
         );
 
         // The human chords their way out.
         for keysym in [CTRL_L, ALT_L] {
-            router.route_physical(physical(keysym, KeyState::Pressed), view, Some(view));
+            router.route_physical(
+                physical(keysym, KeyState::Pressed),
+                view,
+                Some(view.usable()),
+            );
         }
         assert!(
             router
-                .route_physical(physical(fkey(2), KeyState::Pressed), view, Some(view))
+                .route_physical(
+                    physical(fkey(2), KeyState::Pressed),
+                    view,
+                    Some(view.usable())
+                )
                 .is_none(),
             "the chord's press must not reach the app"
         );
@@ -1010,7 +1018,11 @@ mod tests {
         );
         assert_eq!(request.target(), TargetVt(2));
         assert!(router
-            .route_physical(physical(fkey(2), KeyState::Released), view, Some(view))
+            .route_physical(
+                physical(fkey(2), KeyState::Released),
+                view,
+                Some(view.usable())
+            )
             .is_none());
 
         // ...and the lock is still up. A VT switch is never a way past it.

@@ -294,7 +294,11 @@ pub(crate) fn human_visible_from_view(
 /// consent prompt, if any, on top.
 ///
 /// [`Scene::compose`] followed by [`human_visible_from_view`], for callers
-/// that do not separately need the bare realm view. It returns tightly packed
+/// that do not separately need the bare realm view. It takes the session's
+/// [`crate::view::ViewGeometry`] (issue #304) rather than a bare size,
+/// because the compose half places the client below the rows the overlay half
+/// then draws into — the two must be the same reservation or the strip is
+/// back to overdrawing the app. It returns tightly packed
 /// RGBA8888, rows top-down, every pixel opaque — the same layout and the same
 /// contract as [`Scene::compose`], differing from it by the trusted band along
 /// the top edge (always) and the framed prompt (when one is up).
@@ -310,12 +314,12 @@ pub(crate) fn compose_human_visible(
     lock: &mut LockSurface,
     blank: &BlankSurface,
     status: &mut StatusStrip,
-    width: u32,
-    height: u32,
+    geom: crate::view::ViewGeometry,
     attention: bool,
 ) -> Vec<u8> {
+    let (width, height) = geom.output();
     human_visible_from_view(
-        scene.compose(width, height),
+        scene.compose(geom),
         consent,
         lock,
         blank,

@@ -194,9 +194,10 @@ pub(crate) struct PresentationGates<'a> {
     /// shim has not committed, or the app unmapped — is inactive: there is no
     /// surface to constrain to.
     pub surface: Option<(u32, u32)>,
-    /// The realm-view size the surface is placed inside, for the same
-    /// [`super::surface_local`] mapping the router and the compositor use.
-    pub view: (u32, u32),
+    /// The realm-view geometry the surface is placed inside, for the same
+    /// [`super::surface_local`] mapping the router and the compositor use —
+    /// reserved rows included, so the hit test agrees with the pixels.
+    pub view: crate::view::ViewGeometry,
     /// **The human's own pointer**, in view coordinates, or `None` before their
     /// first motion in this realm.
     ///
@@ -630,7 +631,7 @@ mod tests {
             focused: Some(focused),
             output: OutputGates::default(),
             surface: Some((100, 100)),
-            view: (100, 100),
+            view: (100u32, 100u32).into(),
             pointer: Some((50.0, 50.0)),
         }
     }
@@ -854,7 +855,7 @@ mod tests {
         // everything outside [50,150).
         let on_matte = PresentationGates {
             surface: Some((100, 100)),
-            view: (200, 200),
+            view: (200u32, 200u32).into(),
             pointer: Some((10.0, 10.0)),
             ..open_gates(&r)
         };
@@ -1051,7 +1052,7 @@ mod tests {
         );
         let on_matte = PresentationGates {
             surface: Some((100, 100)),
-            view: (200, 200),
+            view: (200u32, 200u32).into(),
             pointer: Some((10.0, 10.0)),
             ..open_gates(&r)
         };
@@ -1081,7 +1082,7 @@ mod tests {
                                     dark: false,
                                 },
                                 surface,
-                                view: (200, 200),
+                                view: (200u32, 200u32).into(),
                                 pointer,
                             };
                             let _ = table.reconcile(&gates);

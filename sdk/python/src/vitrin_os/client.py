@@ -510,9 +510,16 @@ class Grant(_Proxy):
         Fire-and-forget, like :meth:`focus`.
 
         The two modes differ only in whether the realm's view size *tracks*
-        the output's, so while the output and the realm are the same size
-        they are indistinguishable and this changes nothing observable. That
-        is the protocol's own statement, not this SDK's simplification.
+        the output's, so while the realm is already at the output's **usable**
+        size they are indistinguishable and this changes nothing observable.
+        That is the protocol's own statement, not this SDK's simplification.
+
+        The usable size, not the output's: a core may reserve rows along the
+        top edge for chrome of its own — a trusted indicator band, a status
+        strip — and `configure` carries what is left, so an app never lays out
+        for rows it will not see. How many rows, or whether any, is a
+        deployment property; nothing in this SDK computes it and no client
+        needs to.
         """
         facet = self._arrange_facet()
         mode = (

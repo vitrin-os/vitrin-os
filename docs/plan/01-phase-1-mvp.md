@@ -401,29 +401,70 @@ table above; it would move that row's evidence from an incidental mention to a
 signed-off procedure, which is a different and smaller claim than a gate.
 Recorded here so that "closed" reads as *adjudicated* rather than *unmentioned*.
 
-**What the negative gate proves, precisely.** A real `click-target`, clicked by
-the agent through the real chokepoint, repaints its **whole surface** — the
-band's rows included — from black to red; that is the strongest counterfeit
-available to something that cannot observe the colour it would have to match.
-The band's rows are then exactly the app's own colour in **both** capture
-artifacts (the agent's `observe()` frame and `--capture-dump`), before and
-after, and both of those colours carry a channel below the indicator's `[64,
-255]` floor, so "the band is not in this capture" is certainty rather than a
-1-in-7-million coincidence. Meanwhile the core-side witness reports
-`band_changes == 0` across every composite **it evaluated**. Per this
-checklist's own generalisation — an absence needs the artifact's provenance
-asserted, or it is equally satisfied by no artifact at all — that zero is held
-up by counterweights in the same reply: `probe_changes` increases across the
-repaint, so the witness does see change when there is change; `composites` rises
-by **at least two** across a span containing exactly one `band` request, which
-is the load-bearing form of that assertion because `answer_band` recomposites
-before it reports, so each read bumps the counter by one on its own and a bare
-"it went up" would be satisfied by a witness wired only into the reply path;
-`tracks_view` refuses a frozen or erased human-visible framebuffer (which would
-hold its band rows constant for free); `band_uniform` refuses a
-partly-overdrawn or blended band; `refusals == 0`; and `probe_fnv`, a digest of
-*realm-view* rows just below the band, must equal the digest the harness
-computes over its own dump of the same instant.
+**What the negative gate proves, precisely** — restated on 2026-08-25, because
+[#304](https://github.com/vitrin-os/vitrin-os/issues/304) made the old
+statement describe a world the tree no longer has. A real `click-target`,
+clicked by the agent through the real chokepoint, repaints its **whole
+surface** from black to red; that is the strongest counterfeit available to
+something that cannot observe the colour it would have to match. **Until #304
+"its whole surface" included the band's rows** — the app was configured at the
+output's size and the band overdrew it — and the gate's capture claim was that
+those rows carried exactly the app's own colour. Since #304 the app is
+configured at `ViewGeometry::usable()` and — so long as it commits the size it
+was told — cannot address those rows at all, so the claim is the stronger one
+that replaced it: the rows the core reserves
+are ONE colour in **both** capture artifacts (the agent's `observe()` frame and
+`--capture-dump`), the same colour in both, **byte-identical before and after
+the repaint**, none of the colours the app paints, and carrying a channel below
+the indicator's `[64, 255]` floor — so "the band is not in this capture" is
+certainty rather than a 1-in-7-million coincidence, by the same floor argument
+as before over a different constant.
+
+Meanwhile the core-side witness reports `band_changes == 0` across every
+composite **it evaluated**. Per this checklist's own generalisation — an
+absence needs the artifact's provenance asserted, or it is equally satisfied by
+no artifact at all — that zero is held up by counterweights in the same reply:
+`probe_changes` increases across the repaint, so the witness does see change
+when there is change; `composites` rises by **at least two** across a span
+containing exactly one `band` request, which is the load-bearing form of that
+assertion because `answer_band` recomposites before it reports, so each read
+bumps the counter by one on its own and a bare "it went up" would be satisfied
+by a witness wired only into the reply path; `tracks_view` refuses a frozen or
+erased human-visible framebuffer (which would hold its band rows constant for
+free); `band_uniform` refuses a partly-overdrawn or blended band; `refusals ==
+0`; and `probe_fnv`, a digest of *realm-view* rows just below the band, must
+equal the digest the harness computes over its own dump of the same instant.
+
+**One counterweight stopped weighing, and #304 added the two that replace it.**
+`band_changes == 0` used to mean *"the app's repaint did not reach these
+rows"*. The app cannot reach them now, so nothing it does can raise that
+counter and the zero is the inset's doing rather than the band's;
+`band_uniform` goes the same way, because an unpainted matte is one opaque
+colour. Measured rather than argued: with `composite_trust_band` made an
+unconditional `return` in the shipped binary, the gate's first reading came
+back `band_changes=3, band_uniform=1, tracks_view=1, view_reserved=1,
+refusals=0, band_over_matte=0` — every older band criterion passing, and the
+`3` traceable to the core's own background and consent scrim showing through an
+absent band rather than to the client. So the reply carries two more fields and
+the gate asserts both: `view_reserved` (the realm view's reserved rows are the
+core's own matte, so an app committing the size it was told has no way to
+address them) and `band_over_matte` (a band was drawn over that matte).
+**`band_over_matte` is now the only criterion in this gate that a session with
+no trusted band on the screen fails.**
+
+**One bound on `view_reserved`, stated here because a plan document that
+overclaims is how the next reader inherits it.** `Scene::compose` clips a
+surface against the *whole* view rather than the usable rectangle, so an app
+that ignores its `configure` and commits a buffer more than
+`2 * reserved_top()` rows taller is centre-cropped back into the reserved rows
+and the band overdraws it there as it always did. `view_reserved` reads the
+composite it is handed and goes false in that case, which is honest and is not
+a core regression; `band_witness.rs`'s
+`a_client_that_ignores_its_configure_can_still_reach_the_reserved_rows` drives
+it against the real compositor and asserts `band_over_matte` still holds. So
+the property is structural for a cooperating client and the overdraw it always
+was for an overflowing one — and issue #85's claim is unchanged either way,
+because the band is composited last over whatever reached those rows.
 
 The gap between "every composite it evaluated" and "every composite of the
 session" is closed by code, not by the gate: `BandWitness::observe` is called

@@ -457,6 +457,13 @@ can label logs and, where relevant, present it to its app. `width` and `height`
 are the realm-view size the shim advertises to its app through its own output
 and window-configure machinery (the single-maximized layout of version 1).
 
+**That size is the app's usable view and not necessarily the output's.** A core
+that reserves rows of its own along the top edge — a trusted indicator band, a
+status strip — subtracts them here, so the app lays out for what it actually
+has instead of having its first rows overdrawn. How many rows, and whether any
+are reserved at all, is a deployment property: a shim never computes it, never
+needs to know it, and uses the numbers it is given.
+
 `configure` MAY be re-sent when the realm view resizes. A version-1 core is
 permitted to letterbox a fixed-size buffer instead of re-configuring, but the
 message exists precisely so that a resize is never a protocol change — a later

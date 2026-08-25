@@ -525,7 +525,7 @@ class ConsentInjector:
       surface's geometry and, when a card is up, the card's own footprint of
       the human-visible framebuffer as a sealed memfd over ``SCM_RIGHTS``;
     * a synchronous **trusted-band witness** (issue #139) -- ``band`` replies
-      with ten scalar fields and no descriptor. It carries no pixels and,
+      with fifteen scalar fields and no descriptor. It carries no pixels and,
       more strongly, nothing whose value moves with the session's indicator
       colour; `crates/vitrin-core/src/backend/band_witness.rs` argues why the
       weaker "no pixels" rule would not have been enough;
@@ -680,7 +680,7 @@ class ConsentInjector:
         return out, pixels
 
     def band(self, timeout: float = 30.0) -> dict[str, object]:
-        """The trusted-band witness (issue #139), as twelve numbers plus the
+        """The trusted-band witness (issue #139), as fourteen numbers plus the
         bound realm's id.
 
         Deliberately returns **no pixels and no descriptor**, and that is not
@@ -710,6 +710,22 @@ class ConsentInjector:
         inserted among the counters, so every field position an older reader
         indexed is unchanged.
 
+        `view_reserved` and `band_over_matte` (issue #304) are the two halves
+        of the post-inset property, appended after those on the same rule.
+        `view_reserved` says the realm view's reserved rows -- `band_h +
+        strip_h`, the rows the core keeps above the client -- are the core's
+        own matte, so an app that commits the size it was configured with
+        cannot address them at all rather than merely being overdrawn there.
+        (One that ignores its `configure` and commits a much taller buffer is
+        centre-cropped back into them, and this field reads that honestly and
+        goes to 0 -- it is a reading of the composite, not a core invariant.)
+        `band_over_matte` says the band was then
+        drawn over them. **Read them as a pair**: since the inset, an app
+        cannot move the band's rows of the view, so a build whose band never
+        composited would report `band_changes == 0` and `band_uniform == 1`
+        exactly as a correct one does, and only `band_over_matte` tells the
+        two apart.
+
         Raises `InjectorFailed` if the core sent a descriptor with the reply:
         that would mean pixels travelled, which nothing about this request may
         ever cause.
@@ -729,8 +745,8 @@ class ConsentInjector:
             "view_h",
         )
         # verb + scalars + the hex digest + the bound realm's id + the two
-        # WS-E.2.3 strip fields
-        if len(fields) != len(keys) + 5:
+        # WS-E.2.3 strip fields + the two #304 inset fields
+        if len(fields) != len(keys) + 7:
             raise InjectorFailed(f"malformed `band` reply: {fields!r}")
         if len(self._fds) != fds_before:
             raise InjectorFailed(
@@ -747,6 +763,8 @@ class ConsentInjector:
         out["realm"] = None if realm == "-" else realm
         out["strip_h"] = int(fields[3 + len(keys)])
         out["strip_changes"] = int(fields[4 + len(keys)])
+        out["view_reserved"] = int(fields[5 + len(keys)])
+        out["band_over_matte"] = int(fields[6 + len(keys)])
         return out
 
     def decide(self, token: str, choice: str, timeout: float = 30.0) -> str:
@@ -1807,16 +1825,62 @@ def colour_bytes(frame) -> bytes:
     return packed[0::4] + packed[1::4] + packed[2::4]
 
 
+def _below_the_cores_top_chrome(frame) -> bytes:
+    """`colour_bytes` with the leading run of flat, full-width rows dropped.
+
+    **Why this exists (issue #304).** The core reserves the top rows of every
+    realm view for chrome of its own -- the trusted band always, the status
+    strip when `--status` is on -- and `Scene::compose` fills them with a flat
+    matte before it blits the client's buffer below. Those rows are a second
+    colour that is present in EVERY frame from the very first composite,
+    whether or not any app has painted, which is exactly what
+    :func:`has_real_content` was built to distinguish.
+
+    Dropping a leading run of *uniform whole rows* rather than matching the
+    matte's value is deliberate: naming `LETTERBOX_RGBA` here would be a copy
+    of a core constant in a harness, and a copy that goes stale turns this
+    check back into the thing it is being fixed for. A run of identical
+    full-width rows at the top of a realm view is what core-owned top chrome
+    looks like from out here, and it needs no constant.
+
+    An app whose own first rows are flat loses them too, which costs nothing:
+    what is left still decides, and an app that painted a single flat colour
+    over its whole surface loses everything and reads "no content" -- which is
+    precisely what the original check said about a toolkit's pre-chrome fill.
+    """
+    packed = _packed_pixels(frame)
+    row_len = frame.width * 4
+    first = 0
+    while first < frame.height:
+        row = packed[first * row_len : (first + 1) * row_len]
+        if len(set(row[i : i + 4] for i in range(0, len(row), 4))) > 1:
+            break
+        first += 1
+    rest = packed[first * row_len :]
+    return rest[0::4] + rest[1::4] + rest[2::4]
+
+
 def has_real_content(frame) -> bool:
     """True once a frame carries real, non-uniform content, not an empty fill.
 
-    Content-bearing iff the colour channels are both non-zero (some pixel is
-    not black) and non-uniform (more than one colour value). The shim's opaque
-    background and a toolkit's pre-chrome fill are each a single value and both
-    fail this -- which is what makes "a real app frame reached the agent" a
-    genuine claim rather than a pass on the shim's empty output.
+    Content-bearing iff the colour channels **below the core's own top
+    chrome** are both non-zero (some pixel is not black) and non-uniform (more
+    than one colour value). The shim's opaque background and a toolkit's
+    pre-chrome fill are each a single value and both fail this -- which is what
+    makes "a real app frame reached the agent" a genuine claim rather than a
+    pass on the shim's empty output.
+
+    **The chrome exclusion is not cosmetic and was not here before issue
+    #304.** With the realm view inset, an unpainted frame carries the core's
+    flat matte in its reserved rows and the shim's flat background below --
+    two colours, one of them non-black -- so the original whole-frame form
+    returned `True` for every frame of every session from the first composite
+    on. It stopped being a barrier and became a constant, and the gates that
+    lean on it went on passing: `test_real_actuation.py`'s D7 rung typed its
+    string at a shim that had no keyboard focus yet and then asserted an empty
+    GTK entry. See :func:`_below_the_cores_top_chrome`.
     """
-    colour = colour_bytes(frame)
+    colour = _below_the_cores_top_chrome(frame)
     return bool(any(colour)) and len(set(colour)) > 1
 
 

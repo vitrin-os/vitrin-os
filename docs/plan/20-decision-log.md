@@ -351,6 +351,40 @@ realm view -> consent overlay -> lock cover -> STATUS STRIP -> trusted band
 - **The zero-copy draw list gained its first stateful member.** `dmabuf::human_visible_frame` was a pure function returning solid-colour draws, which is what made "no arm omits the band" structurally true. `Draw::StatusStrip` carries a rectangle only — the texture is the executor's — so the function stays pure, but the frame now depends on an upload that can fail. A failed upload drops the strip for that frame and logs; it never drops the band and never refuses to present, because the strip asserts nothing about authenticity and the band asserts everything.
 - **It is not a panel.** Three facts, no tray, no notifications, no workspace switcher, no click targets, and no interaction at all — a principal cannot receive physical input and the core is not taking a fifth gesture for a status bar.
 
+> **AMENDED 2026-08-24 BY [#304](https://github.com/vitrin-os/vitrin-os/issues/304): THE FIRST COST BULLET IS NO LONGER TRUE, AND NEITHER IS THIS ENTRY'S OWN HEADING.**
+> Everything above is left as written — a decision log that edits its own past
+> is worth nothing, and D-031's, D-033's and D-041's amendments set the
+> precedent this follows. Exactly one bullet has stopped being true and it is named here.
+>
+> **False as of 2026-08-24: *"The realm view is NOT inset, and #215 asked for
+> it"*, and with it the heading's *"and the app's rows are still overdrawn"*.**
+> The `ViewGeometry` refactor that bullet describes as *"of its own"* is built:
+> `crates/vitrin-core/src/view.rs` carries one value — the output's size plus
+> the rows the core reserves — and it reaches all five sites the bullet
+> enumerates, `Scene::compose` and `Scene::take_damage_view`, the router's
+> `surface_local`, `dmabuf::human_visible_frame`, and the `configure` the shim
+> is told. The reservation is derived from `status::STRIP_TOP` rather than
+> restated, so the "two places computing the usable view rectangle" the bullet
+> feared has one. `docs/book/src/limits.md`'s `status-strip-overdraws-the-view`
+> limit was **deleted** rather than reworded, which is what #304's acceptance
+> criterion asks for.
+>
+> **Two things the bullet said that are still worth keeping.** The half-done
+> shape it warned about — one path reserving rows the others do not — is what
+> #304 was written to refuse, and it is now held by a test rather than by a
+> warning (`the_view_geometry_has_one_derivation` in
+> `crates/vitrin-core/src/view.rs`). And decision 5 above, `--status` off by
+> default, is **unchanged and for its original reason**: the byte-for-byte
+> comparison in `band_witness` and in `tests/integration/test_real_trust_band.py`
+> is still a function of wall-clock time with a clock on the screen. What
+> changed is only what the flag costs an app — a smaller `configure` instead of
+> overdrawn rows. **The trusted band's own 8 rows were never conditional and are
+> now reserved for every session**, `--status` or not, which is the half of this
+> that #215's text did not separate out.
+>
+> **Decision 1 is untouched and still load-bearing:** nothing is ever
+> composited into the band, and nothing in #304 goes near that.
+
 ---
 
 ### D-027 — The human's screenshot key reads the REALM VIEW, and it is a chord rather than a bare Print
@@ -1061,6 +1095,65 @@ So there are no rows to hand a shell realm. There are rows the core takes from t
 
 **What cannot be known here, and is therefore not claimed.** **Nothing in this entry is built.** There is no code, no closed issue, no measurement and no hardware run behind any sentence above; it is a decision about work not yet done, and the numbers it will owe do not exist yet. When it is built, the halves CI can hold are the least interesting ones: that a shell realm's surface composites where the strip used to is a golden-image comparison, and headless is the only backend CI runs (D-019(4)); that the drawing client and the arranging principal are the same program is **not expressible as a test at all**; and that a human correctly stops trusting a clock that moved one row's worth of meaning is not a property of software. The honest status of this entry is **decided, unbuilt, and gated on a confinement question nobody has answered.**
 
+> **AMENDED 2026-08-24: THE INSET THIS ENTRY CALLED ITS LARGEST PIECE OF UNBUILT
+> WORK IS BUILT. NOTHING ELSE IN THE ENTRY IS.** Everything above stands as
+> written — the amendment convention D-031, D-033 and D-041 established, and the
+> reason is the same: a decision log that edits its own past is worth nothing.
+> Exactly three passages have stopped being true and they are named here.
+>
+> **False as of 2026-08-24: *"No rows are reserved."*** Rows are reserved.
+> `crates/vitrin-core/src/view.rs` holds `ViewGeometry` — an output size plus the
+> rows the core keeps above the client — and the `configure` a shim is sent now
+> carries `ViewGeometry::usable()`, so an app is *told* a smaller view instead of
+> having its top rows overdrawn. The trusted band's 8 rows are reserved for every
+> session; the status strip's rows are reserved on top of them only when
+> `--status` is on.
+>
+> **False with it: *"That is the `ViewGeometry` thread #215 asked for and closed
+> without … This entry does not build it"*, and the cost bullet *"The unmet inset
+> becomes blocking work this entry does not do, and nothing tracks it."*** It was
+> tracked, by this entry's own issue: [#304](https://github.com/vitrin-os/vitrin-os/issues/304)
+> carries the inset as a required task and it is that task, not the shell, that
+> landed on 2026-08-24. The value reaches all five sites this entry enumerates —
+> `Scene::compose`, `Scene::take_damage_view`, the router's `surface_local`,
+> `dmabuf::human_visible_frame`, and the shim's `configure` — and
+> `crates/vitrin-core/src/scene/layout.rs` did **not** grow: the translation
+> below the reserved rows is `ViewGeometry::place`'s, and `layout::place` is asked
+> the same question it always was.
+> [D-046](#d-046--a-shell-realm-reaches-the-core-socket-through-a-descriptor-the-core-mints-and-passes-down-the-spawn-path-it-already-has-the-authority-is-an-operators-declaration-and-a-humans-consent-and-what-the-connection-may-carry-is-fenced-structurally-rather-than-by-consent)'s
+> *"The `ViewGeometry` inset is untouched … it still has no issue"* is false on the
+> same date and for the same reason.
+>
+> **Everything else in this entry is still unbuilt.** No shell realm draws; the
+> core still draws the status strip itself; decision 2's *"stops drawing the
+> status strip itself"* has not happened; `limits.md`'s strip bullets still
+> describe a core-drawn strip. What the inset changed is only the *premise*: the
+> rows a shell realm would be composited into now exist as a reservation instead
+> of as overdraw, so the prerequisite this entry named is met and the decision it
+> gates is not.
+>
+> **One published claim was deleted rather than reworded**, per #304's acceptance
+> criterion: `docs/book/src/limits.md`'s `status-strip-overdraws-the-view` bullet
+> is gone from the page and from this workstream's `limit-set` region. The cost
+> bullet above — *"a published limit that changes meaning is worse than a new
+> one"* — is why it was deleted and not edited.
+>
+> **Correction, appended 2026-08-25.** The block above was published with
+> the standing paragraph's last three sentences — *"When it is built, the
+> halves CI can hold are the least interesting ones … The honest status of
+> this entry is **decided, unbuilt, and gated on a confinement question
+> nobody has answered.**"* — **moved** out of that paragraph and re-emitted
+> inside this quotation. That is an edit to Part A's standing text, which
+> this file forbids and which this very block opens by forbidding
+> (*"Everything above stands as written … a decision log that edits its own
+> past is worth nothing"*). The sentences are restored to the paragraph
+> they belong to, byte for byte from `main`, and this amendment quotes them
+> rather than holding them. Nothing about the amendment's substance changes.
+> On their content: the closing status is still *decided and unbuilt* —
+> [D-046](#d-046--a-shell-realm-reaches-the-core-socket-through-a-descriptor-the-core-mints-and-passes-down-the-spawn-path-it-already-has-the-authority-is-an-operators-declaration-and-a-humans-consent-and-what-the-connection-may-carry-is-fenced-structurally-rather-than-by-consent)
+> already discharged the last clause on 2026-08-24 and says so in its own
+> text, and nothing in #304 discharges any of the rest.
+
 ---
 ### D-039 — Global hotkeys are served as named actions the core resolves, never as keystrokes it forwards; the attention key's one bit becomes an operator-configured chord table, and no verb for observing the human's input is designed
 
@@ -1538,6 +1631,29 @@ Three findings from that run carry the reasoning below, and they have three diff
 - **The measurement is one box on one date**, and none of the boxes this project actually worries about. Not Ubuntu 24.04, not the ABI-6 VPS target, no sub-floor rung. It also does not establish that no route exists — only that none of the enumerated ones did there, and that an untruncated walk found no other socket inode.
 - **[D-025](#d-025--a-locked-screen-does-not-suspend-agent-observation-the-gap-is-published-not-papered-over) is untouched and must stay untouched.** A shell realm's pixels must not paint over a lock cover, exactly as D-038 requires, and whoever builds this re-asserts that ordering as a test rather than inheriting it.
 - **It says nothing about the status read.** D-038 reopened *"a recurring filesystem read inside the TCB"* as an open question — the battery and the clock a client-drawn strip would need. A descriptor to the core socket is not a hole into `/sys`, and this entry neither widens the mount table nor puts a battery percentage on the wire.
+
+> **AMENDED 2026-08-25 BY [#304](https://github.com/vitrin-os/vitrin-os/issues/304):
+> ONE COST BULLET IS SPENT, AND THIS BLOCK EXISTS BECAUSE THE FIRST ATTEMPT TO
+> SAY SO EDITED IT IN PLACE.** Everything above stands as written. The bullet
+> *"The `ViewGeometry` inset is untouched"* was published on 2026-08-24 with a
+> dated parenthetical **appended inside its own sentence**; Part A is
+> append-only, this file's three earlier amendments (D-031, D-033, D-041) are
+> all appended blocks, and there is no precedent anywhere in Part A for an
+> in-line correction. The bullet is restored byte for byte and the correction
+> is here instead.
+>
+> **Spent as of 2026-08-24: *"This entry does not build it, does not schedule
+> it, and it still has no issue."*** The inset landed as a required task of
+> #304 — `crates/vitrin-core/src/view.rs`, all five sites the bullet
+> enumerates threaded through one `ViewGeometry`. The last clause was already
+> wrong when the bullet was written: #304 existed and carried the inset. The
+> rest of the bullet is simply spent — it described work that has since been
+> done, not a claim that turned out false.
+>
+> **Nothing else in this entry moves.** The descriptor route, the authority
+> model, the fencing and every other cost bullet are untouched by #304, and
+> D-038's own status is unchanged by it: still decided and unbuilt, with the
+> confinement clause discharged by this entry on 2026-08-24.
 
 ---
 

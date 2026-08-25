@@ -399,10 +399,19 @@ pub struct Claim {
     /// issue or say plainly that it has none; carrying it here means the gate
     /// cannot hold a claim whose provenance nobody wrote down.
     ///
-    /// Since #172 this field is **checked**, not only printed: every `#N` it
-    /// names must be cited on at least one of the claim's own surfaces. See
-    /// [`uncited_issues`] for what that property is and, more importantly,
-    /// what it is not.
+    /// Since #172 this field is **partly checked**, not only printed: the
+    /// **first** `#N` it names must be cited on at least one of the claim's
+    /// own surfaces. See [`uncited_issues`] for what that property is and,
+    /// more importantly, what it is not.
+    ///
+    /// **What is NOT checked is the rest of the sentence, and it has already
+    /// gone stale once** (see the `no-layer-shell` row, which went on
+    /// asserting that a gap "has no issue of its own" after it had both an
+    /// issue and an implementation, with this gate green throughout). The
+    /// gate carries this prose and prints it; it does not read it. Keep the
+    /// field to issue numbers and their state — a sentence here that describes
+    /// what a tracker holds cannot be checked by a gate that opens no network,
+    /// and this one deliberately does not.
     pub issue: &'static str,
     pub surfaces: &'static [Anchor],
     pub evidence: &'static [Evidence],
@@ -779,9 +788,38 @@ pub const CLAIMS: &[Claim] = &[
         id: "no-layer-shell",
         says: "There is no zwlr_layer_shell_v1, so no client bar, launcher, notification or \
                OSD can map.",
+        // **This field went stale and the gate stayed green, which is worth
+        // recording where the next reader of it will be.** It said, until
+        // 2026-08-25, that "the missing realm-view inset it names is still
+        // open inside that closed issue's text and has no issue of its own".
+        // Both halves were false the moment #304 landed: the inset is built
+        // (`crates/vitrin-core/src/view.rs`) and #304 is its issue.
+        //
+        // **Is that checkable? Half of it, and the half that matters is not.**
+        // What this gate already checks is that the FIRST `#N` here is cited
+        // on one of the claim's own surfaces (`uncited_issues`); everything
+        // else in the field is prose it carries and prints. The stale sentence
+        // named NO issue -- its whole content was an assertion that none
+        // existed -- so no tightening of the citation rule would have caught
+        // it, including the obvious one of checking every `#N` rather than the
+        // first. Deciding whether a closed issue still has an unmet part named
+        // in its text is a question about the TRACKER, and this gate is
+        // deliberately tree-only: it reads files and greps, opens no network,
+        // and giving it a GitHub client to answer this would be a far larger
+        // change than the defect justifies. So it is not made checkable; it is
+        // made SHORT instead, which is the cheap half of the remedy -- this
+        // field now names issues and their state and asserts nothing about
+        // what a tracker does or does not carry.
+        //
+        // **And "their state" is the tracker's state, not the tree's**, which
+        // is the trap this row fell into a second time: #304's inset is built
+        // and on this branch, but the issue itself is open and the commits
+        // that build it are footed `Refs #304`, so nothing here closes it.
+        // "Built" and "closed" are two facts and this field may only carry
+        // the second one when it is true.
         issue: "#215 (WS-E.2.3, closed) shipped the core-owned status strip as the \
-                replacement; the missing realm-view inset it names is still open inside that \
-                closed issue's text and has no issue of its own.",
+                replacement; #304 (open) carries the realm-view inset it also asked \
+                for, and that task is built.",
         surfaces: &[
             Anchor {
                 path: LIMITS,

@@ -124,7 +124,7 @@ pub mod requests {
 pub enum Mode {
     /// compose the realm's view at the size its own app last committed, letterboxed centered and unscaled inside the output
     Windowed = 0,
-    /// configure the realm's view to the output's size, so the app fills the output
+    /// configure the realm's view to the output's USABLE size - the output minus whatever rows the core reserves for its own always-present chrome - so the app fills every pixel of the output that is the app's to fill
     Fullscreen = 1,
 }
 

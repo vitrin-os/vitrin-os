@@ -1734,8 +1734,13 @@ mod gpu_tests {
     /// Read from the shared constant rather than spelled `Transform::Normal`
     /// here, so this harness and the bare-metal scanout path cannot come to
     /// disagree about which kind of target they are.
+    /// **It presents at a real [`ViewGeometry`], not a bare size** (issue
+    /// #304): `--status` off, so the reservation is the trusted band's rows
+    /// and nothing else — the geometry every default session has. That is why
+    /// the expectations below place the client's pixels below the reserved
+    /// rows rather than at `y = 0`.
     fn composite_and_readback(renderer: &mut GlesRenderer, content: &GpuContent) -> Vec<u8> {
-        let size: Size<i32, Physical> = (W as i32, H as i32).into();
+        let geom = crate::view::ViewGeometry::new((W, H), 0);
         let mut target: GlesRenderbuffer = Offscreen::<GlesRenderbuffer>::create_buffer(
             renderer,
             Fourcc::Abgr8888,
@@ -1750,7 +1755,7 @@ mod gpu_tests {
         let _sync = present_human_visible(
             renderer,
             &mut fb,
-            size,
+            geom,
             MEMORY_TARGET_TRANSFORM,
             content,
             harness_indicator(),
@@ -1887,12 +1892,28 @@ mod gpu_tests {
             // everywhere the trusted band does not overdraw them (issue #85:
             // the band is on *every* human-visible frame, and this is the
             // human-visible presentation function).
+            //
+            // **Placed below the reserved rows since issue #304.** This mock
+            // shim commits the view's full `W x H` while the app is
+            // configured for the usable `W x (H - 8)`, so `ViewGeometry::place`
+            // centres it four rows LOWER than it used to: view rows `[0, 4)`
+            // are matte, view rows `[4, H)` carry generator rows `[0, H - 4)`,
+            // and the band then overdraws view rows `[0, 8)`. The offset is
+            // spelled out rather than read from `ViewGeometry::place`, on the
+            // same reasoning as `shim.rs`'s fixtures: an expectation that
+            // asked the production placement would agree with a broken one.
+            const CONTENT_TOP: usize = 4;
+            let row = W as usize * BYTES_PER_PIXEL;
+            let generated = frame_rgba(n, W, H);
+            let mut expected = LETTERBOX_RGBA.repeat(CONTENT_TOP * W as usize);
+            expected.extend_from_slice(&generated[..(H as usize - CONTENT_TOP) * row]);
             let composed =
                 composite_and_readback(&mut renderer, content.as_ref().expect("content retained"));
             assert_eq!(
                 composed,
-                with_trust_band(frame_rgba(n, W, H)),
-                "composited frame {n} must be the exact generator output under the trusted band"
+                with_trust_band(expected),
+                "composited frame {n} must be the exact generator output, placed below the \
+                 rows the core reserves, under the trusted band"
             );
             // The instrumented zero-copy proof: no core-side CPU copy of
             // client pixels happened, for any frame so far.
@@ -2052,7 +2073,10 @@ mod gpu_tests {
 
         // Larger than the view on both axes, asymmetrically, so both
         // center-crop offsets are negative and different: placement is
-        // ((W - SW) / 2, (H - SH) / 2) = (-32, -18) for the 96x64 view.
+        // (-32, -14) for the 96x64 view. `x` is `(W - SW) / 2` as it always
+        // was; `y` is that same centring inside the USABLE `96x56` rectangle
+        // translated down by the 8 reserved rows — `(56 - SH) / 2 + 8 = -14`,
+        // where it was `(H - SH) / 2 = -18` before issue #304 inset the view.
         const SW: u32 = W + 64;
         const SH: u32 = H + 36;
         const N: u32 = 5;
@@ -2081,10 +2105,15 @@ mod gpu_tests {
 
         let composed =
             composite_and_readback(&mut renderer, content.as_ref().expect("content retained"));
-        // Expected: the buffer's central W x H window, row-extracted from
-        // the same deterministic generator the buffer was filled from.
+        // Expected: the W x H window the placement selects, row-extracted
+        // from the same deterministic generator the buffer was filled from.
+        // `cx` is the horizontal centre as before; `cy` is **14, not 18** —
+        // the inset moved the placement four rows down, so the view samples
+        // the buffer four rows EARLIER (issue #304). Spelled literally rather
+        // than read from `ViewGeometry::place`, so a broken placement cannot
+        // agree with this expectation.
         let full = frame_rgba(N, SW, SH);
-        let (cx, cy) = (((SW - W) / 2) as usize, ((SH - H) / 2) as usize);
+        let (cx, cy) = (((SW - W) / 2) as usize, 14usize);
         let row = W as usize * BYTES_PER_PIXEL;
         let mut expected = Vec::with_capacity(row * H as usize);
         for y in 0..H as usize {

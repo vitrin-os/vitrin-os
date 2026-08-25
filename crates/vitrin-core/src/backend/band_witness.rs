@@ -18,11 +18,29 @@
 //!   **Since issue #304 that half is stronger, and this module had to be
 //!   taught the difference.** The app is now *configured* at
 //!   [`crate::view::ViewGeometry::usable`] — the output minus the reserved
-//!   rows — so it is not merely overdrawn in the band's rows, it has no way
-//!   to address them: [`crate::scene::Scene::compose`] fills them with
+//!   rows — so a client that commits the size it was told is not merely
+//!   overdrawn in the band's rows, it has no way to address them:
+//!   [`crate::scene::Scene::compose`] fills them with
 //!   [`crate::scene::LETTERBOX_RGBA`] and places the client's buffer below.
 //!   The old statement ("it painted there and the band covered it anyway") is
 //!   a consequence of the new one, not the other way round.
+//!
+//!   **"A client that commits the size it was told" is the whole of the
+//!   qualifier, and it is not decoration.** `Scene::compose` clips a surface
+//!   against the *whole* view rather than the usable rectangle, deliberately
+//!   and in its own words: an app that ignores its `configure` and commits a
+//!   taller buffer is centre-cropped rather than refused, and once it is more
+//!   than `2 × reserved_top()` rows taller than its usable view the crop
+//!   starts above row 0 and its bytes land in the reserved rows again.
+//!   Measured, not reasoned:
+//!   `a_client_that_ignores_its_configure_can_still_reach_the_reserved_rows`
+//!   drives exactly that and watches [`BandReport::view_reserved`] go false.
+//!   **Nothing about issue #85 is weaker for it** — the band is composited
+//!   onto the human-visible output last, over whatever reached those rows, so
+//!   [`BandReport::band_over_matte`] stays true and the human still reads the
+//!   session's colour. What is bounded is only how much of the property is
+//!   *structural*: for a cooperating client it is the geometry, and for one
+//!   that overflows its view it is the overdraw it always was.
 //!
 //!   That strengthening cost the counters their self-sufficiency, which is
 //!   the trap worth naming: with the client unable to reach those rows of the
@@ -316,15 +334,26 @@ pub(crate) struct BandReport<'a> {
     /// band's whole job was to cover them. Now the app is configured at
     /// [`crate::view::ViewGeometry::usable`] and
     /// [`crate::scene::Scene::compose`] fills the reserved rows with the matte
-    /// before it blits anything, so a confined client has no way to address
-    /// them at all — which is strictly stronger than "it is covered", and this
-    /// is where that strength is asserted rather than assumed.
+    /// before it blits anything, so a client that commits the size it was told
+    /// has no way to address them at all — which is strictly stronger than "it
+    /// is covered", and this is where that strength is asserted rather than
+    /// assumed.
     ///
     /// It fails, loudly, on the regression that would silently restore the old
     /// weaker world: a `configure` that went back to carrying the output's
     /// full height, or a placement that stopped translating by
     /// `reserved_top()`, puts client bytes back in these rows and reads
     /// `false` here.
+    ///
+    /// **A third cause reads `false` too and is not a core regression**, so a
+    /// reader debugging a red one is not sent hunting: a client that ignores
+    /// its `configure` and commits a buffer more than `2 × reserved_top()`
+    /// rows taller than its usable view is centre-cropped *into* these rows —
+    /// `Scene::compose` clips against the whole view rather than the usable
+    /// rectangle, deliberately, and says so. This field is a reading of the
+    /// composite, not a core invariant. [`Self::band_over_matte`] is
+    /// unaffected in that case and the human still sees the band, which is
+    /// why #85's property does not rest on this field alone.
     ///
     /// Secret-independent, like every other field: the comparison is against a
     /// compile-time core constant, and the indicator is not one of its inputs.
@@ -1209,6 +1238,68 @@ mod tests {
             // a reader must not be able to confuse the two halves.
             assert!(witness.report().band_over_matte);
         }
+    }
+
+    /// **The bound on [`BandReport::view_reserved`], measured against the real
+    /// compositor** rather than against a fixture — the sentence it bounds is
+    /// a claim about [`crate::scene::Scene::compose`], so only that function
+    /// can settle it.
+    ///
+    /// `Scene::compose` clips a surface against the **whole** view rather than
+    /// the usable rectangle: an app that ignores its `configure` and commits a
+    /// bigger buffer is centre-cropped rather than refused, deliberately, and
+    /// that module says so in as many words. Past `2 * reserved_top()` rows
+    /// taller than the usable view the crop begins above row 0 and the
+    /// client's bytes are back in the reserved rows. `view_reserved` reads the
+    /// composite it is given, so it goes false — which is honest, and is why
+    /// this field's doc names three causes rather than the two core
+    /// regressions.
+    ///
+    /// **A bound on the structural claim, not on issue #85's property.** The
+    /// band is composited onto the human-visible output last, over whatever
+    /// reached those rows, so [`BandReport::band_over_matte`] still holds here
+    /// and the human still reads the session's colour. Both are asserted in
+    /// this one test so the two can never be confused for each other.
+    #[test]
+    fn a_client_that_ignores_its_configure_can_still_reach_the_reserved_rows() {
+        let geom = crate::view::ViewGeometry::new((W, H), 0);
+        let reserved = geom.reserved_top();
+        let (_, usable_h) = geom.usable();
+        // Just past the threshold at which the centring goes negative.
+        let surface_h = usable_h + 2 * reserved + 2;
+        assert!(
+            geom.place((W, surface_h)).y < 0,
+            "the fixture must actually overflow the view, or this test proves nothing"
+        );
+
+        let mut scene = crate::scene::Scene::new();
+        scene.commit(
+            crate::scene::SurfaceContent::from_rgba(
+                [0x11, 0x22, 0x33, 0xff].repeat((W * surface_h) as usize),
+                W,
+                surface_h,
+            )
+            .expect("a whole-buffer fixture"),
+        );
+        let view = scene.compose(geom);
+
+        let indicator = TrustedIndicator::for_test();
+        let output = human_visible(&view, indicator);
+        let mut witness = BandWitness::new();
+        witness.observe(&view, &output, W, H, 0, Some(&bound()));
+        let report = witness.report();
+
+        assert!(
+            !report.view_reserved,
+            "an oversized commit is centre-cropped INTO the reserved rows, so this must \
+             read false; if it reads true the crop stopped reaching them and this test's \
+             fixture, not the core, is what changed"
+        );
+        assert!(
+            report.band_over_matte,
+            "...and the band is still drawn over them on the human-visible output, which \
+             is exactly why bounding the structural claim takes nothing away from #85's"
+        );
     }
 
     /// With `--status` on, the reserved rows are the band's **and** the

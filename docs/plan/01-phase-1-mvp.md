@@ -4,7 +4,7 @@
 
 **Explicitly out of Phase 1:** semantic trees, epochs/CAS, network sessions, X11, multi-realm fleet, filesystem powerbox, credential wallet, provenance, signed-journal replay tooling, IME, motion synthesis beyond trivial interpolation.
 
-**MVP object-model subset** (of PRD Doc 2 §3.1): `principal`, `realm` (exactly one, `realm-0`), `surface`, `view` (implicit: one view = the realm's composited framebuffer), `actuator`, `grant`. Not in MVP: `scene`, `epoch`, and the signed `journal` of P6 — a plain structured event log ("flight recorder") is kept as a debugging aid and future journal seed (see the backward requirements below).
+**MVP object-model subset** (of PRD Doc 2 §3.1): `principal`, `realm` (exactly one, `realm-0` — **spent; see "A2, retired" in §1, which restates it rather than replacing it**), `surface`, `view` (implicit: one view = the realm's composited framebuffer), `actuator`, `grant`. Not in MVP: `scene`, `epoch`, and the signed `journal` of P6 — a plain structured event log ("flight recorder") is kept as a debugging aid and future journal seed (see the backward requirements below).
 
 **Phase exit = milestone M1** in [00-roadmap.md](00-roadmap.md).
 
@@ -14,12 +14,127 @@
 
 Phases 2–3 cite these as their Phase-1 dependencies; anything not listed here is an internal detail free to change.
 
-- **A1 — Principal-facing protocol core:** connect/handshake, grant request/consent, surface observe, actuator inject. Consumed by every Phase-2 epic and by spec extraction (WS-A).
-- **A2 — Realm spawn model:** shim fork, realm identity assigned at fork, spawn/sandbox skeleton. Consumed by E2.6/E2.7 (which extend the namespace setup) and E3.2/E3.3.
-- **A3 — Grant table + consent surface.** Consumed by E2.6, E2.7, E3.7.
+- **A1 — Principal-facing protocol core:** connect/handshake, grant request/consent, surface observe, actuator inject. Consumed by every Phase-2 epic and by spec extraction (WS-A). **See "A1, restated" below, which is the standing export contract and restates this rather than replacing it.**
+- **A2 — Realm spawn model:** shim fork, realm identity assigned at fork, spawn/sandbox skeleton. Consumed by E2.6/E2.7 (which extend the namespace setup) and E3.2/E3.3. **See "A2, retired" below — the model was replaced, not extended; the original is left standing there rather than rewritten.**
+- **A3 — Grant table + consent surface.** Consumed by E2.6, E2.7, E3.7. **See "A3, restated" below — the consent surface is no longer a prompt, and E3.7 would design against one.**
 - **A4 — Flight-recorder log** (journal seed). Consumed by E3.4 — see backward requirement B1.
 - **A5 — Wayland shim** with buffer/input/damage paths. Consumed by E2.1 (the bridge lives inside it), E2.8, and as the template for E3.2.
-- **A6 — Nested + headless output modes.** Consumed by E3.3 (fleet generalizes headless).
+- **A6 — Nested + headless output modes.** Consumed by E3.3 (fleet generalizes headless). **See "A6, restated" below — there are three backends now, and the third is not a fleet venue.**
+
+### A1, A2, A3 and A6, restated
+
+**REALIGNED 2026-08-25 BY D-047.** The six bullets above are the contract as it
+was written before any of Phase 2 or WS-E ran. Four of them no longer describe
+the system a later phase will find, and they are left standing anyway — a
+contract quietly rewritten is a contract nobody can audit, which is the same
+reason `02-phase-2-semantic-epochs.md` keeps the P2.6.3 row above its
+correction. **This subsection is the standing export contract for A1, A2, A3 and
+A6 from this date, and it restates them rather than replacing them.** A4, A5 and
+both backward requirements are untouched. Nothing below is a new decision:
+**D-047** decision 1 gives WS-E its own numbered **E-series** export block in
+[14-workstream-session-mode.md](14-workstream-session-mode.md), and what follows
+only says which side of that line each Phase-1 artifact falls on.
+
+**A1, restated — four surfaces were exported; sixteen interfaces are what a later
+phase finds.** Connect/handshake, grant request/consent, surface observe and
+actuator inject are all still there and all still A1's, and P1.1.1's eleven
+interfaces are still the shape they arrive in. But `protocol/vitrin-v0.xml` now
+defines **16** interfaces, and the five beyond P1.1.1's list are not A1's to
+export:
+
+- `vitrin_launcher`, `vitrin_layout_focus` and `vitrin_layout_arrange` are the
+  three verbs WS-E served (D-047 decision 1 counts them among its deliverables
+  as "three served verbs with their facets");
+  the layout pair is **D-018**'s decision, enforcement landed early for the
+  nested single-output case by **D-022**. Exported by the **E-series**, not
+  here.
+- `vitrin_powerbox` and `vitrin_egress` are E2.6's and E2.7's, exported by **C5**
+  in [02-phase-2-semantic-epochs.md](02-phase-2-semantic-epochs.md) §1.
+  D-047 additionally routes the fact that their two mint requests on
+  `vitrin_grant` (`get_powerbox`, `get_egress`) are defined at the negotiated
+  version with no dispatch arm, as a wire-conformance defect on shipped code
+  rather than a planning matter. Read C5 for what they export; do not read A1.
+
+Alongside them sits a `since="2"` vocabulary A1 never described and does not
+own: the cross-realm clipboard's `request_selection`/`selection`/
+`offer_selection` (**D-024**), `pointer_constraint`/`pointer_constraint_state`,
+the four gesture events and `relative_motion` (**D-032**), `idle_inhibit`
+(**D-042**) and `attention` (**D-023**). **What A1 exports is unchanged; what it
+*enumerates* is now a subset, and a Phase-3 epic reading A1 as a description of
+the wire is short by five interfaces and that whole vocabulary.** Read A1 for
+the Phase-1 four, the E-series for the session-mode vocabulary, and C5 for the
+powerbox and egress facets.
+
+**A2, retired — the model was replaced, not extended.** A2 promised "shim fork,
+realm identity assigned at fork, spawn/sandbox skeleton", consumed by E2.6/E2.7
+"which extend the namespace setup". They did not extend it. **D-037** replaced
+it, and the spawn path is now **core → `vitrin-realm-init` → shim → app**:
+
+- `vitrin-realm-init` (`crates/vitrin-realm-init/`) is **a second trusted binary
+  inside the TCB**. It `execve`s first and unshares itself, because the core
+  cannot clone into namespaces while it keeps `std::process::Command` —
+  D-037(1) records that as a deadlock, not a preference.
+- It then forks: the supervisor stays in the host PID namespace and is the
+  process the core's `Child` names, and its child is the realm's PID 1
+  (D-037(2)).
+- The core audits the result from outside before it commits — D-037(3),
+  verbatim: *"`applied` is computed from what the kernel says about the child,
+  never from the flag that was requested"*, with the spawn **refused** when
+  `/proc/<pid>/ns/*` and `/proc/<pid>/root` cannot be read for both processes.
+
+**What replaces A2, as a contract:** the confined spawn path is exported by
+**C4**, with the limitations its realignment block in
+[02-phase-2-semantic-epochs.md](02-phase-2-semantic-epochs.md) §1 carries; A2
+exports only what survives of the Phase-1 skeleton — the socketpair placed at a
+fixed descriptor, realm identity assigned at fork and never claimed, and the
+`--isolation=off` path.
+**The replacement's cost belongs here and not only in the decision log**, in
+D-037's own words: *"A second trusted binary in the TCB, and two spawn paths
+inside one file — which is exactly how a confinement claim rots, held apart only
+by clause 3's verification."*
+
+**And the MVP object model's `realm` (exactly one, `realm-0`) is spent.**
+`crates/vitrin-core/src/realm.rs` sets `MAX_REALMS = 16`. `realm-0` is still
+mandatory, but a session holds up to sixteen realms: a `realm.toml` carrying
+more tables than that is refused at load, and `vitrin_launcher.launch` is
+refused `capacity` once `RealmRegistry::capacity_used()` has reached the number.
+Phase 3 plans against 16, not 1 — see E3.3's realigned block in
+[03-phase-3-network-x11-fleet.md](03-phase-3-network-x11-fleet.md), which plans
+a 50-realm box against it.
+
+**A3, restated — the consent surface is permanent screen furniture, not a
+prompt.** A3 is consumed by E2.6, E2.7 and **E3.7**, and E3.7 designing the
+durable consent rungs against *a prompt that appears and goes away* would be
+designing against a system that no longer exists. What A3 exports now:
+
+- **The view is inset in every session, prompt or no prompt.**
+  `crates/vitrin-core/src/view.rs`'s `ViewGeometry` reserves the trusted band's
+  rows **always**, plus the status strip's height when the strip is on, and
+  `usable()` — not the output size — is what `ShimServer::send_configure` tells
+  the app it has. The same value feeds `Scene::compose`, the damage rectangle,
+  the input router's `surface_local` and `dmabuf::human_visible_frame`.
+- **A lock screen with a passphrase gate.** `crates/vitrin-core/src/lock/` —
+  `gate.rs`, `passphrase.rs` (an Argon2id-stored passphrase, WS-E.2.2/#214) and
+  its own renderer — is core-drawn chrome on the same stack and a second
+  *modal* surface the consent ladder has to reason about. **D-025** already
+  records that a locked screen does not suspend agent observation.
+- **The prompt itself is unchanged**: `crates/vitrin-core/src/consent/` still
+  renders it, still takes the exclusive input grab, still carries the
+  per-session trusted indicator, and §5's unspoofability subsection remains the
+  standing statement of what that is and is not evidence for.
+
+**A6, restated — there are three backends, and the third is not a fleet venue.**
+Nested and headless are both still there and still A6's
+(`crates/vitrin-core/src/backend/winit.rs`, `backend/headless.rs`). The third is
+`crates/vitrin-core/src/backend/drm.rs`: a real bare-metal DRM/KMS backend — mode
+setting, a GBM swapchain, libinput, libseat — landed by WS-E.3.2/#218 behind the
+**non-default** `drm-backend` cargo feature, and its own module docs call it
+*"the third [`session::Presenter`]/[`session::RuntimeHost`] pair"*. It is
+exported by the **E-series**, not by A6, and E3.3 must not read it as a third
+fleet venue: **D-029** makes it drive exactly one output and **refuse to start
+otherwise**, and on bare metal it composites the human's cursor itself — which
+the IDL had said the core never does — because nobody else would. **A6's
+contract to E3.3 is the headless backend, unchanged.**
 
 ### Backward requirements (placed on Phase 1 by Phase-2/3 planning)
 
@@ -156,7 +271,7 @@ The single riskiest epic (R2, R4); starts as soon as the shim-facing protocol fr
 | P1.9.2 | Golden-frame harness: per-pixel tolerance + SSIM fallback; goldens regenerated via `xtask bless` | Consent-UI goldens rendered with a bundled font (AA determinism) | P1.3.6 | A deliberate one-pixel scene change fails; bless flow documented |
 | P1.9.3 | Protocol fuzzing: fuzz the core's decoder with arbitrary bytes + arbitrary fd counts (the most attacker-facing core surface) | cargo-fuzz; plus a "hostile client" integration test (garbage pre-handshake, huge lengths, fd spam) | P1.2.3, P1.1.2 | 24 h fuzz clean before M1.5; hostile-client tests in CI |
 | P1.9.4 | wlcs conformance (stretch): curated subset (xdg-shell, seat) against the **shim** | Advisory, not gating — full wlcs is noisy | P1.6.3 | Pass-list checked in with known-failure annotations |
-| P1.9.5 | Docs: `docs/protocol/` per-interface pages, README quickstart, ARCHITECTURE.md mapping code to PRD sections, demo screencast | Spec text permissively licensed from the start (D-005) | rolling | A newcomer runs the M1.5 demo from the README alone (verified on a clean machine) |
+| P1.9.5 | Docs: `docs/protocol/` per-interface pages, README quickstart, ARCHITECTURE.md mapping code to PRD sections, demo screencast | Spec text permissively licensed from the start (D-005) | rolling | A newcomer runs the M1.5 demo from the README alone (verified on a clean machine) — **the "clean machine" half is restated by D-047(6); see "M1.5's two open criteria" in §5** |
 
 ---
 
@@ -197,9 +312,60 @@ P1.7.1-3 consent ◄──────────────────┘   
 | **M1.2 — "Shim runs Firefox"** | Core spawns the shim; weston-terminal, then Firefox; frames flow shim→core (shm) into the nested window; human can click/type into Firefox through it | P1.3.3–4, P1.3.7, P1.5.\*, P1.6.1–2, P1.6.4 (render half) | **#105** (P1.9.6) |
 | **M1.3 — "Agent observes Firefox"** | `observe()` returns live Firefox pixels through the enforcement path; rate limits and expiry enforced; shim crash degrades gracefully | P1.3.6 wired to the realm view, P1.4.4, P1.8.2 | **#107** (P1.8.5) |
 | **M1.4 — "Agent acts under grant + consent"** | Core-rendered consent (human clicks Allow in nested mode); agent injects pointer + text into Firefox; mid-prompt actuations blocked; hold-Esc revocation; sender-constraint and expiry demonstrably enforced | P1.6.3, P1.7.\*, P1.8.3 | **#108** (P1.8.6) **+ #109** (P1.7.4, hold-Esc half) **+ #138** (P1.7.5, consent half) |
-| **M1.5 — "Headless + demo + hardening"** (= roadmap **M1**) | Full demo green in headless CI and impressive in nested mode; dmabuf zero-copy on at least one real GPU; fuzzing clean; docs + screencast published | P1.3.5, P1.8.4, P1.9.\* | **#110** (P1.8.7) |
+| **M1.5 — "Headless + demo + hardening"** (= roadmap **M1**) | Full demo green in headless CI and impressive in nested mode; dmabuf zero-copy on at least one real GPU; fuzzing clean; docs + screencast published — **two of those four are open and are named as exceptions in "M1.5's two open criteria" below, which restates this cell rather than replacing it** | P1.3.5, P1.8.4, P1.9.\* | **#110** (P1.8.7) |
 
 Scheduling pressure: start M1.2's shim work before M1.1 is polished — the wlroots/Firefox risk retires slowest and should soak longest.
+
+### M1.5's two open criteria, named 2026-08-25
+
+**REALIGNED 2026-08-25 BY D-047**, decision 6 (derived, not the owner's). The
+M1.5 row above is left standing. Its named mock-free gate **#110** is closed and
+D12's checklist below was run against it; what this block adds is that **two of
+the four things that row's statement of done names are not evidenced by #110 and
+have never been run**, so "M1.5 = roadmap M1 = done" is not read as covering
+them.
+
+- **dmabuf zero-copy on at least one real GPU** —
+  [#171](https://github.com/vitrin-os/vitrin-os/issues/171), open, labelled
+  `track:rust-core` / `known-limit` / `help wanted`. Its own title calls it
+  *"the last unevidenced M1.5 criterion"*.
+- **The 24-hour fuzz campaign** P1.9.3's acceptance criterion asks for before
+  M1.5 — [#156](https://github.com/vitrin-os/vitrin-os/issues/156), open,
+  labelled `track:ci-docs` / `known-limit` / `help wanted`. Its title carries the
+  open question with it: *"and decide whether to schedule it"*.
+
+**Neither carries a phase label, and this repository has no GitHub milestones by
+rule** (see `CLAUDE.md`'s tracking model, which refuses them outright), so the
+exception exists in this document or nowhere. Both carry `known-limit`, which is
+the label that obliges every published surface to say so.
+
+**#171 is code-blocked by [#253](https://github.com/vitrin-os/vitrin-os/issues/253),
+not hardware-blocked — and the "needs a real GPU" framing hides an
+implementation task inside an excuse.** The shipped shim's single upstream
+attach site — `shim/src/upstream.c:412`, inside the only
+`vitrin_shim_surface_req_attach_encode` call anywhere in `shim/src/` — sets
+
+```c
+.kind = VITRIN_SHIM_SURFACE_KIND_SHM,
+```
+
+as a **literal**, with no branch that could emit any other kind. P1.6.2's stated
+v1 — *"if the app committed a dmabuf, **pass the same fd through untouched**"* —
+was never built, so whatever of P1.3.5's core-side import path exists is
+unreachable from a real app by construction. A GPU does not change that: **#253
+is the work, and #171 is downstream of it.** #253 is open and carries
+`track:c-shim` / `known-limit`.
+
+**One more claim in this document is restated elsewhere rather than here.**
+P1.9.5's acceptance criterion — *"A newcomer runs the M1.5 demo from the README
+alone (verified on a clean machine)"* — is the same sentence D-047 decision 6
+restates as M1's exit evidence, and the restatement lives in
+[00-roadmap.md](00-roadmap.md) so there is one copy of it. In short, and cited
+there rather than argued here: the Landlock admission floor refuses Ubuntu
+22.04 (ABI 1), Debian 12 (ABI 2) and Ubuntu 24.04's GA kernel (ABI 4) — three of
+the five measured distribution kernels — and Ubuntu additionally needs an
+AppArmor profile that #293 records nothing installs. The packaging that would
+make the original sentence true again is **filed, not scheduled**.
 
 ### D12 — Definition of done: a milestone closes only on a named mock-free integration gate
 
@@ -531,7 +697,7 @@ property only.
 - **M1.2:** `input-echo` verifies the shim's Wayland environment before Firefox; mock-shim frame-flow test (deterministic animated buffer, assert frame sequence + damage); Firefox smoke (local page rendering a known solid color, assert dominant color); manual nested matrix on GNOME + Hyprland.
 - **M1.3:** agent-captured frame vs. core-internal capture agree (SSIM — proves the grant path adds no distortion); rate-limit test (100 captures/s against a 5/s grant); chaos test (`kill -9` the shim during a capture loop).
 - **M1.4:** scripted consent via a test-only privileged input injector (clearly test-gated); assert mid-prompt actuations never reach `input-echo`; Unicode pangram fidelity into GTK entry and Firefox URL bar; revocation latency ≤ one round-trip.
-- **M1.5:** the demo script is the acceptance test; instrumented zero-memcpy proof for dmabuf on real hardware; 24 h decoder fuzz; 1 h soak (flat fd count and memory); wlcs subset advisory; fresh-machine README walkthrough.
+- **M1.5:** the demo script is the acceptance test; instrumented zero-memcpy proof for dmabuf on real hardware; 24 h decoder fuzz; 1 h soak (flat fd count and memory); wlcs subset advisory; fresh-machine README walkthrough. **The dmabuf proof and the 24 h fuzz are open (#171, #156) and the fresh-machine walkthrough's premise is restated by D-047(6) — see "M1.5's two open criteria" above.**
 
 ---
 

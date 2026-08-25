@@ -16,14 +16,165 @@ Epic template: Goal / Dependencies / Design decisions / Exit criteria, then a ta
 
 Phase 3 cites these as its Phase-2 dependencies, exactly as Phase 1 exported A1–A6; anything not listed here is an internal detail free to change. Each artifact travels **with its limitations** — an exported capability whose caveat is left in the epic that built it is an artifact Phase 3 will over-read.
 
-- **C1 — Semantic node schema and the tree wire format.** The AccessKit-derived node model pinned to one exact crate version with a reserved Vitrin extension namespace; `node_role`/`node_state`/`tree_flags` enums; the length-prefixed, canonically-ordered serialization carried over an fd; `vitrin_shim_surface.push_tree` (double-buffered, applied at `commit`) and `vitrin_view.observe_tree`/`tree_ready`; **protocol version 2**, with the core implementing versions 1 and 2 simultaneously. Includes the role/state mapping table, the pin-drift check, and the golden wire vectors holding `crates/vitrin-protocol` and the Python SDK to the same bytes (D8). Produced by P2.1.1/P2.1.2; consumed by E3.2, E3.4 (B1), E3.5. **Not exported:** the AT-SPI vocabulary, the D-Bus types and the collector's normalization tables stay inside the shim by the epic's normalization split — Phase 3 must not reach for them.
+- **C1 — Semantic node schema and the tree wire format.** The AccessKit-derived node model pinned to one exact crate version with a reserved Vitrin extension namespace; `node_role`/`node_state`/`tree_flags` enums; the length-prefixed, canonically-ordered serialization carried over an fd; `vitrin_shim_surface.push_tree` (double-buffered, applied at `commit`) and `vitrin_view.observe_tree`/`tree_ready`; **protocol version 2**, with the core implementing versions 1 and 2 simultaneously — **both halves of that last clause are realigned; see "REALIGNED 2026-08-25 BY D-047 — C1, C4 and C5" below, which is the standing statement of what C1 exports and restates this bullet rather than replacing it**. Includes the role/state mapping table, the pin-drift check, and the golden wire vectors holding `crates/vitrin-protocol` and the Python SDK to the same bytes (D8). Produced by P2.1.1/P2.1.2; consumed by E3.2, E3.4 (B1), E3.5. **Not exported:** the AT-SPI vocabulary, the D-Bus types and the collector's normalization tables stay inside the shim by the epic's normalization split — Phase 3 must not reach for them.
 - **C2 — Core tree store and per-observer delta service.** `crates/vitrin-core/src/semantic/`: one canonical tree per surface with a **source tag** (`a11y` / `native` / `synthetic`) answerable in the journal and invisible in the agent's API; exactly one write path from the shim side and one from the principal side; served through the existing single enforcement chokepoint, so revocation, expiry, rate ceilings and `consent_held` apply to trees with zero new authority code; a bounded retained history (stated version count **and** stated byte budget) with normative resync triggers; always a copy into a fresh sealed memfd. Produced by P2.1.6/P2.2.2/P2.2.4; consumed by E3.2, E3.3, E3.4. **Guarantee Phase 3 may rely on:** a client cannot grow the core by never observing.
 - **C3 — Epoch / CAS action semantics.** One monotonic counter per view, defined by D-018(5) over (frame content + view geometry + stacking), never reused within a session; per-node epochs derived from it, not a second clock; `expected_epoch` on node-targeted actuation; the `stale` refusal with `retry_after_epoch`; `in_transition` as a node state; the comparison at exactly one grep-provable site, ordered **authority first, then staleness**, so a stale actuation from a revoked grant reports `revoked` and never leaks that the node changed. Produced by P2.2.3/P2.3.1–P2.3.3; consumed by E3, E3.4, E3.7. **Exported with its measurement:** the false-reject rate and the zero-false-accept count from P2.3.7, without which D-014 forbids freezing the mechanism in the spec.
-- **C4 — Confined realm spawn.** The `vitrin-realm-init` helper and its namespace set (user + mount + PID + IPC + UTS + net), the uid_map/gid_map/setgroups sync-pipe protocol, the realm's mount table with a **reserved fixed in-realm path for the private accessibility bus socket**, the Landlock ruleset applied before `execve` (inherited by every descendant including the app the shim forks), the seccomp deny-list with one comment per row naming the escape class it closes, and the runtime isolation preflight with its refuse-to-start floor and generated per-kernel tier matrix. Produced by P2.6.1–P2.6.4 and P2.7.1; consumed by E3.2, E3.3, E3.6. **Two limitations Phase 3 must not over-read:** the per-UID isolation tier needs install-time provisioning (subuid ranges plus a `newuidmap`-class helper) that no packaging exists for, so E3.3 must own that packaging or the fleet ships on the weaker intra-user tier; and only the microVM tier escapes shared-kernel escape classes (D-010).
-- **C5 — Powerbox and egress: vocabulary, mediation, and the fd/socket delivery path.** Verb bits `designate_file` and `egress`; resource prefixes `file:`, `dir:` and `net:` with a wildcard-free `host:port` grammar; the `vitrin_powerbox` facet minted structurally on `vitrin_grant`, **plus a second, separate facet interface for `egress`** (`vitrin_egress`, landed at P2.7.2 — `interface/@verb` is one value per interface, so one facet cannot declare both verbs); the core-drawn picker on the existing consent stack with `openat2 RESOLVE_NO_SYMLINKS` resolution from a directory fd; `SCM_RIGHTS` delivery and the shim's per-realm relay; the out-of-core egress proxy that asks the enforcement chokepoint per connection and holds no grant of its own; DNS resolved only in the proxy with addresses pinned into the grant row. Produced by P2.6.5–P2.6.7 and P2.7.2–P2.7.4; consumed by E3.5, E3.6, E3.7. **The one limitation that will be misread if unstated:** a delivered fd is kernel authority the core cannot recall, so PRD P2's "revocation is immediate and transitive" is **false for designations already made** — revocation stops future designations and kills the grant row; the payload keeps the fd until the realm dies. E3.7 must know this before designing durable designation grants, which multiply exactly this residue.
+- **C4 — Confined realm spawn.** The `vitrin-realm-init` helper and its namespace set (user + mount + PID + IPC + UTS + net), the uid_map/gid_map/setgroups sync-pipe protocol, the realm's mount table with a **reserved fixed in-realm path for the private accessibility bus socket**, the Landlock ruleset applied before `execve` (inherited by every descendant including the app the shim forks), the seccomp deny-list with one comment per row naming the escape class it closes, and the runtime isolation preflight with its refuse-to-start floor and generated per-kernel tier matrix. Produced by P2.6.1–P2.6.4 and P2.7.1; consumed by E3.2, E3.3, E3.6. **Two limitations Phase 3 must not over-read** — **the count is now four: the two named here both hold, but neither is what a Phase-3 reader hits first; see the realignment block below, which adds the two that stop a deployment and restates this clause rather than replacing it**: the per-UID isolation tier needs install-time provisioning (subuid ranges plus a `newuidmap`-class helper) that no packaging exists for, so E3.3 must own that packaging or the fleet ships on the weaker intra-user tier; and only the microVM tier escapes shared-kernel escape classes (D-010).
+- **C5 — Powerbox and egress: vocabulary, mediation, and the fd/socket delivery path.** Verb bits `designate_file` and `egress`; resource prefixes `file:`, `dir:` and `net:` with a wildcard-free `host:port` grammar; the `vitrin_powerbox` facet minted structurally on `vitrin_grant`, **plus a second, separate facet interface for `egress`** (`vitrin_egress`, landed at P2.7.2 — `interface/@verb` is one value per interface, so one facet cannot declare both verbs); the core-drawn picker on the existing consent stack with `openat2 RESOLVE_NO_SYMLINKS` resolution from a directory fd; `SCM_RIGHTS` delivery and the shim's per-realm relay; the out-of-core egress proxy that asks the enforcement chokepoint per connection and holds no grant of its own; DNS resolved only in the proxy with addresses pinned into the grant row. Produced by P2.6.5–P2.6.7 and P2.7.2–P2.7.4; consumed by E3.5, E3.6, E3.7. **This bullet exports one artifact where the tree holds two in different states — landed vocabulary and unbuilt mediation; it is split in the realignment block below, which is the standing statement of what E3.5/E3.6/E3.7 may name as a dependency and restates this bullet rather than replacing it.** **The one limitation that will be misread if unstated:** a delivered fd is kernel authority the core cannot recall, so PRD P2's "revocation is immediate and transitive" is **false for designations already made** — revocation stops future designations and kills the grant row; the payload keeps the fd until the realm dies. E3.7 must know this before designing durable designation grants, which multiply exactly this residue.
 - **C6 — The native tree path and its reference client.** `protocol/vitrin-semantic-v1.xml` (wayland-scanner dialect, **never** validated against `vitrin-v0.rng`; protocol-derived, so `NOTICE` places it under Apache-2.0 per D-016), the shim-side implementation relaying a native tree verbatim while normalizing an a11y-sourced one into the same bytes, the conformance page, and `shim/tests/native_tree_minimal.c` — a client written **only** from that page, sharing no code with `examples/native-demo/`, whose existence is the evidence the page is sufficient. Produced by P2.5.1/P2.5.2/P2.5.6; consumed by Phase 4's toolkit backends and WS-A's freeze ladder. **The load-bearing property** is byte-equality of the two producers' upstream output — that is what makes "one node model" a test result rather than a claim.
 - **C7 — IME plumbing and the compatibility matrix.** `vitrin_shim_text_input` (a 1:1 mirror of `text-input-v3`, so the shim relays rather than translates), `zwp_text_input_v3` toward the app, the core's separate IME socket with its one-connection-per-session rule and its suspension under `ConsentGrab`, the candidate-popup positioning path with the trusted-band clip, and the **generated** compatibility matrix whose committed-cell count CI asserts. Produced by P2.8.1–P2.8.6; consumed by E3.2, whose XWayland-IME fallback page this epic's exit criterion explicitly feeds. **Exported with a trust statement, not a capability statement:** the IME sees every keystroke destined for the focused realm. It is a keylogger by construction and a genuine extension of the trust boundary beyond the TCB; it belongs in PRD Doc 2 §15 and in `docs/book/src/limits.md`, and no capability in this design constrains what it does with what it sees.
 - **C8 — Sub-realm authority granularity (`node:`).** The `ResourceRef` variants and subtree containment in `covers`, pixel **redaction** (not cropping — the agent receives a full-size frame with everything outside the granted subtree replaced by a constant, so its coordinate space is unchanged and geometry leaks nothing), actuation clipping at the chokepoint, and `observe_tree` scoped to the granted subtree. Produced by P2.2.6, closing #161; consumed by E3.7 and E3.3. **Exported with the risk it creates, which is new in Phase 2 and must travel with it:** once a node id names a grant's resource, a wrong re-identification is not an ergonomics bug but an **authority redirection** — a grant scoped to the `name` field silently covering the `card number` field. That is why identity is core-owned and never shim-supplied, why ambiguous matches fail closed by invalidating rather than picking, and why P2.2.8 asserts the false-identification count as an exact zero rather than as a rate.
+
+#### REALIGNED 2026-08-25 BY D-047 — C1, C4 and C5
+
+The bullets above are the contract as written before any of it was built. Three
+of them describe a tree that no longer exists: one exports an artifact that has
+since landed under a different owner and a clause an owner's decision has since
+struck, one under-counts its own limitations and misses the two that actually
+stop a deployment, and one exports as a single artifact two things in
+incompatible states. The originals are left standing, because a contract whose
+wrong clauses are quietly rewritten is one no consumer can audit; this block is
+the standing statement of what C1, C4 and C5 export, and it restates them rather
+than replacing them. Nothing here touches C2, C3, C6, C7 or C8.
+
+**C1 decomposes into a landed artifact this phase does not produce and a semantic
+artifact it still owes.**
+
+- **Spent: "protocol version 2 … produced by P2.1.1/P2.1.2".** Version 2 is on
+  `main`. `protocol/vitrin-v0.xml`'s root element reads
+  `<protocol name="vitrin" version="2">`, and **29** requests and events carry
+  `since="2"`: `attention`; the launcher (`get_launcher`, `launch`, `launched`);
+  both layout facets (`get_layout_focus`, `get_layout_arrange`, `focus`,
+  `set_fullscreen`); the powerbox (`get_powerbox`, `request_file`,
+  `request_dir`, `designated`, `refused`, `designation`); egress (`get_egress`,
+  `request_connect`, `connected`, `connect_failed`); clipboard/selection
+  (`request_selection`, `selection`, `offer_selection`); pointer constraints
+  (`pointer_constraint`, `pointer_constraint_state`); `idle_inhibit`;
+  `relative_motion`; and the four gesture events. **Not one of them is
+  semantic.** The bump was spent by WS-E (§5's own note anticipated exactly
+  this: "the 1→2 version bump is owned by whoever lands first") and by the
+  powerbox/egress vocabulary of M2.5's own rung, so the version-2 negotiation
+  machinery is a **landed** artifact whose producer is WS-E, not this phase. It
+  belongs with the **E-series** exported-artifact contract, which now exists:
+  [`14-workstream-session-mode.md`](14-workstream-session-mode.md) **§9**,
+  added 2026-08-25 by D-047(1) and carrying **E1–E9**. Phase 3 should cite the
+  `since="2"` vocabulary from there — **E3** for the three session verbs and
+  their facets, **E5** for the seat additions and `attention` — and should note
+  what §9 does *not* carry: no E-entry exports the version *negotiation* as an
+  artifact of its own, because there is nothing to negotiate while the core
+  accepts exactly one integer. C1 exports it no longer.
+- **Struck: "with the core implementing versions 1 and 2 simultaneously"**
+  (D-047 decision 4, the owner's). The shipped core accepts exactly its maximum
+  and refuses every other integer, version 1 included:
+  `crates/vitrin-core/src/principal.rs`'s `handle_hello` returns
+  `VersionUnsupported` for any `hello.version != PROTOCOL_VERSION`, and its own
+  comment concedes the gap and names the per-connection version matrix as the
+  fix. **Protocol version 1 is declared dead now.** The precondition is
+  **D-032**'s decision 6 — *"no version bump, and no scheduling question —
+  because version 2 has never left this repository"*, whose check is that
+  version 2 "has never been released, frozen or negotiated by any
+  implementation outside this repository" — so there is no client anywhere that
+  declaring version 1 dead can break. The debt is recorded rather than
+  discharged — the per-connection version matrix is an obligation of **WS-A's
+  spec 1.0-candidate rung**, not of P2.1.2 — and the two other sites that
+  promised the opposite are struck at their own locations in §3's walking
+  skeleton and §4's M2.1 row.
+- **What C1 still exports, and what P2.1.1/P2.1.2 still owe:** the semantic node
+  schema and the tree wire format — the AccessKit-derived node model pinned to
+  one exact crate version with a reserved Vitrin extension namespace,
+  `node_role`/`node_state`/`tree_flags`, the length-prefixed canonically-ordered
+  serialization over an fd, `push_tree`/`observe_tree`/`tree_ready`, the
+  role/state mapping table, the pin-drift check and the golden wire vectors
+  (D8). **None of it exists**: no `since="2"` message above is one of them, and
+  under D-047 decision 2 P2.1.1 and P2.1.2 are among the eleven E2.1 task issues
+  cut now. What P2.1.2 exclusively owns is no longer the bump; it is the
+  argument-reservation discipline, restated at §3's second serialization point.
+
+**C4 gains the two limitations that actually stop a deployment.** The bullet
+names two — install-time subuid provisioning, and shared-kernel escape classes
+— and both are real. Neither is what a Phase-3 reader hits first.
+
+- **Where AppArmor restricts unprivileged user namespaces, no realm starts at
+  all without an installed per-binary profile.** Measured once, on one
+  mainstream default: a GitHub `ubuntu-latest` runner, kernel
+  `6.17.0-1020-azure`, 2026-08-14, with
+  `kernel.apparmor_restrict_unprivileged_userns` at `1` on that stock image.
+  AppArmor permits the `unshare` and then confines the process to a profile
+  that denies the capabilities inside the namespace, so the preflight's first
+  `mount(NULL, "/", NULL, MS_REC|MS_PRIVATE, NULL)` answers `EACCES` and the
+  matrix renders `mount.in_userns=restricted-by-policy(errno=13)`, `tier=none`
+  — the session is refused before any realm is spawned. That is §7's
+  `host-must-permit-unprivileged-userns`. **That is one CI image, on one
+  kernel, on one date — not a distribution survey**, and this bullet states it
+  at exactly that strength because the governing surface,
+  [`docs/book/src/limits.md`](../book/src/limits.md), forbids the stronger
+  reading in as many words: "Calling it *the distribution's* default is one
+  step further than this reaches — the runner's `/etc/os-release` was never
+  opened, and one image is not a distribution."
+  [#286](https://github.com/vitrin-os/vitrin-os/issues/286)'s title does frame
+  it as a distribution — *"vitrind refuses to start on a default Ubuntu 24.04
+  install, and nothing the project publishes says so"* — and that framing is
+  the issue's, not a measurement. The remedy is a **new artifact C4 does not
+  export**: `packaging/apparmor/vitrind`, whose lever was measured both ways
+  under #286 — `restricted-by-policy(errno=13)` → `available`, `tier` `none` →
+  `per-uid`. [#293](https://github.com/vitrin-os/vitrin-os/issues/293) records
+  that **nothing installs it**: the profile is path-attached to
+  `/usr/lib/vitrin/{vitrind,vitrin-realm-init}`, and the only thing that ever
+  puts binaries there is one inline CI job. So E3.2/E3.3/E3.6 may not read C4
+  as "a realm spawns": on any host that restricts unprivileged user namespaces
+  this way, it spawns only after a packaging step this contract does not export
+  and no document schedules — and how many hosts that is has not been measured
+  ([#281](https://github.com/vitrin-os/vitrin-os/issues/281) is the
+  cross-kernel matrix).
+- **The Landlock domain denies every mount-topology change to every descendant,
+  and no grant restores it.** `crates/vitrin-realm-init/src/landlock.rs`'s module
+  documentation carries this under the heading *"The consequence nobody grants
+  their way out of: **no mounts, ever**"*: it "is not an access right, so it is
+  not in any rule and no grant enables it", measured rather than reasoned — with
+  **all** rights granted on `/`, `mount(NULL, "/", NULL, MS_REC|MS_PRIVATE, NULL)`
+  returns `EPERM`; without the domain the same sequence returns 0; and a domain
+  handling the whole rung-9 mask with every one of those rights granted on `/`
+  fails the identical decode. C4 exports "the Landlock ruleset applied before
+  `execve` (inherited by every descendant)" and stops there, which reads as a
+  filesystem-rights statement. It is also a **capability** statement: nothing
+  inside a realm can build a nested sandbox that mounts, so an app whose image
+  decoding runs in one decodes unsandboxed. §7's
+  `landlock-breaks-nested-image-sandboxes` publishes it; E3.2's XWayland work
+  and E3.6's portal work both put third-party sandboxing machinery inside a realm
+  and must know it before they design against C4.
+
+**C5 splits: the vocabulary landed, the mediation does not exist.** Read as one
+artifact, C5 exports a mediation path Phase 3 can build on. Read against the
+tree, it exports a name space.
+
+- **Landed.** Two verb bits — `designate_file` (**64**) and `egress` (**128**) —
+  and both are deliberately **outside** `SERVED_VERB_BITS`, which is
+  `1 | 2 | 4 | 16 | 32 | 512` = **567** in `crates/vitrin-core/src/grants.rs`;
+  the constant's own doc comment says each is "deliberately absent", so every
+  petition naming either resolves `unsupported` **whole**. Two facet interfaces
+  (`vitrin_powerbox`, `vitrin_egress` — two, because `interface/@verb` is one
+  value per interface), two resource prefixes (`file:`/`dir:` and `net:`), and
+  the prose pages `13-vitrin_powerbox.md` and `19-vitrin_egress.md`.
+- **Does not exist.** The core-drawn picker with `openat2 RESOLVE_NO_SYMLINKS`
+  resolution ([#190](https://github.com/vitrin-os/vitrin-os/issues/190), open),
+  the chokepoint arm that carries a designation, the shim's per-realm relay
+  ([#191](https://github.com/vitrin-os/vitrin-os/issues/191), open), the
+  out-of-core egress proxy
+  ([#197](https://github.com/vitrin-os/vitrin-os/issues/197), open) and DNS
+  pinning ([#198](https://github.com/vitrin-os/vitrin-os/issues/198), open).
+  Four open issues, no code, and `grants.rs` names the same absences in the same
+  order: "for the first, no picker mints a descriptor (P2.6.6), no chokepoint
+  arm carries a designation, and no consent copy names what approving it costs
+  (P2.6.8, Q13's rule); for the second, no proxy asks the chokepoint per
+  connection (P2.7.3)".
+- **Stated plainly, because it is the clause a downstream document will get
+  wrong: E3.5, E3.6 and E3.7 may not name C5 as a dependency as written.** A
+  dependency on the *vocabulary* is satisfiable today. A dependency on
+  "the fd/socket delivery path" or on "mediation" is a dependency on four open
+  issues. C5's own exported limitation — that a delivered fd is authority the
+  core cannot recall — is a statement about a mechanism that has never delivered
+  an fd, and E3.7 must not read it as evidence that the residue has been
+  observed.
 
 ---
 
@@ -49,7 +200,7 @@ Task IDs are `P2.<epic>.<task>` — `P2.6.1` is E2.6's first task. Every task ca
 |---|---|---|---|---|---|
 | **P2.1.1** | Decide and pin the semantic node schema: adopt AccessKit's node model as the normative baseline pinned to one exact crate version, add a reserved Vitrin extension namespace, and land it as a new normative prose page docs/protocol/12-semantic-nodes.md plus node_role/node_state enums in protocol/vitrin-v0.xml, with the pin recorded as a moving… | AccessKit schema with extensions over an independent superset, on Newton/COSMIC gravity, with the PRD Doc 2 §6.1 dependency-risk caveat restated on the prose page rather than paraphrased away. AccessKit is the schema, AT-SPI2 is the Phase-2 source: named explicitly so nobody reads 'AccessKit bridge' as a transport claim. | A1 | A checked-in machine-readable mapping table maps every role and every state of the pinned AccessKit version to exactly one Vitrin role/state or to an explicitly enumerated unmapped list — a CI lint fails if any AccessKit entry is in neither set. | `protocol` |
 | **P2.1.2** | Add the tree transport to the wire as paired IDL+prose: shim-facing `vitrin_shim_surface.push_tree(fd, size, version, format)` and principal-facing `vitrin_view.observe_tree(since_version)` → `vitrin_view.tree_ready(fd, size, version, flags)`, all since="2", and bump protocol/vitrin-v0.xml's root @version from 1 to 2. | `push_tree` is **double-buffered surface state applied at `commit`**, beside `attach`/`damage` — E2.5's shape, adopted here so a tree can never describe pixels that are not on screen. | P2.1.1 | `xmllint --relaxng` passes; `cargo xtask codegen --check` idempotent and green; the scanner's append-only opcode lint passes (messages appended, requests and events numbered separately). Version-matrix test, four cells, all against the shipped binary: a v1 client handshakes and completes a capture unchanged | `protocol` |
-| **P2.1.3** | Give each shim its own accessibility bus: spawn a private dbus-daemon into the shim's runtime dir from shim/src/main.c, export AT_SPI_BUS_ADDRESS/DBUS_SESSION_BUS_ADDRESS pointing only at it when the shim execs the app, register the shim as that bus's accessibility registry, and remove GTK_A11Y=none / NO_AT_BRIDGE=1 from the environment… | An own bus instance inside the shim's runtime dir, never the host session bus — this is what closes the AT-SPI backdoor (PRD §1.3) by construction rather than by policy. The core injects no DBUS_SESSION_BUS_ADDRESS today (crates/vitrin-core/src/spawn.rs module docs say so explicitly); that stays true | P2.6.2, P2.6.1, P2.1.2 | Component test in shim/tests/acceptance/: the shim starts, the private bus socket exists at mode 0700 inside the shim's runtime dir, and a probe execed with the app's exact composed environment reaches that bus and only that bus. | `c-shim` |
+| **P2.1.3** | Give each shim its own accessibility bus: spawn a private dbus-daemon into the shim's runtime dir from shim/src/main.c, export AT_SPI_BUS_ADDRESS/DBUS_SESSION_BUS_ADDRESS pointing only at it when the shim execs the app, register the shim as that bus's accessibility registry, and remove GTK_A11Y=none / NO_AT_BRIDGE=1 from the environment… | An own bus instance inside the shim's runtime dir, never the host session bus — this is what closes the AT-SPI backdoor (PRD §1.3) by construction rather than by policy. The core injects no DBUS_SESSION_BUS_ADDRESS today (crates/vitrin-core/src/spawn.rs module docs say so explicitly); that stays true | ~~P2.6.2~~, P2.6.1, P2.1.2 — **the P2.6.2 edge is discharged and dropped 2026-08-25 by D-047; see §3's realignment block.** `crates/vitrin-realm-init/src/lib.rs` reserves `IN_REALM_A11Y_BUS = "/run/vitrin/a11y-bus"` inside the already-bound `IN_REALM_RUNTIME_DIR`, and says in its own words that P2.1.3 therefore "adds **no bind mount** and re-makes **no** confinement claim". This task now also owns a `known-limit` un-publication (see the same block), which makes it not a `c-shim`-only task | Component test in shim/tests/acceptance/: the shim starts, the private bus socket exists at mode 0700 inside the shim's runtime dir, and a probe execed with the app's exact composed environment reaches that bus and only that bus. | `c-shim` |
 | **P2.1.4** | Build the in-shim AT-SPI2 tree collector (new shim/src/a11y.c): walk the app's accessible tree at surface map over the private bus, subscribe to object:children-changed / object:state-changed / object:text-changed / object:property-change, and maintain a live mirror keyed by AT-SPI accessible path. | Push, not poll, following Newton's model (PRD Doc 2 §6.2) — the collector reacts to signals and never round-trips the bus on an agent's observe, so agent latency is not a function of D-Bus round trips. Signal storms are coalesced into one push per shim dispatch round, on the same argument that bounds compositor composites in D-019. | P2.1.3 | Convergence test against a repo-authored fixture app under shim/tests/ that mutates its own accessible tree on command: after each of >=200 scripted mutations spanning all four subscribed signal classes, the mirror is compared against a fresh full walk of the same bus | `c-shim` |
 | **P2.1.5** | Normalize and push: map AT-SPI roles/states/attributes onto the P2.1.1 schema inside the shim, serialize the tree into a memfd, and emit `vitrin_shim_surface.push_tree` alongside the surface's buffer commit in shim/src/upstream.c. | The shim normalizes and the core only stores/serves — no AT-SPI vocabulary, no D-Bus types and no parser code cross the TCB boundary, which is the epic's stated normalization split and R7 (TCB dependency creep) carried into Phase 2. | P2.1.2, P2.1.4 | Golden normalization fixtures: recorded AT-SPI dumps from real Firefox ESR, Chromium, a GTK4 app and a Qt6 app are checked in under tests/golden/ and normalize byte-identically to checked-in expected trees, regenerated only via `cargo xtask bless`. | `c-shim` |
 | **P2.1.6** | Store and serve in the core: a new crates/vitrin-core/src/semantic/ module holding one canonical tree per surface, populated by `push_tree` in shim.rs and served through `observe_tree`/`tree_ready` behind the existing single enforcement chokepoint in enforcement.rs, copied into a fresh sealed memfd exactly as capture.rs does for pixels. | The core stores and serves and does nothing else to the tree in E2.1 — no parsing, no interpretation, no role logic; structural work arrives in E2.2. Serving a tree is an `observe`-verb use through the same chokepoint as `capture_frame`, so revocation, expiry, rate ceilings and consent_held apply to trees with zero new authority code, and P1.4.4's… | P2.1.2, P2.1.5 | Component test with vitrin-mock-shim pushing a synthetic tree: `observe_tree` under a live grant returns it byte-identically; under a revoked grant returns `refused(observe, revoked)` and never a stale tree; under a rate-limited grant returns `refused(observe, rate_limited)` with retry_after_ms > 0. | `rust-core` |
@@ -97,6 +248,7 @@ Task IDs are `P2.<epic>.<task>` — `P2.6.1` is E2.6's first task. Every task ca
 | **P2.3.5** | Close Q4: fix the grant delegation-chain depth at 1 as a normative statement in protocol/vitrin-v0.xml's `vitrin_grant` description and docs/protocol/04-vitrin_grant.md, and make it structural in crates/vitrin-core/src/grants.rs against the `parent_grant_id` field the Phase-1 grant table already carries present-but-null. | Q4 must close before spec 1.0-candidate (M2 = Phase 2 exit) and no Phase-2 epic builds `attenuate` — so it closes as a cap enforced before the mechanism exists, which is cheap now and impossible to retrofit once a chain is on the wire. | P2.3.2 | Unit test constructs a two-level parent chain directly in the grant table and asserts the third grant is refused; a one-level chain is accepted. `xmllint --relaxng` green after the description edit. The decision-log entry exists and Part B's Q4 row is marked CLOSED with a link to it, matching how Q15/Q16 were closed by D-017/D-018. | `protocol` |
 | **P2.3.6** | Land the CAS loop in the SDK: `grant.actuate(click(node.id), expected_epoch=obs.epoch)` plus a `StaleEpoch` exception in sdk/python/src/vitrin_os/errors.py, and a checked-in executable file reproducing PRD Doc 2 §18 steps 4-5 verbatim as the reference client for the epoch API. | The SDK does NOT retry automatically. An automatic retry loop inside the SDK hides exactly the number P2.3.7 must measure and turns a false-reject rate into a latency figure nobody sees; the SDK raises `StaleEpoch` carrying the current epoch and the retry hint, and the agent decides — which is what the PRD's own pseudocode does. | P2.3.3, P2.2.5 | The checked-in PRD-18-steps-4-5 file executes against the real chain and its source is diffed against the PRD's own code block by a CI check, so a divergence between document and running code fails the build in whichever direction it happens. Unit tests: `StaleEpoch` exposes `current_epoch` and `retry_after_epoch` | `sdk` |
 | **P2.3.7** ★ | Test the design claim: tests/integration/test_real_epoch_cas.py drives shipped `vitrind` + real `vitrin-shim` + real Firefox ESR against a checked-in animation-heavy page and measures the false-reject and false-accept rates of P2.3.1's invalidation policy over >=500 scripted observe-then-act cycles, publishing the numbers to… | This is the task that turns 'a design claim, not a proven result' into a number, and D-014 makes it a gate on freezing the mechanism in the spec — so a red result blocks the core 1.0-candidate rather than being noted and shipped. | P2.3.4, P2.3.6, P2.2.8 | False-accept count == 0 over >=500 cycles — one instance fails the gate. False-reject rate <= 5%, reported with per-invalidation-class attribution from P2.3.1's counters so a miss is actionable. The PRD Doc 2 §18 steps 4-5 file from P2.3.6 runs verbatim inside this gate and completes. | `rust-core` |
+| **P2.3.8** *(added 2026-08-25 by D-047; see §3's fourth serialization point)* | Retrofit the two **already-served** layout verbs under the epoch: bring `vitrin_layout_focus.focus` and `vitrin_layout_arrange.set_fullscreen` under the per-view counter `crates/vitrin-core/src/semantic/epoch.rs` introduces, so a layout mutation bumps it and an agent's cached coordinates are invalidated by a third party's arrangement exactly as a repaint invalidates them. | **D-018(5)** makes the epoch a *binding constraint* on layout — "E2.3's epoch MUST be defined over (frame content + view geometry + stacking), not content alone, and a layout mutation MUST bump it" — and **D-022(1)** served both verbs anyway, discharging D-018's deferral "for the nested, single-output case only" and stating the residue in its own words: "E2.3's epoch does not exist, so an agent's cached coordinates can be invalidated by a shell with no compare-and-swap available to notice. That is a correctness gap for agents, created here and closed later." This row is the *later*. It is a retrofit, not a design: the verbs are on the wire and immutable, so nothing here changes a signature. | P2.2.3, P2.3.1, P2.3.3 | A test drives a real client holding `layout_arrange` to fullscreen a realm between another principal's `observe` and its node-addressed actuation, and requires the actuation to refuse `stale` rather than land at the pre-arrangement coordinates — with the same sequence under no layout change landing, as the positive control §5's absence rule demands. `rg` still proves exactly one epoch-comparison site (P2.3.3's property survives the retrofit). | `rust-core` |
 
 ### E2.4 — VLM fallback pipeline
 
@@ -160,6 +312,8 @@ Task IDs are `P2.<epic>.<task>` — `P2.6.1` is E2.6's first task. Every task ca
 | **P2.6.8** | Make the durable consent rungs structurally unshippable, and run Q13's first prompt-design review across **every verb Phase 2 serves** — `designate_file`, `egress` and `publish_tree` — each shipping admitted-but-refused `unsupported` until its human-readable copy exists, the same staging `observe_cursor` still uses and `layout_*` used until WS-E.1.4 served both. | Q9 v0 posture: only once and while_running ship. The block is made STRUCTURAL rather than documented — admitting a durable rung requires a ProvenanceRef value whose only constructor lives behind a provenance cargo feature that no build in the tree enables, so 'ship the ladder ungated' becomes a compile-time impossibility rather than a review discipline. | P2.6.6, P2.4.1, P2.7.2 | A test enumerating all four persistence entries shows exactly two admissible and the other two resolving unsupported; a CI feature-matrix check proves the durable path is unreachable in every configuration the tree can build | `rust-core` |
 | **P2.6.9** ★ | Land the ransomware demo as a scripted, reproducible adversarial suite — tests/integration/test_real_ransomware.py plus a repo-authored payload realm — covering home-directory reach, path races and picker spoofing, and report the payload's measured write set. | The payload is repo-authored, following the click-target/form-target precedent, and the disclosure is made in the same breath rather than left to be noticed — no third-party program will cooperatively enumerate its own write attempts. | P2.6.2, P2.6.3, P2.6.4, P2.6.6, P2.6.7, P2.6.8 | The run reports the payload's actual write set and the gate asserts it equals exactly {designated fds} union {realm private storage} — a measured set equality, not an assertion that confinement is implemented. Every designation appears in the journal with a matching (dev, ino). | `rust-core` |
 | **P2.6.10** | Deliver the standing grant as the object PRD Doc 2 §12 describes — first-class in the grant table, enumerable in a connected-apps surface, revocable one-by-one, journaled and rate-audited — or state in the epic that A3's `while_running` already is it and nothing new ships. | Q9's v0 posture makes the durable rungs unshippable (P2.6.8); that is the *negative* half. This is the positive half, and the two are separately deliverable. If the answer is "`while_running` suffices", that must be written down, because the epic's goal line otherwise claims something Phase 1 already shipped. | P2.6.6 | A human can enumerate every live designation and standing grant for a realm and revoke one without revoking the others; each appears in the flight recorder with its designation journaled; the enumeration is asserted against a run that made three designations across two realms. | `rust-core` |
+| **P2.6.11** *(added 2026-08-25 as an in-place correction: a published residual whose named closure went unowned. **Not one of D-047's enumerated changes** — it stands on the two shipped source comments quoted in the next cell, not on a decision entry, and the next entry to touch E2.6 should adopt or reject it.)* | Build the shim-side Landlock stack that two shipped source files already name as the closure of a published residual, and that P2.6.3's closure left with no owner: a second Landlock domain applied by the shim around the app, narrow enough that the app cannot `unlink` and rebind the sockets in `/run/vitrin` that the shim and the core own. **It is a prerequisite of E2.1**: one of the paths it protects is `IN_REALM_A11Y_BUS`, which P2.1.3 will bind, and a bus socket an app can replace is a bus an app can impersonate to the collector. | The residual is published in the code rather than inferred: `crates/vitrin-core/src/spawn.rs` lists it among the three that "travel with" the confinement — "**Within one realm, the app can unlink and rebind any socket in `/run/vitrin`**, including `wayland-0` and the reserved a11y bus path … Blast radius is that one realm; the closure is P2.6.3's shim-side Landlock stack" — and `crates/vitrin-realm-init/src/lib.rs` states it in the same terms at `IN_REALM_A11Y_BUS`, down to naming "P2.6.3's shim-side Landlock stack" as the closure. **P2.6.3 is accepted (Correction 7 below), so the named closure now points at a closed task**, which is how a residual stops being owned by anyone. Mode bits cannot substitute: the shim and the app are one uid inside a single-id map. | P2.6.3, A5 | The app, run inside a realm, cannot `unlink`, `rename` or rebind `/run/vitrin/wayland-0` or `/run/vitrin/a11y-bus` — asserted from inside the realm with the same run proving both operations succeed with the shim-side domain disabled (positive control). Both source comments above are updated to name what closed them, or the residual is republished with its new closure named. | `c-shim` |
+| **P2.6.12** *(added 2026-08-25 by D-047; see §3's realignment of the inversion)* | Re-run both confinement policies against a realm that is actually running the accessibility stack: bring `crates/vitrin-realm-init/src/seccomp.rs`'s deny-list and `crates/vitrin-realm-init/src/landlock.rs`'s ruleset up against a realm running `dbus-daemon` plus the dconf/gsettings machinery Firefox drags in with a11y enabled, and publish what each policy had to widen. | **This is the inversion's second stated benefit, and it was not collected.** §3 put Track C first partly so that both policies would be "brought up against a realm that already runs `dbus-daemon` plus the dconf/gsettings machinery Firefox drags in with accessibility enabled". The inversion ran; both policies shipped against a realm with accessibility **off** — `GTK_A11Y=none`/`NO_AT_BRIDGE=1` are still pinned at every site §3 enumerates, and neither `seccomp.rs` nor `landlock.rs` mentions dbus, dconf, gsettings or AT-SPI anywhere. **It reopens E2.6 rather than belonging to P2.1.3**, on `CLAUDE.md`'s owner-of-the-deliverable rule: the deliverables are P2.6.3's ruleset and P2.6.4's deny-list, not the shim's bus. P2.1.3 is a *precondition* of running it, not its owner. | P2.6.3, P2.6.4, P2.1.3, P2.1.4 | The seccomp table's per-row probe suite (P2.6.4) and the Landlock behavioural rungs both re-run with the private bus and the a11y bridge live, and **every widening is a named row with the escape class it reopens**, not a mask edit. A widening that lands with no row fails the test. If neither policy needs widening, that is the result and it is published as a measurement with the run's evidence — never asserted from the fact that nothing crashed. | `rust-core` |
 
 #### P2.6.3, corrected
 
@@ -524,7 +678,7 @@ five kernels and for no others** — the sentence above stands.
 
 | ID | Task | Key decisions | Depends on | Acceptance criteria | Track |
 |---|---|---|---|---|---|
-| **P2.7.1** | Add CLONE_NEWNET to the realm clone and bring lo up inside the new network namespace, completing the container-per-realm baseline of PRD Doc 2 §4.5 on top of P2.6.2's namespace set. | Loopback-only: no veth, no bridge, no NAT, no routing state anywhere in the TCB (PRD Doc 2 §12). lo is brought up because apps expect it to exist, and that is safe precisely because nothing is listening on it — 'ssh localhost reaches the realm's own empty loopback' is a statement about what is bound, not about what is routable. | P2.6.1, P2.6.2 | Inside the realm the interface set is exactly {lo}, enumerated from the netns. connect() to a host loopback port THE TEST ITSELF OPENED fails ENETUNREACH or ECONNREFUSED, while the same run proves that port reachable from outside the realm (positive control — a refusal against a port nothing was listening on proves nothing). | `rust-core` |
+| **P2.7.1** *(re-scoped 2026-08-25 as an in-place correction — **not one of D-047's enumerated changes**, on the P2.6.11 footing: it stands on the shipped code cited in the acceptance cell, not on a decision entry. The **code** landed inside P2.6.2, the **measurement** did not, so this row is neither future work nor already delivered)* | Add CLONE_NEWNET to the realm clone and bring lo up inside the new network namespace, completing the container-per-realm baseline of PRD Doc 2 §4.5 on top of P2.6.2's namespace set. | Loopback-only: no veth, no bridge, no NAT, no routing state anywhere in the TCB (PRD Doc 2 §12). lo is brought up because apps expect it to exist, and that is safe precisely because nothing is listening on it — 'ssh localhost reaches the realm's own empty loopback' is a statement about what is bound, not about what is routable. | P2.6.1, P2.6.2 | Inside the realm the interface set is exactly {lo}, enumerated from the netns. connect() to a host loopback port THE TEST ITSELF OPENED fails ENETUNREACH or ECONNREFUSED, while the same run proves that port reachable from outside the realm (positive control — a refusal against a port nothing was listening on proves nothing). **What landed, and what did not:** `crates/vitrin-realm-init/src/main.rs` carries `libc::CLONE_NEWNET` in the unshare set and calls `bring_loopback_up()`, both inside P2.6.2's helper — so the *deliverable* of this row shipped under another row's issue. Neither acceptance criterion above was taken: nothing enumerates the realm's interface set, and no positive-controlled `connect()` measurement exists. **All that remains of P2.7.1 is its measurement**, and until that runs, no surface may cite the netns as measured. | `rust-core` |
 | **P2.7.2** *(vocabulary **and** facet landed at #196; the verb is served by nobody)* | Paired IDL+prose edit adding the egress vocabulary: verb bit egress (128), resource prefix net: with a host:port grammar, and the pinned-address column the grant row needs — then, in a second pass on the same issue, the facet: `vitrin_grant.get_egress` and the `vitrin_egress` interface carrying request_connect(host, port), its connected(fd, host, port) delivery event, and **a third terminal, connect_failed(reason)**, for the case the chokepoint admitted and the far end did not answer. | **Two facets, not one — this row said "one facet, not two" and the dialect refuses it.** `interface/@verb` is **one value per interface**, so an interface declaring `verb="designate_file"` cannot also declare `verb="egress"`, and its egress requests would reach the enforcement chokepoint with no verb to check them against. That is the same rule that forced the layout facet into `vitrin_layout_focus` + `vitrin_layout_arrange`, and the same correction: `vitrin_powerbox` (P2.6.5) carries request_file/request_dir, and egress gets its own facet interface. "The socket analog of request_file" (PRD Doc 2 §18 step 9) survives as the *shape* of the request, not as a claim about which interface hosts it. The grant row grows a pinned_addrs column holding the addresses resolved at grant time, so the pin is grant-table state rather than proxy state and survives a proxy restart — **present-but-null until P2.7.4 fills it**. **A third terminal rather than a new `refusal` code**, and this was an owner-reviewable call: `vitrin_grant.refused` is the enforcement chokepoint's voice and every code in it names something a server *decided*, so a host that is down has no honest code — `not_granted` would tell an agent to stop asking about work it is permitted to do. A transport failure therefore voices on the facet, and `refusal` stays what it is. | P2.6.5, A1 | xmllint --relaxng green; cargo xtask codegen --check green; a proptest over generated selectors asserting every accepted string round-trips to exactly one (host, port) and that no accepted string contains a wildcard, a CIDR or a comma — checked by generation rather than by inspection; every new message in `crates/vitrin-protocol/tests/roundtrip.rs` including the fd-bearing `connected`, and one negative case per new message in `protocol/test-mutations.sh`. **Not met by this task and stated rather than omitted:** the reference core dispatches none of the four new opcodes — `vitrind` answers `get_egress` and `request_connect` `invalid_opcode`, where the IDL says the mint is always legal and the use refuses recoverably. P2.7.3 closes that with the proxy. | `protocol` |
 | **P2.7.3** | Build the per-realm egress proxy: a listening socket created inside the realm's netns by setns-then-bind-then-setns-back, served by an out-of-core sidecar speaking SOCKS5 and HTTP CONNECT, which asks the core's enforcement chokepoint per connection and never decides anything itself. | Mechanism = a socket injected into the netns, not veth plus transparent redirect — the recommended v0 in the plan, and the reason is that it gives the TCB a listener instead of a router: no NAT, no nftables state, no packet path in the core. | P2.7.1, P2.7.2, A3 | A designated egress to an HTTP origin the harness starts itself works end to end from inside the realm through real curl. Revocation is MEASURED, not asserted: the latency from revoke to the first refused connection is reported and must be within one round-trip, and live connections are torn down… | `rust-core` |
 | **P2.7.4** | Resolve DNS in the proxy, pin the resolved addresses into the grant row, and refuse any CONNECT to an address the pin does not contain — including literal-IP CONNECTs under a name-scoped grant. | There is no resolver inside the realm: no /etc/resolv.conf in the mount namespace, no route to a DNS server in the netns. Name resolution is therefore available ONLY through the proxy (SOCKS5h / CONNECT by name), which makes DNS mediation structural rather than a policy the app could route around. | P2.7.3 | A DNS server under the harness's control returns address A at grant time and address B afterwards: the connection to B is refused and journaled with the reason, and the same test proves A still works (positive control). A literal-IP CONNECT to an address the pin does not contain is refused even when the name grant would have covered it after the rebind. | `rust-core` |
@@ -558,7 +712,7 @@ five kernels and for no others** — the sentence above stands.
   - The benchmark is **not** P2.2.7. Delta size compares a semantic delta against a full tree; the M2 benchmark compares Vitrin against the Xvfb + screenshot + xdotool incumbent on token cost, success rate and wall-clock (PRD §1.6). Both are needed and neither substitutes for the other — which is exactly the confusion that let the obligation go unowned.
   - The freeze follows the implementation (D-014), so it cannot precede P2.3.7's number: **a red epoch/CAS result blocks the freeze rather than being noted and shipped.**
   - One owner for the honesty surfaces. Nine tasks across the phase write into `docs/book/src/limits.md`; the sweep proves the set is complete and mutually consistent, and is a `blocked_by` on the phase closing.
-- **Exit criteria:** benchmark numbers published against a real incumbent baseline with every input pinned; spec 1.0-candidate tagged with Q1/Q2/Q4 revisits recorded; `observe_cursor` served and the `ConsentGrab` shared-cursor workaround deleted rather than bypassed; every `known-limit` Phase 2 closes enumerated across all published surfaces (#172 closes); Q6 evaluated or explicitly moved to E3.1 with the reason.
+- **Exit criteria:** benchmark numbers published against a real incumbent baseline with every input pinned; spec 1.0-candidate tagged with Q1/Q2/Q4 revisits recorded; `observe_cursor` served and the `ConsentGrab` shared-cursor workaround deleted rather than bypassed; every `known-limit` Phase 2 closes enumerated across all published surfaces (#172 closes); Q6 evaluated or explicitly moved to E3.1 with the reason. **Corrected 2026-08-25, outside D-047's enumeration, which does not reach this criterion:** [#172](https://github.com/vitrin-os/vitrin-os/issues/172) is already **closed**, so "#172 closes" is no longer something this criterion can require. The cross-check it asked for exists as `cargo xtask limits-check` (`crates/xtask/src/limits.rs`), comparing the set §7 enumerates against the set `docs/book/src/limits.md` publishes (the set, never the wording) and holding the anchored claims on `README.md`, `SECURITY.md` and `site/index.html` — so read that clause as **green under `cargo xtask limits-check`**, the gate that now carries the claim. What the gate does **not** hold is the three surfaces §7 marks "not anchored" outright — `docs/book/src/01-run-the-demo.md`, `docs/book/src/04-realms-and-shims.md` and `tests/integration/README.md` — **plus** `site/index.html`'s nested-sandbox paragraph, which §7's row also marks not anchored while its two host-requirement claims are held; that remainder is this criterion's human half.
 
 **Tasks**
 
@@ -567,7 +721,7 @@ five kernels and for no others** — the sentence above stands.
 | **P2.9.1** ★ | Build the OSWorld-style benchmark against the Xvfb + screenshot + xdotool baseline (PRD §1.6): a named task set, the baseline harness, and `docs/benchmarks/screenshot-baseline.md`. | This is the benchmark roadmap §5 attaches to M2 — ≥10× token-cost reduction, success rate ≥ parity, wall-clock reported. P2.2.7's delta-size number is a *different* comparison (semantic delta vs. full tree) and says nothing about tokens or task success. Both are needed; neither substitutes. | P2.3.6, P2.2.7 | N named tasks run against both stacks; token cost, success rate and wall-clock published with the Firefox pin, corpus hash and task list; CI fails when any input moved without the numbers being regenerated. | `ci-docs` |
 | **P2.9.2** | Perform the core spec 1.0-candidate freeze (D-014, WS-A §2): the pre-freeze sweep of `docs/protocol/00-conventions.md` (§7.3's version prose no longer degenerates to an exact match; the scope note "Semantic trees — no accessibility/DOM-like node graph" becomes false at version 2), Q1's and Q2's empirical revisits, Q4's closure, and the logged… | D-014 freezes the spec **behind** the measured implementation, so the freeze cannot precede P2.3.7's false-reject number — a red result blocks the freeze rather than being noted and shipped. Q1's tuning pass and Q2's coverage-matrix revisit are conditions ON this task, which is why they have no separate owner. | P2.3.7, P2.2.8, P2.3.5, P2.5.6 | Spec 1.0-candidate tagged; every scope note that version 2 falsified is rewritten rather than deleted; Q1/Q2/Q4 each carry a recorded revisit; ≥3 substantive external reviews logged (roadmap §5's M2 row) or the row explicitly marked unmet rather than silently unchecked. | `protocol` |
 | **P2.9.3** | Serve the D-017/D-019 M2 deferrals: `since="2"` sibling `vitrin_shim_seat` events naming the principal (each still ending with `origin`, so B2 holds), the `crates/vitrin-core/src/input/` delivery half, and `observe_cursor` served rather than resolving `unsupported`. | Both decision entries defer this to M2 in as many words, and M2 *is* this phase's exit — the cleanest orphan in the set, dated in an accepted entry rather than inferred. It rides P2.1.2's version-2 bump. It also deletes the `ConsentGrab` shared-cursor workaround D-017 promises it would. | P2.1.2, P2.3.2 | Two principals' cursors are delivered and distinguishable to the app with `origin` preserved end to end; `observe_cursor` returns a real position under grant and refuses without one; the `ConsentGrab` workaround is deleted, not bypassed; `sdk/python/tests/test_verb_parity.py` and the unserved-set catalogue test both move. | `protocol` |
-| **P2.9.4** | Sweep the honesty surfaces once, at phase exit: every `known-limit` Phase 2 closes, enumerated across `docs/book/src/limits.md`, `README.md`, `NOTICE`, `crates/vitrin-core/src/spawn.rs`'s D9 section, the book's realm/shim pages and the project site. | Nine tasks across three clusters write into `limits.md` and none owns it; that is exactly how a stale gap claim ships, which is what open issue #172 exists to prevent. Individual tasks still write their own tier statements — this one proves the set is complete and mutually consistent. | P2.6.9, P2.7.6, P2.1.10, P2.8.6 | A cross-check fails when a gap is described differently on two surfaces or named on one and absent from another; #160's and #161's `known-limit` labels close with every surface enumerated; #172 closes. | `ci-docs` |
+| **P2.9.4** | Sweep the honesty surfaces once, at phase exit: every `known-limit` Phase 2 closes, enumerated across `docs/book/src/limits.md`, `README.md`, `NOTICE`, `crates/vitrin-core/src/spawn.rs`'s D9 section, the book's realm/shim pages and the project site. | Nine tasks across three clusters write into `limits.md` and none owns it; that is exactly how a stale gap claim ships, which is what `cargo xtask limits-check` now prevents mechanically — [#172](https://github.com/vitrin-os/vitrin-os/issues/172), which asked for the cross-check, is **closed** and the gate is what carries its claim. Individual tasks still write their own tier statements — this one proves the set is complete and mutually consistent. | P2.6.9, P2.7.6, P2.1.10, P2.8.6 | A cross-check fails when a gap is described differently on two surfaces or named on one and absent from another; #160's and #161's `known-limit` labels close with every surface enumerated; #172 closes. **Corrected 2026-08-25:** #172 is already closed, so the last clause is discharged by the gate it asked for rather than by this task — read it as `cargo xtask limits-check` green over the whole set, plus every surface §7 marks "not anchored" swept by hand in the same pass, since the gate cannot see those. | `ci-docs` |
 | **P2.9.5** | Evaluate Q6 (network buffer codec) during Phase 2 as the roadmap's long-lead pre-study schedules, producing a recommendation E3.1 decides on — or record that it moves wholesale to E3.1. | `20-decision-log.md` Part B and roadmap §3 both say evaluation happens during Phase 2 with the decision at E3.1 start. It is small and cheap to lose; silence is the one outcome that is not allowed. | — | A written codec comparison against the realm-view frame characteristics measured in this phase, or an accepted decision-log line moving the evaluation to E3.1 with the reason. | `ci-docs` |
 
 ---
@@ -579,7 +733,7 @@ PHASE 2 — dependency graph   (★ = named mock-free gate · [M2.x] = rung clos
 
 CONFINEMENT TRACK (independent of the schema; starts at phase open)
 
-  Q11 ──► P2.6.1 preflight ──► P2.6.2 empty-authority spawn (#160)
+  Q11 ──► P2.6.1 preflight ──► P2.6.2 empty-authority spawn (#186)
                                    │        │         │
                      ┌─────────────┘        │         │
                      ▼                      ▼         ▼
@@ -596,7 +750,7 @@ SEMANTIC SPINE (critical path)
         freeze #1                 freeze #2   │          │
                                               │          ▼
   P2.1.3 private bus ◄── mount path ──────────┘   P2.1.7 SDK find
-        │  (needs P2.6.2)                                │
+        │  (P2.6.2 dropped)                              │
         ▼                                                ▼
   P2.1.4 collector ─► P2.1.5 normalize ──────────► P2.1.8 matrix
                                         P2.1.11 fixtures ─┘
@@ -638,18 +792,65 @@ Phase 2 has **four** genuinely parallel tracks, not Phase 1's two.
 
 - **Track C — confinement** (`rust-core` → `c-shim` → `ci-docs`): `Q11 → P2.6.1 → P2.6.2 → {P2.6.3, P2.6.4, P2.7.1} → powerbox/egress → ★P2.6.9, ★P2.7.6`. Consumes only A2/A3 and touches no semantic code.
 - **Track A — semantic spine** (`protocol` → `rust-core` → `sdk`): `P2.1.1 → P2.1.2 → P2.1.6 → P2.1.7 → E2.2 → E2.3`. The phase's critical path, and the only track whose gates are strictly serial.
-- **Track B — shim a11y** (`c-shim`): `P2.1.3 → P2.1.4 → P2.1.5`. Runs beside Track A after P2.1.2 fixes the wire, but is *blocked at its head* by Track C's P2.6.2.
+- **Track B — shim a11y** (`c-shim`): `P2.1.3 → P2.1.4 → P2.1.5`. Runs beside Track A after P2.1.2 fixes the wire, ~~but is *blocked at its head* by Track C's P2.6.2~~ — **the head block is discharged and dropped 2026-08-25 by D-047**; P2.6.2 landed the realm runtime directory the bus socket sits in, so Track B no longer waits on Track C for a mount. See "REALIGNED 2026-08-25 BY D-047 — the inversion ran, and two of its three benefits were not collected" below, which is the standing statement and restates this bullet rather than replacing it.
 - **Track D — IME** (`protocol` → `c-shim` → `rust-core` → `ci-docs`): fully independent, touching only A5's seat model and the P1.7.1/D-019 overlay compositing stage.
 
 The two producer tracks (E2.4 sidecar, E2.5 native app) fork from Track A at P2.1.2 and rejoin only at their gates, which need E2.3's `expected_epoch`.
 
 ### Hard serialization points
 
-Phase 1 had exactly one (the IDL freeze). Phase 2 has **three**:
+Phase 1 had exactly one (the IDL freeze). Phase 2 has **three** — **re-counted to four on 2026-08-25 by D-047; the fourth is the epoch, added below, and point 2 is restated in the block that follows the list**:
 
 1. **P2.1.1 — the node-schema freeze.** The epic doc names it the phase's critical-path decision. It gates E2.2, E2.4, E2.5 and every SDK surface. Everything Q3 needs (`confidence`, `synthetic`) and everything E2.3 needs (`in_transition`) must be a reserved slot here, or it costs a `since`-gated schema extension after golden delta vectors have shipped.
-2. **P2.1.2 — the protocol 1→2 bump and every `since="2"` signature.** The sharper of the two. A signature is immutable forever ([00-conventions.md](../protocol/00-conventions.md) §7.4), so every argument any later Phase-2 epic needs must exist at this landing: `flags` on `tree_ready`, `since_version` **and** a reserved `options` word on `observe_tree` (E2.4's `accept_synthetic`), and the `observed_epoch` shape E2.4's publisher names. Miss one and that epic buys a sibling request forever. **Nothing may bump to version 3:** P2.1.2 owns the single bump for the whole phase, and E2.4–E2.8 all land at `since="2"`.
-3. **Q11 → P2.6.2 — the empty-authority spawn.** Serializes E2.6, E2.7 *and* — via the in-realm bus path — E2.1's Track B behind one large, kernel-dependent change. It is the phase's biggest single schedule risk, which is why its preflight P2.6.1 must land as early as anything in the phase.
+2. **P2.1.2 — the protocol 1→2 bump and every `since="2"` signature.** The sharper of the two. A signature is immutable forever ([00-conventions.md](../protocol/00-conventions.md) §7.4), so every argument any later Phase-2 epic needs must exist at this landing: `flags` on `tree_ready`, `since_version` **and** a reserved `options` word on `observe_tree` (E2.4's `accept_synthetic`), and the `observed_epoch` shape E2.4's publisher names. Miss one and that epic buys a sibling request forever. **Nothing may bump to version 3:** P2.1.2 owns the single bump for the whole phase, and E2.4–E2.8 all land at `since="2"`. **The bump half of this point is spent and its stated reason is false — see the realignment block below, which is the standing statement of what P2.1.2 exclusively owns and restates this point rather than replacing it.**
+3. **Q11 → P2.6.2 — the empty-authority spawn.** Serializes E2.6, E2.7 *and* — via the in-realm bus path — E2.1's Track B behind one large, kernel-dependent change. It is the phase's biggest single schedule risk, which is why its preflight P2.6.1 must land as early as anything in the phase. **The Track B clause is discharged**: P2.6.2 landed, and the a11y-bus path it was serializing needs no mount of its own (see the inversion block below).
+4. **E2.3's epoch — the retrofit two already-served verbs now owe** *(added 2026-08-25 by D-047)*. **D-018(5)** does not treat the epoch as a sequencing note: "A layout change invalidates an agent's cached coordinates exactly as a repaint does, so **E2.3's epoch MUST be defined over (frame content + view geometry + stacking), not content alone**, and a layout mutation MUST bump it", and "the epoch must be a compare-and-swap *on actuation*, not merely a token returned by observation: between an agent's capture and its click, a shell holding `layout_arrange` may have moved the target." **D-022(1) then served `layout_arrange` and `layout_focus` before the epoch existed**, discharging D-018's deferral for the nested single-output case and recording the residue in its own words as "a correctness gap for agents, created here and closed later". *Later* is E2.3, and until 2026-08-25 no task row in this document carried the obligation. It is a serialization point rather than a task note because it binds in both directions: the epoch's definition cannot be chosen without the two served verbs in scope, and no third verb may be served over view geometry until the counter exists. **P2.3.8** is the row.
+
+#### REALIGNED 2026-08-25 BY D-047 — serialization point 2 is half spent and half misstated
+
+Point 2 stands above and is not deleted. What follows is the standing statement
+of what P2.1.2 exclusively owns.
+
+**Spent: "P2.1.2 owns the single bump for the whole phase".** It does not, and
+this document already knew it in one place and not the other — §5's *"The 1→2
+version bump is owned by whoever lands first, not by P2.1.2 by name"* was
+written when WS-E.1.1 needed version 2 before Track A opened. WS-E landed it.
+`protocol/vitrin-v0.xml`'s root reads `version="2"` and 29 requests and events
+carry `since="2"`, none of them semantic (§1's realignment block enumerates
+them). Track A has not started; the bump it was to own was spent before the
+phase reached it.
+
+**The prohibition survives; its stated reason does not.** "Nothing may bump to
+version 3" is still the rule, but *"P2.1.2 owns the single bump"* is no longer
+why. The rule now rests on **D-032**'s decision 6, which
+point 2 never carried and which is the whole of what makes appending to a
+shipped integer legitimate: **version 2 "has never been released, frozen or negotiated by any
+implementation outside this repository"**. The one tagged release, `v0.1.0`,
+ships `version="1"`; core and shims are release-paired so a shim's version is
+pinned at spawn; and the only other speaker is this repository's own Python SDK.
+Had version 2 been released, appending to it would be a silent redefinition of
+what a released integer means, and the honest answer would have been version 3.
+**So the precondition is a live obligation, not a footnote**: the first external
+spec release consumes it, and after that this point's prohibition needs a
+different argument or a different answer.
+
+**What P2.1.2 still exclusively owns is the argument-reservation discipline**,
+which is the half that was always the sharp one and is untouched by the bump
+having been spent elsewhere. A signature is immutable forever
+([00-conventions.md](../protocol/00-conventions.md) §7.4), so every argument any
+later Phase-2 epic needs must exist at P2.1.2's landing: `flags` on
+`tree_ready`; `since_version` **and** a reserved `options` word on
+`observe_tree` (E2.4's `accept_synthetic`); and the `observed_epoch` shape
+E2.4's publisher names. Miss one and that epic buys a sibling request forever.
+That is the serialization point. It binds whether or not P2.1.2 performs a bump,
+because what it constrains is the *arguments within a signature* and not the
+calendar order of two additive landings — §5 makes the same distinction.
+
+**And the dual-version clause is struck** (D-047 decision 4, the owner's).
+Nothing in this section may require the core to serve version 1: it refuses
+every integer but its maximum, by construction and by a disclosed comment. See
+§1's realignment block for the site and for where the version-matrix debt now
+sits.
 
 ### Fully serialized validity (R8), and one inversion
 
@@ -661,11 +862,78 @@ The plan stays valid fully serialized for a single maintainer in rung order M2.1
 
 Recommended serial order: **P2.6.1 → P2.6.2 (+P2.6.3/P2.6.4/P2.7.1) → P2.1.1 → P2.1.2 → Track A/B to ★P2.1.9 → E2.2 → E2.3 → powerbox/egress to ★P2.6.9/★P2.7.6 → E2.4/E2.5 → E2.8 → E2.9.** Track D (IME) is the only track deferrable wholesale without stalling anything else, and it carries an explicit effort cap — so it is the correct schedule shock absorber, never the semantic spine.
 
-One consequence no epic states on its own: **E2.1 reverses `GTK_A11Y=none` and `NO_AT_BRIDGE=1`**, pinned in `shim/docs/firefox.md`, `shim/tests/acceptance/firefox_bringup.sh`, `shim/tests/acceptance/seat_input_replay.sh` and `crates/xtask/src/main.rs` precisely because a11y activation cost ~20 s. Every existing mock-free gate that boots Firefox or GTK inherits that change. Re-running and re-timing the full `MILESTONE_GATES` set belongs inside P2.1.3's acceptance; a timeout that must move is a named `ci-docs` change with the measurement attached, not CI flake absorbed later.
+One consequence no epic states on its own: **E2.1 reverses `GTK_A11Y=none` and `NO_AT_BRIDGE=1`**, set precisely because a11y activation cost ~20 s. This sentence named four sites and there are **nine**, in three classes — the count was wrong and is corrected here rather than in a block, because nothing was ever decided about it:
+
+- **Four inherit the setting from a harness** — `shim/docs/firefox.md`, `shim/tests/acceptance/firefox_bringup.sh`, `shim/tests/acceptance/seat_input_replay.sh` and `crates/xtask/src/main.rs`, which is the original enumeration.
+- **Three pin the two variables themselves**, in their own environment dictionaries, so reversing the harness leaves them set: `tests/integration/test_real_actuation.py`, `tests/integration/test_real_firefox.py` and `tests/integration/test_real_gtk.py`. These are the sites a sweep that follows the original four would miss, and all three are named mock-free gates.
+- **One records them and one publishes them.** `shim/docs/globals-touched-firefox-140.12.0esr.log` carries the command line the ledger was taken with, so a reversal that does not re-take the ledger leaves a record of a run nobody can reproduce. And **`docs/book/src/limits.md` publishes the disabled bridge as a `known-limit`** — id `no-accessibility`, whose text says in as many words that "the shim's own acceptance runs *disable* the bridge a toolkit would otherwise start — `GTK_A11Y=none` and `NO_AT_BRIDGE=1`, for the stated reason *'neither exists here'*".
+
+That last site changes what P2.1.3 is. `no-accessibility` is a wider limit than the bridge — it also publishes the absence of a screen reader, a magnifier and an on-screen keyboard, none of which P2.1.3 touches — but **the sentences inside it about `GTK_A11Y`/`NO_AT_BRIDGE` and about no AT-SPI2 bus being advertised to a realm are exactly what P2.1.3 falsifies**, and a published limit that has stopped being true is the failure `cargo xtask limits-check` exists to catch. So P2.1.3 owns a `known-limit` **edit** across every surface that carries those sentences, which makes it not a `c-shim`-only task: `CLAUDE.md`'s rule is to enumerate every surface when closing one, and the id is declared by [`14-workstream-session-mode.md`](14-workstream-session-mode.md) §6 rather than by §7 of this document, so the edit crosses two plan documents' limit sets and one of them is not this phase's. Every existing mock-free gate that boots Firefox or GTK inherits the environment change. Re-running and re-timing the full `MILESTONE_GATES` set belongs inside P2.1.3's acceptance; a timeout that must move is a named `ci-docs` change with the measurement attached, not CI flake absorbed later.
+
+#### REALIGNED 2026-08-25 BY D-047 — the inversion ran, and two of its three benefits were not collected
+
+The three bullets above are the argument for putting Track C first. The
+inversion was executed: P2.6.1, P2.6.2, P2.6.3 and P2.6.4 landed, and the
+semantic track has not started. The bullets are left standing, because the
+argument was correct and is what a reader auditing the build order needs to see;
+what follows is the standing statement of which of its benefits were actually
+banked. **One of three was.**
+
+**Bullet 1 — the mount edge — is genuinely discharged.** P2.6.2 owns the realm's
+mount table, and `crates/vitrin-realm-init/src/lib.rs` reserves the bus path
+inside a directory that table already binds: `IN_REALM_A11Y_BUS =
+"/run/vitrin/a11y-bus"`, whose doc comment marks it **Reserved** under D-020(4)
+and says it "is a name plus an ordering, not a mount. The directory it sits in
+is the core-created realm runtime directory bound at `IN_REALM_RUNTIME_DIR`, so
+P2.1.3 adds **no bind mount** and re-makes **no** confinement claim — which is
+what the reservation was written for." That is exactly the benefit the bullet
+argued for, banked in the code rather than promised. **Consequence, applied
+above:** the `P2.1.3 ← P2.6.2` blocking edge is dropped in the P2.1.3 task row,
+in the dependency graph's annotation and in Track B's *"blocked at its head"*
+sentence. Track B still needs P2.1.2 for the wire; it no longer waits on Track C
+for a mount.
+
+**Bullet 2 — the policy benefit — was not collected, and this is the one that
+cost something.** The bullet's claim was that P2.6.4's seccomp deny-list and
+P2.6.3's Landlock ruleset "must be brought up against a realm that already runs
+`dbus-daemon` plus the dconf/gsettings machinery Firefox drags in with
+accessibility enabled — discovering that later means widening a policy under
+schedule pressure, which is how a deny-list rots." Both policies shipped against
+a realm with accessibility **off**. The evidence is on both sides of the seam:
+`GTK_A11Y=none` and `NO_AT_BRIDGE=1` are still pinned at all nine sites the
+paragraph above enumerates, and neither `crates/vitrin-realm-init/src/seccomp.rs`
+nor `crates/vitrin-realm-init/src/landlock.rs` mentions dbus, dconf, gsettings
+or AT-SPI anywhere. So the policies were brought up against precisely the realm
+the bullet said not to bring them up against, and the widening it wanted to
+avoid is still ahead of the project — now with two accepted, published policies
+to widen rather than two drafts. **The task is added rather than the risk
+re-stated: P2.6.12.** It **reopens E2.6** rather than belonging to P2.1.3, on
+`CLAUDE.md`'s owner-of-the-deliverable rule — the deliverables are P2.6.3's
+ruleset and P2.6.4's deny-list, and P2.1.3 is a precondition of running the
+measurement, not its owner. Its acceptance is that every widening is a named row
+carrying the escape class it reopens; a widening with no row fails.
+
+**Bullet 3 — R2.9 — was not retired the way the bullet said it would be. It
+fired.** The bullet's mitigation was "it retires only by running the preflight
+on real kernels". The preflight was built and does run, and the risk still
+materialised on the most mainstream target there is: `vitrind` refuses to start
+on a default Ubuntu 24.04 install
+([#286](https://github.com/vitrin-os/vitrin-os/issues/286)). What retired it was
+not the preflight but an AppArmor profile written afterwards, and the residue —
+that nothing installs it — is open as
+[#293](https://github.com/vitrin-os/vitrin-os/issues/293) with no scheduled
+home. §6's R2.9 row is restated there.
+
+**What this does not change.** The recommended serial order above still holds,
+and the inversion was still the right call: bullet 1 alone repaid it, and the
+confinement track is the half of Phase 2 that is decomposed at all. The finding
+is narrower and worth keeping narrow — **an executed build-order decision is not
+self-evidently a collected one**, and two of these three benefits were recorded
+as reasons and then never checked.
 
 ### Walking skeleton
 
-**M2.1 — a tree the agent can find a node in, with no accessibility stack anywhere.** `vitrind` runs headless serving protocol **versions 1 and 2 simultaneously**. `vitrin-mock-shim` pushes one checked-in, hand-authored tree over `push_tree`. The core stores it as one canonical tree per surface in `crates/vitrin-core/src/semantic/` and serves it through `observe_tree` → `tree_ready` at the **existing** enforcement chokepoint, copied into a fresh sealed memfd exactly as `capture.rs` does for pixels. The Python SDK deserializes it independently and `find(role="button", name="Search")` returns the node. A version-1 client on the same core still completes a Phase-1 `capture_frame` unchanged; a version-1 client sending the `observe_tree` opcode dies with fatal `invalid_opcode`.
+**M2.1 — a tree the agent can find a node in, with no accessibility stack anywhere.** `vitrind` runs headless serving protocol **versions 1 and 2 simultaneously** — **struck; see the realignment note at the end of this rung's description, which restates the seam rather than replacing it**. `vitrin-mock-shim` pushes one checked-in, hand-authored tree over `push_tree`. The core stores it as one canonical tree per surface in `crates/vitrin-core/src/semantic/` and serves it through `observe_tree` → `tree_ready` at the **existing** enforcement chokepoint, copied into a fresh sealed memfd exactly as `capture.rs` does for pixels. The Python SDK deserializes it independently and `find(role="button", name="Search")` returns the node. A version-1 client on the same core still completes a Phase-1 `capture_frame` unchanged; a version-1 client sending the `observe_tree` opcode dies with fatal `invalid_opcode`.
 
 It exercises every seam that is *new invention* — the node schema and its canonical serialization, the fd-carried transport, the 1→2 bump and the two-version matrix the core must now implement, per-surface tree storage in the TCB, `observe` as a verb over trees (so revocation, expiry, rate ceilings and `consent_held` apply with **zero new authority code**, and P1.4.4's grep-provable single-path property must survive), the flight recorder's tree digest (B1), and the SDK's second independent implementation pinned to golden vectors (D8).
 
@@ -673,20 +941,103 @@ It defers everything that is *known-hard integration*: AT-SPI2 and D-Bus, Firefo
 
 **It has no mock-free gate, and says so** — on exactly the M1.1 carve-out: at this rung the only tree producer in existence is `vitrin-mock-shim`, so there is nothing mock-free to *be* mock-free about. Every test on M2.1 is a component test and is labelled one in [tests/integration/README.md](../../tests/integration/README.md). **The carve-out is spent here and is unavailable to M2.2 onward.**
 
+**REALIGNED 2026-08-25 BY D-047 — the two-version clauses are struck, and one
+of them was a red seam before the rung started.** Three sentences above require
+the core to serve version 1: *"serving protocol versions 1 and 2
+simultaneously"*, *"A version-1 client on the same core still completes a
+Phase-1 `capture_frame` unchanged; a version-1 client sending the `observe_tree`
+opcode dies with fatal `invalid_opcode`"*, and *"the 1→2 bump and the two-version
+matrix the core must now implement"*. **None of them can pass on `main`**:
+`handle_hello` refuses every integer but the core's maximum, so a version-1
+client does not reach a `capture_frame` at all — it is refused at the handshake.
+The first clause of a walking skeleton is supposed to be the seam that is
+cheapest to prove, and this one was red before anyone started the rung.
+
+Under **D-047 decision 4** (the owner's) protocol version 1 is dead, so the
+clauses are struck rather than scheduled: **M2.1's skeleton runs at version 2
+only**, and its version seam is now the one that is actually new — a tree
+carried over an fd at `since="2"` on a core that already speaks 2. What is *not*
+struck is the debt: the per-connection version matrix is an obligation of
+**WS-A's spec 1.0-candidate rung**, owed before the first external spec release,
+because the moment a third party implements the published protocol "an older
+client keeps working" stops being theoretical. Everything else in this rung's
+description — the schema, the canonical serialization, the fd transport,
+per-surface storage in the TCB, `observe` as a verb over trees with zero new
+authority code, the flight recorder's tree digest, the SDK's second independent
+implementation — is untouched, and so is the no-mock-free-gate carve-out and its
+being spent here.
+
 ---
 
 ## 4. Milestones within Phase 2
 
-`M2.1`–`M2.6` are Phase-2-internal rungs, exactly as `M1.1`–`M1.5` were Phase-1-internal. The roadmap defines only the external **M2**, which M2.6 is.
+`M2.1`–`M2.6` are Phase-2-internal rungs, exactly as `M1.1`–`M1.5` were Phase-1-internal. The roadmap defines only the external **M2**, which M2.6 is. **The external gate has since split into M2a and M2b (D-047 decision 3, the owner's), so the last clause no longer holds — see "REALIGNED 2026-08-25 BY D-047 — the rungs re-cut against M2a/M2b" below, which is the standing mapping and restates this sentence and the table rather than replacing them.**
 
 | Milestone | Statement of done | Contains | Named exit gate |
 |---|---|---|---|
-| **M2.1 — "Tree on the wire"** (walking skeleton) | `vitrind` serves versions 1 and 2 simultaneously; a hand-authored tree pushed over `push_tree` is stored per surface, served through `observe_tree` at the existing chokepoint into a fresh sealed memfd, deserialized independently by the Python SDK, and `find(role, name)` returns the node; a v1 client still completes a Phase-1 `capture_frame` unchanged | P2.1.1, P2.1.2, P2.1.6, P2.1.7 (partial) | **none, deliberately** — walking skeleton, on the M1.1 carve-out (see §3) |
+| **M2.1 — "Tree on the wire"** (walking skeleton) | ~~`vitrind` serves versions 1 and 2 simultaneously~~ (**struck by D-047 decision 4; version 2 only — see §3's walking-skeleton realignment note**); a hand-authored tree pushed over `push_tree` is stored per surface, served through `observe_tree` at the existing chokepoint into a fresh sealed memfd, deserialized independently by the Python SDK, and `find(role, name)` returns the node; ~~a v1 client still completes a Phase-1 `capture_frame` unchanged~~ (**struck with the clause above; this criterion cannot pass on `main` — a version-1 client is refused at the handshake**) | P2.1.1, P2.1.2, P2.1.6, P2.1.7 (partial) | **none, deliberately** — walking skeleton, on the M1.1 carve-out (see §3) |
 | **M2.2 — "Agent finds a real element in real Firefox"** | Every shim surface carries a live, normalized tree from the confined app's own accessibility stack over a private per-shim bus; `find(role, name)` locates a named element in real Firefox ESR and the node is proved to *be* that element by actuating at its geometry and reading the app's own visible response; the four-app coverage matrix is generated (not written); no route from inside a realm to the host session a11y bus is reachable | P2.1.3–P2.1.5, P2.1.8, P2.1.11, remainder of P2.1.6/P2.1.7 | **★P2.1.9** (`test_real_semantic_firefox.py`) **+ ★P2.1.10** (`test_real_a11y_isolation.py`) |
 | **M2.3 — "Versioned trees: KB deltas and addresses that do not lie"** | Tree updates are atomic and epoch-stamped over one monotonic per-view counter; per-observer deltas are served against `since_version` with enumerated normative resync triggers; a held node reference across a real page's dynamic updates either resolves to the same element or raises `NodeInvalidated`, with silent re-binding measured at exactly zero; median delta size over a pinned corpus is published with its full-tree baseline and ratio | P2.2.1–P2.2.6 | **★P2.2.8** (`test_real_node_stability.py`, correctness) **+ ★P2.2.7** (`test_real_semantic_delta_size.py`, measurement) |
 | **M2.4 — "Race-free action, one node model from three producers"** | Observation returns an epoch; node-targeted actuation carries `expected_epoch`; the single chokepoint rejects stale targets with `stale` before anything is acted on; animated nodes refuse with `retry_after_epoch`; false accepts are zero and the false-reject rate is measured against a threshold stated *before* the run; PRD Doc 2 §18 steps 4–5 run verbatim as checked-in executable code; a canvas-only surface and a native egui app both yield trees agents reach through the **same** `find()` + node-addressed actuation | P2.3.1–P2.3.6, P2.4.1–P2.4.6, P2.5.1–P2.5.4, P2.5.6 | **★P2.3.7** (`test_real_epoch_cas.py`, primary) **+ ★P2.4.7** (`test_real_synthetic_tree.py`) **+ ★P2.5.5** (`test_real_native_tree.py`) |
 | **M2.5 — "The non-ambient realm"** | A realm spawns with a user+mount+PID+IPC+UTS+net namespace set, a Landlock ruleset and a seccomp filter, at an isolation tier the core measured and refuses to start below; the picker returns already-open fds resolved race-free from a directory fd; a payload realm's measured write set equals exactly {designated fds} ∪ {realm private storage} against attempted home-directory reach, path races and picker spoofing; host loopback unreachable, abstract sockets confined, path sockets absent, a grantless realm emits zero outbound packets by capture, and one designated `host:443` egress works, expires and revokes with both latencies measured | P2.6.1–P2.6.10, P2.7.1–P2.7.5 | **★P2.6.9** (`test_real_ransomware.py`) **+ ★P2.7.6** (`test_real_ssh_localhost.py`) |
 | **M2.6 — "IME reference combination + phase exit"** (= roadmap **M2**) | Agent `text` entry into a CJK-locale app works with the IME running and provably untouched (zero bytes across `vitrin_shim_text_input`, with the same counter shown nonzero in the same run); a human types Japanese into **Firefox**-in-realm via real fcitx5 with candidates positioned at the app-reported cursor rect within 1 px across multiple realm-view offsets; the effort cap is structural. **And** the publication obligations are met: benchmark-vs-screenshot numbers, delta-size and false-reject numbers, the core spec 1.0-candidate freeze, and the D-017/D-019 cursor deferrals served | P2.8.1–P2.8.6, P2.9.1–P2.9.5 | **★P2.8.5** (`test_real_ime.py`, IME half) **+ ★P2.9.1** (benchmark half) |
+
+#### REALIGNED 2026-08-25 BY D-047 — the rungs re-cut against M2a/M2b
+
+The table above stands. What changes is the external gate it ladders toward:
+**M2 splits into M2a and M2b** (D-047 decision 3, the owner's), because M2 was
+one exit gate over two tracks in incomparable states — a semantic chain with
+zero task issues, and a confinement/powerbox track four of sixteen built. They
+cannot exit together. **M3 and M4 keep their numbers**, which is why the split
+is `a`/`b` rather than a renumbering: WS-B and WS-C key triggers to milestone
+ids, and renumbering M3 would move a funding artifact and an announcement beat
+for no gain.
+
+| External gate | What it is | Which internal rungs close it | Its mock-free gates |
+|---|---|---|---|
+| **M2a — the non-ambient realm** (ships **first**) | A realm with no ambient filesystem or network authority, demonstrated. | **M2.5** entire | **★P2.6.9** (`test_real_ransomware.py`) **+ ★P2.7.6** (`test_real_ssh_localhost.py`) |
+| **M2b — the semantic realm** | An agent drives Firefox by semantic tree under epoch/CAS, plus the first benchmark numbers and the core spec 1.0-candidate. | **M2.1** (skeleton) → **M2.2** → **M2.3** → **M2.4** → **M2.6** | **★P2.1.9 + ★P2.1.10**, **★P2.2.7 + ★P2.2.8**, **★P2.3.7 + ★P2.4.7 + ★P2.5.5**, **★P2.8.5 + ★P2.9.1** |
+
+**M2a ships first, and that is the executed order rather than a preference.**
+§3's inversion put Track C ahead of the semantic spine and it ran: P2.6.1–P2.6.4
+landed, the confinement/powerbox track is four of sixteen built, and E2.6 is the
+one epic among C1–C5's producers that is decomposed at all. Under the inversion
+M2a's two demos are a handful of tasks from done; M2b's spine has not started.
+
+**Where the three rows added on 2026-08-25 land, and one that does not land
+where its epic does.** (Two of them are D-047's — P2.3.8 from the epoch
+serialization point, P2.6.12 from the policy revalidation it names. P2.6.11 is
+the in-place correction its own row describes and carries no decision entry
+yet.) P2.3.8 (the epoch retrofit) is M2.4's, with E2.3. P2.6.11 (the
+shim-side Landlock stack) is M2.5's, with E2.6 — and it is the rung's tidiest
+ordering fact, because it is also a **prerequisite of E2.1**: it protects the
+`/run/vitrin` sockets, one of which is the a11y-bus path P2.1.3 will bind, so
+M2a's last confinement row is a precondition of M2b's first semantic one.
+**P2.6.12 (the policy revalidation) is E2.6's deliverable but closes inside
+M2b**, because it cannot run until P2.1.3 and P2.1.4 have produced a realm that
+actually runs the accessibility stack. That is not a filing convenience and it
+has a cost that M2a must state rather than absorb: **the seccomp deny-list and
+Landlock ruleset M2a ships were measured against a realm with accessibility
+off**, so M2a's confinement claim carries that bound until P2.6.12 runs.
+
+**The "Contains" column is inconsistent, and the rule is this.** M2.2, M2.3 and
+M2.4 exclude their own gate tasks from Contains — the gates are named in the
+last column and nowhere else. M2.5 and M2.6 **swallow** theirs: `P2.6.1–P2.6.10`
+contains ★P2.6.9, and `P2.8.1–P2.8.6, P2.9.1–P2.9.5` contains both ★P2.8.5 and
+★P2.9.1. The convention is the first one, because a rung's gate is what *closes*
+it rather than a thing it contains, and a span notation that silently absorbs a
+gate is how a rung reads as complete with its gate unwritten. Read the two
+swallowing rows as: **M2.5 contains P2.6.1–P2.6.8, P2.6.10, P2.6.11 and
+P2.7.1–P2.7.5**, closed by ★P2.6.9 and ★P2.7.6; **M2.6 contains P2.8.1–P2.8.4,
+P2.8.6 and P2.9.2–P2.9.5**, closed by ★P2.8.5 and ★P2.9.1. The spans are left
+as written above rather than edited, and this paragraph is the rule.
+
+**What this block does not do.** It does not make the rungs tracked. Nine of the
+eleven mock-free gates named in the last column of that table **do not exist as
+issues** (D-047 decision 2), and D-047 cuts eleven E2.1 task issues rather than
+all fifty rows the audit counted. A rung with a named gate and no issue behind
+it is a plan row, not a schedule. And it assigns no dates: M2a shipping first is
+an ordering, and [`00-roadmap.md`](00-roadmap.md) refuses dates outright.
 
 ### The definition-of-done rule, restated for Phase 2
 
@@ -811,7 +1162,7 @@ Phase-1 risk IDs `R1`–`R8` are not reused; these are `R2.n`.
 | **R2.6** | **The private bus adds a process to the realm before the realm is confined**, if E2.1 runs before E2.6. | The build order inverts to put Track C first (§3). Where the tiers still overlap, P2.1.10's claim publishes **as a tier** — `limits.md` names which routes are closed structurally and which only by environment hygiene — and the weaker tier is retired *inside* E2.6, never quietly upgraded. |
 | **R2.7** | **Three repo-authored gate artifacts in one phase.** E2.2/E2.3's gates rest on repo-authored page content inside third-party Firefox; E2.5's demo app and E2.4's canvas fixture are ours too. M1.5 already conceded this shape once for `form-target`; doing it three more times erodes the mitigation that made the first acceptable. | State it in each gate's own docstring rather than letting a reader find it; keep Firefox, the shim, the transport and the chokepoint third-party or shipped; keep E2.1's third-party a11y rungs green in CI; and require a receipt-frozen breakage in each gate's watched-failing list, so a page that lies by not updating turns the gate **red** instead of passing it. |
 | **R2.8** | **E2.1's environment change perturbs every Phase-1 gate** by reversing `GTK_A11Y=none`/`NO_AT_BRIDGE=1`, which exist because a11y activation cost ~20 s. | Re-run and re-time the full `MILESTONE_GATES` set inside P2.1.3 and publish the new figure; a timeout that must move moves as a named `ci-docs` change with the measurement attached, never as absorbed CI flake. |
-| **R2.9** | **Unprivileged user namespaces are restricted or disabled on major distros.** No userns → no netns → no confinement at all. This is the one risk that can invalidate two whole epics. | P2.6.1's preflight runs on real kernels as early as anything in the phase; the core measures its tier and **refuses to start below a floor** rather than degrading silently; the per-kernel tier matrix is generated, not asserted. |
+| **R2.9** ⚠ **FIRED** | **Unprivileged user namespaces are restricted or disabled on major distros.** No userns → no netns → no confinement at all. This is the one risk that can invalidate two whole epics. **This is no longer a risk. It materialised on 2026-08-14 as [#286](https://github.com/vitrin-os/vitrin-os/issues/286) — *"vitrind refuses to start on a default Ubuntu 24.04 install, and nothing the project publishes says so"* — and in a shape the row did not name: the distribution does **not** restrict the `unshare`. AppArmor permits it and then confines the process to a profile that denies the capabilities inside the namespace, so the preflight's first `mount(NULL, "/", NULL, MS_REC\|MS_PRIVATE, NULL)` answers `EACCES` and the matrix renders `mount.in_userns=restricted-by-policy(errno=13)`, `tier=none`. Probing the `unshare` alone would have measured a proxy and reported a pass.** | P2.6.1's preflight runs on real kernels as early as anything in the phase; the core measures its tier and **refuses to start below a floor** rather than degrading silently; the per-kernel tier matrix is generated, not asserted. **REALIGNED 2026-08-25 BY D-047 — the mitigation above stands as written; this is what happened to it.** It held only in part, and the part that failed is the one the row leaned on. **What worked:** the core measured its tier and refused to start rather than degrading silently, so the failure was a refusal and not a false confinement claim. **What did not:** *"P2.6.1's preflight runs on real kernels as early as anything in the phase"* did not retire the risk — the preflight ran and the risk fired anyway, on the most mainstream target there is. **What retired it** was written afterwards and outside this phase: `packaging/apparmor/vitrind`, whose lever was measured both ways under #286 on kernel `6.17.0-1022-azure` (2026-08-15) — `restricted-by-policy(errno=13)` → `available`, `tier` `none` → `per-uid`, a real realm spawning, and the profile then removed and the spawn required to fail again. **Neither #286 nor its residue carries a `phase-N` label**, which under `CLAUDE.md`'s rule means no document schedules them. **The residue is real and unowned:** [#293](https://github.com/vitrin-os/vitrin-os/issues/293) records that nothing installs the profile or the binaries it names — it is path-attached to `/usr/lib/vitrin/{vitrind,vitrin-realm-init}` and the only thing that ever puts binaries there is one inline CI job — so *"we ship a profile"* is true of this repository and false of any installation of it, and a build at `/usr/local/bin/vitrind` fails **exactly as if no profile existed**. **The third clause still holds and is still the right mitigation:** the per-kernel tier matrix is generated, not asserted — Correction 6 in §2 records the rows being taken under QEMU on kernels this repository boots, which is what makes the matrix a rendered measurement rather than a claim. §7's `host-must-permit-unprivileged-userns` publishes the requirement; C4's realignment in §1 names the packaging as an artifact C4 does not export. |
 | **R2.10** | **A delivered fd is authority the core cannot recall**, so PRD P2's "revocation is immediate and transitive" is false for designations already made. | Stated as an exported limitation on C5 rather than discovered by E3.7; revocation kills the grant row and stops future designations; the residue ends when the realm does. |
 | **R2.11** | **The synthetic tree is an unmodelled cross-principal channel.** The sidecar (principal A) publishes structure derived from a realm; an agent (principal B) reads it. The grant table models A→realm and B→realm, but nothing models A→B. | Attribution on every stored tree, the `accept_synthetic` opt-in defaulted off, and P2.4.2's journal entry — plus a plain statement in `limits.md` that cross-principal flow through the tree store is **unmodelled in v0** and is a decide-by-M3 item, rather than letting the attribution field imply it is solved. |
 | **R2.12** | **The IME is a keylogger by construction.** It sees every keystroke destined for the focused realm — a genuine extension of the trust boundary beyond the TCB that no capability in this design constrains. | Stated as a trust statement on C7, in PRD Doc 2 §15's threat model and in `limits.md`. It is not mitigated by the architecture and must not be described as if it were. |

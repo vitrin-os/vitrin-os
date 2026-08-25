@@ -106,7 +106,41 @@ xmllint --noout --relaxng protocol/vitrin-v0.rng protocol/vitrin-v0.xml
 # The real-binary suite: needs the C shim built and a real Wayland client
 meson setup shim/build shim && meson compile -C shim/build
 VITRIN_C_SHIM_BIN="$PWD/shim/build/vitrin-shim" bash tests/integration/run.sh
+
+# The Rust tests that drive the REAL C shim. `cargo test --workspace` above
+# does NOT run these — it skips them (see below).
+VITRIN_C_SHIM_BIN="$PWD/shim/build/vitrin-shim" cargo test -p vitrin-core c_shim
 ```
+
+### `cargo test --workspace` is not the whole Rust suite
+
+Read this before reporting a branch green. A plain `cargo test --workspace`
+leaves `VITRIN_C_SHIM_BIN` unset, and the two cross-track tests that drive the
+real C shim against the real Rust core — `c_shim_conforms_to_the_real_core`
+and `c_shim_consent_prompt_occludes_..._the_real_apps_capture` — **skip
+outside CI and fail inside it**. Locally they skip. So the workspace run
+reports `ok` having never started a shim, and the first machine that actually
+runs them is GitHub.
+
+That is not hypothetical: three review rounds on
+[#304](https://github.com/vitrin-os/vitrin-os/issues/304) each ran
+`cargo test --workspace`, each reported green, and each missed a broken
+geometric expectation in `c_shim_consent_prompt_occludes_...` that CI caught
+on the first push. It is the same class as
+[#288](https://github.com/vitrin-os/vitrin-os/issues/288) and
+[#229](https://github.com/vitrin-os/vitrin-os/issues/229) — a green count
+standing in for absent evidence — reaching the seam nobody re-ran.
+
+The `c_shim` line in the block above is the fix, and
+`cargo xtask skip-census --min-tests 2 -- cargo test -p vitrin-core c_shim --
+--show-output` is what the `conformance` job itself runs, which additionally
+fails if either test skipped. Two further sets run on no default local
+invocation at all and are worth knowing about before touching anything
+geometric: `dmabuf::gpu_tests::*` (`#[ignore]`d; needs a real GPU —
+`VITRIN_GPU_TESTS=1 cargo test -p vitrin-core --features gpu-tests --
+--ignored dmabuf`), and the confinement and Landlock tests, which skip on a
+host whose kernel or userns policy cannot support them. `cargo xtask
+skip-scan` enumerates every sanctioned skip site in the tree.
 
 The two `meson` lines create `shim/build/`, and `cargo test --workspace`
 passes in a tree that has it. That was not true until

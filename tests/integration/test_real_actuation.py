@@ -303,11 +303,49 @@ class RealActuationPointer(IntegrationTest):
         # carries a word the app said.
         out = core.app_output()
 
-        # The app's own report of the surface-local coordinate it received. In
-        # the single-maximized steady state the shim's view→surface mapping is
-        # the identity, so it must match the view coordinate the agent clicked
-        # within rounding (wl_fixed + integer truncation) — this is the D10
-        # coordinate-mapping claim, checked number for number.
+        # The app's own report of the surface-local coordinate it received.
+        #
+        # **This assertion said "the mapping is the identity" until issue
+        # #304**, and it was true then: the app was configured at the OUTPUT's
+        # size, so its surface started at view row 0. It is now configured at
+        # `ViewGeometry::usable()` — the output minus the rows the core
+        # reserves for the trusted band, plus the status strip when `--status`
+        # is on — and `ViewGeometry::place` centres that smaller surface in the
+        # rectangle below them. So the mapping is a **translation**, and this
+        # checks it number for number rather than being relaxed to a tolerance
+        # that would swallow it: x is unshifted because the surface is the
+        # output's full width, and y is shifted by exactly the reserved rows.
+        #
+        # The offset is DERIVED FROM THIS RUN, never restated. The app prints
+        # the size it was configured with, and the realm's view is the size
+        # this test asked the core for, so their difference is the core's own
+        # reservation. A test that hard-coded 8 would go green against a build
+        # whose inset had silently changed, which is the failure `#304`'s own
+        # `the_view_geometry_has_one_derivation` exists to refuse one level
+        # down.
+        target_line = next(
+            (ln for ln in out.splitlines() if ln.startswith("TARGET ")), None
+        )
+        self.assertIsNotNone(
+            target_line, f"click-target never reported its configured size.\n{out}"
+        )
+        app_w, app_h = (int(n) for n in target_line.split("size=")[1].split()[0].split("x"))
+        self.assertEqual(
+            app_w,
+            REALM_WH[0],
+            "the core reserves rows along the TOP edge only, so a configured app keeps the "
+            "output's full width; a narrower app means the reservation grew a second axis "
+            "and every coordinate claim below is about the wrong rectangle",
+        )
+        reserved = REALM_WH[1] - app_h
+        self.assertGreater(
+            reserved,
+            0,
+            "the app was configured at the whole output's height, so the core reserved no "
+            "rows for the trusted band it draws on every human-visible frame. That is the "
+            "pre-#304 world, in which every app laid out for rows it would never see",
+        )
+
         hit_line = next((ln for ln in out.splitlines() if ln.startswith("HIT ")), None)
         self.assertIsNotNone(
             hit_line, f"click-target never reported a HIT; the click did not reach it.\n{out}"
@@ -318,9 +356,18 @@ class RealActuationPointer(IntegrationTest):
             abs(sx - cx),
             2,
             f"the surface-local x the app received ({sx}) does not match the view x the agent "
-            f"clicked ({cx}); the view→surface mapping is not the identity it must be here",
+            f"clicked ({cx}); the core reserves no columns, so x must be unshifted",
         )
-        self.assertLessEqual(abs(sy - cy), 2, f"surface-local y {sy} != clicked view y {cy}")
+        self.assertLessEqual(
+            abs(sy - (cy - reserved)),
+            2,
+            f"surface-local y {sy} != clicked view y {cy} minus the {reserved} rows the core "
+            f"reserved (the app was configured {app_w}x{app_h} inside a {REALM_WH[0]}x"
+            f"{REALM_WH[1]} view). The router maps view coordinates to surface coordinates "
+            "through `ViewGeometry::place`; a mismatch here means one of the paths that "
+            "place a client's pixels disagrees with the one that maps a pointer onto them, "
+            "which is the half-done inset #304 was written to refuse",
+        )
 
         # Both halves (criterion 5): the chokepoint RECORDED the allowed move at
         # the clicked coordinate, and the app demonstrably received it (above).
@@ -332,7 +379,9 @@ class RealActuationPointer(IntegrationTest):
 
         print(
             f"\n[real-actuation] agent located the target at view ({cx}, {cy}); clicked; the app "
-            f"received surface ({sx}, {sy}); the surface flipped to #{self.HIT} at {hit_pct}%"
+            f"received surface ({sx}, {sy}) -- view y minus the {reserved} rows the core "
+            f"reserves above a {app_w}x{app_h} client in a {REALM_WH[0]}x{REALM_WH[1]} view; "
+            f"the surface flipped to #{self.HIT} at {hit_pct}%"
         )
 
 

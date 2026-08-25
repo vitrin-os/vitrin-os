@@ -1059,7 +1059,7 @@ static inline bool vitrin_shim_seat_gesture_state_is_valid(uint32_t v) {
 typedef enum {
     /* compose the realm's view at the size its own app last committed, letterboxed centered and unscaled inside the output */
     VITRIN_LAYOUT_ARRANGE_MODE_WINDOWED = 0,
-    /* configure the realm's view to the output's size, so the app fills the output */
+    /* configure the realm's view to the output's USABLE size - the output minus whatever rows the core reserves for its own always-present chrome - so the app fills every pixel of the output that is the app's to fill */
     VITRIN_LAYOUT_ARRANGE_MODE_FULLSCREEN = 1,
 } vitrin_layout_arrange_mode_t;
 

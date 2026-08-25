@@ -3112,7 +3112,7 @@
         "invalid_argument".
       </description>
       <entry name="windowed" value="0" summary="compose the realm's view at the size its own app last committed, letterboxed centered and unscaled inside the output"/>
-      <entry name="fullscreen" value="1" summary="configure the realm's view to the output's size, so the app fills the output"/>
+      <entry name="fullscreen" value="1" summary="configure the realm's view to the output's USABLE size - the output minus whatever rows the core reserves for its own always-present chrome - so the app fills every pixel of the output that is the app's to fill"/>
     </enum>
   </interface>
 

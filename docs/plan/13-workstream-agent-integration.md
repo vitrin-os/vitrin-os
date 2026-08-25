@@ -194,7 +194,7 @@ than a demo where the agent behaves well.
 
 | Order | Item | Depends on | Why this order |
 |---|---|---|---|
-| 1 | MCP server (`vitrin_observe`/`click`/`type`/`request_grant`) | nothing | Unblocks every agent runtime at once; needs no protocol change |
+| 1 | MCP server (`vitrin_observe`/`click`/`type`/`request_grant`) | nothing — **but see "§5, reconciled" below, which is the standing sequencing record and restates this row rather than replacing it: §6.1 and §6.2 are this item's real dependencies, and both are unresolved** | Unblocks every agent runtime at once; needs no protocol change |
 | 2 | Agent-legible refusal semantics in the tool descriptions | 1 | Cheap, and prevents teaching agents to hammer a revocation |
 | 3 | Grid-overlay aiming aid, labelled a stopgap | 1 | Makes pixel mode usable enough to evaluate honestly |
 | 4 | Denial reasons (#162) | protocol edit | Closes the adapt-after-refusal loop |
@@ -204,6 +204,94 @@ than a demo where the agent behaves well.
 
 Items 1–3 are additive and need no wire change. Items 4–5 are protocol edits
 and follow the paired-edit rule.
+
+### §5, reconciled
+
+**REALIGNED 2026-08-25 BY D-047** (the obligation on this document: "WS-D's §5
+reconciled with its own §6 and §7"). The table above is left standing; this restates
+it. Three things were wrong with it, and they are different kinds of wrong.
+
+**First: item 1 depends on two open questions in this same document, and said
+"nothing."** §6.1 asks *"Does the MCP server belong in this repository at all?"* and
+answers **"Unresolved."** §6.2 asks *"Should the MCP server hold the grant, or should
+the agent?"* and answers **"Needs deciding before any code."** §7.3(1) then leans on
+§6.2's un-made decision as the thing OAuth buys. So §5 schedules first, and with no
+dependency, the one item §6 says cannot start. That is a contradiction inside one
+document, not a stale fact about the tree, so it is restated rather than quietly
+patched: **item 1's real dependencies are §6.1 and §6.2**, and §6.2 in particular is
+load-bearing — a server that holds one grant on behalf of every agent behind it
+destroys per-principal identity, which is the project's first pillar. Building it the
+wrong way round is not a refactor; it is a demolition of the property the workstream
+exists to demonstrate.
+
+**Second: §5 is one section out of date with its own tracker.** [#169](https://github.com/vitrin-os/vitrin-os/issues/169)'s
+sub-issue rollup holds **eight** issues; §5 orders seven rows, which cover **six** of
+them. The two it never mentions are the identity leg, and they come from **§7** — written
+after §5 and never folded back into it. A reader who schedules from §5 schedules six of
+the eight and misses the one piece in the whole workstream that carries a protocol edit.
+
+**Third: two of those issues carry a `phase-2` label that no phase document earns.**
+Noted below for the tracker pass; this file changes no labels.
+
+The reconciled order, with every `#169` sub-issue accounted for:
+
+| Order | Item | Issue | Track | Depends on |
+|---|---|---|---|---|
+| 1 | MCP server (`vitrin_observe`/`click`/`type`/`request_grant`) | [#164](https://github.com/vitrin-os/vitrin-os/issues/164) | `track:sdk` | **§6.1 and §6.2** — repo location, and who holds the grant. Both unresolved; §6.2 blocks code |
+| 2 | Agent-legible refusal semantics in the tool descriptions | [#165](https://github.com/vitrin-os/vitrin-os/issues/165) | `track:sdk` | 1 |
+| 3 | Grid-overlay aiming aid, labelled a stopgap | [#168](https://github.com/vitrin-os/vitrin-os/issues/168) | `track:sdk` | 1; **§6.5** (is a grid overlay honest?) is open and governs how it is labelled |
+| 4 | Denial reasons | [#162](https://github.com/vitrin-os/vitrin-os/issues/162) | `track:protocol` | a paired IDL + prose edit |
+| 5 | Sub-surface `region:`/`node:` scoping | [#161](https://github.com/vitrin-os/vitrin-os/issues/161) | `track:protocol` | protocol + core. **Scheduled in Phase 2 as P2.2.6**, which closes it with `node:` naming — so this row is not WS-D's to sequence |
+| 6 | The prompt-injection demo | [#166](https://github.com/vitrin-os/vitrin-os/issues/166) | `track:sdk` | 1, 5 |
+| 7 | OIDC/OAuth verifier — the identity leg, from §7 | [#167](https://github.com/vitrin-os/vitrin-os/issues/167) | `track:rust-core`, `known-limit` | **a decision-log entry for §7** (below). Needs no protocol change: §7.1 shows `credential_type: "oidc"` is already named in the IDL and D-008's pluggable verifier is the extension point. Carries `known-limit`, so closing it means enumerating every surface that publishes the gap |
+| 8 | Accept a re-presented credential mid-connection (§7.6's refresh) | [#170](https://github.com/vitrin-os/vitrin-os/issues/170) | `track:protocol` | 7, **and a decision-log entry for §7**. A new since-gated sibling request: it regenerates bindings and follows the paired-edit rule |
+| 9 | Set-of-marks / semantic nodes | *no issue* | — | Phase 2 (E2.1, E2.4). The real fix for §2.2; not a WS-D deliverable |
+
+Items 1–3 remain additive and need no wire change. Items 4, 5 and 8 are protocol edits
+and follow the paired-edit rule; item 7 is a core change with no wire consequence.
+
+### §7 needs a decision-log entry before items 7 and 8 can be scheduled
+
+**§7.6 is headed "DECIDED", and it is a decision with a wire consequence** — expiry
+refreshes and the connection survives, revocation kills the connection, the fatal code
+is the existing `auth_failed` rather than a new enum value, the revocation window
+equals the access-token lifetime with a recommended default of **300 s**, and the whole
+thing requires a new since-gated request the core must accept mid-connection. It also
+records a weakness plainly: revocation is **fail-open for up to one token lifetime**.
+
+That is exactly the shape of thing this repository puts in
+[20-decision-log.md](20-decision-log.md) — a decision, its refused alternatives, its
+accepted cost — and it is currently recorded only inside a workstream document. Nothing
+cites it as normative, nothing can supersede it, and the security parameter it fixes
+(the token lifetime, which §7.6 itself says "must be chosen deliberately and written
+down — never inherited from an authorization server's default") lives in prose that no
+decision id points at. §7.2's scope-is-a-ceiling rule is the same shape: it is the one
+way to get OAuth catastrophically wrong here, and it has no id either.
+
+**So: WS-D owes a decision-log entry covering §7 — at minimum §7.2's ceiling rule and
+§7.6's asymmetry — before #167 and #170 are scheduled.** This document cannot write it: a
+workstream page is not the instrument, D-047 itself *"amends no earlier entry"* and is
+not a licence to write new ones on this document's behalf, and the entry needs the
+owner's clauses rather than a derivation. Items 7 and 8 above are blocked on it, and that is
+the honest reason they are last rather than an assertion that identity matters less
+than the MCP server.
+
+### Label mismatch, noted for the tracker pass
+
+CLAUDE.md's rule: **`phase-N` belongs only where a plan document actually schedules the
+work**, and its absence is meaningful. Measured 2026-08-25:
+
+| Issue | Carries `phase-2` | Scheduled by a phase document? |
+|---|---|---|
+| [#161](https://github.com/vitrin-os/vitrin-os/issues/161) | yes | **Yes** — `02-phase-2-semantic-epochs.md` P2.2.6 and export C8. The label is correct |
+| [#162](https://github.com/vitrin-os/vitrin-os/issues/162) | yes | **No** — it appears in `docs/plan/` only in this file (§1, §2.3, §5) |
+| [#170](https://github.com/vitrin-os/vitrin-os/issues/170) | yes | **No** — it appears nowhere in `docs/plan/` at all, including here, until the table above; §7.6 describes the work without citing the issue |
+
+A workstream document is not a phase document. Both mismatches are the tidy-tracker
+failure the rule was written against — a label that reads as scheduled work when no
+document schedules it. **Recorded here for the tracker pass; no labels are changed by
+this file.** The workstream membership label those three already carry
+(`workstream:agent-integration`) is the correct one and is not in question.
 
 ## 6. Open questions
 

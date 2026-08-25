@@ -1458,14 +1458,17 @@ mod tests {
         //
         // Two facts about this core that are not the same fact. This test
         // holds the first: `egress` is outside `SERVED_VERB_BITS`, so no
-        // petition naming it resolves `granted`. The second is that this
-        // binary dispatches the facet's messages not at all -- `get_egress`
-        // is answered fatal `invalid_opcode` and the connection dies, where
-        // the IDL says a mint is always legal and refuses at use. That
-        // divergence is P2.7.3's as well, and it is pinned under its own name
-        // by `principal::tests::
-        // get_egress_is_defined_by_the_idl_and_still_refused_by_this_core`,
-        // not here.
+        // petition naming it resolves `granted`. The second used to be a
+        // divergence and is now conformance: this binary dispatches
+        // `get_egress` and `vitrin_egress.request_connect`, minting the
+        // facet structurally and refusing every use of it recoverably
+        // (`not_granted`), which is what the IDL says a server does. Issue
+        // #322 closed it; it is held by `principal::tests::
+        // get_egress_mints_an_inert_facet_and_never_kills_the_connection`
+        // and its `request_connect` siblings, not here. What P2.7.3 still
+        // owes is the mechanism -- the out-of-core proxy -- which is what
+        // would move the bit into `SERVED_VERB_BITS` and make this
+        // assertion the one that goes red.
         //
         // In range, so naming the verb is never a killed connection;
         // unserved, so it is never granted. A deployment MUST NOT grant a

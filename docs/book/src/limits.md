@@ -1773,12 +1773,16 @@ genuine wedge; it is documented, asserted
 ([`tests/integration/test_shell.py`](https://github.com/vitrin-os/vitrin-os/blob/main/tests/integration/test_shell.py)),
 and not solved.
 
-**`set_fullscreen` is a no-op whenever the output and the realm are the same
-size.** The two modes differ only in whether the realm's view size tracks the
-output's, so while they are equal — which is the ordinary case for a realm
-spawned into an output that has not resized — switching between them changes
-nothing you can see. It is honest and it is surprising; the IDL says so in as
-many words.
+**`set_fullscreen` is a no-op whenever the realm's view is already the output's
+usable size.** The two modes differ only in whether the realm's view size
+tracks the output's, so while they are equal — which is the ordinary case for a
+realm spawned into an output that has not resized — switching between them
+changes nothing you can see. It is honest and it is surprising; the IDL says so
+in as many words. **The size they are equal to is the output's *usable* view,
+not the output**: the core reserves the top rows of every frame for the trusted
+band, and for the status strip when `--status` is on, and an app is configured
+for what is left. This bullet said "the output and the realm are the same size"
+until that inset shipped, which named a condition that no longer occurs at all.
 
 **Captures do tell realms apart, and that is enforced rather than
 incidental.** An agent's capture is of the realm its **grant names**, never

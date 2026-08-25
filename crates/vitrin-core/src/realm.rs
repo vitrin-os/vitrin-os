@@ -373,8 +373,9 @@
 //!    did, which is why an earlier draft of this audit miscounted it as
 //!    unchanged.
 //! 3. **The geometry**, which the sentence was silent on: the view size
-//!    handed to `start_shim_session` is one output's size shared by every
-//!    realm, not a per-realm geometry, so it is hoisted out of the loop and
+//!    handed to `start_shim_session` is one output's usable view (issue
+//!    #304) shared by every realm, not a per-realm geometry, so it is
+//!    hoisted out of the loop and
 //!    every shim is configured identically. WS-E.1.3 examined that and
 //!    **kept it**: there is one output, so one size, and per-realm geometry
 //!    would be window-management policy (decision 3). What WS-E.1.3 did

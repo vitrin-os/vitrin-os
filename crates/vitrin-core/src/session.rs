@@ -535,7 +535,8 @@ pub(crate) struct RealmRuntime {
     ///
     /// Born [`LayoutMode::Fullscreen`], because that is the state
     /// [`start_realm_in`] already puts a realm in — it configures every shim
-    /// with the output's size — and a field whose initial value did not
+    /// with the output's usable view ([`crate::view::ViewGeometry::usable`],
+    /// issue #304) — and a field whose initial value did not
     /// describe the world would be a lie a later `set_fullscreen(fullscreen)`
     /// would silently correct.
     ///
@@ -1659,8 +1660,10 @@ fn attach_spawned_realm<H: RuntimeHost>(
             life,
             server: Some(server),
             outbox,
-            // The spawn `configure` above carried the output's size, so the
-            // realm really is in the fullscreen arrangement here.
+            // The spawn `configure` above carried this output's usable view
+            // (`ViewGeometry::usable`, issue #304 -- the output minus the
+            // rows the core reserves), which is what the fullscreen
+            // arrangement means, so the realm really is in it here.
             arrangement: LayoutMode::Fullscreen,
         },
     );
@@ -2902,8 +2905,11 @@ fn dispatch_principal<H: RuntimeHost>(
                 //
                 // One `(width, height)` for every realm: there is one output
                 // and decision 3 keeps it that way, so every realm's view is
-                // composed at the output's size (`start_realm_in` configures
-                // every shim with it).
+                // composed at the output's size. Note this is the COMPOSED
+                // buffer's size, which is the whole output; what
+                // `start_realm_in` configures each shim with is the smaller
+                // usable view (issue #304), and the two stopped being the
+                // same number when the inset landed.
                 //
                 // The cache itself is refreshed at redraw time, never here,
                 // so capture stays a pure read of the last completed frame.
@@ -3514,8 +3520,10 @@ fn reconfigure_realm(realm: &RealmId, entry: &mut RealmRuntime, geom: crate::vie
 ///
 /// The second half is the normative half. `vitrin_layout_arrange.set_fullscreen`
 /// says, in the IDL's own words, that fullscreen means the realm's view size
-/// *tracks* the output's: `configure` carries the output's size on entering
+/// *tracks* the output's: `configure` carries "the USABLE view" on entering
 /// the mode "and again whenever the output resizes while the realm is in it".
+/// (That clause said "the output's size" until issue #304 inset the realm
+/// view; the tracking is unchanged, the number sent is smaller.)
 /// Entering the mode is [`apply_layout`]'s; this function is the "and again",
 /// and without it [`RealmRuntime::arrangement`] would be a field nothing ever
 /// read and four surfaces would be describing behaviour that did not exist.
@@ -12227,8 +12235,8 @@ mod tests {
 
     /// **Fullscreen *tracks* the output across a later resize; windowed does
     /// not.** The second half of `set_fullscreen`'s normative wire semantics:
-    /// `configure` carries the output's size on entering the mode "and again
-    /// whenever the output resizes while the realm is in it".
+    /// `configure` carries the output's usable view on entering the mode "and
+    /// again whenever the output resizes while the realm is in it".
     ///
     /// Entering the mode was already covered
     /// ([`set_fullscreen_reconfigures_the_realm_across_an_output_resize`]);
@@ -12249,9 +12257,9 @@ mod tests {
         commit_into(&mut rig, &a, VIEW.0, VIEW.1, 0x11);
         commit_into(&mut rig, &b, VIEW.0, VIEW.1, 0x99);
 
-        // Both realms are spawned configured to the output's size and both
-        // are born fullscreen (`start_realm_in` told each shim that size, so
-        // the field is not a guess). One holder takes realm-a out of it —
+        // Both realms are spawned configured to the output's usable view
+        // (issue #304) and both are born fullscreen (`start_realm_in` told
+        // each shim that size, so the field is not a guess). One holder takes realm-a out of it —
         // and only one holder exists, because D-018(4) allows exactly one
         // live `layout_arrange` grant per output.
         let mut holder = layout_holder(&mut rig, DEMO_IDENTITY, TOKEN, "realm-a");

@@ -810,8 +810,16 @@ pub const CLAIMS: &[Claim] = &[
         // made SHORT instead, which is the cheap half of the remedy -- this
         // field now names issues and their state and asserts nothing about
         // what a tracker does or does not carry.
+        //
+        // **And "their state" is the tracker's state, not the tree's**, which
+        // is the trap this row fell into a second time: #304's inset is built
+        // and on this branch, but the issue itself is open and the commits
+        // that build it are footed `Refs #304`, so nothing here closes it.
+        // "Built" and "closed" are two facts and this field may only carry
+        // the second one when it is true.
         issue: "#215 (WS-E.2.3, closed) shipped the core-owned status strip as the \
-                replacement; #304 (closed) built the realm-view inset it also asked for.",
+                replacement; #304 (open) carries the realm-view inset it also asked \
+                for, and that task is built.",
         surfaces: &[
             Anchor {
                 path: LIMITS,

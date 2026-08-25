@@ -5404,11 +5404,19 @@ mod tests {
         consent: ConsentSurface,
         /// The output's size. A **field** rather than the `VIEW` constant
         /// since WS-E.1.4: the two arrangements `set_fullscreen` chooses
-        /// between are indistinguishable while the output's size and the
-        /// realm's size are equal (IDL `set_fullscreen`), so a rig that
-        /// could not resize its output could not tell them apart at all.
-        /// The nested backend's `Resized` handler is what moves this in
+        /// between are indistinguishable while the output's **usable view**
+        /// and the realm's size are equal (IDL `set_fullscreen`), so a rig
+        /// that could not resize its output could not tell them apart at
+        /// all. The nested backend's `Resized` handler is what moves this in
         /// production.
+        ///
+        /// *The output's usable view, not the output* — this clause quoted
+        /// the IDL's, and issue #304 corrected the IDL's when it inset the
+        /// realm view. A realm spawned into an unresized output is at
+        /// [`crate::view::ViewGeometry::usable`], so "the output and the
+        /// realm are the same size" now names a condition that never holds
+        /// and would have made this comment an argument for a field nothing
+        /// needs.
         size: (u32, u32),
         /// The last position [`Presenter::set_agent_cursor`] was **offered**,
         /// `None` when it has not been called since a test cleared it.

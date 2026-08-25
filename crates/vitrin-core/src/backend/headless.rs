@@ -825,7 +825,17 @@ impl HeadlessState {
         // makes the presence tap's `note` and the chokepoint's `owns_target`
         // read one timeline. `route_physical_turn` pushes it into the tap.
         let now = std::time::Instant::now();
+        // **Two different sizes, and they stopped being the same value under
+        // issue #304.** `intake` clamps a pointer position into the OUTPUT,
+        // which is the space the injector's peer names coordinates in and the
+        // space the consent card is drawn in; the router maps that position
+        // into SURFACE coordinates and therefore needs the geometry, because
+        // the app's first row is below the rows the core reserves. This is the
+        // same split `NestedState::route_physical_inputs` makes with the host
+        // window's size and `Presenter::view_geometry`, and it is spelled the
+        // same way here so the two backends cannot drift.
         let view = session::Presenter::view_size(&self.view);
+        let geom = session::Presenter::view_geometry(&self.view);
         for parsed in batch.unwrap_or_default() {
             let Some(request) = parsed else {
                 injector.reject("unknown request");
@@ -844,7 +854,7 @@ impl HeadlessState {
                 &self.view.scenes,
                 None,
                 inputs,
-                view,
+                geom,
                 now,
             );
             injector.ack(produced);

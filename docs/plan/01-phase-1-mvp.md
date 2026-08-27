@@ -53,7 +53,9 @@ export:
   D-047 additionally routes the fact that their two mint requests on
   `vitrin_grant` (`get_powerbox`, `get_egress`) are defined at the negotiated
   version with no dispatch arm, as a wire-conformance defect on shipped code
-  rather than a planning matter. Read C5 for what they export; do not read A1.
+  rather than a planning matter — **that routing is discharged; see the block
+  appended at the end of this A1 restatement, which restates this bullet rather
+  than replacing it**. Read C5 for what they export; do not read A1.
 
 Alongside them sits a `since="2"` vocabulary A1 never described and does not
 own: the cross-realm clipboard's `request_selection`/`selection`/
@@ -64,6 +66,26 @@ the four gesture events and `relative_motion` (**D-032**), `idle_inhibit`
 the wire is short by five interfaces and that whole vocabulary.** Read A1 for
 the Phase-1 four, the E-series for the session-mode vocabulary, and C5 for the
 powerbox and egress facets.
+
+> **DISCHARGED 2026-08-27 BY [#322](https://github.com/vitrin-os/vitrin-os/issues/322).**
+> The bullet above is accurate about what D-047 did — it routed the finding rather
+> than deciding it, and that is history this block does not rewrite. What has stopped
+> being true of the tree is the clause the routing quotes: `get_powerbox` (opcode 3)
+> and `get_egress` (opcode 4) are **no longer** "defined at the negotiated version
+> with no dispatch arm". Both reach an arm in
+> `crates/vitrin-core/src/principal.rs` — `handle_get_powerbox` and
+> `handle_get_egress` — and mint the structural facet the IDL describes: always
+> legal, born inert, conferring nothing. The facets' own requests refuse
+> `not_granted` recoverably instead of killing the connection.
+>
+> **The export routing this bullet exists for is unchanged.** `vitrin_powerbox` and
+> `vitrin_egress` are still C5's and not A1's; both verbs are still served by
+> nobody; and a Phase-3 epic reading A1 as a description of the wire is still short
+> by five interfaces and that whole vocabulary. #322 fixed **grammar** on shipped
+> code and moved no exported-artifact boundary. See "P2.7.2, the conformance clause
+> discharged" in
+> [02-phase-2-semantic-epochs.md](02-phase-2-semantic-epochs.md) for what C5's
+> producing task still owes.
 
 **A2, retired — the model was replaced, not extended.** A2 promised "shim fork,
 realm identity assigned at fork, spawn/sandbox skeleton", consumed by E2.6/E2.7

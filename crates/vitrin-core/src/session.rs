@@ -10779,8 +10779,17 @@ mod tests {
         // excludes `egress`, so no petition naming it resolves `granted`, so
         // this core never grants a verb whose requests it cannot carry out.
         // That is exactly what invariant 2 forbids and exactly what staying
-        // unserved avoids. The proxy that would make the verb servable, and
-        // the core dispatch for these four opcodes, are P2.7.3's.
+        // unserved avoids. The proxy that would make the verb servable is
+        // still P2.7.3's. The core dispatch is not, and only two of these
+        // four messages ever wanted one: issue #322 landed the arms for the
+        // two REQUESTS -- `get_egress` mints, always legal and silent, and
+        // `request_connect` is decoded and refused `not_granted` at the
+        // chokepoint, recoverably -- while `connected` and `connect_failed`
+        // are EVENTS, which a server sends rather than dispatches, and both
+        // stay unreachable because each belongs to a use the chokepoint
+        // admitted and no `egress` use is. Nothing above changes: #322 moved
+        // the dispatch, never the verb, and `SERVED_VERB_BITS` still excludes
+        // `egress`.
         //
         // 58 is 48 + 6 + 4: the two appends were authored in parallel against
         // 48, so the merge that brought them together carries both rather than

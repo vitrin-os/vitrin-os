@@ -1674,6 +1674,53 @@ Five auditors swept one plan surface each — the Phase-2 document, the decision
 
 **One finding is not a planning matter and is routed rather than decided.** `vitrin_grant.get_powerbox` (opcode 3) and `get_egress` (opcode 4) are defined requests of the negotiated version with **no dispatch arm**: both fall to the catch-all and are answered fatal `invalid_opcode`, so a conformant version-2 client that mints either facet loses its connection. The core's own comment calls it "a **conformance gap**, not a design", and two tests — `get_powerbox_is_defined_at_version_2_and_this_core_answers_it_fatally` and its egress twin — pin the wrong behaviour in place. **No issue tracks it.** It is a wire-conformance defect on shipped code, it is fixed independently of anything below, and this entry's only decision about it is that "landed vocabulary only" stops being citable as a cost-free precedent — E2.4's `publish_tree` is queued to follow the same pattern.
 
+> **DISCHARGED 2026-08-27 BY [#322](https://github.com/vitrin-os/vitrin-os/issues/322):
+> ALL THREE OF THE ROUTED PARAGRAPH'S FACTUAL CLAUSES ARE SPENT, AND ITS ONE
+> DECISION IS NOT.** The paragraph above stands byte for byte. Part A is
+> append-only, and the D-046 amendment immediately above this entry exists
+> precisely because the first attempt to record a spent clause edited it in
+> place. Routing the finding out of the plan tree was the right call and this
+> block does not revisit it; it records that the thing routed has landed.
+>
+> **Spent: *"defined requests of the negotiated version with no dispatch arm"*,
+> and with it *"answered fatal `invalid_opcode`"*.** Both opcodes reach an arm —
+> `handle_get_powerbox` and `handle_get_egress` in
+> `crates/vitrin-core/src/principal.rs` — and each mints the structural facet the
+> IDL describes: always legal whether or not the grant has resolved, born inert,
+> duplicates permitted, no wire acknowledgement at all, bounded only by a
+> per-facet live-object cap. The facets' own requests — `request_file`,
+> `request_dir`, `request_connect` — funnel through the same enforcement
+> chokepoint every other verb reaches and refuse **`not_granted`**, recoverably,
+> with the connection intact.
+>
+> **Spent: the two tests this paragraph names.** They were not deleted, they were
+> inverted: they now assert the connection *survives* the mint and fail if it does
+> not. Their names in `crates/vitrin-core/src/principal.rs` are
+> `get_powerbox_mints_an_inert_facet_and_never_kills_the_connection` and
+> `get_egress_mints_an_inert_facet_and_never_kills_the_connection` — names rather
+> than line numbers, because a line number in a file under active edit is a
+> citation that stops checking. A third test the finding did not ask for is the one
+> that makes the class unrepeatable:
+> `every_since_2_mint_on_a_grant_has_a_dispatch_arm` derives the opcode set from
+> the checked-in generated protocol crate instead of from a list written by hand,
+> so a sixth mint appended to `vitrin_grant` vocabulary-only is caught the moment
+> it is generated.
+>
+> **False: *"No issue tracks it."*** [#322](https://github.com/vitrin-os/vitrin-os/issues/322)
+> tracks it, filed against this paragraph's own routing, and carries the inverted
+> tests and the general dispatch-arm test as acceptance criteria. The fix is on
+> branch `p322-facet-mint-conformance` — `9d78a13` (core) and `7238908` (IDL and
+> prose) — and the issue closes with that branch's merge, not with this block.
+>
+> **Not discharged, and untouched by #322: this paragraph's one decision.**
+> *"Landed vocabulary only" stops being citable as a cost-free precedent* stands
+> exactly as written, and E2.4's `publish_tree` is still queued to follow the same
+> pattern. Neither verb is served either: `designate_file` and `egress` are both
+> outside `SERVED_VERB_BITS`, which is *why* every use of both facets refuses
+> today, and the authority work that would change that — P2.6.6 and P2.7.3 — is
+> where it was. #322 fixed the **grammar**, and grammar was the whole of what this
+> paragraph routed.
+
 ---
 
 **Decision 1, the owner's: WS-E gets a retroactive exported-artifact contract and a Stage 5, rather than being folded into a phase.** WS-E closed 2026-08-13 having shipped more than any phase since Phase 1 — the DRM/KMS backend, multi-realm spawn, three served verbs with their facets, the cross-realm clipboard, pointer constraints, idle inhibit, gestures, relative motion, the `attention` event, backlight actuation, the lock and idle-blank policy, VT handling and the `ViewGeometry` inset — and `docs/plan/14-workstream-session-mode.md` contains **no exported-artifact section at all**. Under the plan tree's own rule ("anything not listed here is an internal detail free to change") every one of those is an internal detail later phases may not rely on, which is false: Phase 3 already reaches for several. WS-E therefore gains a numbered **E-series** export block on the A1–A6 / C1–C8 model, each artifact carrying its evidence and its limitations, and a **Stage 5** that owns the four decisions it produced which are accepted, unbuilt and scheduled nowhere — **D-038** (the shell as a realm), **D-039** (hotkeys as named actions), **D-040** (the N-surface scene, and the layer-shell/tiling deferral that rests on it) and **D-046** (the principal socket).

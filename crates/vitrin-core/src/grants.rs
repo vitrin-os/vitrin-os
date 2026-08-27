@@ -551,11 +551,18 @@ impl NetSelector {
 /// deliberately absent from this constant**, which is the whole of that
 /// issue's core-side deliverable, and `egress` (128) joined at P2.7.2 (issue
 /// #196) on identical terms. Each verb has a facet interface
-/// (`vitrin_powerbox`, `vitrin_egress`) and nothing else: for the first, no
-/// picker mints a descriptor
-/// (P2.6.6), no chokepoint arm carries a designation, and no consent copy
+/// (`vitrin_powerbox`, `vitrin_egress`) whose messages issue #322 taught this
+/// core to dispatch, and no mechanism behind it: for the first, no picker
+/// mints a descriptor (P2.6.6) and no consent copy
 /// names what approving it costs (P2.6.8, Q13's rule); for the second, no
-/// proxy asks the chokepoint per connection (P2.7.3). Leaving both out means
+/// proxy asks the chokepoint per connection (P2.7.3). **Dispatch is not
+/// authority, and #322 moved only the first**: a designation now reaches the
+/// chokepoint as [`crate::enforcement::UseKind::Designate`] and a connection
+/// as [`crate::enforcement::UseKind::Egress`], and both are refused there --
+/// `not_granted` at the grant check, precisely because this constant omits
+/// both bits, and `internal` from the arm those two variants share, which is
+/// the unreachable guard against an unserved verb being admitted at all.
+/// Leaving both out means
 /// [`UNSERVED_VERB_BITS`] picks them up by derivation and
 /// [`crate::petitions::PetitionRegistry::admit`] resolves every petition
 /// naming either `unsupported` **whole** -- so the failure mode if someone

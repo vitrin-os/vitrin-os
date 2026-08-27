@@ -118,10 +118,12 @@
 //! (P1.4.4, issue #28).** The five co-minted objects enter the object
 //! table with their roles (the facets carrying their co-minted grant's
 //! wire id -- the chokepoint's key). Every facet request -- `capture_frame`,
-//! `move`, `button`, `scroll`, `type`, and since version 2 `launch` -- is
-//! decoded here (grammar and
+//! `move`, `button`, `scroll`, `type`, and since version 2 `launch`,
+//! `focus`, `set_fullscreen`, `request_file`, `request_dir` and
+//! `request_connect` -- is decoded here (grammar and
 //! argument validation stay connection-scoped: `type`'s forbidden-control-
-//! character rule is fatal `invalid_argument`, like the zero-verb rule),
+//! character rule is fatal `invalid_argument`, like the zero-verb rule and
+//! like `request_connect`'s 1-65535 port domain),
 //! then handed as one [`UseKind`] to the **single enforcement function**,
 //! [`Chokepoint::enforce_use`], which owns the whole `connection ->
 //! principal -> grant -> verbs -> constraints` decision, every
@@ -130,20 +132,37 @@
 //! question itself -- no second enforcement voice exists, and
 //! [`enforcement`]'s single-path test greps this file to prove it.
 //!
-//! **The version-2 launch facet is minted here, not co-minted.**
-//! `request_grant`'s five `new_id` arguments are frozen forever, so
-//! [`get_launcher`](PrincipalServer::handle_get_launcher) is a structural
-//! mint **on the grant** -- the route every facet added after version 1
-//! must take. The mint is always legal (object-graph rules only: the
-//! live-object cap and the watermark rule, both fatal); the *use* is what
-//! is judged, and it funnels through the same `serve_facet_use` as every
-//! other facet -- answering `launched(realm)` when the chokepoint admits
-//! it (WS-E.1.1, issue #207) and a recoverable `refused(realm_launch, …)`
-//! with the connection intact when it does not. Answering the mint itself
-//! with `invalid_opcode` -- the shape this dispatch had before the facet
-//! existed -- would kill a conformant client for sending a documented
-//! request, which is the razor's fatal-vs-recoverable line exactly. Every
-//! *other* opcode on a grant, and every opcode at all on a consent
+//! **The version-2 facets are minted here, not co-minted.**
+//! `request_grant`'s five `new_id` arguments are frozen forever, so every
+//! facet added after version 1 arrives as a structural mint **on the
+//! grant** -- and `vitrin_grant` now carries five of them:
+//! [`get_launcher`](PrincipalServer::handle_get_launcher),
+//! [`get_layout_focus`](PrincipalServer::handle_get_layout_focus),
+//! [`get_layout_arrange`](PrincipalServer::handle_get_layout_arrange),
+//! [`get_powerbox`](PrincipalServer::handle_get_powerbox) and
+//! [`get_egress`](PrincipalServer::handle_get_egress). Each mint is always
+//! legal (object-graph rules only: the live-object cap and the watermark
+//! rule, both fatal); the *use* is what is judged, and it funnels through
+//! the same `serve_facet_use` as every other facet -- answering
+//! `launched(realm)` when the chokepoint admits a launch (WS-E.1.1, issue
+//! #207) and a recoverable `refused(verb, …)` with the connection intact
+//! when it does not.
+//!
+//! **Answering a mint with `invalid_opcode` is the defect this shape
+//! exists to prevent, and it recurred once.** `get_powerbox` (P2.6.5) and
+//! `get_egress` (P2.7.2) reached the wire with no arm here, so a
+//! conformant version-2 client that minted either facet was disconnected
+//! for sending a documented request of the version this core negotiates --
+//! the razor's fatal-vs-recoverable line, inverted. Issue #322 landed both
+//! arms and both facets' own request arms with them, because minting an
+//! object whose requests nothing dispatches reproduces the identical
+//! defect one level down. What keeps it from recurring a third time is not
+//! this paragraph: it is
+//! `tests::every_since_2_mint_on_a_grant_has_a_dispatch_arm`, which
+//! derives the opcode set from the generated protocol crate and fails on a
+//! mint that lands vocabulary-only.
+//!
+//! Every *other* opcode on a grant, and every opcode at all on a consent
 //! object (which defines no requests at any version), stays fatal
 //! `invalid_opcode`: grammar, not authority.
 //!
@@ -231,6 +250,7 @@ use vitrin_protocol::generated::vitrin_actuator_pointer as pointer;
 use vitrin_protocol::generated::vitrin_actuator_text as text;
 use vitrin_protocol::generated::vitrin_consent as consent;
 use vitrin_protocol::generated::vitrin_consent::ConsentState;
+use vitrin_protocol::generated::vitrin_egress as egress;
 use vitrin_protocol::generated::vitrin_grant as grant;
 use vitrin_protocol::generated::vitrin_grant::{Outcome, Persistence as WirePersistence, Verb};
 use vitrin_protocol::generated::vitrin_handshake as handshake;
@@ -238,6 +258,7 @@ use vitrin_protocol::generated::vitrin_handshake::Error as WireError;
 use vitrin_protocol::generated::vitrin_launcher as launcher;
 use vitrin_protocol::generated::vitrin_layout_arrange as layout_arrange;
 use vitrin_protocol::generated::vitrin_layout_focus as layout_focus;
+use vitrin_protocol::generated::vitrin_powerbox as powerbox;
 use vitrin_protocol::generated::vitrin_principal as principal;
 use vitrin_protocol::generated::vitrin_realm as realm;
 use vitrin_protocol::generated::vitrin_view as view;
@@ -318,6 +339,33 @@ pub(crate) const MAX_LIVE_LAUNCHERS: usize = MAX_LIVE_PETITIONS;
 /// grants) and tight against a connection minting facets in a loop.
 pub(crate) const MAX_LIVE_LAYOUT_FACETS: usize = 2 * MAX_LIVE_PETITIONS;
 
+/// Cap on **powerbox facets** per connection -- the live-object cap's
+/// `get_powerbox` half. Same derivation and the same fatal
+/// `resource_exhausted` breach as [`MAX_LIVE_LAUNCHERS`]: no version
+/// defines a destructor, so every `get_powerbox` is a permanent
+/// per-connection allocation; a compliant client needs exactly one
+/// powerbox per grant; and a connection can hold no more grants than
+/// [`MAX_LIVE_PETITIONS`]. The IDL permits minting a second, equivalent
+/// facet on the same grant (duplicates confer nothing extra -- each is
+/// checked against the same grant at use time), and this cap is what
+/// bounds the repetition.
+///
+/// **Its own counter rather than a share of the layout facets' pooled
+/// one**, and the two precedents differ on purpose. The layout pair shares
+/// [`MAX_LIVE_LAYOUT_FACETS`] because it is one facet split across two
+/// interfaces by `interface/@verb`'s one-verb rule -- the same authority
+/// class, counted once. A powerbox is a different authority class
+/// (`designate_file`) reached through a different interface, so it counts
+/// like the launcher does: separately, against a bound of its own.
+pub(crate) const MAX_LIVE_POWERBOXES: usize = MAX_LIVE_PETITIONS;
+
+/// Cap on **egress facets** per connection -- the live-object cap's
+/// `get_egress` half, derived and enforced exactly as
+/// [`MAX_LIVE_POWERBOXES`] is, and separate from it for the same reason it
+/// is separate from the launcher's: `egress` is its own verb reached
+/// through its own interface.
+pub(crate) const MAX_LIVE_EGRESS_FACETS: usize = MAX_LIVE_PETITIONS;
+
 /// Burst capacity of the per-connection petition-rate token bucket (the
 /// conventions' "server-side petition-rate ceiling"; breach is fatal
 /// `resource_exhausted`). A compliant client sends a handful of petitions
@@ -390,6 +438,22 @@ pub(crate) enum PrincipalViolation {
     /// "a correct client never emits them") -- argument validation the
     /// generated decoder cannot see, like [`PrincipalViolation::ZeroVerbs`].
     ForbiddenControl { object_id: u32, codepoint: u32 },
+    /// `invalid_argument`: a `vitrin_egress.request_connect` whose `port`
+    /// falls outside 1-65535 (IDL `request_connect`: "a port outside
+    /// 1-65535 (`invalid_argument`) ... argument validation the decoder
+    /// cannot do, exactly like request_grant's non-zero-verbs rule"), so it
+    /// joins [`PrincipalViolation::ZeroVerbs`] and
+    /// [`PrincipalViolation::ForbiddenControl`] here rather than at the
+    /// chokepoint.
+    ///
+    /// **Fatal, where the same mistake inside a `net:` selector resolves
+    /// `unsupported`**, and the IDL argues the asymmetry rather than
+    /// leaving it to look inconsistent: a selector is a string whose only
+    /// wire constraint is a byte length and whose content is a policy
+    /// question, while `port` here is a numeric argument with a stated
+    /// domain -- the same shape as an enum, whose out-of-range values the
+    /// generated decoder already kills a connection for.
+    PortOutOfRange { object_id: u32, port: u32 },
     /// `resource_exhausted`: a documented per-connection bound was
     /// breached ([`MAX_LIVE_REALMS`], object-id exhaustion).
     ResourceExhausted(&'static str),
@@ -415,9 +479,9 @@ impl PrincipalViolation {
             }
             PrincipalViolation::InvalidObject { .. } => WireError::InvalidObject,
             PrincipalViolation::Malformed { source, .. } => source.to_wire_error(),
-            PrincipalViolation::ZeroVerbs { .. } | PrincipalViolation::ForbiddenControl { .. } => {
-                WireError::InvalidArgument
-            }
+            PrincipalViolation::ZeroVerbs { .. }
+            | PrincipalViolation::ForbiddenControl { .. }
+            | PrincipalViolation::PortOutOfRange { .. } => WireError::InvalidArgument,
             PrincipalViolation::ResourceExhausted(_) => WireError::ResourceExhausted,
             PrincipalViolation::ServerError { .. } | PrincipalViolation::ConnectionDead => {
                 WireError::Internal
@@ -435,6 +499,7 @@ impl PrincipalViolation {
             | PrincipalViolation::Malformed { object_id, .. }
             | PrincipalViolation::ZeroVerbs { object_id }
             | PrincipalViolation::ForbiddenControl { object_id, .. }
+            | PrincipalViolation::PortOutOfRange { object_id, .. }
             | PrincipalViolation::ServerError { object_id, .. } => *object_id,
             _ => HANDSHAKE_ID,
         }
@@ -461,6 +526,9 @@ impl PrincipalViolation {
             PrincipalViolation::ZeroVerbs { .. } => "petition verb set is empty".into(),
             PrincipalViolation::ForbiddenControl { codepoint, .. } => {
                 format!("text contains forbidden control character U+{codepoint:04X}")
+            }
+            PrincipalViolation::PortOutOfRange { port, .. } => {
+                format!("port {port} is outside 1-65535")
             }
             PrincipalViolation::ResourceExhausted(detail) => (*detail).into(),
             PrincipalViolation::ServerError { .. } => "server-side failure".into(),
@@ -524,6 +592,13 @@ impl fmt::Display for PrincipalViolation {
                     f,
                     "invalid_argument: forbidden control character U+{codepoint:04X} \
                      in text on object {object_id}"
+                )
+            }
+            PrincipalViolation::PortOutOfRange { object_id, port } => {
+                write!(
+                    f,
+                    "invalid_argument: request_connect port {port} outside 1-65535 \
+                     on object {object_id}"
                 )
             }
             PrincipalViolation::ResourceExhausted(detail) => {
@@ -760,6 +835,26 @@ enum ObjectKind {
     /// table, where a later edit could set it from something other than
     /// which mint created the object.
     LayoutArrange { grant: u32 },
+    /// The designation facet (see [`ObjectKind::Launcher`]), minted on the
+    /// grant by `get_powerbox`. Carries its grant's wire id and nothing
+    /// else, and the chokepoint judges every `request_file` and
+    /// `request_dir` -- refusing all of them `not_granted` in this build,
+    /// because `designate_file` is outside
+    /// [`SERVED_VERB_BITS`](crate::grants::SERVED_VERB_BITS).
+    Powerbox { grant: u32 },
+    /// The egress facet (see [`ObjectKind::Powerbox`]), minted on the grant
+    /// by `get_egress`.
+    ///
+    /// A **separate kind** for the reason [`ObjectKind::LayoutArrange`] is
+    /// separate from [`ObjectKind::LayoutFocus`]: a facet interface declares
+    /// exactly one `verb`, and that declaration is what generates the
+    /// single-site authority check. `vitrin_powerbox` declares
+    /// `designate_file` and `vitrin_egress` declares `egress` -- the IDL
+    /// records that an earlier plan had `request_connect` as a third request
+    /// on the powerbox and that `interface/@verb` could not express it, so
+    /// merging the two kinds here would re-create in the object table the
+    /// exact ambiguity the dialect refused on the wire.
+    Egress { grant: u32 },
 }
 
 /// A grant handle's lifecycle on the wire: born pending, flipped exactly
@@ -960,6 +1055,15 @@ pub(crate) struct PrincipalServer {
     /// against [`MAX_LIVE_LAYOUT_FACETS`] -- the same bound and the same
     /// reason [`Self::launcher_count`] has one.
     layout_facet_count: usize,
+    /// Powerbox facets ever minted on this connection, against
+    /// [`MAX_LIVE_POWERBOXES`] -- the same bound and the same reason
+    /// [`Self::launcher_count`] has one, and counted separately from the
+    /// layout facets' pooled counter because a powerbox is a different
+    /// authority class rather than the other half of one.
+    powerbox_count: usize,
+    /// Egress facets ever minted on this connection, against
+    /// [`MAX_LIVE_EGRESS_FACETS`] (see [`Self::powerbox_count`]).
+    egress_count: usize,
     /// Petition-rate token bucket: remaining burst tokens.
     petition_tokens: u32,
     /// The bucket's refill anchor (the instant up to which refill has been
@@ -992,6 +1096,8 @@ impl PrincipalServer {
             petition_count: 0,
             launcher_count: 0,
             layout_facet_count: 0,
+            powerbox_count: 0,
+            egress_count: 0,
             petition_tokens: PETITION_RATE_BURST,
             petition_refill_anchor: None,
             chokepoint: Chokepoint::new(),
@@ -1135,28 +1241,28 @@ impl PrincipalServer {
                         },
                         // vitrin_grant carries FIVE requests as of P2.7.2,
                         // all since="2" structural mints, and THIS CORE
-                        // SERVES ONLY THE FIRST THREE. Two are on the wire
-                        // with no arm here, so they fall to the catch-all
-                        // below and are answered fatal invalid_opcode --
-                        // version-2 conformance gaps owed by a later task,
-                        // not decisions:
+                        // SERVES ALL FIVE (issue #322). Every one of them
+                        // is always legal -- whatever verbs the grant holds
+                        // and whether or not it has resolved -- and answers
+                        // nothing on the wire; the *use* of what they mint
+                        // is what the chokepoint judges.
                         //
-                        // * `get_powerbox` (opcode 3), owed by P2.6.6
-                        //   together with the picker;
-                        // * `get_egress` (opcode 4), owed by P2.7.3
-                        //   together with the out-of-core mediating proxy
-                        //   and the `vitrin_egress` object kind.
-                        //
-                        // Each is pinned by its own test below --
-                        // `get_powerbox_is_defined_at_version_2_and_this_core_answers_it_fatally`
-                        // and
-                        // `get_egress_is_defined_by_the_idl_and_still_refused_by_this_core`
-                        // -- each of which goes red the moment its arm lands
-                        // and names the texts that must move with it.
-                        // Nothing today can reach either usefully anyway:
+                        // Two of them had no arm here until #322, and what
+                        // that cost is worth keeping: a conformant version-2
+                        // client that sent `get_powerbox` or `get_egress`
+                        // fell to the catch-all below and was answered fatal
+                        // `invalid_opcode`, so its connection died for
+                        // sending a documented request of the version this
+                        // core negotiates. It was harmless-looking, because
                         // `designate_file` and `egress` are both outside
-                        // `SERVED_VERB_BITS`, so no grant resolves granted
-                        // carrying them.
+                        // `SERVED_VERB_BITS` and a minted facet confers
+                        // nothing -- but "confers nothing" and "kills the
+                        // socket" are not the same answer, and only the
+                        // second is a conformance defect. The structural
+                        // test `every_since_2_mint_on_a_grant_has_a_dispatch_arm`
+                        // below is what makes it unrepeatable: it derives the
+                        // opcode set from the generated protocol crate, so a
+                        // sixth mint cannot land vocabulary-only.
                         //
                         // Every other opcode on a grant, and every opcode at
                         // all on vitrin_consent (which defines no requests
@@ -1170,6 +1276,8 @@ impl PrincipalServer {
                             grant::requests::GetLayoutArrange::OPCODE => {
                                 self.handle_get_layout_arrange(msg)
                             }
+                            grant::requests::GetPowerbox::OPCODE => self.handle_get_powerbox(msg),
+                            grant::requests::GetEgress::OPCODE => self.handle_get_egress(msg),
                             _ => {
                                 Err(PrincipalViolation::UnknownOpcode { object_id, opcode }.into())
                             }
@@ -1360,6 +1468,107 @@ impl PrincipalServer {
                                     ctx,
                                     send,
                                 )
+                            }
+                            _ => {
+                                Err(PrincipalViolation::UnknownOpcode { object_id, opcode }.into())
+                            }
+                        },
+                        // The powerbox's two asks funnel through the same
+                        // `serve_facet_use` as every other use, and they
+                        // funnel through it as ONE `UseKind`: a facet
+                        // interface declares one verb, both asks exercise
+                        // `designate_file`, and the only answer this build
+                        // can give is the chokepoint's own
+                        // `refused(designate_file, not_granted)` -- whose
+                        // payload is the verb and the code, with terminals
+                        // pairing in request order. `request_file`'s `mode`
+                        // is decoded and dropped: decoding it is the grammar
+                        // check (an out-of-range enum is fatal
+                        // `invalid_argument` from the generated decoder,
+                        // exactly as `set_fullscreen`'s is), and the picker
+                        // that would act on it is P2.6.6's.
+                        ObjectKind::Powerbox { grant } => match opcode {
+                            powerbox::requests::RequestFile::OPCODE => {
+                                let (_, _req) =
+                                    powerbox::requests::RequestFile::decode(&msg.bytes, msg.fd)
+                                        .map_err(|source| PrincipalViolation::Malformed {
+                                            object_id,
+                                            source,
+                                        })?;
+                                self.serve_facet_use(
+                                    object_id,
+                                    grant,
+                                    UseKind::Designate,
+                                    ctx,
+                                    send,
+                                )
+                            }
+                            powerbox::requests::RequestDir::OPCODE => {
+                                let (_, _req) =
+                                    powerbox::requests::RequestDir::decode(&msg.bytes, msg.fd)
+                                        .map_err(|source| PrincipalViolation::Malformed {
+                                            object_id,
+                                            source,
+                                        })?;
+                                self.serve_facet_use(
+                                    object_id,
+                                    grant,
+                                    UseKind::Designate,
+                                    ctx,
+                                    send,
+                                )
+                            }
+                            _ => {
+                                Err(PrincipalViolation::UnknownOpcode { object_id, opcode }.into())
+                            }
+                        },
+                        ObjectKind::Egress { grant } => match opcode {
+                            egress::requests::RequestConnect::OPCODE => {
+                                let (_, req) =
+                                    egress::requests::RequestConnect::decode(&msg.bytes, msg.fd)
+                                        .map_err(|source| PrincipalViolation::Malformed {
+                                            object_id,
+                                            source,
+                                        })?;
+                                // The IDL's normative port rule: "a port
+                                // outside 1-65535 (invalid_argument) ...
+                                // argument validation the decoder cannot do,
+                                // exactly like request_grant's non-zero-verbs
+                                // rule". So it is checked HERE, with the
+                                // zero-verb and forbidden-control rules, and
+                                // it is FATAL -- the razor's grammar side,
+                                // where a numeric argument with a stated
+                                // domain sits. The `host` bound (253 bytes,
+                                // the DNS maximum) needs no check beside it:
+                                // the generated decoder carries it, and
+                                // over-long input never reaches this line.
+                                //
+                                // Checked before the funnel, so a malformed
+                                // request never becomes an authority
+                                // question: grammar precedes authority in
+                                // the IDL's own check order, and an
+                                // out-of-domain port answered `not_granted`
+                                // would tell a client its grant was the
+                                // problem.
+                                if !(1..=65_535).contains(&req.port) {
+                                    return Err(PrincipalViolation::PortOutOfRange {
+                                        object_id,
+                                        port: req.port,
+                                    }
+                                    .into());
+                                }
+                                // The endpoint is decoded, grammar-checked
+                                // and dropped. The IDL has the chokepoint
+                                // compare it against what the grant covers,
+                                // narrowing only -- but `egress` is outside
+                                // `SERVED_VERB_BITS`, so no row carries the
+                                // bit, step 4 refuses `not_granted` first,
+                                // and there is nothing yet to compare
+                                // against. P2.7.3 lands the comparison with
+                                // the proxy, in one change: serving the verb
+                                // without it would turn a grant over one
+                                // endpoint into reach to every endpoint.
+                                self.serve_facet_use(object_id, grant, UseKind::Egress, ctx, send)
                             }
                             _ => {
                                 Err(PrincipalViolation::UnknownOpcode { object_id, opcode }.into())
@@ -1788,6 +1997,80 @@ impl PrincipalServer {
             ObjectKind::LayoutArrange { grant: object_id },
         );
         self.layout_facet_count += 1;
+        Ok(())
+    }
+
+    /// `vitrin_grant.get_powerbox` (since version 2): a structural mint, on
+    /// exactly [`handle_get_launcher`]'s terms. The IDL says so in as many
+    /// words -- "Identical in every structural respect to get_launcher and
+    /// the two layout mints - always legal whatever verbs this grant holds
+    /// and whether or not it has resolved, born inert, duplicates permitted
+    /// and conferring nothing extra, never refusable, and a malformed mint
+    /// is a fatal object-graph error rather than an authority answer."
+    ///
+    /// So only the object-graph rules can fail: the live-object cap
+    /// ([`MAX_LIVE_POWERBOXES`]) and the watermark rule, both fatal. There
+    /// is no reply, no refusal and no wire acknowledgement.
+    ///
+    /// **Refusing the mint would be the wrong answer twice over**, which is
+    /// worth stating because this request had no arm at all until issue #322
+    /// and "add a refusal" is the tempting shape. A fatal answer kills a
+    /// conformant client for sending a documented request of the negotiated
+    /// version; and a *recoverable* refusal at mint time would make the mint
+    /// an authority oracle, telling a petitioner something about its own
+    /// pending petition that only `resolved` may say. The authority question
+    /// is asked once, at the single enforcement chokepoint, when
+    /// `request_file` or `request_dir` is used -- and this build answers
+    /// every one of those `not_granted`, because `designate_file` is outside
+    /// [`SERVED_VERB_BITS`](crate::grants::SERVED_VERB_BITS).
+    ///
+    /// [`handle_get_launcher`]: PrincipalServer::handle_get_launcher
+    fn handle_get_powerbox(&mut self, msg: Message) -> Result<(), PrincipalFault> {
+        // The request's target object *is* the grant (dispatch resolved it
+        // to an `ObjectKind::Grant` before calling), so the facet's
+        // chokepoint key is the frame's own object id -- no second lookup,
+        // and no way for the two to disagree.
+        let object_id = msg.header.object_id;
+        let (_, req) = grant::requests::GetPowerbox::decode(&msg.bytes, msg.fd)
+            .map_err(|source| PrincipalViolation::Malformed { object_id, source })?;
+        // The cap precedes the mint (the `get_realm` precedent): no version
+        // defines destructors, so every powerbox is a permanent
+        // per-connection allocation.
+        if self.powerbox_count >= MAX_LIVE_POWERBOXES {
+            return Err(PrincipalViolation::ResourceExhausted("live-powerbox cap exceeded").into());
+        }
+        self.allocate_id(req.powerbox)?;
+        self.objects
+            .insert(req.powerbox, ObjectKind::Powerbox { grant: object_id });
+        self.powerbox_count += 1;
+        Ok(())
+    }
+
+    /// `vitrin_grant.get_egress` (since version 2): the sibling of
+    /// [`handle_get_powerbox`], on identical terms and for the identical
+    /// reason -- the IDL's `get_egress` description restates
+    /// `get_powerbox`'s structural clause word for word.
+    ///
+    /// Its own counter and its own cap ([`MAX_LIVE_EGRESS_FACETS`]) rather
+    /// than a share of the powerbox's: `egress` is its own verb through its
+    /// own interface, so it counts the way the launcher does. Only the
+    /// layout pair pools a counter, because that pair is one authority class
+    /// split across two interfaces by `interface/@verb`'s one-verb rule.
+    ///
+    /// [`handle_get_powerbox`]: PrincipalServer::handle_get_powerbox
+    fn handle_get_egress(&mut self, msg: Message) -> Result<(), PrincipalFault> {
+        let object_id = msg.header.object_id;
+        let (_, req) = grant::requests::GetEgress::decode(&msg.bytes, msg.fd)
+            .map_err(|source| PrincipalViolation::Malformed { object_id, source })?;
+        if self.egress_count >= MAX_LIVE_EGRESS_FACETS {
+            return Err(
+                PrincipalViolation::ResourceExhausted("live-egress-facet cap exceeded").into(),
+            );
+        }
+        self.allocate_id(req.egress)?;
+        self.objects
+            .insert(req.egress, ObjectKind::Egress { grant: object_id });
+        self.egress_count += 1;
         Ok(())
     }
 
@@ -2399,6 +2682,16 @@ pub(crate) mod tests {
     const TOKEN: &str = "9b2f4c1d8a7e5f30619b2f4c1d8a7e5f30619b2f4c1d8a7e5f30619b2f4c1d8a";
     const DEMO_IDENTITY: &str = "vitrin://local/agent/demo";
 
+    /// How long a rig's blocking read waits before declaring that the event
+    /// it wanted is never coming ([`connect`] arms both ends with it).
+    ///
+    /// Generous on purpose: every frame these tests read was written by the
+    /// same thread before the read, so the wait is zero in the passing case
+    /// and this bound is reached only when the frame does not exist. Long
+    /// enough that no loaded machine can mistake slowness for absence, short
+    /// enough that a whole failing suite still reports.
+    const TEST_RECV_TIMEOUT: Duration = Duration::from_secs(10);
+
     /// The full version-1 verb set, as the demo agent petitions for it.
     fn all_verbs() -> Verb {
         Verb::OBSERVE | Verb::ACTUATE_POINTER | Verb::ACTUATE_TEXT
@@ -2588,6 +2881,24 @@ pub(crate) mod tests {
     /// client end.
     fn connect(shared: &mut Shared) -> (PrincipalServer, Connection, Connection) {
         let (core, client) = Connection::pair().expect("socketpair");
+        // **A test that hangs is not a test that fails.** Every rig in this
+        // module is single-threaded: a frame is either already in the socket
+        // when a helper reads, or no one is left to put it there. Without a
+        // receive timeout, "the event that should have arrived did not" is a
+        // blocked `recvmsg` -- a test that never returns a verdict, which is
+        // how a mutation to `UseKind::coalescible` (a coalesced-away
+        // refusal) was observed to hang
+        // `designation_asks_refuse_not_granted_and_leave_the_socket_alive`
+        // instead of failing it. With the timeout the read returns
+        // `WouldBlock`, which [`recv_event`] turns into a named panic.
+        for end in [&core, &client] {
+            rustix::net::sockopt::set_socket_timeout(
+                end,
+                rustix::net::sockopt::Timeout::Recv,
+                Some(TEST_RECV_TIMEOUT),
+            )
+            .expect("SO_RCVTIMEO on a socketpair end");
+        }
         let connection = shared.petitions.register_connection();
         (
             PrincipalServer::new(core.peer_cred(), connection),
@@ -2773,7 +3084,7 @@ pub(crate) mod tests {
     ) -> String {
         send_hello(client, 2, DEMO_IDENTITY, TOKEN);
         process_n(server, core, verifier, shared, 1).expect("handshake");
-        let msg = client.recv_message().unwrap().unwrap();
+        let msg = recv_event(client, "a `bound`");
         let (object_id, bound) = principal::events::Bound::decode(&msg.bytes, msg.fd).unwrap();
         assert_eq!(object_id, 2, "bound arrives on the pre-allocated principal");
         bound.identity
@@ -2813,10 +3124,37 @@ pub(crate) mod tests {
             .expect("deliver resolution");
     }
 
+    /// Read the next client-visible message, or **fail** naming what never
+    /// arrived -- never block forever waiting for it.
+    ///
+    /// The bounded read is [`connect`]'s `SO_RCVTIMEO`; this is where the
+    /// timeout becomes a verdict a reader can act on. `what` names the
+    /// event the caller was waiting for, because "no `refused` arrived" is
+    /// a diagnosis and "the test timed out" is not.
+    fn recv_event(client: &mut Connection, what: &str) -> Message {
+        match client.recv_message() {
+            Ok(Some(msg)) => msg,
+            Ok(None) => panic!("the connection closed before {what} arrived"),
+            Err(TransportError::Io(e))
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                panic!(
+                    "no {what} arrived within {TEST_RECV_TIMEOUT:?}: nothing else is \
+                     running that could still send it, so the core never emitted it \
+                     (a coalesced-away terminal looks exactly like this)"
+                )
+            }
+            Err(e) => panic!("the transport failed while waiting for {what}: {e}"),
+        }
+    }
+
     /// Assert the next client-visible event is the fatal goodbye with the
     /// given code, returning the full decoded event for deeper assertions.
     fn expect_error(client: &mut Connection, code: WireError) -> handshake::events::Error {
-        let msg = client.recv_message().unwrap().unwrap();
+        let msg = recv_event(client, "a fatal error");
         let (object_id, err) = handshake::events::Error::decode(&msg.bytes, msg.fd).unwrap();
         assert_eq!(object_id, HANDSHAKE_ID, "error is an event on object 1");
         assert_eq!(err.code, code, "unexpected wire code: {err:?}");
@@ -2839,7 +3177,7 @@ pub(crate) mod tests {
     /// Assert the next client-visible event is a consent `state`
     /// transition on the given observer.
     fn expect_consent_state(client: &mut Connection, consent_id: u32, want: ConsentState) {
-        let msg = client.recv_message().unwrap().unwrap();
+        let msg = recv_event(client, "a consent `state`");
         let (object_id, ev) = consent::events::State::decode(&msg.bytes, msg.fd).unwrap();
         assert_eq!(
             object_id, consent_id,
@@ -2851,7 +3189,7 @@ pub(crate) mod tests {
     /// Assert the next client-visible event is `resolved` on the given
     /// grant handle, returning it for outcome assertions.
     fn expect_resolved(client: &mut Connection, grant_id: u32) -> grant::events::Resolved {
-        let msg = client.recv_message().unwrap().unwrap();
+        let msg = recv_event(client, "a `resolved`");
         let (object_id, ev) = grant::events::Resolved::decode(&msg.bytes, msg.fd).unwrap();
         assert_eq!(
             object_id, grant_id,
@@ -2869,7 +3207,7 @@ pub(crate) mod tests {
         verb: Verb,
         code: Refusal,
     ) -> grant::events::Refused {
-        let msg = client.recv_message().unwrap().unwrap();
+        let msg = recv_event(client, &format!("a `refused({verb:?}, {code:?})`"));
         assert!(msg.fd.is_none(), "a refusal carries no fd");
         let (object_id, ev) = grant::events::Refused::decode(&msg.bytes, msg.fd).unwrap();
         assert_eq!(object_id, grant_id, "refused arrives on the grant handle");
@@ -2887,7 +3225,7 @@ pub(crate) mod tests {
     /// Assert the next client-visible event is `frame_ready` on the given
     /// view facet, returning the decoded frame (whose fd closes on drop).
     fn expect_frame(client: &mut Connection, view_id: u32) -> view::events::FrameReady {
-        let msg = client.recv_message().unwrap().unwrap();
+        let msg = recv_event(client, "a `frame_ready`");
         let (object_id, ev) = view::events::FrameReady::decode(&msg.bytes, msg.fd).unwrap();
         assert_eq!(object_id, view_id, "frame_ready arrives on the view facet");
         assert_eq!(ev.width, VIEW_W);
@@ -3567,7 +3905,7 @@ pub(crate) mod tests {
     ) {
         send_sync(client, cookie);
         process_n(server, core, verifier, shared, 1).expect("sync must dispatch");
-        let msg = client.recv_message().unwrap().unwrap();
+        let msg = recv_event(client, &format!("the fence's `done({cookie})`"));
         let (object_id, done) = handshake::events::Done::decode(&msg.bytes, msg.fd).unwrap();
         assert_eq!(object_id, HANDSHAKE_ID);
         assert_eq!(done.cookie, cookie, "done must be the next event in stream");
@@ -5303,11 +5641,15 @@ pub(crate) mod tests {
         // defined. A literal cannot notice an append; `mints.len()` cannot
         // miss one.
         //
-        // Opcodes 3 and 4 are deliberately NOT probed here. They are defined
-        // by the IDL and unserved by this core, which is a different fact
-        // from "undefined", and conflating the two is exactly what let the
-        // old probes keep passing while the IDL grew under them. Each has its
-        // own test below.
+        // Opcodes 3 and 4 are deliberately NOT probed here: they are DEFINED
+        // by the IDL, so "undefined" is not a fact about them. They were
+        // defined-but-undispatched until issue #322 -- a third fact again,
+        // and conflating any two of the three is exactly what let the old
+        // probes keep passing while the IDL grew under them. That every
+        // defined mint reaches an arm is asserted by
+        // `every_since_2_mint_on_a_grant_has_a_dispatch_arm`, off the
+        // generated opcode set; this test is only about what lies PAST the
+        // set.
         let mints = [
             grant::requests::GetLauncher::OPCODE,
             grant::requests::GetLayoutFocus::OPCODE,
@@ -5360,91 +5702,126 @@ pub(crate) mod tests {
         }
     }
 
-    /// **The pin on P2.6.5's conformance gap, and the tripwire that forces
-    /// four documents to move when P2.6.6 closes it.**
+    // -- acceptance: the version-2 designation and egress facets (#322) ----
+
+    /// Encode one `get_powerbox(powerbox)` on the standard grant handle
+    /// (id 4) -- the version-2 structural mint.
+    fn get_powerbox(powerbox_id: u32) -> Vec<u8> {
+        grant::requests::GetPowerbox {
+            powerbox: powerbox_id,
+        }
+        .encode(4)
+    }
+
+    /// Encode one `get_egress(egress)` on the standard grant handle (id 4).
+    fn get_egress(egress_id: u32) -> Vec<u8> {
+        grant::requests::GetEgress { egress: egress_id }.encode(4)
+    }
+
+    /// Encode one `request_file(mode)` on a powerbox facet.
+    fn request_file(powerbox_id: u32, mode: powerbox::Mode) -> Vec<u8> {
+        powerbox::requests::RequestFile { mode }.encode(powerbox_id)
+    }
+
+    /// Encode one `request_dir` on a powerbox facet.
+    fn request_dir(powerbox_id: u32) -> Vec<u8> {
+        powerbox::requests::RequestDir {}.encode(powerbox_id)
+    }
+
+    /// Encode one `request_connect(host, port)` on an egress facet.
+    fn request_connect(egress_id: u32, host: &str, port: u32) -> Vec<u8> {
+        egress::requests::RequestConnect {
+            host: host.into(),
+            port,
+        }
+        .encode(egress_id)
+    }
+
+    /// **The regression test for issue #322, powerbox half.**
     ///
     /// `vitrin_grant.get_powerbox` (opcode 3, `since="2"`) is on the wire,
-    /// this core negotiates exactly version 2 and nothing else, and it has
-    /// no dispatch arm for that opcode -- so it answers the request with
-    /// fatal `invalid_opcode` and the connection dies. That is a
-    /// **conformance gap**, not a design: a defined request of the
-    /// negotiated version must never kill a connection. `get_powerbox` is
-    /// the first mint this IDL has declared without a core arm; the arm,
-    /// the picker behind it and the facet's own use path are P2.6.6's.
+    /// this core negotiates exactly version 2, and until #322 it had no
+    /// dispatch arm -- so a conformant client that minted the facet was
+    /// answered fatal `invalid_opcode` and disconnected for sending a
+    /// documented request of the negotiated version. That was a
+    /// **conformance gap**, not a design: the IDL says this mint is
+    /// "Identical in every structural respect to get_launcher and the two
+    /// layout mints - always legal whatever verbs this grant holds and
+    /// whether or not it has resolved, born inert, duplicates permitted and
+    /// conferring nothing extra, never refusable".
     ///
-    /// It is asserted rather than described because four texts state what
-    /// the *protocol* asks for -- mint succeeds, use refuses `not_granted`
-    /// -- and every one of them would be a false statement about this
-    /// binary if the gap were left silent:
-    ///
-    /// * `protocol/vitrin-v0.xml`, `get_powerbox`'s `<description>`;
-    /// * `docs/protocol/04-vitrin_grant.md`, "### get_powerbox";
-    /// * `docs/protocol/13-vitrin_powerbox.md`, "Served status";
-    /// * the dispatch comment on `ObjectKind::Grant` above.
-    ///
-    /// **When P2.6.6 adds the arm this test goes red**, which is the point:
-    /// it cannot land without the four paragraphs above being deleted in
-    /// the same change.
+    /// This test asserted the gap until #322 closed it. It now asserts what
+    /// the IDL says: the mint succeeds, the facet enters the object table
+    /// carrying its grant's wire id (the chokepoint's key), and the
+    /// connection survives with nothing on the wire -- a structural mint
+    /// makes no wire acknowledgement at all (conventions §6).
     #[test]
-    fn get_powerbox_is_defined_at_version_2_and_this_core_answers_it_fatally() {
+    fn get_powerbox_mints_an_inert_facet_and_never_kills_the_connection() {
         let _fd = crate::capture::tests::fd_lock();
         let verifier = demo_verifier();
         let (mut server, mut core, mut client, mut shared) = granted_rig(&verifier, 0, 0);
         // A well-formed mint on the standard granted handle (id 4) -- the
         // exact frame the IDL says is always legal.
-        let frame = grant::requests::GetPowerbox { powerbox: 9 }.encode(4);
-        client.send_message(&frame, None).unwrap();
-        expect_violation(
-            process_n(&mut server, &mut core, &verifier, &mut shared, 1),
-            "invalid_opcode",
-        );
-        expect_error(&mut client, WireError::InvalidOpcode);
+        client.send_message(&get_powerbox(9), None).unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).expect("the mint is legal");
         assert_eq!(
             server.objects.get(&9),
-            None,
-            "no facet is minted: there is no handler to mint one"
+            Some(&ObjectKind::Powerbox { grant: 4 }),
+            "the facet remembers its grant's wire id -- the chokepoint's key"
+        );
+        // Duplicates are permitted and confer nothing extra (IDL): a second
+        // mint on the same grant is legal and yields a second, equivalent
+        // facet. What bounds the repetition is the live-object cap, tested
+        // separately.
+        client.send_message(&get_powerbox(10), None).unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1)
+            .expect("a duplicate mint is legal too");
+        assert_eq!(
+            server.objects.get(&10),
+            Some(&ObjectKind::Powerbox { grant: 4 })
+        );
+        // ALIVE, and silent: the fence is both assertions at once -- `done`
+        // is the very next client-visible event, so neither mint answered
+        // anything and the connection survived.
+        sync_fence(
+            &mut server,
+            &mut core,
+            &mut client,
+            &verifier,
+            &mut shared,
+            31,
         );
         // The two facts this test is about, stated as constants so a
-        // renumbered opcode or a version bump cannot leave the prose
-        // above pointing at nothing.
+        // renumbered opcode or a version bump cannot leave the prose above
+        // pointing at nothing.
         assert_eq!(grant::requests::GetPowerbox::OPCODE, 3);
         assert_eq!(
             grant::requests::GetPowerbox::SINCE,
             vitrin_protocol::generated::PROTOCOL_VERSION,
-            "the gap only matters because this core negotiates the very \
-             version that defines the request"
+            "the conformance claim only matters because this core negotiates \
+             the very version that defines the request"
         );
     }
 
+    /// **The regression test for issue #322, egress half.** See
+    /// [`get_powerbox_mints_an_inert_facet_and_never_kills_the_connection`];
+    /// `get_egress` is the same mint on the same terms, and until #322 it
+    /// killed a conformant connection the same way.
+    ///
+    /// IT IS OPCODE 4 AND NOT 3, and the number is asserted below rather
+    /// than only written here. `get_egress` was drafted as the fourth mint
+    /// at opcode 3 while P2.6.5 was landing `get_powerbox` at the same
+    /// number on another branch. Powerbox shipped first and keeps 3;
+    /// opcodes are immutable once shipped, so the unshipped one moved.
+    ///
+    /// **Minted on a still-PENDING grant here, deliberately.** The IDL's
+    /// structural clause says the mint is legal "whether or not it has
+    /// resolved", and refusing it before resolution would make the mint an
+    /// authority oracle -- telling a petitioner something about its own
+    /// pending petition that only `resolved` may say.
     #[test]
-    fn get_egress_is_defined_by_the_idl_and_still_refused_by_this_core() {
+    fn get_egress_mints_an_inert_facet_and_never_kills_the_connection() {
         let _fd = crate::capture::tests::fd_lock();
-        // THIS TEST PINS A DIVERGENCE, NOT A CONFORMANCE.
-        //
-        // `vitrin_grant.get_egress` is opcode 4, `since="2"`, and the IDL says
-        // a structural mint is always legal on a live grant and refuses at
-        // USE. This binary has no dispatch arm for it (see the comment on the
-        // `ObjectKind::Grant` match), so a well-formed get_egress is answered
-        // fatal `invalid_opcode` and the connection dies -- which is not what
-        // the IDL says the server does. P2.7.3 closes it, together with the
-        // out-of-core proxy and the `vitrin_egress` object kind.
-        //
-        // IT IS OPCODE 4 AND NOT 3, and the number is asserted below rather
-        // than only written here. `get_egress` was drafted as the fourth mint
-        // at opcode 3 while P2.6.5 was landing `get_powerbox` at the same
-        // number on another branch. Powerbox shipped first and keeps 3;
-        // opcodes are immutable once shipped, so the unshipped one moved.
-        //
-        // The frame below is fully encoded rather than a bare header, so the
-        // refusal cannot be blamed on a malformed payload: the opcode is the
-        // whole reason.
-        //
-        // Nothing reachable is lost by the gap today -- `egress` is outside
-        // `SERVED_VERB_BITS`, so no petition naming it resolves `granted` and
-        // a minted facet would confer nothing -- but "harmless" is not
-        // "correct", and this assertion is what makes the divergence go red
-        // the moment P2.7.3 serves the mint, instead of leaving it to be
-        // noticed.
         let verifier = demo_verifier();
         let (mut server, mut core, mut client, mut shared) = setup();
         bind_with_realm(&mut server, &mut core, &mut client, &verifier, &mut shared);
@@ -5453,17 +5830,21 @@ pub(crate) mod tests {
             .unwrap();
         process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
         expect_consent_state(&mut client, 5, ConsentState::Queued);
-        client
-            .send_message(&grant::requests::GetEgress { egress: 9 }.encode(4), None)
-            .unwrap();
-        expect_violation(
-            process_n(&mut server, &mut core, &verifier, &mut shared, 1),
-            "invalid_opcode",
+        client.send_message(&get_egress(9), None).unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1)
+            .expect("the mint is legal on a pending grant");
+        assert_eq!(
+            server.objects.get(&9),
+            Some(&ObjectKind::Egress { grant: 4 }),
+            "the facet remembers its grant's wire id, resolved or not"
         );
-        expect_error(&mut client, WireError::InvalidOpcode);
-        assert!(
-            !server.objects.contains_key(&9),
-            "the refused mint allocates nothing"
+        sync_fence(
+            &mut server,
+            &mut core,
+            &mut client,
+            &verifier,
+            &mut shared,
+            32,
         );
         // Stated as constants so a renumbered opcode or a version bump cannot
         // leave the prose above pointing at nothing -- and so the 3-vs-4
@@ -5478,9 +5859,693 @@ pub(crate) mod tests {
         assert_eq!(
             grant::requests::GetEgress::SINCE,
             vitrin_protocol::generated::PROTOCOL_VERSION,
-            "the gap only matters because this core negotiates the very \
-             version that defines the request"
+            "the conformance claim only matters because this core negotiates \
+             the very version that defines the request"
         );
+    }
+
+    /// The generated protocol crate's own record of what **one interface**
+    /// defines: `(request name, opcode, since)` for every request in
+    /// `generated`, scraped from the generated source rather than
+    /// transcribed.
+    ///
+    /// The generated files are checked in and `cargo xtask codegen --check`
+    /// holds them equal to `protocol/vitrin-v0.xml`, so scanning one is
+    /// scanning the IDL through the one artifact that cannot drift from it.
+    /// A hand-written list here would be the very thing the tests below
+    /// exist to abolish.
+    ///
+    /// **Parameterised by the module source, not fixed to `vitrin_grant`.**
+    /// The `/// Request `name` (opcode N) on `interface`.` doc shape is
+    /// emitted by one scanner template, so it is identical in every
+    /// generated interface module -- which is what lets the facets
+    /// (`vitrin_powerbox`, `vitrin_egress`, ...) be scanned by this same
+    /// scraper instead of by a literal array of the opcodes someone
+    /// remembered. `interface` is checked against every doc line the scan
+    /// accepts, so handing this the wrong module fails loudly rather than
+    /// scanning something plausible.
+    fn generated_requests(generated: &str, interface: &str) -> Vec<(String, u8, u32)> {
+        let tail = format!(" on `{interface}`.");
+        let mut out: Vec<(String, u8, u32)> = Vec::new();
+        let mut pending: Option<(String, u8)> = None;
+        for line in generated.lines() {
+            let line = line.trim();
+            // `/// Request `get_powerbox` (opcode 3) on `vitrin_grant`.`
+            if let Some(rest) = line.strip_prefix("/// Request `") {
+                let (name, rest) = rest.split_once("` (opcode ").expect("generated doc shape");
+                let (opcode, rest) = rest.split_once(')').expect("generated doc shape");
+                assert_eq!(
+                    rest, tail,
+                    "the scan of {interface} was handed a module that documents \
+                     a different interface (or the generated doc shape moved)"
+                );
+                pending = Some((name.to_string(), opcode.parse().expect("an opcode is a u8")));
+            } else if let Some(rest) = line.strip_prefix("pub const SINCE: u32 = ") {
+                // The first SINCE after a request's doc line is that
+                // request's; events carry their own doc line, which clears
+                // `pending` to None before theirs is reached.
+                if let Some((name, opcode)) = pending.take() {
+                    let since = rest
+                        .trim_end_matches(';')
+                        .parse()
+                        .expect("a since is a version integer");
+                    out.push((name, opcode, since));
+                }
+            } else if line.starts_with("/// Event `") {
+                pending = None;
+            }
+        }
+        out
+    }
+
+    /// What `vitrin_grant` defines, through [`generated_requests`].
+    ///
+    /// `include_str!` rather than a runtime path: the test then cannot pass
+    /// because a file was missing, and it recompiles when the IDL is
+    /// regenerated. Every facet source below is included for the same
+    /// reason.
+    fn generated_grant_requests() -> Vec<(String, u8, u32)> {
+        generated_requests(
+            include_str!("../../vitrin-protocol/src/generated/vitrin_grant.rs"),
+            "vitrin_grant",
+        )
+    }
+
+    /// Every facet a `vitrin_grant` mint produces, as `(interface name,
+    /// that interface's generated source, a frame minting it at
+    /// `facet_id`)`.
+    ///
+    /// One list, consumed by both facet-level structural tests: the one
+    /// that says every defined request on a facet reaches an arm, and the
+    /// one that says everything past the defined requests stays a grammar
+    /// error. Neither writes an opcode down; each asks
+    /// [`generated_requests`] what the interface defines.
+    fn mintable_facets(facet_id: u32) -> Vec<(&'static str, &'static str, Vec<u8>)> {
+        vec![
+            (
+                "vitrin_launcher",
+                include_str!("../../vitrin-protocol/src/generated/vitrin_launcher.rs"),
+                get_launcher(facet_id),
+            ),
+            (
+                "vitrin_layout_focus",
+                include_str!("../../vitrin-protocol/src/generated/vitrin_layout_focus.rs"),
+                grant::requests::GetLayoutFocus {
+                    layout_focus: facet_id,
+                }
+                .encode(4),
+            ),
+            (
+                "vitrin_layout_arrange",
+                include_str!("../../vitrin-protocol/src/generated/vitrin_layout_arrange.rs"),
+                grant::requests::GetLayoutArrange {
+                    layout_arrange: facet_id,
+                }
+                .encode(4),
+            ),
+            (
+                "vitrin_powerbox",
+                include_str!("../../vitrin-protocol/src/generated/vitrin_powerbox.rs"),
+                get_powerbox(facet_id),
+            ),
+            (
+                "vitrin_egress",
+                include_str!("../../vitrin-protocol/src/generated/vitrin_egress.rs"),
+                get_egress(facet_id),
+            ),
+        ]
+    }
+
+    /// The facet interfaces this core mints, and how many requests each
+    /// defines **today** -- the non-vacuity floor for the two facet-level
+    /// structural tests, which would otherwise pass by scanning nothing.
+    ///
+    /// A count, not a list of opcodes: the count is what proves the scraper
+    /// still matches the generated doc shape, while *which* opcodes are
+    /// defined stays derived. Appending a request to one of these
+    /// interfaces makes this assertion fail with a message telling the
+    /// author to raise the count -- and the tests below then cover the new
+    /// request without any further edit here.
+    const FACET_REQUEST_COUNTS: &[(&str, usize)] = &[
+        ("vitrin_launcher", 1),
+        ("vitrin_layout_focus", 1),
+        ("vitrin_layout_arrange", 1),
+        ("vitrin_powerbox", 2),
+        ("vitrin_egress", 1),
+    ];
+
+    /// Scan one facet's generated module and check the scan against
+    /// [`FACET_REQUEST_COUNTS`] before anything is asserted from it.
+    fn facet_requests(interface: &str, generated: &str) -> Vec<(String, u8, u32)> {
+        let requests = generated_requests(generated, interface);
+        let (_, expected) = FACET_REQUEST_COUNTS
+            .iter()
+            .find(|(name, _)| *name == interface)
+            .unwrap_or_else(|| panic!("{interface} is not in FACET_REQUEST_COUNTS"));
+        assert_eq!(
+            requests.len(),
+            *expected,
+            "the scan of the generated {interface} found {} request(s), not {expected}: \
+             either a request was appended (raise the count -- the tests below then \
+             cover it automatically) or the generated doc shape changed and the scan, \
+             not the protocol, is what is broken",
+            requests.len()
+        );
+        requests
+    }
+
+    /// **THE test that makes this defect class unrepeatable.**
+    ///
+    /// Issue #322's defect was not "two opcodes were forgotten". It was
+    /// that a mint could be appended to `vitrin_grant` -- vocabulary only,
+    /// no arm -- and every existing test stayed green while a conformant
+    /// version-2 client that sent it was disconnected. It happened twice, on
+    /// two parallel branches (P2.6.5's `get_powerbox`, P2.7.2's
+    /// `get_egress`), which is the mechanism to expect for every future
+    /// append rather than an accident peculiar to those two.
+    ///
+    /// So this asserts the general property directly: **every request
+    /// `vitrin_grant` defines at the negotiated version reaches a dispatch
+    /// arm.** The opcode set is derived from the generated protocol crate
+    /// ([`generated_grant_requests`]), never written down here, so a sixth
+    /// mint is covered the moment it is generated and needs no edit to this
+    /// file to be noticed.
+    ///
+    /// The probe is a **bare header** at each opcode, which is what lets one
+    /// loop cover requests whose argument lists this test knows nothing
+    /// about. An opcode with an arm answers the empty payload with a decode
+    /// failure (`oversized`, the truncation code -- grammar about the
+    /// *payload*); an opcode with no arm falls to the catch-all and answers
+    /// `invalid_opcode` -- grammar about the *request*, and the fatal
+    /// conformance defect. The two are distinguished by violation variant,
+    /// not by wire code, so the assertion says exactly what it means.
+    #[test]
+    fn every_since_2_mint_on_a_grant_has_a_dispatch_arm() {
+        let _fd = crate::capture::tests::fd_lock();
+        let requests = generated_grant_requests();
+        // The scraper is load-bearing, so it is checked before it is
+        // trusted: if it silently matched nothing this test would pass
+        // vacuously, which is precisely the failure mode it exists to
+        // prevent elsewhere.
+        assert!(
+            requests.len() >= 5,
+            "the scan of the generated vitrin_grant found {} request(s); it \
+             found five when this test was written, so the generated file's \
+             doc-comment shape has changed and the scan -- not the protocol \
+             -- is what is broken",
+            requests.len()
+        );
+        for (name, opcode, since) in [
+            ("get_launcher", grant::requests::GetLauncher::OPCODE, 2u32),
+            (
+                "get_layout_focus",
+                grant::requests::GetLayoutFocus::OPCODE,
+                2,
+            ),
+            (
+                "get_layout_arrange",
+                grant::requests::GetLayoutArrange::OPCODE,
+                2,
+            ),
+            ("get_powerbox", grant::requests::GetPowerbox::OPCODE, 2),
+            ("get_egress", grant::requests::GetEgress::OPCODE, 2),
+        ] {
+            assert!(
+                requests.contains(&(name.to_string(), opcode, since)),
+                "the scan did not find {name} at opcode {opcode} since {since}"
+            );
+        }
+
+        let verifier = demo_verifier();
+        for (name, opcode, since) in requests {
+            if since > vitrin_protocol::generated::PROTOCOL_VERSION {
+                // Not defined on any connection this core will negotiate, so
+                // `invalid_opcode` is the correct answer for it and no arm
+                // is owed. Unreachable today (PROTOCOL_VERSION is the newest
+                // version the IDL has), and written out so that a future
+                // since="3" request does not make this test demand an arm
+                // for a request the negotiated version does not define.
+                continue;
+            }
+            let (mut server, mut core, mut client, mut shared) = granted_rig(&verifier, 0, 0);
+            client.send_message(&bare_header(4, opcode), None).unwrap();
+            let result = process_n(&mut server, &mut core, &verifier, &mut shared, 1);
+            match result {
+                Err(PrincipalFault::Violation(PrincipalViolation::UnknownOpcode { .. })) => {
+                    panic!(
+                        "vitrin_grant.{name} (opcode {opcode}, since {since}) is defined at \
+                         the version this core negotiates and has NO dispatch arm: a \
+                         conformant client that sends it is answered fatal invalid_opcode \
+                         and disconnected. Add the arm (see handle_get_powerbox), the \
+                         facet's ObjectKind, its live-object cap, and -- if the mint \
+                         produces a facet -- that facet's own request arms, which is the \
+                         same defect one level down. Issue #322."
+                    )
+                }
+                // A decode failure on the empty payload: the arm exists and
+                // rejected the frame on its arguments, which is grammar
+                // about the payload and exactly what a bare header deserves.
+                Err(PrincipalFault::Violation(PrincipalViolation::Malformed { .. })) => {}
+                // A mint that takes no arguments at all would succeed on an
+                // empty payload. None does today; admitted rather than
+                // failed, because "the arm exists" is the whole claim.
+                Ok(()) => {}
+                other => {
+                    panic!("vitrin_grant.{name} (opcode {opcode}) answered unexpectedly: {other:?}")
+                }
+            }
+        }
+    }
+
+    /// A rig whose grant is granted and which already holds one powerbox
+    /// facet (id 9) and one egress facet (id 10).
+    fn designation_rig(
+        verifier: &dyn Verifier,
+    ) -> (PrincipalServer, Connection, Connection, Shared) {
+        let (mut server, mut core, mut client, mut shared) = granted_rig(verifier, 0, 0);
+        client.send_message(&get_powerbox(9), None).unwrap();
+        client.send_message(&get_egress(10), None).unwrap();
+        process_n(&mut server, &mut core, verifier, &mut shared, 2).expect("both mints are legal");
+        (server, core, client, shared)
+    }
+
+    /// **The trap this issue is really about**: minting a facet whose own
+    /// requests nothing dispatches reproduces the identical defect one level
+    /// down. A `vitrin_powerbox` would exist, and `request_file` on it would
+    /// fall to a catch-all and kill the connection.
+    ///
+    /// Both asks are refused **recoverably**, and the code is
+    /// `not_granted` rather than anything else. `unsupported` is not
+    /// available and its absence is structural, not an oversight: it is an
+    /// entry of the petition `outcome` enum, and `vitrin_grant.refusal` --
+    /// the enum a `refused` event carries -- has no such entry at all. The
+    /// IDL's `not_granted` covers this case by name ("the verb is outside
+    /// its effective set"), and the IDL's own reachability note for
+    /// designation lists exactly the codes it reaches: "DESIGNATION reaches
+    /// the grant-lifecycle four (not_granted, expired, revoked,
+    /// rate_limited) and internal".
+    ///
+    /// It arrives at the chokepoint's step 4 for a reason no deployment can
+    /// vary today: `designate_file` is outside `SERVED_VERB_BITS`, so a
+    /// petition naming it resolves `unsupported` whole and no row can carry
+    /// the bit.
+    #[test]
+    fn designation_asks_refuse_not_granted_and_leave_the_socket_alive() {
+        let _fd = crate::capture::tests::fd_lock();
+        let verifier = demo_verifier();
+        let (mut server, mut core, mut client, mut shared) = designation_rig(&verifier);
+        assert_eq!(
+            Verb::DESIGNATE_FILE.bits() & crate::grants::SERVED_VERB_BITS,
+            0,
+            "SERVED_VERB_BITS gained `designate_file` without the picker \
+             (P2.6.6) or the consent copy (P2.6.8) that would make the \
+             refusal below the wrong assertion"
+        );
+        // Both asks, and both of each: a designation ask is reply-bearing,
+        // so its refusals are never coalesced (IDL: "EXACTLY ONE terminal
+        // per request, in request order, never coalesced"), unlike an
+        // actuation's.
+        client
+            .send_message(&request_file(9, powerbox::Mode::Read), None)
+            .unwrap();
+        client
+            .send_message(&request_file(9, powerbox::Mode::ReadWrite), None)
+            .unwrap();
+        client.send_message(&request_dir(9), None).unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 3)
+            .expect("an authority answer never kills the connection");
+        for _ in 0..3 {
+            expect_refused(&mut client, 4, Verb::DESIGNATE_FILE, Refusal::NotGranted);
+        }
+        // ALIVE AND USABLE, not merely "a refusal was emitted": the fence
+        // proves the connection still serves a request after all three, and
+        // that nothing else was queued behind them.
+        sync_fence(
+            &mut server,
+            &mut core,
+            &mut client,
+            &verifier,
+            &mut shared,
+            33,
+        );
+    }
+
+    /// The egress half of
+    /// [`designation_asks_refuse_not_granted_and_leave_the_socket_alive`].
+    /// The IDL is explicit about the code and about what is NOT reachable:
+    /// "EGRESS reaches the grant-lifecycle four (not_granted, expired,
+    /// revoked, rate_limited) and internal, and NOTHING ELSE."
+    #[test]
+    fn request_connect_refuses_not_granted_and_leaves_the_socket_alive() {
+        let _fd = crate::capture::tests::fd_lock();
+        let verifier = demo_verifier();
+        let (mut server, mut core, mut client, mut shared) = designation_rig(&verifier);
+        assert_eq!(
+            Verb::EGRESS.bits() & crate::grants::SERVED_VERB_BITS,
+            0,
+            "SERVED_VERB_BITS gained `egress` without the out-of-core \
+             mediating proxy (P2.7.3) that would make the refusal below the \
+             wrong assertion"
+        );
+        // The endpoint is legal grammar and irrelevant to the answer: the
+        // chokepoint refuses at step 4, before any endpoint could be
+        // compared against what the grant covers.
+        client
+            .send_message(&request_connect(10, "example.com", 443), None)
+            .unwrap();
+        client
+            .send_message(&request_connect(10, "example.com", 1), None)
+            .unwrap();
+        client
+            .send_message(&request_connect(10, "example.com", 65_535), None)
+            .unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 3)
+            .expect("an authority answer never kills the connection");
+        for _ in 0..3 {
+            expect_refused(&mut client, 4, Verb::EGRESS, Refusal::NotGranted);
+        }
+        sync_fence(
+            &mut server,
+            &mut core,
+            &mut client,
+            &verifier,
+            &mut shared,
+            34,
+        );
+    }
+
+    /// **A pending grant refuses its facets' uses too**, and it is the same
+    /// `not_granted`: "use while pending, through an ungranted facet, or
+    /// after any non-granted resolution" is one entry in the IDL's refusal
+    /// enum. The mint stayed legal while pending (see
+    /// [`get_egress_mints_an_inert_facet_and_never_kills_the_connection`]);
+    /// this is the other half -- born inert means the object exists and
+    /// confers nothing.
+    #[test]
+    fn a_designation_ask_through_a_pending_grants_facet_refuses_not_granted() {
+        let _fd = crate::capture::tests::fd_lock();
+        let verifier = demo_verifier();
+        let (mut server, mut core, mut client, mut shared) = setup();
+        bind_with_realm(&mut server, &mut core, &mut client, &verifier, &mut shared);
+        client
+            .send_message(&petition_frame().encode(3), None)
+            .unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1).unwrap();
+        expect_consent_state(&mut client, 5, ConsentState::Queued);
+        client.send_message(&get_powerbox(9), None).unwrap();
+        client.send_message(&get_egress(10), None).unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 2).unwrap();
+        client
+            .send_message(&request_file(9, powerbox::Mode::Read), None)
+            .unwrap();
+        client
+            .send_message(&request_connect(10, "example.com", 443), None)
+            .unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 2)
+            .expect("a use of a pending grant is an answer, not a violation");
+        expect_refused(&mut client, 4, Verb::DESIGNATE_FILE, Refusal::NotGranted);
+        expect_refused(&mut client, 4, Verb::EGRESS, Refusal::NotGranted);
+        sync_fence(
+            &mut server,
+            &mut core,
+            &mut client,
+            &verifier,
+            &mut shared,
+            35,
+        );
+    }
+
+    /// The IDL's normative port domain: "a port outside 1-65535
+    /// (`invalid_argument`). The port rule is argument validation the
+    /// decoder cannot do, exactly like request_grant's non-zero-verbs rule,
+    /// and it is FATAL where the same mistake inside a `net:` selector
+    /// resolves `unsupported`."
+    ///
+    /// So this is the one place a `request_connect` kills a connection, and
+    /// it kills it for **grammar** rather than for authority -- which is why
+    /// the refusal tests above and this one have to sit side by side: the
+    /// razor's whole content is which side of it a given failure lands on.
+    #[test]
+    fn request_connect_port_outside_the_idls_domain_is_fatal_invalid_argument() {
+        let _fd = crate::capture::tests::fd_lock();
+        let verifier = demo_verifier();
+        for bad_port in [0u32, 65_536, u32::MAX] {
+            let (mut server, mut core, mut client, mut shared) = designation_rig(&verifier);
+            client
+                .send_message(&request_connect(10, "example.com", bad_port), None)
+                .unwrap();
+            expect_violation(
+                process_n(&mut server, &mut core, &verifier, &mut shared, 1),
+                "outside 1-65535",
+            );
+            expect_error(&mut client, WireError::InvalidArgument);
+        }
+    }
+
+    /// A structural mint's only failure modes are the object graph's
+    /// (conventions §3.1/§6): a `new_id` at or below the watermark is fatal
+    /// `invalid_object`, exactly as `get_realm`'s and `get_launcher`'s are.
+    /// The rig's watermark is 8 (the petition's fifth co-minted id).
+    #[test]
+    fn get_powerbox_and_get_egress_mint_under_the_watermark_rule() {
+        let _fd = crate::capture::tests::fd_lock();
+        let verifier = demo_verifier();
+        for bad_id in [8u32, 4, 1] {
+            for frame in [get_powerbox(bad_id), get_egress(bad_id)] {
+                let (mut server, mut core, mut client, mut shared) = granted_rig(&verifier, 0, 0);
+                client.send_message(&frame, None).unwrap();
+                expect_violation(
+                    process_n(&mut server, &mut core, &verifier, &mut shared, 1),
+                    "invalid_object",
+                );
+                expect_error(&mut client, WireError::InvalidObject);
+            }
+        }
+    }
+
+    /// The IDL permits minting a second, equivalent facet on the same grant
+    /// and says what bounds the repetition: "the per-connection live-object
+    /// cap". No version defines a destructor, so every mint is a permanent
+    /// per-connection allocation and the breach is fatal
+    /// `resource_exhausted` -- the launcher's bound and the launcher's
+    /// confinement, applied to each of the two new facets.
+    #[test]
+    fn powerbox_facets_are_bounded_by_the_live_object_cap() {
+        let _fd = crate::capture::tests::fd_lock();
+        let verifier = demo_verifier();
+        let (mut server, mut core, mut client, mut shared) = granted_rig(&verifier, 0, 0);
+        for i in 0..MAX_LIVE_POWERBOXES as u32 {
+            client.send_message(&get_powerbox(9 + i), None).unwrap();
+        }
+        process_n(
+            &mut server,
+            &mut core,
+            &verifier,
+            &mut shared,
+            MAX_LIVE_POWERBOXES,
+        )
+        .expect("every mint up to the cap is legal");
+        client
+            .send_message(&get_powerbox(9 + MAX_LIVE_POWERBOXES as u32), None)
+            .unwrap();
+        expect_violation(
+            process_n(&mut server, &mut core, &verifier, &mut shared, 1),
+            "live-powerbox cap",
+        );
+        expect_error(&mut client, WireError::ResourceExhausted);
+    }
+
+    #[test]
+    fn egress_facets_are_bounded_by_the_live_object_cap() {
+        let _fd = crate::capture::tests::fd_lock();
+        let verifier = demo_verifier();
+        let (mut server, mut core, mut client, mut shared) = granted_rig(&verifier, 0, 0);
+        for i in 0..MAX_LIVE_EGRESS_FACETS as u32 {
+            client.send_message(&get_egress(9 + i), None).unwrap();
+        }
+        process_n(
+            &mut server,
+            &mut core,
+            &verifier,
+            &mut shared,
+            MAX_LIVE_EGRESS_FACETS,
+        )
+        .expect("every mint up to the cap is legal");
+        client
+            .send_message(&get_egress(9 + MAX_LIVE_EGRESS_FACETS as u32), None)
+            .unwrap();
+        expect_violation(
+            process_n(&mut server, &mut core, &verifier, &mut shared, 1),
+            "live-egress-facet cap",
+        );
+        expect_error(&mut client, WireError::ResourceExhausted);
+    }
+
+    /// The two caps are **separate counters**, not one pooled bound. The
+    /// layout pair pools [`MAX_LIVE_LAYOUT_FACETS`] because it is one
+    /// authority class split across two interfaces by `interface/@verb`'s
+    /// one-verb rule; a powerbox and an egress facet are two authority
+    /// classes, so each counts against its own bound like the launcher does.
+    /// Asserted rather than described: a shared counter would let a
+    /// connection at the powerbox cap be refused an egress mint it is
+    /// entitled to.
+    #[test]
+    fn the_powerbox_and_egress_caps_do_not_share_a_counter() {
+        let _fd = crate::capture::tests::fd_lock();
+        let verifier = demo_verifier();
+        let (mut server, mut core, mut client, mut shared) = granted_rig(&verifier, 0, 0);
+        for i in 0..MAX_LIVE_POWERBOXES as u32 {
+            client.send_message(&get_powerbox(9 + i), None).unwrap();
+        }
+        process_n(
+            &mut server,
+            &mut core,
+            &verifier,
+            &mut shared,
+            MAX_LIVE_POWERBOXES,
+        )
+        .expect("every powerbox up to its own cap is legal");
+        // The powerbox counter is full; the egress counter is untouched.
+        let next = 9 + MAX_LIVE_POWERBOXES as u32;
+        client.send_message(&get_egress(next), None).unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1)
+            .expect("an egress mint is not bounded by the powerbox cap");
+        assert_eq!(
+            server.objects.get(&next),
+            Some(&ObjectKind::Egress { grant: 4 })
+        );
+        // And neither is bounded by the launcher's or the layout pair's.
+        client.send_message(&get_launcher(next + 1), None).unwrap();
+        process_n(&mut server, &mut core, &verifier, &mut shared, 1)
+            .expect("a launcher mint is not bounded by the powerbox cap either");
+    }
+
+    /// A bare header -- header only, no argument payload -- addressed to
+    /// `object_id` at `opcode`. The probe both facet-level structural tests
+    /// use: it needs to know nothing about an interface's argument lists,
+    /// which is what lets one loop cover every request a facet defines.
+    fn bare_header(object_id: u32, opcode: u8) -> Vec<u8> {
+        let mut frame = Vec::new();
+        vitrin_protocol::wire::FrameHeader {
+            object_id,
+            size: 0,
+            opcode,
+            fd_count: 0,
+        }
+        .encode_with_placeholder_size(&mut frame);
+        vitrin_protocol::wire::patch_size(&mut frame);
+        frame
+    }
+
+    /// **THE sibling of [`every_since_2_mint_on_a_grant_has_a_dispatch_arm`],
+    /// one level down -- which is where issue #322's body says the trap
+    /// really is.**
+    ///
+    /// The mint-level test proves a grant's own requests reach an arm. It
+    /// says nothing about the facet that mint produces, and every facet arm
+    /// ends `_ => Err(UnknownOpcode)`: append a `since="3"` request to
+    /// `vitrin_powerbox` with no arm beside it and a conformant client that
+    /// sends it is answered fatal `invalid_opcode` and disconnected -- the
+    /// identical defect, in the code that fixed it.
+    ///
+    /// So this asserts the same property for every facet a grant can mint:
+    /// **every request the interface defines at the negotiated version
+    /// reaches a dispatch arm.** The opcode set per facet is scraped from
+    /// that interface's generated module ([`facet_requests`]), never written
+    /// down here, and the probe is the same bare header for the same
+    /// reason: an arm rejects the empty payload on its *arguments*
+    /// ([`PrincipalViolation::Malformed`], or admits it and answers a
+    /// refusal), while no arm falls to the catch-all
+    /// ([`PrincipalViolation::UnknownOpcode`]). Distinguished by violation
+    /// variant, not by wire code.
+    #[test]
+    fn every_request_on_a_minted_facet_has_a_dispatch_arm() {
+        let _fd = crate::capture::tests::fd_lock();
+        let verifier = demo_verifier();
+        for (interface, generated, mint) in mintable_facets(9) {
+            for (name, opcode, since) in facet_requests(interface, generated) {
+                if since > vitrin_protocol::generated::PROTOCOL_VERSION {
+                    // Not defined on any connection this core negotiates, so
+                    // `invalid_opcode` is the correct answer and no arm is
+                    // owed -- the same carve-out the mint-level test makes,
+                    // unreachable for the same reason.
+                    continue;
+                }
+                let (mut server, mut core, mut client, mut shared) = granted_rig(&verifier, 0, 0);
+                client.send_message(&mint, None).unwrap();
+                process_n(&mut server, &mut core, &verifier, &mut shared, 1)
+                    .expect("a structural mint is always legal");
+                client.send_message(&bare_header(9, opcode), None).unwrap();
+                match process_n(&mut server, &mut core, &verifier, &mut shared, 1) {
+                    Err(PrincipalFault::Violation(PrincipalViolation::UnknownOpcode {
+                        ..
+                    })) => {
+                        panic!(
+                            "{interface}.{name} (opcode {opcode}, since {since}) is defined at \
+                             the version this core negotiates and has NO dispatch arm on the \
+                             facet: a conformant client that sends it is answered fatal \
+                             invalid_opcode and disconnected. Add the arm beside the others \
+                             in this facet's ObjectKind, funnelling through serve_facet_use \
+                             so the answer is an authority judgement and not a grammar \
+                             error. Issue #322."
+                        )
+                    }
+                    // The arm exists and rejected the empty payload on its
+                    // arguments: grammar about the payload, which is what a
+                    // bare header deserves.
+                    Err(PrincipalFault::Violation(PrincipalViolation::Malformed { .. })) => {}
+                    // A request with no arguments at all decodes from a bare
+                    // header and reaches the chokepoint, which refuses it
+                    // recoverably (no facet verb is served by this build).
+                    // Admitted rather than failed: "the arm exists" is the
+                    // whole claim.
+                    Ok(()) => {}
+                    other => panic!("{interface}.{name} (opcode {opcode}) answered: {other:?}"),
+                }
+            }
+        }
+    }
+
+    /// Unknown opcodes on a minted facet stay grammar errors, exactly as
+    /// they do on a grant: everything past what the interface defines is
+    /// fatal `invalid_opcode` -- grammar, never an authority judgement.
+    ///
+    /// The probes are derived from what
+    /// [`generated_requests`] scrapes rather than from a literal array, so
+    /// **membership** is derived and not only the opcode values: a request
+    /// appended to any facet cannot leave this test asserting that a
+    /// defined opcode is undefined. Its own doc comment used to claim that
+    /// while the membership sat in a hand-written array beside it -- the
+    /// defect class #322 is about, inside #322's own fix.
+    #[test]
+    fn unknown_opcodes_on_every_minted_facet_stay_grammar_errors() {
+        let _fd = crate::capture::tests::fd_lock();
+        let verifier = demo_verifier();
+        for (interface, generated, mint) in mintable_facets(9) {
+            let mut opcodes: Vec<u8> = facet_requests(interface, generated)
+                .iter()
+                .map(|(_, opcode, _)| *opcode)
+                .collect();
+            opcodes.sort_unstable();
+            // Contiguity from 0 is what makes "one past the last" the FIRST
+            // undefined opcode rather than merely an undefined one.
+            for (i, opcode) in opcodes.iter().enumerate() {
+                assert_eq!(usize::from(*opcode), i, "{interface}'s opcodes have a hole");
+            }
+            let first_undefined = u8::try_from(opcodes.len()).expect("a count fits in a u8");
+            for opcode in [first_undefined, first_undefined + 7] {
+                let (mut server, mut core, mut client, mut shared) = granted_rig(&verifier, 0, 0);
+                client.send_message(&mint, None).unwrap();
+                process_n(&mut server, &mut core, &verifier, &mut shared, 1)
+                    .expect("a structural mint is always legal");
+                client.send_message(&bare_header(9, opcode), None).unwrap();
+                expect_violation(
+                    process_n(&mut server, &mut core, &verifier, &mut shared, 1),
+                    "invalid_opcode",
+                );
+                expect_error(&mut client, WireError::InvalidOpcode);
+            }
+        }
     }
 
     // -- acceptance: the version-2 launch facet (WS-E.1.1, issue #207) -----
@@ -5502,7 +6567,7 @@ pub(crate) mod tests {
     /// Assert the next client-visible event is `vitrin_launcher.launched`
     /// on the given facet, returning it for the realm-id assertion.
     fn expect_launched(client: &mut Connection, facet_id: u32) -> launcher::events::Launched {
-        let msg = client.recv_message().unwrap().unwrap();
+        let msg = recv_event(client, "a `launched`");
         assert!(msg.fd.is_none(), "launched carries no fd");
         let (object_id, ev) = launcher::events::Launched::decode(&msg.bytes, msg.fd)
             .expect("the terminal of a launch is `launched`");

@@ -35,18 +35,27 @@ no ambient reach for it to be a convenience over.
 petition naming the verb resolves `unsupported`, so no grant carries the bit,
 so a server that implements this facet refuses every use `not_granted`.
 
-**The reference core does not implement the facet at all yet, and that is
-stated rather than implied by the sentence above.** `vitrind` negotiates
-exactly version 2 but has no dispatch arm for
-[`get_powerbox`](./04-vitrin_grant.md#get_powerbox): sending it kills the
-connection with fatal `invalid_opcode`, so today the facet cannot be obtained
-from that core and therefore cannot refuse anything. That is a conformance gap
-in the reference implementation rather than a property of this interface, it
-is the first mint the IDL has declared without one, and it closes in **P2.6.6**
-alongside the picker. `crates/vitrin-core/src/principal.rs` pins the gap with a
-test that asserts the fatal answer, so the arm cannot land without this
-paragraph, the IDL's, and
-[page 04's](./04-vitrin_grant.md#get_powerbox) going with it.
+**The reference core implements the facet's messages, which is a different and
+much weaker claim than serving the verb.** Since issue #322 `vitrind`
+dispatches [`get_powerbox`](./04-vitrin_grant.md#get_powerbox),
+[`request_file`](#request_file) and [`request_dir`](#request_dir): the mint is
+always legal and puts nothing on the wire, each ask is decoded (an
+out-of-range `mode` is fatal `invalid_argument` from the decoder, as every enum
+argument is), and each is then refused
+[`refused(designate_file, not_granted)`](./04-vitrin_grant.md#refused) —
+recoverably, connection intact, which is the answer this interface's inertness
+is written to produce. No picker is raised, and **this interface's own
+[`refused`](#refused) event is unreachable in that build**, because that event
+belongs to an ask the chokepoint *allowed* and no ask is allowed anywhere.
+
+> **Until issue #322 there was no arm for any of the three**, so a conformant
+> version-2 client that minted this facet was answered fatal `invalid_opcode`
+> and disconnected for sending a documented request of the version that core
+> negotiates. Three paragraphs — this one, the IDL's and
+> [page 04's](./04-vitrin_grant.md#get_powerbox) — described the gap and a core
+> test pinned the fatal answer; none of them made the arm land. What replaced
+> them is structural: a core test derives `vitrin_grant`'s mint opcodes from
+> generated code and fails on any one of them no arm dispatches.
 
 **The verb's refusal** is the
 [defined-but-unserved](./04-vitrin_grant.md#defined-but-unserved)
@@ -463,6 +472,14 @@ nothing, and asking again is legal.
 
 The mint succeeds and the *use* refuses. Refusing at mint time would turn the
 mint into an oracle for what a grant holds.
+
+Since issue #322 this is exactly what the reference core does, rather than the
+shape a conforming server would have — and it is the answer for **every** verb
+set, not only `observe`, because no grant anywhere carries `designate_file`.
+The same four lines against a still-**pending** grant give the same answer:
+minting before resolution is legal, and "use while pending, through an
+ungranted facet" is one of the things
+[`not_granted`](./04-vitrin_grant.md#refusal) names.
 
 ## Growth
 

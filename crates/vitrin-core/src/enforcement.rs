@@ -19,6 +19,21 @@
 //! ([`vitrin_grant.get_launcher`](crate::principal)) stays structural and
 //! always legal; the *use* is what is judged.
 //!
+//! Since issue #322 the same funnel carries the last two use classes the
+//! IDL defines -- `vitrin_powerbox`'s `request_file`/`request_dir`
+//! ([`UseKind::Designate`]) and `vitrin_egress.request_connect`
+//! ([`UseKind::Egress`]) -- and neither can *succeed*: `designate_file` and
+//! `egress` are both outside
+//! [`SERVED_VERB_BITS`](crate::grants::SERVED_VERB_BITS), so no row carries
+//! either bit and step 4 refuses `not_granted`. That is the point of routing
+//! them here rather than leaving them undispatched. An undispatched request
+//! of the negotiated version is answered fatal `invalid_opcode` and the
+//! connection dies -- a *grammar* answer to an *authority* question, which
+//! is the fatal-vs-recoverable razor inverted. Routed here, "this deployment
+//! serves no picker / no proxy" is an answer the client survives and can act
+//! on, which is what every staged verb in this protocol is defined ahead of
+//! its mechanism in order to buy.
+//!
 //! # The one-path property (grep-provable)
 //!
 //! "Exactly one code path to the check" is this module's acceptance
@@ -308,6 +323,58 @@ pub(crate) enum UseKind {
     /// version 2): whether this grant's realm view tracks the output's
     /// size or keeps its own and is letterboxed.
     LayoutArrange(LayoutMode),
+    /// `vitrin_powerbox.request_file` and `vitrin_powerbox.request_dir`
+    /// (reply-bearing, since version 2): ask the human to designate one
+    /// file or one directory subtree.
+    ///
+    /// **One variant for both requests**, exactly as [`Self::Pointer`] is
+    /// one variant for `move`/`button`/`scroll`: the variant is the *verb*
+    /// (IDL `interface/@verb` is one value per interface), and both asks
+    /// exercise `designate_file`. Which of the two was asked is not carried
+    /// because nothing here reads it: the only answer this core can give is
+    /// a `vitrin_grant.refused(designate_file, …)`, whose payload is the
+    /// verb and the code, and terminals pair in request order so the client
+    /// already knows which ask it answered.
+    ///
+    /// **Its use is never admitted by this build.** `designate_file` is
+    /// outside [`SERVED_VERB_BITS`](crate::grants::SERVED_VERB_BITS), so no
+    /// petition naming it resolves `granted`, so no row carries the bit and
+    /// step 4 refuses `not_granted` before any use-context gate is reached.
+    /// The mint that produces the facet
+    /// ([`vitrin_grant.get_powerbox`](crate::principal)) is structural and
+    /// always legal, and the *ask* is what is judged -- the launcher's shape
+    /// exactly, one rung earlier in its life.
+    ///
+    /// Whoever lands the core-drawn picker (P2.6.6) owns the arguments this
+    /// variant does not carry -- `request_file`'s `mode`, and which of the
+    /// two asks it was, both of which the picker needs -- along with the
+    /// two use-context questions the IDL's `refusal` enum deliberately
+    /// leaves open for designation (`preempted` and `consent_held`; see
+    /// [`Self::contends_for_attention`]).
+    Designate,
+    /// `vitrin_egress.request_connect` (reply-bearing, since version 2):
+    /// open one outbound connection to the single endpoint this grant's
+    /// `net:` resource selector names.
+    ///
+    /// **The endpoint is not carried**, and that is a statement about what
+    /// this build can do rather than about the protocol. The IDL is explicit
+    /// that the chokepoint compares what the request names against what the
+    /// grant covers and that the comparison "can only ever narrow" -- but
+    /// `egress` is outside
+    /// [`SERVED_VERB_BITS`](crate::grants::SERVED_VERB_BITS), so no row can
+    /// carry the bit, step 4 refuses `not_granted` first, and an endpoint
+    /// travelling to a comparison that cannot run would be a field with no
+    /// reader. Whoever lands the out-of-core mediating proxy (P2.7.3) adds
+    /// the endpoint here and the comparison at the gate, in the same change:
+    /// serving the verb without it would grant reach to every endpoint from
+    /// a grant that named one.
+    ///
+    /// The *grammar* of the endpoint is still enforced, and stays where
+    /// grammar lives -- [`crate::principal`]'s dispatch checks the IDL's
+    /// `port` domain (1-65535, fatal `invalid_argument`) that the generated
+    /// decoder cannot, exactly as it checks `request_grant`'s non-zero-verbs
+    /// rule.
+    Egress,
 }
 
 /// The arrangement a `set_fullscreen` asks for, re-stated in core terms so
@@ -353,15 +420,50 @@ impl UseKind {
             UseKind::Launch => Verb::REALM_LAUNCH,
             UseKind::LayoutFocus => Verb::LAYOUT_FOCUS,
             UseKind::LayoutArrange(_) => Verb::LAYOUT_ARRANGE,
+            UseKind::Designate => Verb::DESIGNATE_FILE,
+            UseKind::Egress => Verb::EGRESS,
         }
     }
 
     /// Whether refusals of this use MAY be coalesced (fire-and-forget
     /// actuations and layout requests) or are per-request terminals
-    /// (reply-bearing captures and launches) -- the delivery
-    /// classification, conventions §6.
+    /// (reply-bearing captures, launches, designation asks and connect
+    /// requests) -- the delivery classification, conventions §6.
+    ///
+    /// The reply-bearing list is the one that grows: `request_file`,
+    /// `request_dir` and `request_connect` each state "EXACTLY ONE terminal
+    /// per request, in request order, never coalesced" in their own IDL
+    /// descriptions, for the reason a capture's does -- a terminal that
+    /// coalesced away leaves the client waiting forever for a resource it
+    /// asked for.
     fn coalescible(&self) -> bool {
-        !matches!(self, UseKind::Capture | UseKind::Launch)
+        !matches!(
+            self,
+            UseKind::Capture | UseKind::Launch | UseKind::Designate | UseKind::Egress
+        )
+    }
+
+    /// Whether a realm with **no live view** refuses this use `no_surface`
+    /// (step 5a). Three of the six use classes are exempt, and each
+    /// exemption is normative in the IDL's `refusal` enum rather than an
+    /// implementation preference -- which is why they are gathered into one
+    /// named predicate instead of a `matches!` at the gate that a fourth
+    /// class could quietly miss:
+    ///
+    /// * a **launch** ("a launch is never refused no_surface"): a vacant
+    ///   realm is the state `realm_launch` exists to leave;
+    /// * a **designation**: the descriptor is delivered to the realm's
+    ///   *shim*, which exists from the moment the realm does, whether or not
+    ///   its app has ever committed a surface;
+    /// * an **egress** connection ("That is a NORMATIVE exemption a server
+    ///   must implement, not an observation - the obvious implementation
+    ///   refuses every non-launch use with no live view, and egress joining
+    ///   that arm would be a bug"): a connection is not made to a window.
+    ///
+    /// Capture, both actuations and both layout verbs are refused, each for
+    /// the reason the module docs give at step 5a.
+    fn refused_by_a_vacant_realm(&self) -> bool {
+        !matches!(self, UseKind::Launch | UseKind::Designate | UseKind::Egress)
     }
 
     /// Whether this use **contends for the human's attention**: it moves, or
@@ -378,6 +480,22 @@ impl UseKind {
     /// different -- the human's own signal, which *lifts* a refusal this
     /// predicate selects for. A free rename then; a permanent reading hazard
     /// in the one function where misreading it is most expensive.
+    ///
+    /// **Egress is excluded normatively; designation is excluded
+    /// vacuously, and the difference matters.** The IDL settles egress --
+    /// "It is never refused preempted or consent_held either ... an
+    /// outbound socket neither reaches the human's realm nor is visible to
+    /// the human". For designation it says the opposite: "WHAT IS NOT
+    /// SETTLED is preempted and consent_held ... P2.6.6 answers it when it
+    /// builds the picker; nothing here forecloses either answer, and a
+    /// server must not read the silence as licence to give either code a
+    /// third meaning." No answer is observable from this build either way,
+    /// because `designate_file` is unserved, so step 4 refuses
+    /// `not_granted` before any use of a powerbox facet reaches step 5 --
+    /// so excluding it here decides nothing and P2.6.6 still owns the
+    /// decision. Leaving it *in* would have been the choice that decides
+    /// something: it would put a code on the wire that the IDL says nobody
+    /// may assume yet.
     pub(crate) fn contends_for_attention(&self) -> bool {
         matches!(
             self,
@@ -399,6 +517,14 @@ impl UseKind {
     /// handed the launch arm `None` (and therefore `internal`) the moment
     /// the verb became servable. A **capture** is still excluded, which is
     /// what keeps the high-rate path free of the realm-name clone.
+    ///
+    /// A **designation** and an **egress** connection are excluded for the
+    /// same reason the clone is skipped for a capture and for no other:
+    /// nothing in this build reads a realm for them. Neither can be
+    /// admitted (both verbs are unserved), so the arm that would need the
+    /// realm does not exist yet. It will: a designation is delivered to the
+    /// realm's shim, so P2.6.6 moves `Designate` into this set in the same
+    /// change that gives it somewhere to deliver.
     pub(crate) fn names_a_realm(&self) -> bool {
         self.contends_for_attention() || matches!(self, UseKind::Launch)
     }
@@ -807,13 +933,14 @@ impl Chokepoint {
                 Err(reason) => break 'decide Err(Refuse::code(reason.into())),
             };
             // Step 5, use-context on live authority.
-            // 5a, no_surface -- capture and actuation alike: never a
-            // stale frame, and never input swallowed by a dead realm. A
-            // launch is exempt by the IDL's own reachability note: a
-            // vacant realm is the state `realm_launch` exists to leave,
-            // so refusing a launch `no_surface` would refuse it for
-            // being asked to do its job.
-            if !matches!(req.kind, UseKind::Launch) && live_view(env.realm_view).is_none() {
+            // 5a, no_surface -- capture, actuation and layout alike: never
+            // a stale frame, and never input swallowed by a dead realm.
+            // Three classes are exempt and the predicate names all three
+            // with the IDL clause behind each; it used to be an inline
+            // `!matches!(_, Launch)` here, which is exactly the shape that
+            // would have swept a later exempt class into the refusing arm
+            // without anyone reading the sentence that forbids it.
+            if req.kind.refused_by_a_vacant_realm() && live_view(env.realm_view).is_none() {
                 break 'decide Err(Refuse::code(Refusal::NoSurface));
             }
             if req.kind.contends_for_attention() {
@@ -1177,6 +1304,42 @@ impl Chokepoint {
                     }
                 }
             }
+            // **Unreachable, and refused rather than asserted.** Neither
+            // `designate_file` nor `egress` is in
+            // [`SERVED_VERB_BITS`](crate::grants::SERVED_VERB_BITS), so no
+            // petition naming either resolves `granted`, so no row carries
+            // the bit and step 4 refused `not_granted` long before here.
+            // Reaching this arm would mean a verb was served without the
+            // mechanism behind it -- the exact condition the IDL forbids
+            // ("a deployment MUST NOT grant a verb it does not enforce") --
+            // so it answers the IDL's `internal`, recoverable and never
+            // coalesced, on precisely the terms the capture path's
+            // unreachable readback failure does: fail closed, never a
+            // panic, and never a fabricated success.
+            //
+            // This is the arm P2.6.6 (the core-drawn picker) and P2.7.3
+            // (the out-of-core mediating proxy) replace with a mechanism.
+            // Written out rather than left to a wildcard so that neither can
+            // land by widening `SERVED_VERB_BITS` alone: the verb becomes
+            // servable and this arm still refuses, loudly, in the log.
+            UseKind::Designate | UseKind::Egress => {
+                tracing::warn!(
+                    ?verb,
+                    "a use of an unserved verb was admitted; refusing internal"
+                );
+                let voiced = self.voice_refusal(
+                    req.grant_wire_id,
+                    verb,
+                    Refuse::code(Refusal::Internal),
+                    false,
+                    now,
+                    send,
+                )?;
+                Ok(UseOutcome::Refused {
+                    code: Refusal::Internal,
+                    voiced,
+                })
+            }
         }
     }
 
@@ -1191,30 +1354,34 @@ impl Chokepoint {
     /// invariant that `retry_after_ms` is nonzero only for
     /// `rate_limited`, in release builds too.
     ///
-    /// **This function is one voice for four of the IDL's six use
-    /// classes, not six**, and the missing two are named here rather than
-    /// left to be inferred from a `match` with no arm.
-    /// `vitrin_grant.refusal` enumerates capture, actuation, launch, the
-    /// layout verbs, **designation** and **egress**; [`UseKind`] has a
-    /// variant for the first four and for neither of the last two,
-    /// because this core dispatches none of `vitrin_grant.get_powerbox`,
-    /// `vitrin_powerbox`'s two asks, `vitrin_grant.get_egress` or
-    /// `vitrin_egress.request_connect` -- every one of them is answered
-    /// `invalid_opcode` today, which the IDL's own `vitrin_powerbox` and
-    /// `vitrin_egress` descriptions record as a gap between the document
-    /// and this binary. So no designation and no egress refusal is ever
-    /// built here, and in both cases the reason is an absent dispatch arm
-    /// rather than an exemption at the chokepoint. P2.6.6 (the core-drawn
-    /// picker) and the task that lands the out-of-core proxy own closing
-    /// the two halves.
+    /// **This function is one voice for all six of the IDL's use
+    /// classes.** `vitrin_grant.refusal` enumerates capture, actuation,
+    /// launch, the layout verbs, **designation** and **egress**, and
+    /// [`UseKind`] now has a variant for every one of them: P2.6.5's and
+    /// P2.7.2's facets reached the wire before this core had a dispatch
+    /// arm for their mints, so a conformant version-2 client that minted a
+    /// powerbox or an egress facet was answered fatal `invalid_opcode` and
+    /// disconnected, and no designation or egress refusal could be built
+    /// here because no such use could be decoded at all. Issue #322 closed
+    /// that: both mints and all three facet requests dispatch, and their
+    /// authority answer arrives through this one voice like every other.
     ///
-    /// That count read **five** until this commit, and why is worth
-    /// keeping: it was written here on the egress branch (P2.7.2) while
-    /// `designate_file` (P2.6.5) was landing on a parallel one, so the
-    /// IDL enumeration this comment restates had itself omitted
-    /// designation. Restating a normative list is only ever as sound as
-    /// the list -- which is why the number is spelled out here rather
-    /// than left as "every class `UseKind` does not cover".
+    /// What a designation or an egress refusal can *say* is still narrow,
+    /// and narrow for a reason that is not this function's: both verbs are
+    /// outside [`SERVED_VERB_BITS`](crate::grants::SERVED_VERB_BITS), so
+    /// every such use is refused `not_granted` at step 4 -- an authority
+    /// answer, recoverable, with the connection intact. The mechanisms
+    /// behind the two verbs (P2.6.6's core-drawn picker, P2.7.3's
+    /// out-of-core mediating proxy) are what widen that; a facet is a
+    /// request to ask through, never a mechanism to answer with.
+    ///
+    /// That count read **four** until issue #322 and **five** before that,
+    /// and why is worth keeping: the five was written here on the egress
+    /// branch (P2.7.2) while `designate_file` (P2.6.5) was landing on a
+    /// parallel one, so the IDL enumeration this comment restates had
+    /// itself omitted designation. Restating a normative list is only ever
+    /// as sound as the list -- which is why the number is spelled out here
+    /// rather than left as "every class `UseKind` does not cover".
     fn voice_refusal<F>(
         &mut self,
         grant_wire_id: u32,
@@ -1316,6 +1483,165 @@ mod tests {
 
     fn rate(n: u32) -> NonZeroU32 {
         NonZeroU32::new(n).unwrap()
+    }
+
+    // -- the use-classification predicates ----------------------------------
+
+    /// Every [`UseKind`] variant's name, indexed by [`use_kind_name`]'s
+    /// arms.
+    ///
+    /// The array is what makes the census in
+    /// [`each_use_kind_answers_every_classification_predicate_as_documented`]
+    /// binding rather than decorative: a new variant does not compile until
+    /// it has an arm below, that arm has to index a new entry here (a
+    /// constant index past the end of the array is a compile error, not a
+    /// silent pass), and the census then fails until the table carries a row
+    /// for the name. A hand-written list alone would let a new variant slip
+    /// in unclassified -- which is the shape of the defect these tests
+    /// exist to catch.
+    const USE_KIND_NAMES: [&str; 8] = [
+        "Capture",
+        "Pointer",
+        "Text",
+        "Launch",
+        "LayoutFocus",
+        "LayoutArrange",
+        "Designate",
+        "Egress",
+    ];
+
+    /// Name one variant. **No wildcard arm, deliberately.**
+    fn use_kind_name(kind: &UseKind) -> &'static str {
+        match kind {
+            UseKind::Capture => USE_KIND_NAMES[0],
+            UseKind::Pointer(_) => USE_KIND_NAMES[1],
+            UseKind::Text(_) => USE_KIND_NAMES[2],
+            UseKind::Launch => USE_KIND_NAMES[3],
+            UseKind::LayoutFocus => USE_KIND_NAMES[4],
+            UseKind::LayoutArrange(_) => USE_KIND_NAMES[5],
+            UseKind::Designate => USE_KIND_NAMES[6],
+            UseKind::Egress => USE_KIND_NAMES[7],
+        }
+    }
+
+    /// Which of the six classification predicates hold for `kind`, in one
+    /// fixed order, so a failure reads as a diff of predicate *names*.
+    fn predicates_that_hold(kind: &UseKind) -> Vec<&'static str> {
+        let mut held = Vec::new();
+        for (name, answer) in [
+            ("coalescible", kind.coalescible()),
+            (
+                "refused_by_a_vacant_realm",
+                kind.refused_by_a_vacant_realm(),
+            ),
+            ("contends_for_attention", kind.contends_for_attention()),
+            ("names_a_realm", kind.names_a_realm()),
+            ("is_layout", kind.is_layout()),
+            (
+                "delivered_through_the_seat",
+                kind.delivered_through_the_seat(),
+            ),
+        ] {
+            if answer {
+                held.push(name);
+            }
+        }
+        held
+    }
+
+    /// **The direct check the exemptions have no other way to get.**
+    ///
+    /// Each of these predicates is a `matches!` over the variants, and their
+    /// newest entries -- the `Designate` and `Egress` exemptions -- are
+    /// **unreachable end to end in this build**: `designate_file` and
+    /// `egress` are outside
+    /// [`SERVED_VERB_BITS`](crate::grants::SERVED_VERB_BITS), so step 4
+    /// refuses `not_granted` before any use of a powerbox or egress facet
+    /// reaches step 5's vacant-realm gate or the realm-name resolution.
+    /// Before this test existed, deleting both from
+    /// [`UseKind::refused_by_a_vacant_realm`] was measured to leave every
+    /// test in `principal` and in this module green -- documented behaviour
+    /// with zero detection, which is the defect class issue #322 is about.
+    ///
+    /// So the predicate's answer is asserted **per variant, directly**: the
+    /// only reachable check while the verbs are unserved, and the one that
+    /// stays exact when they are served. Each row lists EXACTLY the
+    /// predicates that hold; a predicate absent from a row must answer
+    /// false. The values restate the doc comment on each predicate, which
+    /// is what makes them worth asserting -- a mutation to the `matches!`
+    /// and its own doc comment disagree here.
+    #[test]
+    fn each_use_kind_answers_every_classification_predicate_as_documented() {
+        let motion = SeatInputKind::Motion { x: 0.0, y: 0.0 };
+        let typed = SeatInputKind::Text {
+            text: "a".to_string(),
+        };
+        let actuation = [
+            "coalescible",
+            "refused_by_a_vacant_realm",
+            "contends_for_attention",
+            "names_a_realm",
+            "delivered_through_the_seat",
+        ];
+        let layout = [
+            "coalescible",
+            "refused_by_a_vacant_realm",
+            "contends_for_attention",
+            "names_a_realm",
+            "is_layout",
+        ];
+        let rows: Vec<(UseKind, Vec<&'static str>)> = vec![
+            // A capture is reply-bearing (never coalesced), refused by a
+            // vacant realm, and names no realm: observation is concurrent
+            // by design and the high-rate path skips the realm-name clone.
+            (UseKind::Capture, vec!["refused_by_a_vacant_realm"]),
+            (UseKind::Pointer(motion), actuation.to_vec()),
+            (UseKind::Text(typed), actuation.to_vec()),
+            // A launch: reply-bearing, NEVER refused by a vacant realm ("a
+            // launch is never refused no_surface" -- that vacancy is the
+            // state it exists to leave), contends for nothing, and names
+            // the realm its template comes from.
+            (UseKind::Launch, vec!["names_a_realm"]),
+            (UseKind::LayoutFocus, layout.to_vec()),
+            (
+                UseKind::LayoutArrange(LayoutMode::Fullscreen),
+                layout.to_vec(),
+            ),
+            (
+                UseKind::LayoutArrange(LayoutMode::Windowed),
+                layout.to_vec(),
+            ),
+            // A designation ask and an egress connection: reply-bearing
+            // (a coalesced-away terminal leaves the client waiting forever
+            // for a resource it asked for), and exempt from every
+            // use-context question -- the descriptor goes to the realm's
+            // shim, which exists from the moment the realm does, and a
+            // connection is not made to a window.
+            (UseKind::Designate, Vec::new()),
+            (UseKind::Egress, Vec::new()),
+        ];
+
+        for (kind, want) in &rows {
+            assert_eq!(
+                &predicates_that_hold(kind),
+                want,
+                "{} classifies differently from its documented answer",
+                use_kind_name(kind)
+            );
+        }
+
+        // The census: every variant has a row. `use_kind_name`'s
+        // wildcard-free match is what keeps this honest -- see
+        // [`USE_KIND_NAMES`].
+        let covered: BTreeSet<&str> = rows.iter().map(|(kind, _)| use_kind_name(kind)).collect();
+        let all: BTreeSet<&str> = USE_KIND_NAMES.iter().copied().collect();
+        assert_eq!(
+            covered, all,
+            "every UseKind variant needs a row above: the predicates decide \
+             whether a vacant realm refuses it, whether its refusals coalesce \
+             and whether the chokepoint resolves its realm, and a variant with \
+             no row has had none of that asserted"
+        );
     }
 
     // -- the token bucket ---------------------------------------------------

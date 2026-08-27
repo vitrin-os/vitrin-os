@@ -533,7 +533,26 @@ impl ActuationDetail {
             // names the program and no command ever crosses the wire), so
             // there is nothing for the log to summarize beyond the verb
             // the `use_decision` entry already names.
-            UseKind::Capture | UseKind::Launch | UseKind::LayoutFocus => None,
+            //
+            // A **designation** ask and an **egress** connection have no
+            // variant either, and for a different reason that is stated
+            // rather than folded into the sentence above: they do carry
+            // arguments a log could summarize (`request_file`'s `mode`,
+            // `request_connect`'s host and port), but neither verb is
+            // served, so every such use is refused `not_granted` at the
+            // chokepoint's step 4 and the `use_decision` entry's verb,
+            // grant and refusal code already say the whole of what
+            // happened. Listed here rather than caught by a wildcard so
+            // that whoever serves the verb (P2.6.6's picker, P2.7.3's
+            // proxy) has to decide at this line what an audit entry may
+            // say about an ask that was actually carried out -- including
+            // that `request_connect`'s host is agent-chosen text, which
+            // this module escapes but never parses or trusts.
+            UseKind::Capture
+            | UseKind::Launch
+            | UseKind::LayoutFocus
+            | UseKind::Designate
+            | UseKind::Egress => None,
             UseKind::LayoutArrange(mode) => Some(Self::Arrange {
                 fullscreen: matches!(mode, crate::enforcement::LayoutMode::Fullscreen),
             }),

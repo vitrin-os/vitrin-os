@@ -837,16 +837,34 @@
         "not_granted", which is the defined-but-unserved staging and not a
         defect.
 
-        THE REFERENCE CORE DOES NOT IMPLEMENT THIS REQUEST YET, AND THAT IS
-        SAID HERE RATHER THAN LEFT TO BE DISCOVERED. vitrind negotiates
-        exactly version 2 and has no dispatch arm for this opcode, so a
-        get_powerbox sent to it is answered with fatal "invalid_opcode" and
-        the connection dies - not the mint-then-refuse above. It is a
-        conformance gap in that implementation rather than a property of
-        this request, it is the first mint this IDL has declared without
-        one, and it closes in P2.6.6 together with the picker. A core-side
-        test pins the gap by asserting the fatal answer, so the arm cannot
-        land without this paragraph being deleted in the same change.
+        THE REFERENCE CORE IS NOW SUCH A SERVER, and what it does is the
+        paragraph above and nothing extra. vitrind dispatches this opcode:
+        the mint succeeds whatever the grant holds and whether or not it
+        has resolved, the facet enters the object table bound to this
+        grant, nothing is put on the wire in answer, and every request_file
+        and request_dir asked through it draws
+        vitrin_grant.refused(designate_file, "not_granted") - recoverable,
+        connection intact. Only the object-graph rules can fail the mint,
+        fatally: a new_id that breaks the id rules, or a per-connection
+        live-object bound. What is still absent is the picker (P2.6.6) and
+        the consent copy (P2.6.8) that would let a petition naming
+        designate_file resolve granted at all, which is an absence in the
+        VERB rather than in this request.
+
+        IT WAS NOT, UNTIL ISSUE #322, AND THAT RECORD IS KEPT BECAUSE THE
+        FAILURE MODE IS GENERIC RATHER THAN THIS REQUEST'S. This request
+        reached the wire with no dispatch arm behind it, so a conformant
+        version-2 client that minted the facet was answered fatal
+        "invalid_opcode" and disconnected for sending a documented request
+        of the version that core negotiates - a grammar answer to a request
+        whose only honest answers are structural, which is the
+        fatal-vs-recoverable razor inverted. A paragraph here said so and a
+        core-side test pinned the fatal answer; neither made the arm land,
+        and prose that describes a defect is not a check that closes it.
+        What replaced both is structural: a core test derives this
+        interface's mint opcodes from generated code and fails on any one
+        of them no arm dispatches, so a later mint cannot land
+        vocabulary-only the way this one did.
       </description>
       <arg name="powerbox" type="new_id" interface="vitrin_powerbox" summary="the powerbox facet, born inert (confers nothing until this grant is granted with designate_file)"/>
     </request>
@@ -891,17 +909,20 @@
         deployment served realm_launch: minting is not an authority oracle,
         and a facet that refuses on first use leaks nothing.
 
-        NOT IMPLEMENTED BY THE REFERENCE CORE, which it is now the SECOND
-        mint on this interface to have to say - get_powerbox was the first,
-        and the two gaps are separately owned rather than one gap with two
-        names. Stated here rather than only
-        in the prose page, because a reader of this document would
-        otherwise reasonably infer that the shipped vitrind answers this
-        opcode as described above. It does not: its grant-object dispatch
-        has no arm for this request, so the opcode is answered
-        invalid_opcode and the connection dies - which is what "always
-        legal, never refusable" is written against. The gap belongs to
-        P2.7.3, which lands the core half together with the proxy.
+        IMPLEMENTED BY THE REFERENCE CORE, and exactly as the paragraph
+        above describes: vitrind's grant-object dispatch mints the facet,
+        answers nothing on the wire, and refuses every request_connect
+        asked through it not_granted, recoverably. Stated here rather than
+        only in the prose page, because this request and get_powerbox were
+        for a time the two mints in this document a reader could not assume
+        the shipped binary answered - both were on the wire with no arm
+        behind them, so both were answered fatal invalid_opcode and the
+        connection died, which is what "always legal, never refusable" is
+        written against. Issue #322 closed both, together with the two
+        facets' own requests, because a mint whose object serves no request
+        moves the identical defect one interface down. Nothing about the
+        VERB moved with them: egress is still served by nobody, and P2.7.3
+        still owns the proxy that would change that.
       </description>
       <arg name="egress" type="new_id" interface="vitrin_egress" summary="the egress facet, born inert (confers nothing until this grant is granted with egress, which no deployment does yet)"/>
     </request>
@@ -3189,6 +3210,21 @@
       is what makes a petition for it an answer rather than a connection
       death.
 
+      THE REFERENCE CORE IMPLEMENTS THESE MESSAGES, which is a different
+      and much weaker claim than serving the verb. vitrind dispatches
+      get_powerbox, request_file and request_dir: the mint is always legal
+      and silent, each ask is decoded (an out-of-range mode is fatal
+      "invalid_argument" from the decoder, as every enum argument is), and
+      each is then refused vitrin_grant.refused(designate_file,
+      "not_granted") - recoverably, connection intact, the answer this
+      interface's inertness is written to produce. No picker is raised and
+      this interface's own refused event is unreachable, because that event
+      belongs to an ask the chokepoint ALLOWED and no ask is allowed
+      anywhere. Until issue #322 there was no dispatch arm for any of the
+      three, so a conformant version-2 client that minted the facet was
+      answered fatal "invalid_opcode" and disconnected; see
+      vitrin_grant.get_powerbox, which carries the record.
+
       ONE VERB PER INTERFACE, AND WHERE THAT ALREADY DECIDED THE NEXT
       CHANGE. interface/@verb is one value, which is why this facet
       declares designate_file and why the layout pair is two interfaces
@@ -3426,15 +3462,25 @@
       get an answer rather than a dead socket, and a facet that refuses on
       first use leaks nothing about why.
 
-      THE REFERENCE CORE DOES NOT IMPLEMENT THESE MESSAGES AT ALL, which
-      is a stronger statement than the paragraph above and is stated
-      separately so it is not read as the same one. vitrind's dispatch has
-      no arm for get_egress or for request_connect: sending either today
-      is answered "invalid_opcode" and the connection dies, where this
+      THE REFERENCE CORE IMPLEMENTS THESE MESSAGES, which is a weaker
+      statement than the paragraph above and is kept separate so the two
+      are not read as one. vitrind dispatches get_egress and
+      request_connect: the mint is always legal and silent, the request's
+      grammar is checked (a port outside 1-65535 is fatal
+      "invalid_argument", the host bound is the decoder's), and the use is
+      then refused "not_granted" through vitrin_grant.refused, recoverably,
+      with the connection intact. That is the whole of what "implemented"
+      buys while no proxy exists: an answer instead of a dead socket.
+
+      UNTIL ISSUE #322 IT DID NOT, and the record stays because the gap was
+      a class of defect rather than an oversight about egress. Neither
+      get_egress nor request_connect had a dispatch arm, so both were
+      answered "invalid_opcode" and the connection died, where this
       document says the mint is always legal and the use refuses
-      recoverably. That is a gap between this document and the shipped
-      binary, owned by the task that lands the proxy, and it is written
-      here because a reader of the IDL has no other way to learn it.
+      recoverably. A reader of the IDL had no way to learn that except from
+      a paragraph here, and a paragraph is not a check: what closed it and
+      keeps it closed is a core test that derives vitrin_grant's mint
+      opcodes from generated code and fails on any that no arm dispatches.
 
       A SEPARATE INTERFACE FROM THE FILESYSTEM POWERBOX, and the dialect
       decides that rather than taste. interface/@verb is one value per

@@ -84,6 +84,45 @@ that gap is what D-047's routed conformance finding
 fatal `invalid_opcode`) is an instance of. **So: `docs/protocol/` is held to the IDL
 by CI, and the IDL is held to the core by nothing.** Declaring the prose to *be* a
 corrected spec 0.2 would have asserted the second half, which is not true.
+**The cited instance is gone and the second half is narrower than it was — see
+the block appended immediately below, which restates this paragraph rather than
+replacing it.**
+
+> **THE IDL AGAINST THE CORE, NARROWED — AMENDED 2026-08-27 BY [#322](https://github.com/vitrin-os/vitrin-os/issues/322).**
+> The paragraph above stands as written and its general claim is not overturned here.
+> What changed is its **evidence**: the parenthetical names `vitrin_grant.get_powerbox`
+> and `get_egress` as defined at version 2 and answered fatal `invalid_opcode`, and
+> #322 gave both a dispatch arm. Citing them as a live instance of the gap is now
+> wrong; citing the gap is not.
+>
+> **One interface's requests are held to the core, by one test.**
+> `every_since_2_mint_on_a_grant_has_a_dispatch_arm`, in
+> `crates/vitrin-core/src/principal.rs`, scrapes `(request, opcode, since)` out of the
+> checked-in generated `crates/vitrin-protocol/src/generated/vitrin_grant.rs` — which
+> `cargo xtask codegen --check` holds equal to `protocol/vitrin-v0.xml` — sends a bare
+> header at each opcode the negotiated version defines, and fails if the core answers
+> `UnknownOpcode` rather than a decode error. The opcode set is **derived, never
+> transcribed**, so a sixth mint appended to `vitrin_grant` is covered the moment it
+> is generated.
+>
+> **What that test is not, stated because overstating it would repeat the defect it
+> closes.** It covers `vitrin_grant`'s requests and no other interface's, and it
+> covers **requests only** — nothing in this workspace holds the core to the IDL's
+> *events*, and `vitrin_egress.connected` and `connect_failed` are defined at version
+> 2 with no code path in the core that emits either, a gap of exactly the same shape
+> uncaught by exactly the same absence. It asserts an arm **exists**, not that the arm
+> does what the interface's `<description>` says. And it is a `vitrin-core` unit test
+> rather than an `xtask` sweeping the IDL, so nothing carries it to the other
+> interfaces on its own.
+>
+> **So, restated as measured on 2026-08-27 against `7238908`:** `docs/protocol/` is
+> held to the IDL by CI, and the IDL is held to the core by **one test over one
+> interface's requests**. That is narrower than "by nothing" and a long way from
+> enough to declare a corrected spec, which is what the paragraph above was written
+> to refuse. Read the test before widening this sentence — the count of what is
+> covered is exactly the kind of claim that goes stale silently. This section's own
+> 1.0-candidate obligation — *"the conformance answer for defined-but-undispatched
+> requests"* — is untouched by #322 and still owed.
 
 **The ladder's own decision is still `proposed`.** [D-014](20-decision-log.md) —
 "Spec versions track the implementation" — has carried **Status: proposed** since it

@@ -667,8 +667,16 @@ down host has none. The ordering is normative (the chokepoint answers first), so
 this class is unreachable for a principal whose grant does not cover the
 endpoint; [§6.1](#61-reply-bearing-requests) states the same argument as a
 question about terminal sets. **Nothing serves it today**: `egress` is refused
-`unsupported` by every deployment, and the reference core dispatches
-`vitrin_egress` not at all.
+`unsupported` by every deployment, so no grant resolves `granted` carrying the
+verb and the chokepoint answers every `request_connect` `not_granted` before
+any host is dialled. Since issue #322 the reference core does **dispatch** the
+facet's messages — `get_egress` mints, always legal and silent; a `port`
+outside 1–65535 is fatal `invalid_argument`; the use is then refused
+recoverably, connection intact — which makes this event **unreachable** there
+rather than undispatched, since it belongs to a use the chokepoint admitted and
+no `egress` use is. Dispatch is not authority: the verb did not move, and
+P2.7.3 still owns the proxy that would serve it. See
+[`vitrin_egress`](19-vitrin_egress.md#nothing-serves-this-interface-read-this-section-first).
 
 **Shim fallback** — `vitrin_shim_surface.buffer_done(buffer_id, status)` with a
 non-`released` status is the recoverable dmabuf-import-fallback path

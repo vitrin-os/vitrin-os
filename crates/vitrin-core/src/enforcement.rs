@@ -1485,6 +1485,165 @@ mod tests {
         NonZeroU32::new(n).unwrap()
     }
 
+    // -- the use-classification predicates ----------------------------------
+
+    /// Every [`UseKind`] variant's name, indexed by [`use_kind_name`]'s
+    /// arms.
+    ///
+    /// The array is what makes the census in
+    /// [`each_use_kind_answers_every_classification_predicate_as_documented`]
+    /// binding rather than decorative: a new variant does not compile until
+    /// it has an arm below, that arm has to index a new entry here (a
+    /// constant index past the end of the array is a compile error, not a
+    /// silent pass), and the census then fails until the table carries a row
+    /// for the name. A hand-written list alone would let a new variant slip
+    /// in unclassified -- which is the shape of the defect these tests
+    /// exist to catch.
+    const USE_KIND_NAMES: [&str; 8] = [
+        "Capture",
+        "Pointer",
+        "Text",
+        "Launch",
+        "LayoutFocus",
+        "LayoutArrange",
+        "Designate",
+        "Egress",
+    ];
+
+    /// Name one variant. **No wildcard arm, deliberately.**
+    fn use_kind_name(kind: &UseKind) -> &'static str {
+        match kind {
+            UseKind::Capture => USE_KIND_NAMES[0],
+            UseKind::Pointer(_) => USE_KIND_NAMES[1],
+            UseKind::Text(_) => USE_KIND_NAMES[2],
+            UseKind::Launch => USE_KIND_NAMES[3],
+            UseKind::LayoutFocus => USE_KIND_NAMES[4],
+            UseKind::LayoutArrange(_) => USE_KIND_NAMES[5],
+            UseKind::Designate => USE_KIND_NAMES[6],
+            UseKind::Egress => USE_KIND_NAMES[7],
+        }
+    }
+
+    /// Which of the six classification predicates hold for `kind`, in one
+    /// fixed order, so a failure reads as a diff of predicate *names*.
+    fn predicates_that_hold(kind: &UseKind) -> Vec<&'static str> {
+        let mut held = Vec::new();
+        for (name, answer) in [
+            ("coalescible", kind.coalescible()),
+            (
+                "refused_by_a_vacant_realm",
+                kind.refused_by_a_vacant_realm(),
+            ),
+            ("contends_for_attention", kind.contends_for_attention()),
+            ("names_a_realm", kind.names_a_realm()),
+            ("is_layout", kind.is_layout()),
+            (
+                "delivered_through_the_seat",
+                kind.delivered_through_the_seat(),
+            ),
+        ] {
+            if answer {
+                held.push(name);
+            }
+        }
+        held
+    }
+
+    /// **The direct check the exemptions have no other way to get.**
+    ///
+    /// Each of these predicates is a `matches!` over the variants, and their
+    /// newest entries -- the `Designate` and `Egress` exemptions -- are
+    /// **unreachable end to end in this build**: `designate_file` and
+    /// `egress` are outside
+    /// [`SERVED_VERB_BITS`](crate::grants::SERVED_VERB_BITS), so step 4
+    /// refuses `not_granted` before any use of a powerbox or egress facet
+    /// reaches step 5's vacant-realm gate or the realm-name resolution.
+    /// Before this test existed, deleting both from
+    /// [`UseKind::refused_by_a_vacant_realm`] was measured to leave every
+    /// test in `principal` and in this module green -- documented behaviour
+    /// with zero detection, which is the defect class issue #322 is about.
+    ///
+    /// So the predicate's answer is asserted **per variant, directly**: the
+    /// only reachable check while the verbs are unserved, and the one that
+    /// stays exact when they are served. Each row lists EXACTLY the
+    /// predicates that hold; a predicate absent from a row must answer
+    /// false. The values restate the doc comment on each predicate, which
+    /// is what makes them worth asserting -- a mutation to the `matches!`
+    /// and its own doc comment disagree here.
+    #[test]
+    fn each_use_kind_answers_every_classification_predicate_as_documented() {
+        let motion = SeatInputKind::Motion { x: 0.0, y: 0.0 };
+        let typed = SeatInputKind::Text {
+            text: "a".to_string(),
+        };
+        let actuation = [
+            "coalescible",
+            "refused_by_a_vacant_realm",
+            "contends_for_attention",
+            "names_a_realm",
+            "delivered_through_the_seat",
+        ];
+        let layout = [
+            "coalescible",
+            "refused_by_a_vacant_realm",
+            "contends_for_attention",
+            "names_a_realm",
+            "is_layout",
+        ];
+        let rows: Vec<(UseKind, Vec<&'static str>)> = vec![
+            // A capture is reply-bearing (never coalesced), refused by a
+            // vacant realm, and names no realm: observation is concurrent
+            // by design and the high-rate path skips the realm-name clone.
+            (UseKind::Capture, vec!["refused_by_a_vacant_realm"]),
+            (UseKind::Pointer(motion), actuation.to_vec()),
+            (UseKind::Text(typed), actuation.to_vec()),
+            // A launch: reply-bearing, NEVER refused by a vacant realm ("a
+            // launch is never refused no_surface" -- that vacancy is the
+            // state it exists to leave), contends for nothing, and names
+            // the realm its template comes from.
+            (UseKind::Launch, vec!["names_a_realm"]),
+            (UseKind::LayoutFocus, layout.to_vec()),
+            (
+                UseKind::LayoutArrange(LayoutMode::Fullscreen),
+                layout.to_vec(),
+            ),
+            (
+                UseKind::LayoutArrange(LayoutMode::Windowed),
+                layout.to_vec(),
+            ),
+            // A designation ask and an egress connection: reply-bearing
+            // (a coalesced-away terminal leaves the client waiting forever
+            // for a resource it asked for), and exempt from every
+            // use-context question -- the descriptor goes to the realm's
+            // shim, which exists from the moment the realm does, and a
+            // connection is not made to a window.
+            (UseKind::Designate, Vec::new()),
+            (UseKind::Egress, Vec::new()),
+        ];
+
+        for (kind, want) in &rows {
+            assert_eq!(
+                &predicates_that_hold(kind),
+                want,
+                "{} classifies differently from its documented answer",
+                use_kind_name(kind)
+            );
+        }
+
+        // The census: every variant has a row. `use_kind_name`'s
+        // wildcard-free match is what keeps this honest -- see
+        // [`USE_KIND_NAMES`].
+        let covered: BTreeSet<&str> = rows.iter().map(|(kind, _)| use_kind_name(kind)).collect();
+        let all: BTreeSet<&str> = USE_KIND_NAMES.iter().copied().collect();
+        assert_eq!(
+            covered, all,
+            "every UseKind variant needs a row above: the predicates decide \
+             whether a vacant realm refuses it, whether its refusals coalesce \
+             and whether the chokepoint resolves its realm, and a variant with \
+             no row has had none of that asserted"
+        );
+    }
+
     // -- the token bucket ---------------------------------------------------
 
     #[test]

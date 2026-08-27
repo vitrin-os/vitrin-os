@@ -2682,6 +2682,16 @@ pub(crate) mod tests {
     const TOKEN: &str = "9b2f4c1d8a7e5f30619b2f4c1d8a7e5f30619b2f4c1d8a7e5f30619b2f4c1d8a";
     const DEMO_IDENTITY: &str = "vitrin://local/agent/demo";
 
+    /// How long a rig's blocking read waits before declaring that the event
+    /// it wanted is never coming ([`connect`] arms both ends with it).
+    ///
+    /// Generous on purpose: every frame these tests read was written by the
+    /// same thread before the read, so the wait is zero in the passing case
+    /// and this bound is reached only when the frame does not exist. Long
+    /// enough that no loaded machine can mistake slowness for absence, short
+    /// enough that a whole failing suite still reports.
+    const TEST_RECV_TIMEOUT: Duration = Duration::from_secs(10);
+
     /// The full version-1 verb set, as the demo agent petitions for it.
     fn all_verbs() -> Verb {
         Verb::OBSERVE | Verb::ACTUATE_POINTER | Verb::ACTUATE_TEXT
@@ -2871,6 +2881,24 @@ pub(crate) mod tests {
     /// client end.
     fn connect(shared: &mut Shared) -> (PrincipalServer, Connection, Connection) {
         let (core, client) = Connection::pair().expect("socketpair");
+        // **A test that hangs is not a test that fails.** Every rig in this
+        // module is single-threaded: a frame is either already in the socket
+        // when a helper reads, or no one is left to put it there. Without a
+        // receive timeout, "the event that should have arrived did not" is a
+        // blocked `recvmsg` -- a test that never returns a verdict, which is
+        // how a mutation to `UseKind::coalescible` (a coalesced-away
+        // refusal) was observed to hang
+        // `designation_asks_refuse_not_granted_and_leave_the_socket_alive`
+        // instead of failing it. With the timeout the read returns
+        // `WouldBlock`, which [`recv_event`] turns into a named panic.
+        for end in [&core, &client] {
+            rustix::net::sockopt::set_socket_timeout(
+                end,
+                rustix::net::sockopt::Timeout::Recv,
+                Some(TEST_RECV_TIMEOUT),
+            )
+            .expect("SO_RCVTIMEO on a socketpair end");
+        }
         let connection = shared.petitions.register_connection();
         (
             PrincipalServer::new(core.peer_cred(), connection),
@@ -3056,7 +3084,7 @@ pub(crate) mod tests {
     ) -> String {
         send_hello(client, 2, DEMO_IDENTITY, TOKEN);
         process_n(server, core, verifier, shared, 1).expect("handshake");
-        let msg = client.recv_message().unwrap().unwrap();
+        let msg = recv_event(client, "a `bound`");
         let (object_id, bound) = principal::events::Bound::decode(&msg.bytes, msg.fd).unwrap();
         assert_eq!(object_id, 2, "bound arrives on the pre-allocated principal");
         bound.identity
@@ -3096,10 +3124,37 @@ pub(crate) mod tests {
             .expect("deliver resolution");
     }
 
+    /// Read the next client-visible message, or **fail** naming what never
+    /// arrived -- never block forever waiting for it.
+    ///
+    /// The bounded read is [`connect`]'s `SO_RCVTIMEO`; this is where the
+    /// timeout becomes a verdict a reader can act on. `what` names the
+    /// event the caller was waiting for, because "no `refused` arrived" is
+    /// a diagnosis and "the test timed out" is not.
+    fn recv_event(client: &mut Connection, what: &str) -> Message {
+        match client.recv_message() {
+            Ok(Some(msg)) => msg,
+            Ok(None) => panic!("the connection closed before {what} arrived"),
+            Err(TransportError::Io(e))
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                panic!(
+                    "no {what} arrived within {TEST_RECV_TIMEOUT:?}: nothing else is \
+                     running that could still send it, so the core never emitted it \
+                     (a coalesced-away terminal looks exactly like this)"
+                )
+            }
+            Err(e) => panic!("the transport failed while waiting for {what}: {e}"),
+        }
+    }
+
     /// Assert the next client-visible event is the fatal goodbye with the
     /// given code, returning the full decoded event for deeper assertions.
     fn expect_error(client: &mut Connection, code: WireError) -> handshake::events::Error {
-        let msg = client.recv_message().unwrap().unwrap();
+        let msg = recv_event(client, "a fatal error");
         let (object_id, err) = handshake::events::Error::decode(&msg.bytes, msg.fd).unwrap();
         assert_eq!(object_id, HANDSHAKE_ID, "error is an event on object 1");
         assert_eq!(err.code, code, "unexpected wire code: {err:?}");
@@ -3122,7 +3177,7 @@ pub(crate) mod tests {
     /// Assert the next client-visible event is a consent `state`
     /// transition on the given observer.
     fn expect_consent_state(client: &mut Connection, consent_id: u32, want: ConsentState) {
-        let msg = client.recv_message().unwrap().unwrap();
+        let msg = recv_event(client, "a consent `state`");
         let (object_id, ev) = consent::events::State::decode(&msg.bytes, msg.fd).unwrap();
         assert_eq!(
             object_id, consent_id,
@@ -3134,7 +3189,7 @@ pub(crate) mod tests {
     /// Assert the next client-visible event is `resolved` on the given
     /// grant handle, returning it for outcome assertions.
     fn expect_resolved(client: &mut Connection, grant_id: u32) -> grant::events::Resolved {
-        let msg = client.recv_message().unwrap().unwrap();
+        let msg = recv_event(client, "a `resolved`");
         let (object_id, ev) = grant::events::Resolved::decode(&msg.bytes, msg.fd).unwrap();
         assert_eq!(
             object_id, grant_id,
@@ -3152,7 +3207,7 @@ pub(crate) mod tests {
         verb: Verb,
         code: Refusal,
     ) -> grant::events::Refused {
-        let msg = client.recv_message().unwrap().unwrap();
+        let msg = recv_event(client, &format!("a `refused({verb:?}, {code:?})`"));
         assert!(msg.fd.is_none(), "a refusal carries no fd");
         let (object_id, ev) = grant::events::Refused::decode(&msg.bytes, msg.fd).unwrap();
         assert_eq!(object_id, grant_id, "refused arrives on the grant handle");
@@ -3170,7 +3225,7 @@ pub(crate) mod tests {
     /// Assert the next client-visible event is `frame_ready` on the given
     /// view facet, returning the decoded frame (whose fd closes on drop).
     fn expect_frame(client: &mut Connection, view_id: u32) -> view::events::FrameReady {
-        let msg = client.recv_message().unwrap().unwrap();
+        let msg = recv_event(client, "a `frame_ready`");
         let (object_id, ev) = view::events::FrameReady::decode(&msg.bytes, msg.fd).unwrap();
         assert_eq!(object_id, view_id, "frame_ready arrives on the view facet");
         assert_eq!(ev.width, VIEW_W);
@@ -3850,7 +3905,7 @@ pub(crate) mod tests {
     ) {
         send_sync(client, cookie);
         process_n(server, core, verifier, shared, 1).expect("sync must dispatch");
-        let msg = client.recv_message().unwrap().unwrap();
+        let msg = recv_event(client, &format!("the fence's `done({cookie})`"));
         let (object_id, done) = handshake::events::Done::decode(&msg.bytes, msg.fd).unwrap();
         assert_eq!(object_id, HANDSHAKE_ID);
         assert_eq!(done.cookie, cookie, "done must be the next event in stream");
@@ -5809,28 +5864,41 @@ pub(crate) mod tests {
         );
     }
 
-    /// The generated protocol crate's own record of what `vitrin_grant`
-    /// defines: `(request name, opcode, since)` for every request, scraped
-    /// from the generated source rather than transcribed.
+    /// The generated protocol crate's own record of what **one interface**
+    /// defines: `(request name, opcode, since)` for every request in
+    /// `generated`, scraped from the generated source rather than
+    /// transcribed.
     ///
-    /// The generated file is checked in and `cargo xtask codegen --check`
-    /// holds it equal to `protocol/vitrin-v0.xml`, so scanning it is
+    /// The generated files are checked in and `cargo xtask codegen --check`
+    /// holds them equal to `protocol/vitrin-v0.xml`, so scanning one is
     /// scanning the IDL through the one artifact that cannot drift from it.
-    /// A hand-written list here would be the very thing the test below
-    /// exists to abolish.
-    fn generated_grant_requests() -> Vec<(String, u8, u32)> {
-        // `include_str!` rather than a runtime path: the test then cannot
-        // pass because a file was missing, and it recompiles when the IDL is
-        // regenerated.
-        const GENERATED: &str = include_str!("../../vitrin-protocol/src/generated/vitrin_grant.rs");
+    /// A hand-written list here would be the very thing the tests below
+    /// exist to abolish.
+    ///
+    /// **Parameterised by the module source, not fixed to `vitrin_grant`.**
+    /// The `/// Request `name` (opcode N) on `interface`.` doc shape is
+    /// emitted by one scanner template, so it is identical in every
+    /// generated interface module -- which is what lets the facets
+    /// (`vitrin_powerbox`, `vitrin_egress`, ...) be scanned by this same
+    /// scraper instead of by a literal array of the opcodes someone
+    /// remembered. `interface` is checked against every doc line the scan
+    /// accepts, so handing this the wrong module fails loudly rather than
+    /// scanning something plausible.
+    fn generated_requests(generated: &str, interface: &str) -> Vec<(String, u8, u32)> {
+        let tail = format!(" on `{interface}`.");
         let mut out: Vec<(String, u8, u32)> = Vec::new();
         let mut pending: Option<(String, u8)> = None;
-        for line in GENERATED.lines() {
+        for line in generated.lines() {
             let line = line.trim();
             // `/// Request `get_powerbox` (opcode 3) on `vitrin_grant`.`
             if let Some(rest) = line.strip_prefix("/// Request `") {
                 let (name, rest) = rest.split_once("` (opcode ").expect("generated doc shape");
-                let (opcode, _) = rest.split_once(')').expect("generated doc shape");
+                let (opcode, rest) = rest.split_once(')').expect("generated doc shape");
+                assert_eq!(
+                    rest, tail,
+                    "the scan of {interface} was handed a module that documents \
+                     a different interface (or the generated doc shape moved)"
+                );
                 pending = Some((name.to_string(), opcode.parse().expect("an opcode is a u8")));
             } else if let Some(rest) = line.strip_prefix("pub const SINCE: u32 = ") {
                 // The first SINCE after a request's doc line is that
@@ -5848,6 +5916,102 @@ pub(crate) mod tests {
             }
         }
         out
+    }
+
+    /// What `vitrin_grant` defines, through [`generated_requests`].
+    ///
+    /// `include_str!` rather than a runtime path: the test then cannot pass
+    /// because a file was missing, and it recompiles when the IDL is
+    /// regenerated. Every facet source below is included for the same
+    /// reason.
+    fn generated_grant_requests() -> Vec<(String, u8, u32)> {
+        generated_requests(
+            include_str!("../../vitrin-protocol/src/generated/vitrin_grant.rs"),
+            "vitrin_grant",
+        )
+    }
+
+    /// Every facet a `vitrin_grant` mint produces, as `(interface name,
+    /// that interface's generated source, a frame minting it at
+    /// `facet_id`)`.
+    ///
+    /// One list, consumed by both facet-level structural tests: the one
+    /// that says every defined request on a facet reaches an arm, and the
+    /// one that says everything past the defined requests stays a grammar
+    /// error. Neither writes an opcode down; each asks
+    /// [`generated_requests`] what the interface defines.
+    fn mintable_facets(facet_id: u32) -> Vec<(&'static str, &'static str, Vec<u8>)> {
+        vec![
+            (
+                "vitrin_launcher",
+                include_str!("../../vitrin-protocol/src/generated/vitrin_launcher.rs"),
+                get_launcher(facet_id),
+            ),
+            (
+                "vitrin_layout_focus",
+                include_str!("../../vitrin-protocol/src/generated/vitrin_layout_focus.rs"),
+                grant::requests::GetLayoutFocus {
+                    layout_focus: facet_id,
+                }
+                .encode(4),
+            ),
+            (
+                "vitrin_layout_arrange",
+                include_str!("../../vitrin-protocol/src/generated/vitrin_layout_arrange.rs"),
+                grant::requests::GetLayoutArrange {
+                    layout_arrange: facet_id,
+                }
+                .encode(4),
+            ),
+            (
+                "vitrin_powerbox",
+                include_str!("../../vitrin-protocol/src/generated/vitrin_powerbox.rs"),
+                get_powerbox(facet_id),
+            ),
+            (
+                "vitrin_egress",
+                include_str!("../../vitrin-protocol/src/generated/vitrin_egress.rs"),
+                get_egress(facet_id),
+            ),
+        ]
+    }
+
+    /// The facet interfaces this core mints, and how many requests each
+    /// defines **today** -- the non-vacuity floor for the two facet-level
+    /// structural tests, which would otherwise pass by scanning nothing.
+    ///
+    /// A count, not a list of opcodes: the count is what proves the scraper
+    /// still matches the generated doc shape, while *which* opcodes are
+    /// defined stays derived. Appending a request to one of these
+    /// interfaces makes this assertion fail with a message telling the
+    /// author to raise the count -- and the tests below then cover the new
+    /// request without any further edit here.
+    const FACET_REQUEST_COUNTS: &[(&str, usize)] = &[
+        ("vitrin_launcher", 1),
+        ("vitrin_layout_focus", 1),
+        ("vitrin_layout_arrange", 1),
+        ("vitrin_powerbox", 2),
+        ("vitrin_egress", 1),
+    ];
+
+    /// Scan one facet's generated module and check the scan against
+    /// [`FACET_REQUEST_COUNTS`] before anything is asserted from it.
+    fn facet_requests(interface: &str, generated: &str) -> Vec<(String, u8, u32)> {
+        let requests = generated_requests(generated, interface);
+        let (_, expected) = FACET_REQUEST_COUNTS
+            .iter()
+            .find(|(name, _)| *name == interface)
+            .unwrap_or_else(|| panic!("{interface} is not in FACET_REQUEST_COUNTS"));
+        assert_eq!(
+            requests.len(),
+            *expected,
+            "the scan of the generated {interface} found {} request(s), not {expected}: \
+             either a request was appended (raise the count -- the tests below then \
+             cover it automatically) or the generated doc shape changed and the scan, \
+             not the protocol, is what is broken",
+            requests.len()
+        );
+        requests
     }
 
     /// **THE test that makes this defect class unrepeatable.**
@@ -5924,16 +6088,7 @@ pub(crate) mod tests {
                 continue;
             }
             let (mut server, mut core, mut client, mut shared) = granted_rig(&verifier, 0, 0);
-            let mut frame = Vec::new();
-            vitrin_protocol::wire::FrameHeader {
-                object_id: 4,
-                size: 0,
-                opcode,
-                fd_count: 0,
-            }
-            .encode_with_placeholder_size(&mut frame);
-            vitrin_protocol::wire::patch_size(&mut frame);
-            client.send_message(&frame, None).unwrap();
+            client.send_message(&bare_header(4, opcode), None).unwrap();
             let result = process_n(&mut server, &mut core, &verifier, &mut shared, 1);
             match result {
                 Err(PrincipalFault::Violation(PrincipalViolation::UnknownOpcode { .. })) => {
@@ -6265,42 +6420,125 @@ pub(crate) mod tests {
             .expect("a launcher mint is not bounded by the powerbox cap either");
     }
 
-    /// Unknown opcodes on either facet stay grammar errors, exactly as they
-    /// do on every other facet: `vitrin_powerbox` defines opcodes 0 and 1,
-    /// `vitrin_egress` defines opcode 0, and everything past them is fatal
-    /// `invalid_opcode` -- grammar, never an authority judgement. The probes
-    /// are derived from the generated constants rather than written down, so
-    /// a request appended to either interface cannot leave this test
-    /// asserting that a defined opcode is undefined.
+    /// A bare header -- header only, no argument payload -- addressed to
+    /// `object_id` at `opcode`. The probe both facet-level structural tests
+    /// use: it needs to know nothing about an interface's argument lists,
+    /// which is what lets one loop cover every request a facet defines.
+    fn bare_header(object_id: u32, opcode: u8) -> Vec<u8> {
+        let mut frame = Vec::new();
+        vitrin_protocol::wire::FrameHeader {
+            object_id,
+            size: 0,
+            opcode,
+            fd_count: 0,
+        }
+        .encode_with_placeholder_size(&mut frame);
+        vitrin_protocol::wire::patch_size(&mut frame);
+        frame
+    }
+
+    /// **THE sibling of [`every_since_2_mint_on_a_grant_has_a_dispatch_arm`],
+    /// one level down -- which is where issue #322's body says the trap
+    /// really is.**
+    ///
+    /// The mint-level test proves a grant's own requests reach an arm. It
+    /// says nothing about the facet that mint produces, and every facet arm
+    /// ends `_ => Err(UnknownOpcode)`: append a `since="3"` request to
+    /// `vitrin_powerbox` with no arm beside it and a conformant client that
+    /// sends it is answered fatal `invalid_opcode` and disconnected -- the
+    /// identical defect, in the code that fixed it.
+    ///
+    /// So this asserts the same property for every facet a grant can mint:
+    /// **every request the interface defines at the negotiated version
+    /// reaches a dispatch arm.** The opcode set per facet is scraped from
+    /// that interface's generated module ([`facet_requests`]), never written
+    /// down here, and the probe is the same bare header for the same
+    /// reason: an arm rejects the empty payload on its *arguments*
+    /// ([`PrincipalViolation::Malformed`], or admits it and answers a
+    /// refusal), while no arm falls to the catch-all
+    /// ([`PrincipalViolation::UnknownOpcode`]). Distinguished by violation
+    /// variant, not by wire code.
     #[test]
-    fn unknown_opcodes_on_the_designation_and_egress_facets_stay_grammar_errors() {
+    fn every_request_on_a_minted_facet_has_a_dispatch_arm() {
         let _fd = crate::capture::tests::fd_lock();
         let verifier = demo_verifier();
-        let powerbox_defined = [
-            powerbox::requests::RequestFile::OPCODE,
-            powerbox::requests::RequestDir::OPCODE,
-        ];
-        let egress_defined = [egress::requests::RequestConnect::OPCODE];
-        for (facet_id, defined) in [(9u32, &powerbox_defined[..]), (10u32, &egress_defined[..])] {
-            let first_undefined =
-                u8::try_from(defined.len()).expect("an opcode count fits in a u8");
+        for (interface, generated, mint) in mintable_facets(9) {
+            for (name, opcode, since) in facet_requests(interface, generated) {
+                if since > vitrin_protocol::generated::PROTOCOL_VERSION {
+                    // Not defined on any connection this core negotiates, so
+                    // `invalid_opcode` is the correct answer and no arm is
+                    // owed -- the same carve-out the mint-level test makes,
+                    // unreachable for the same reason.
+                    continue;
+                }
+                let (mut server, mut core, mut client, mut shared) = granted_rig(&verifier, 0, 0);
+                client.send_message(&mint, None).unwrap();
+                process_n(&mut server, &mut core, &verifier, &mut shared, 1)
+                    .expect("a structural mint is always legal");
+                client.send_message(&bare_header(9, opcode), None).unwrap();
+                match process_n(&mut server, &mut core, &verifier, &mut shared, 1) {
+                    Err(PrincipalFault::Violation(PrincipalViolation::UnknownOpcode {
+                        ..
+                    })) => {
+                        panic!(
+                            "{interface}.{name} (opcode {opcode}, since {since}) is defined at \
+                             the version this core negotiates and has NO dispatch arm on the \
+                             facet: a conformant client that sends it is answered fatal \
+                             invalid_opcode and disconnected. Add the arm beside the others \
+                             in this facet's ObjectKind, funnelling through serve_facet_use \
+                             so the answer is an authority judgement and not a grammar \
+                             error. Issue #322."
+                        )
+                    }
+                    // The arm exists and rejected the empty payload on its
+                    // arguments: grammar about the payload, which is what a
+                    // bare header deserves.
+                    Err(PrincipalFault::Violation(PrincipalViolation::Malformed { .. })) => {}
+                    // A request with no arguments at all decodes from a bare
+                    // header and reaches the chokepoint, which refuses it
+                    // recoverably (no facet verb is served by this build).
+                    // Admitted rather than failed: "the arm exists" is the
+                    // whole claim.
+                    Ok(()) => {}
+                    other => panic!("{interface}.{name} (opcode {opcode}) answered: {other:?}"),
+                }
+            }
+        }
+    }
+
+    /// Unknown opcodes on a minted facet stay grammar errors, exactly as
+    /// they do on a grant: everything past what the interface defines is
+    /// fatal `invalid_opcode` -- grammar, never an authority judgement.
+    ///
+    /// The probes are derived from what
+    /// [`generated_requests`] scrapes rather than from a literal array, so
+    /// **membership** is derived and not only the opcode values: a request
+    /// appended to any facet cannot leave this test asserting that a
+    /// defined opcode is undefined. Its own doc comment used to claim that
+    /// while the membership sat in a hand-written array beside it -- the
+    /// defect class #322 is about, inside #322's own fix.
+    #[test]
+    fn unknown_opcodes_on_every_minted_facet_stay_grammar_errors() {
+        let _fd = crate::capture::tests::fd_lock();
+        let verifier = demo_verifier();
+        for (interface, generated, mint) in mintable_facets(9) {
+            let mut opcodes: Vec<u8> = facet_requests(interface, generated)
+                .iter()
+                .map(|(_, opcode, _)| *opcode)
+                .collect();
+            opcodes.sort_unstable();
             // Contiguity from 0 is what makes "one past the last" the FIRST
             // undefined opcode rather than merely an undefined one.
-            for (i, opcode) in defined.iter().enumerate() {
-                assert_eq!(usize::from(*opcode), i, "the facet's opcodes have a hole");
+            for (i, opcode) in opcodes.iter().enumerate() {
+                assert_eq!(usize::from(*opcode), i, "{interface}'s opcodes have a hole");
             }
+            let first_undefined = u8::try_from(opcodes.len()).expect("a count fits in a u8");
             for opcode in [first_undefined, first_undefined + 7] {
-                let (mut server, mut core, mut client, mut shared) = designation_rig(&verifier);
-                let mut frame = Vec::new();
-                vitrin_protocol::wire::FrameHeader {
-                    object_id: facet_id,
-                    size: 0,
-                    opcode,
-                    fd_count: 0,
-                }
-                .encode_with_placeholder_size(&mut frame);
-                vitrin_protocol::wire::patch_size(&mut frame);
-                client.send_message(&frame, None).unwrap();
+                let (mut server, mut core, mut client, mut shared) = granted_rig(&verifier, 0, 0);
+                client.send_message(&mint, None).unwrap();
+                process_n(&mut server, &mut core, &verifier, &mut shared, 1)
+                    .expect("a structural mint is always legal");
+                client.send_message(&bare_header(9, opcode), None).unwrap();
                 expect_violation(
                     process_n(&mut server, &mut core, &verifier, &mut shared, 1),
                     "invalid_opcode",
@@ -6329,7 +6567,7 @@ pub(crate) mod tests {
     /// Assert the next client-visible event is `vitrin_launcher.launched`
     /// on the given facet, returning it for the realm-id assertion.
     fn expect_launched(client: &mut Connection, facet_id: u32) -> launcher::events::Launched {
-        let msg = client.recv_message().unwrap().unwrap();
+        let msg = recv_event(client, "a `launched`");
         assert!(msg.fd.is_none(), "launched carries no fd");
         let (object_id, ev) = launcher::events::Launched::decode(&msg.bytes, msg.fd)
             .expect("the terminal of a launch is `launched`");

@@ -28,7 +28,14 @@
 #
 # WHAT A FAILURE HERE MEANS
 # -------------------------
-# Not "CI is broken". One of:
+# Read the failing STEP first. Everything below is an outcome of the
+# measurement, so a job that fell over in `install` or `build` measured nothing
+# and none of it applies. That is not hypothetical: this workflow's first
+# scheduled run was red for a missing link dependency (#338) while this block
+# sent its reader to look at kernels.
+#
+# If the failure is in collect.sh, it is one of -- and then it is not "CI is
+# broken":
 #
 #   * a kernel now answers differently (a distribution respun the package under
 #     the same version -- but the sha256 pin would have caught that first, so
@@ -72,14 +79,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: install qemu
+      - name: install qemu, and the two libraries vitrind links
         # No KVM on a hosted runner, so every boot is TCG. That is a schedule
         # difference and not a result difference: the rows are the guest's own
         # output and carry which accelerator produced them in a `#~ accel:`
         # line, which `--check` ignores for exactly this reason.
+        #
+        # libxkbcommon-dev and libpixman-1-dev are here for the reason ci.yml
+        # installs them in EVERY job that builds `vitrind` (:265, :1416, :1682,
+        # :2157, and inside the DRM set at :917): the winit backend links
+        # libxkbcommon and the headless backend's pixman renderer links
+        # libpixman-1, and the runner image ships neither -dev package. Without
+        # them the next step dies "unable to find library -lxkbcommon" /
+        # "-lpixman-1" -- which is how this workflow spent its first and only
+        # scheduled run before #338. They are build-host packages and touch
+        # nothing measured: the guest boots an initramfs holding the linked
+        # binary, so no -dev package is ever inside a kernel's answer.
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends qemu-system-x86 cpio zstd
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 cpio zstd libxkbcommon-dev libpixman-1-dev
 
       - name: build the binary under test
         # RELEASE, and it matters: the rows are the SHIPPED binary's answers.

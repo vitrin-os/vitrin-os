@@ -7212,4 +7212,243 @@ pub(crate) mod tests {
              realm's own configuration can name"
         );
     }
+
+    // -- the no-packet-path property (the reviewer's grep, run by CI) -------
+
+    /// Whether `c` can continue a Rust identifier -- the boundary test for
+    /// [`spellings_of`]'s whole-identifier matching.
+    ///
+    /// Taken from `crate::enforcement`'s `single_enforcement_path` scan,
+    /// which is the style [P2.7.1](https://github.com/vitrin-os/vitrin-os/issues/195)
+    /// asks for by name. Two other files in this crate (`view.rs`,
+    /// `backlight.rs`) each carry their own copy for the same reason: the
+    /// helpers live in private `mod tests` modules that no sibling can
+    /// import, and promoting them into shared test support would edit three
+    /// load-bearing tripwires to save thirty lines.
+    fn is_ident(c: char) -> bool {
+        c.is_ascii_alphanumeric() || c == '_'
+    }
+
+    /// The non-test portion of one source file: everything before the
+    /// crate-conventional trailing unit-test module.
+    ///
+    /// **The visibility prefix is not decoration.** This very file's module
+    /// is `pub(crate) mod tests`, so the naive `split_once` that
+    /// `backlight.rs` uses would truncate nothing here and the scan would
+    /// read its own needles back as production hits. A bare `#[cfg(test)]`
+    /// mid-file -- there are two above -- deliberately does not end the
+    /// scan.
+    fn production(text: &str) -> &str {
+        let attr = format!("#[cfg({})]\n", "test");
+        let mut from = 0;
+        while let Some(found) = text[from..].find(&attr) {
+            let at = from + found;
+            let item = text[at + attr.len()..]
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim_start();
+            let item = item
+                .strip_prefix("pub(crate) ")
+                .or_else(|| item.strip_prefix("pub "))
+                .unwrap_or(item);
+            if item.starts_with("mod tests") {
+                return &text[..at];
+            }
+            from = at + attr.len();
+        }
+        text
+    }
+
+    /// Count occurrences of `needle` as a whole identifier, optionally
+    /// carrying a numeric suffix, in the production portion of `haystack`,
+    /// skipping comment lines.
+    ///
+    /// **Both halves of that rule are paid for by a name in this tree.**
+    /// Plain substring matching is wrong: `DESIGNATE_FILE` (`grants.rs`,
+    /// `recorder.rs`, `principal.rs`) contains `NAT`, and a scan that
+    /// counted it would be red on arrival against a verb bit that has
+    /// nothing to do with network address translation. Requiring a *bare*
+    /// identifier is also wrong in the other direction: interface names
+    /// carry indices, and `veth0` is the spelling anybody adding a pair
+    /// would actually write. So digits between the needle and the boundary
+    /// are absorbed -- `veth0` is a hit, `DESIGNATE_FILE` is not, and
+    /// [`the_matcher_is_not_vacuous`] pins both rather than trusting this
+    /// paragraph.
+    fn spellings_of(haystack: &str, needle: &str) -> usize {
+        production(haystack)
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .map(|line| {
+                let mut hits = 0;
+                let mut from = 0;
+                while let Some(found) = line[from..].find(needle) {
+                    let at = from + found;
+                    let mut end = at + needle.len();
+                    let before = line[..at].chars().next_back().is_none_or(|c| !is_ident(c));
+                    while line[end..]
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_digit())
+                    {
+                        end += 1;
+                    }
+                    let after = line[end..].chars().next().is_none_or(|c| !is_ident(c));
+                    if before && after {
+                        hits += 1;
+                    }
+                    from = at + 1;
+                }
+                hits
+            })
+            .sum()
+    }
+
+    /// Every production `.rs` under a crate's `src/`, named relative to it.
+    fn rust_sources(base: &Path, dir: &Path, out: &mut Vec<(String, String)>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.is_dir() {
+                rust_sources(base, &path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                out.push((
+                    path.strip_prefix(base)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .into(),
+                    text,
+                ));
+            }
+        }
+    }
+
+    /// The spellings a packet path would have to utter. P2.7.1's acceptance
+    /// criterion names exactly these five.
+    const PACKET_PATH_SPELLINGS: &[&str] = &["veth", "bridge", "nftables", "iptables", "NAT"];
+
+    /// The matcher's own positive control, in the same run as the property.
+    ///
+    /// Without it a `spellings_of` that had been broken into always
+    /// returning zero -- by a bad boundary rule, by `production` truncating
+    /// the whole file, by anything -- would satisfy
+    /// [`the_realm_gets_a_namespace_and_not_a_network_stack`] silently and
+    /// for ever. That is the vacuity this repository keeps finding in its
+    /// own guards, so the guard is measured before it is trusted.
+    #[test]
+    fn the_matcher_is_not_vacuous() {
+        assert_eq!(
+            spellings_of("    let pair = veth0_peer_name();\n", "veth"),
+            0,
+            "`veth0_peer_name` continues past the digits, so it is one identifier and not a hit"
+        );
+        assert_eq!(
+            spellings_of("    let up = veth0;\n", "veth"),
+            1,
+            "an interface name with an index must be caught: `veth0` is how a pair gets written"
+        );
+        assert_eq!(
+            spellings_of("    let up = veth;\n", "veth"),
+            1,
+            "the bare identifier must be caught too"
+        );
+        assert_eq!(
+            spellings_of("    Verb::DESIGNATE_FILE => \"designate_file\",\n", "NAT"),
+            0,
+            "`DESIGNATE_FILE` contains NAT; a scan that counted it would be red on arrival"
+        );
+        assert_eq!(
+            spellings_of("    // a bridge would go here\n", "bridge"),
+            0,
+            "comment lines are prose and are skipped; this file's own header names all five"
+        );
+        assert_eq!(
+            spellings_of(
+                &format!(
+                    "let a = 1;\n#[cfg({})]\npub(crate) mod tests {{\nlet veth = 2;\n",
+                    "test"
+                ),
+                "veth"
+            ),
+            0,
+            "the trailing test module is not production -- and it is `pub(crate)` here, which \
+             is the case a naive split_once misses"
+        );
+    }
+
+    /// **A namespace, not a network stack** (P2.7.1, issue #195).
+    ///
+    /// The realm's confinement is `CLONE_NEWNET` and a loopback bring-up:
+    /// one flag in `vitrin-realm-init`'s single `unshare` and one
+    /// `SIOCSIFFLAGS`. Nothing routes. No veth pair, no bridge, no NAT, no
+    /// firewall state, and PRD Doc 2 §12 is explicit about why -- a router
+    /// is a packet path, and a packet path is code inside the TCB that
+    /// parses attacker-controlled bytes. A namespace with one interface is
+    /// a *configuration*; a mechanism would be something else entirely, and
+    /// everything outbound is meant to arrive later as a listener the
+    /// out-of-core proxy owns (P2.7.3), which is the only reason that task
+    /// can be a sidecar at all.
+    ///
+    /// The property holds today by nobody having written one. This test is
+    /// what keeps it from being lost to a single plausible-looking commit,
+    /// and it covers **both** halves of the spawn path: the core, and the
+    /// helper that actually makes the namespace and is the likelier place
+    /// for a second interface to be added.
+    ///
+    /// **It is a named-spelling guard and not a completeness claim** -- the
+    /// same distinction `--print-seccomp` draws about the deny-list. A
+    /// packet path built entirely out of raw `AF_NETLINK` message
+    /// constants, naming none of these five, would pass. What it forecloses
+    /// is the readable spelling, which is the one a change would use.
+    #[test]
+    fn the_realm_gets_a_namespace_and_not_a_network_stack() {
+        let mut sources = Vec::new();
+        for crate_src in [
+            concat!(env!("CARGO_MANIFEST_DIR"), "/src"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../vitrin-realm-init/src"),
+        ] {
+            let base = Path::new(crate_src);
+            let mut here = Vec::new();
+            rust_sources(base, base, &mut here);
+            assert!(
+                !here.is_empty(),
+                "{crate_src} produced no sources; a scan that reads nothing proves nothing"
+            );
+            sources.extend(here);
+        }
+
+        // Non-vacuity, on the two files that would have to change for the
+        // property to become false. Named individually because an empty or
+        // half-walked scan is the failure mode that looks exactly like a
+        // pass.
+        for required in ["spawn.rs", "main.rs"] {
+            assert!(
+                sources.iter().any(|(name, _)| name == required),
+                "the scan must cover {required}, or it proves nothing: that is where a realm's \
+                 namespaces are asked for and where they are made"
+            );
+        }
+
+        let mut found: Vec<String> = Vec::new();
+        for (name, text) in &sources {
+            for needle in PACKET_PATH_SPELLINGS {
+                let hits = spellings_of(text, needle);
+                if hits > 0 {
+                    found.push(format!("{name}: {needle} x{hits}"));
+                }
+            }
+        }
+        assert!(
+            found.is_empty(),
+            "a packet path has entered the TCB, or something borrowed its vocabulary: {found:?}. \
+             A realm gets ONE namespace with ONE interface and nothing that forwards a packet \
+             (PRD Doc 2 §12). If this is a legitimate use of one of these words, it is still \
+             worth a reviewer reading the line before this list is narrowed"
+        );
+    }
 }

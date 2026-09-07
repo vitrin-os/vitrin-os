@@ -328,7 +328,7 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use vitrin_protocol::generated::vitrin_actuator_pointer::ButtonState;
+use vitrin_protocol::generated::vitrin_actuator_pointer::{Axis, ButtonState};
 use vitrin_protocol::generated::vitrin_consent::ConsentState;
 use vitrin_protocol::generated::vitrin_shim_seat::{KeyState, Origin};
 
@@ -336,7 +336,8 @@ use crate::input::{Gate, PreemptionHook, SeatInput, SeatInputKind};
 use crate::petitions::{PetitionId, PetitionRegistry, PromptRoute};
 use crate::recorder::{Event, Recorder};
 
-use super::render::ChoiceBox;
+use super::render::{ChoiceBox, SlotBox};
+use super::PanelContent;
 use crate::paint::centered;
 
 use super::{Choice, ConsentSurface};
@@ -386,8 +387,6 @@ struct ArmedPrompt {
     petition: PetitionId,
     /// The rasterized card's size, for the centering computation.
     card: (u32, u32),
-    /// Every choice and where it was drawn, card-local, in render order.
-    buttons: Vec<ChoiceBox>,
     /// When this prompt went up. A press before `raised_at + `
     /// [`GUARD_INTERVAL`] arms nothing (module docs: the guard interval).
     raised_at: Instant,
@@ -396,11 +395,153 @@ struct ArmedPrompt {
     /// prompt — the backstop against a permanent human input lockout
     /// (module docs).
     deadline: Instant,
-    /// Set once this prompt's decision has been taken. The grab keeps
-    /// consuming afterwards — the card is still on screen until the
-    /// embedder lowers it, and input must not start reaching the app in the
-    /// gap — but no second decision is ever queued for the same petition.
-    decided: bool,
+    /// Whether this prompt can still be answered, and the state that only an
+    /// unanswered one has.
+    answerable: Answerable,
+}
+
+/// Whether a raised prompt can still be answered.
+///
+/// **This replaced a `decided: bool`, and the replacement is the point.** A
+/// flag says "do not act on this"; something has to keep checking it, and
+/// every way that check can be forgotten is a way a card gets answered twice.
+/// Here the geometry an answer needs — the choice rectangles, and the panel a
+/// navigable card has — lives *inside* [`Answerable::Open`] and is **dropped**
+/// when the prompt is answered. So a second decision is not refused, it is
+/// unreachable: [`ConsentGrab::hit_test`] has no rectangles to hit and
+/// [`ConsentGrab::commit`] has nothing to commit, because those fields no
+/// longer exist on this value.
+///
+/// The grab still consumes input in either state, and that is unchanged and
+/// load-bearing: the card is on screen until the embedder lowers it, and
+/// input must not start reaching the app in the gap.
+///
+/// The transition is one infallible assignment (`answerable = Answered`), not
+/// a take-and-put-back. That matters because `ConsentGrab` is shared through
+/// `Rc<RefCell<..>>` (`backend/drm.rs`), where a fallible move out of `self`
+/// with an early return between the take and the restore would leave a card
+/// on screen with no state behind it — a worse failure than the flag this
+/// replaces.
+#[derive(Debug)]
+enum Answerable {
+    /// Still answerable: the human can arm a choice, commit it, and — when
+    /// the card drew a panel — navigate.
+    Open(Open),
+    /// Answered. Carries nothing on purpose: no rectangles, no panel, no
+    /// second decision.
+    Answered,
+}
+
+/// The state a prompt has only while it is still answerable.
+#[derive(Debug)]
+struct Open {
+    /// Every choice and where it was drawn, card-local, in render order.
+    buttons: Vec<ChoiceBox>,
+    /// The interactive panel — `Some` **exactly when the raised card drew
+    /// one**, which is the only thing that makes a prompt navigable. There
+    /// is no interactive flag beside this; see
+    /// [`super::render::Card::panel`].
+    panel: Option<Panel>,
+}
+
+/// The live state of a navigable card's panel.
+///
+/// Hover and scroll live here and nowhere else. Neither confers authority:
+/// the only thing that leaves this grab is a [`Navigation`] the embedder
+/// folds into new content, and the only thing that grants anything is still
+/// a [`Decision`].
+#[derive(Debug)]
+struct Panel {
+    /// Every slot and where it was drawn, card-local. Re-snapshotted whole by
+    /// every refresh, on `buttons`' reasoning: geometry that was not produced
+    /// by the pass that painted it can disagree with the pixels.
+    slots: Vec<SlotBox>,
+    /// The slot the pointer is resting on, if any.
+    hover: Option<u16>,
+    /// A press held inside a slot: the button code, which slot, and the
+    /// content epoch it was armed in.
+    pressed: Option<(u32, u16, u64)>,
+    /// Bumped by every content refresh that changed anything.
+    ///
+    /// **This is the panel's version of the guard interval.** Activating a
+    /// slot can change what the slots mean — stepping into a directory
+    /// relabels every row while the human's finger is still resting on one —
+    /// so a press armed against the old content must not commit against the
+    /// new. A press whose epoch no longer matches is stale and activates
+    /// nothing. It is deliberately *not* [`GUARD_INTERVAL`]: the guard is a
+    /// clock against a card appearing under a descending finger, and this is
+    /// an identity check against content changing under a resting one.
+    epoch: u64,
+    /// Sub-detent scroll accumulator in `value120` units, so a
+    /// high-resolution wheel emits one step per detent rather than one per
+    /// fractional event.
+    accum: i32,
+}
+
+impl Panel {
+    /// A freshly drawn panel: the slots the renderer just painted, nothing
+    /// hovered, nothing pressed, epoch zero.
+    fn new(slots: Vec<SlotBox>) -> Self {
+        Self {
+            slots,
+            hover: None,
+            pressed: None,
+            epoch: 0,
+            accum: 0,
+        }
+    }
+}
+
+/// One **non-terminal** thing the human did to a navigable card.
+///
+/// [`Decision`]'s sibling, and deliberately a separate type rather than a new
+/// [`Choice`] variant: `Choice` is exhaustively matched in four places so a
+/// persistence rung cannot reach a screen unnamed, and its labels are
+/// `&'static str` so a caption that was not compiled in cannot exist. A
+/// navigation is not a decision, grants nothing, and must not weaken either
+/// property by sharing their type.
+///
+/// Carries its petition id for [`Decision`]'s own reason: the embedder may
+/// drain this queue after the prompt was lowered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Navigation {
+    pub petition: PetitionId,
+    pub step: Step,
+}
+
+/// What the human did to a panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Step {
+    /// The pointer came to rest on a slot, or left the panel (`None`).
+    /// Presentation only — a hover confers nothing.
+    Hover(Option<u16>),
+    /// A press and its matching release both landed on the same slot, with
+    /// the panel's content unchanged in between.
+    Activate(u16),
+    /// Scrolled by whole detents; negative is toward the top of the list.
+    Scroll(i16),
+}
+
+/// What a panel refresh did to the card.
+///
+/// Returned rather than inferred so the caller cannot forget to ask: the
+/// guard-restart question ("did anything move under the human's finger?") is
+/// answered by the type rather than by remembering to check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Applied {
+    /// The content was equal to what is already on screen. Nothing was
+    /// re-rasterized and no texture was invalidated.
+    Unchanged,
+    /// The panel was repainted at the same geometry. The card's size, its
+    /// origin and its choice row are all where they were, so nothing moved
+    /// under the pointer and the guard is **not** restarted.
+    Redrawn,
+    /// The card's size changed. **Unreachable while the panel's height is a
+    /// constant** ([`super::render::PANEL_ROWS`]), and reported rather than
+    /// asserted because an assertion vanishes in the release build CI also
+    /// runs. A caller seeing this has a resized card whose Deny button may
+    /// have moved, and the refresh is refused rather than applied.
+    Reshaped,
 }
 
 /// The consent input grab: the state [`ConsentGate`] judges against, shared
@@ -429,9 +570,31 @@ pub(crate) struct ConsentGrab {
     /// choice — the press that a matching release commits.
     armed: Option<(u32, Choice)>,
     /// Decisions taken and not yet drained (FIFO). Bounded in practice by
-    /// one per raised prompt: `ArmedPrompt::decided` stops the second.
+    /// one per raised prompt: answering drops the geometry a second decision
+    /// would need ([`Answerable`]).
     decisions: VecDeque<Decision>,
+    /// Navigations taken and not yet drained (FIFO).
+    ///
+    /// Bounded by [`MAX_NAVIGATIONS`] rather than by one-per-prompt, because
+    /// unlike a decision a navigation is not terminal: a human can hover and
+    /// scroll as long as the card is up. An embedder that stops draining must
+    /// not be able to grow this without limit, so the oldest are dropped —
+    /// stated here because dropping the oldest hover is harmless (the newest
+    /// is the truth) while dropping the oldest *activation* would not be, and
+    /// that is exactly why an activation is not something this queue may
+    /// silently lose. See [`Self::push_navigation`].
+    navigations: VecDeque<Navigation>,
 }
+
+/// How many undrained navigations the grab will hold.
+///
+/// One dispatch round's worth of pointer motion across a panel, with room to
+/// spare: the embedder drains every round, so reaching this bound means an
+/// embedder that stopped draining while a card is still up.
+const MAX_NAVIGATIONS: usize = 64;
+
+/// One scroll detent, in the kernel's `value120` units.
+const SCROLL_DETENT: i32 = 120;
 
 impl ConsentGrab {
     /// An idle grab: no prompt, nothing consumed, a zero view until the
@@ -450,6 +613,7 @@ impl ConsentGrab {
             pointer: None,
             armed: None,
             decisions: VecDeque::new(),
+            navigations: VecDeque::new(),
         }
     }
 
@@ -572,10 +736,16 @@ impl ConsentGrab {
         let armed = ArmedPrompt {
             petition,
             card: (card.width, card.height),
-            buttons: card.buttons.clone(),
             raised_at: now,
             deadline,
-            decided: false,
+            // Open, with whatever the renderer actually painted. `panel` is
+            // `Some` exactly when `rasterize` drew one, so a card is
+            // navigable because there is a panel on the screen -- never
+            // because a flag beside the pixels said so.
+            answerable: Answerable::Open(Open {
+                buttons: card.buttons.clone(),
+                panel: card.panel.clone().map(Panel::new),
+            }),
         };
         // Checked rather than `debug_assert`ed: assertions vanish in the
         // release build CI also runs, and a grab held with no `consent_held`
@@ -733,6 +903,81 @@ impl ConsentGrab {
         self.decisions.pop_front()
     }
 
+    /// Drain the next navigation the human made, oldest first.
+    ///
+    /// Separate from [`Self::take_decision`] and returning a separate type,
+    /// so an embedder cannot handle one where it meant the other: a
+    /// navigation grants nothing and resolves no petition, and the registry
+    /// has no method that would accept it.
+    pub fn take_navigation(&mut self) -> Option<Navigation> {
+        self.navigations.pop_front()
+    }
+
+    /// Replace the raised card's panel and re-snapshot its geometry.
+    ///
+    /// The embedder's half of navigation: it drains a [`Navigation`], decides
+    /// what the panel should now show, and calls this once per round with the
+    /// result. Content and geometry move together in one call, so the
+    /// rectangles this grab hit-tests are always the ones the renderer just
+    /// painted — [`super::render::ChoiceBox`]' property, kept for slots.
+    ///
+    /// Returns what actually happened; see [`Applied`]. In particular a
+    /// refresh does **not** restart [`GUARD_INTERVAL`]: the panel's height is
+    /// a constant, so the card cannot resize, its origin cannot move and the
+    /// choice row stays where it was. Nothing the human might be reaching for
+    /// has moved, so restarting the guard would punish them for scrolling.
+    /// What a refresh *does* invalidate is an in-flight press on the panel
+    /// itself, through [`Panel::epoch`] — because the slot under the finger
+    /// may now mean something else.
+    ///
+    /// `false`-ish outcomes are ordinary: no prompt, an answered one, or a
+    /// card that drew no panel all yield [`Applied::Unchanged`].
+    pub fn refresh_panel(
+        &mut self,
+        content: PanelContent,
+        surface: &mut ConsentSurface,
+    ) -> Applied {
+        // Nothing to refresh unless a panel is actually on screen.
+        if self.open().and_then(|o| o.panel.as_ref()).is_none() {
+            return Applied::Unchanged;
+        }
+        let before = self.prompt.as_ref().map(|p| p.card);
+        if !surface.set_panel(content) {
+            return Applied::Unchanged;
+        }
+        let Some(card) = surface.card() else {
+            // The renderer returned nothing for content it just accepted.
+            // Defence in depth, on `raise`'s own precedent.
+            tracing::error!("panel refresh produced no card");
+            return Applied::Unchanged;
+        };
+        if before != Some((card.width, card.height)) {
+            // Unreachable while the panel's height is a constant. Refused
+            // rather than applied: a resized card is a card whose Deny button
+            // may have moved under a finger, which is precisely what the
+            // fixed height exists to make impossible.
+            tracing::error!(
+                ?before,
+                after = ?(card.width, card.height),
+                "panel refresh would have resized the consent card; refused"
+            );
+            return Applied::Reshaped;
+        }
+        let Some(slots) = card.panel.clone() else {
+            tracing::error!("panel refresh produced a card with no panel");
+            return Applied::Unchanged;
+        };
+        let Some(open) = self.open() else {
+            return Applied::Unchanged;
+        };
+        let Some(panel) = open.panel.as_mut() else {
+            return Applied::Unchanged;
+        };
+        panel.slots = slots;
+        panel.epoch = panel.epoch.wrapping_add(1);
+        Applied::Redrawn
+    }
+
     /// **Test seam.** Push a decision into the queue as if a physical click
     /// had produced it.
     ///
@@ -847,15 +1092,21 @@ impl ConsentGrab {
                 // The guard interval (module docs): a press that arrives
                 // before the human could have read the card arms nothing.
                 // Still consumed -- it does not reach the app either.
-                self.armed = if now.saturating_duration_since(raised_at) < GUARD_INTERVAL {
+                if now.saturating_duration_since(raised_at) < GUARD_INTERVAL {
                     tracing::debug!(
                         %petition,
                         "press ignored inside the consent prompt's guard interval"
                     );
-                    None
+                    self.armed = None;
+                    // The panel is inside the same guard, deliberately: a
+                    // press that arrived before the human could have read the
+                    // card arms nothing on it either. A navigable card is
+                    // still a card that just appeared.
+                    self.disarm_slot();
                 } else {
-                    self.hit_test().map(|choice| (*button, choice))
-                };
+                    self.armed = self.hit_test().map(|choice| (*button, choice));
+                    self.arm_slot(*button);
+                }
                 Gate::Consume
             }
             SeatInputKind::Button {
@@ -891,11 +1142,37 @@ impl ConsentGrab {
             // consumed begin starts nothing, so its updates and its end are
             // dropped by the router's own pairing rather than needing a rule
             // here.
+            // Motion and scroll navigate a panel, when the raised card drew
+            // one. Both still `Consume` in every case, exactly as before:
+            // `a_raised_prompt_consumes_every_physical_event_except_releases`
+            // holds unedited, and a card with no panel takes neither branch.
+            SeatInputKind::Motion { .. } => {
+                self.navigate_hover(petition);
+                Gate::Consume
+            }
+            SeatInputKind::Scroll { axis, value120 } => {
+                self.navigate_scroll(petition, *axis, *value120);
+                Gate::Consume
+            }
+            // Key presses — and text, which physical intake never produces
+            // but which would be human-aimed if it ever did. Relative motion
+            // and a gesture's begin and updates join them: a human answering
+            // a consent card is not driving the app, and a consumed begin
+            // starts nothing, so its updates and its end are dropped by the
+            // router's own pairing rather than needing a rule here.
+            //
+            // **No key navigates a panel, and that is settled policy rather
+            // than an omission** (module docs: no key answers a prompt, and
+            // Escape belongs to the dead-man chord). A navigable card is
+            // pointer-driven for the same reason a prompt is, and the
+            // keyboard-accessibility gap the module docs already record as
+            // "deferred rather than half-built" is widened by exactly
+            // nothing here: a human who cannot answer a card could not
+            // navigate one either. Closing it is one design task for both.
+            //
             // Exhaustive by intent: a new input kind must be classified
             // here rather than defaulting to reaching the app mid-prompt.
-            SeatInputKind::Motion { .. }
-            | SeatInputKind::Scroll { .. }
-            | SeatInputKind::Key { .. }
+            SeatInputKind::Key { .. }
             | SeatInputKind::Text { .. }
             | SeatInputKind::RelativeMotion { .. }
             | SeatInputKind::GestureBegin { .. }
@@ -904,42 +1181,277 @@ impl ConsentGrab {
         }
     }
 
+    /// Arm a panel press against the slot under the pointer, stamped with the
+    /// content epoch it was armed in.
+    fn arm_slot(&mut self, button: u32) {
+        let landed = self.slot_hit_test();
+        let Some(open) = self.open() else { return };
+        let Some(panel) = open.panel.as_mut() else {
+            return;
+        };
+        panel.pressed = landed.map(|slot| (button, slot, panel.epoch));
+    }
+
+    /// Drop any armed panel press.
+    fn disarm_slot(&mut self) {
+        if let Some(open) = self.open() {
+            if let Some(panel) = open.panel.as_mut() {
+                panel.pressed = None;
+            }
+        }
+    }
+
+    /// **Test seam.** Give the raised prompt a panel, as if the petition it
+    /// was built from had asked for one.
+    ///
+    /// This exists because the production path *cannot* produce a panelled
+    /// card and that is the honest state of the tree:
+    /// [`PetitionRegistry::prompt_content`] writes `panel: None` at its only
+    /// construction site, so no petition can raise a navigable prompt until
+    /// the surface that has something to browse — the core-drawn file picker,
+    /// P2.6.6 / issue #190 — exists to build one.
+    ///
+    /// So the navigation tests below drive a card that no deployment can
+    /// currently raise. That is stated rather than hidden: they prove the
+    /// mechanism, and they are **not** evidence that anything reaches it.
+    /// The seam is `#[cfg(test)]` so it cannot become that reach by
+    /// accident, on the precedent of [`super::ConsentSurface::show_for_test`].
+    #[cfg(test)]
+    fn give_panel_for_test(&mut self, surface: &mut ConsentSurface, panel: PanelContent) {
+        let mut content = surface.prompt.clone().expect("a prompt is up");
+        content.panel = Some(panel);
+        surface.show(content);
+        let card = surface.card().expect("the panelled card rasterizes");
+        let prompt = self.prompt.as_mut().expect("a prompt is up");
+        prompt.card = (card.width, card.height);
+        prompt.answerable = Answerable::Open(Open {
+            buttons: card.buttons.clone(),
+            panel: card.panel.clone().map(Panel::new),
+        });
+    }
+
+    /// **Test accessor.** The choice rectangles of the raised prompt, while
+    /// it is still answerable.
+    ///
+    /// Exists so this module's tests can assert on geometry without reaching
+    /// through [`Answerable`] at three call sites — and so that reaching for
+    /// the buttons of an *answered* prompt reads as `None` in a test exactly
+    /// as it does in production, rather than as a field that happens to still
+    /// hold stale rectangles.
+    #[cfg(test)]
+    fn buttons(&self) -> Option<&[ChoiceBox]> {
+        match self.prompt.as_ref()?.answerable {
+            Answerable::Open(ref open) => Some(&open.buttons),
+            Answerable::Answered => None,
+        }
+    }
+
+    /// The open state of the raised prompt, if there is one and it is still
+    /// answerable.
+    fn open(&mut self) -> Option<&mut Open> {
+        match self.prompt.as_mut()?.answerable {
+            Answerable::Open(ref mut open) => Some(open),
+            Answerable::Answered => None,
+        }
+    }
+
+    /// Queue a navigation, dropping the oldest if the embedder has stopped
+    /// draining.
+    ///
+    /// An **activation is never dropped silently**: it is the one step that
+    /// stands for a deliberate act, so a full queue drops older steps to make
+    /// room and says so in the log. Hovers and scrolls are safe to lose
+    /// because the newest is the truth.
+    fn push_navigation(&mut self, nav: Navigation) {
+        if self.navigations.len() >= MAX_NAVIGATIONS {
+            let dropped = self.navigations.pop_front();
+            tracing::warn!(
+                petition = %nav.petition,
+                ?dropped,
+                "consent navigation queue is full; the embedder is not draining it"
+            );
+        }
+        self.navigations.push_back(nav);
+    }
+
+    /// Update the panel's hover from the pointer's current position.
+    fn navigate_hover(&mut self, petition: PetitionId) {
+        let Some(slot) = self.slot_hit_test() else {
+            // No panel, or no pointer: nothing to report. A card with no
+            // panel takes this path on every motion and does nothing, which
+            // is what keeps the one-shot prompt bit-for-bit unchanged.
+            let Some(open) = self.open() else { return };
+            let Some(panel) = open.panel.as_mut() else {
+                return;
+            };
+            if panel.hover.take().is_some() {
+                self.push_navigation(Navigation {
+                    petition,
+                    step: Step::Hover(None),
+                });
+            }
+            return;
+        };
+        let Some(open) = self.open() else { return };
+        let Some(panel) = open.panel.as_mut() else {
+            return;
+        };
+        if panel.hover == Some(slot) {
+            return;
+        }
+        panel.hover = Some(slot);
+        self.push_navigation(Navigation {
+            petition,
+            step: Step::Hover(Some(slot)),
+        });
+    }
+
+    /// Accumulate scroll and emit whole detents.
+    ///
+    /// Horizontal scroll is ignored: the panel is a vertical list, and a
+    /// sideways wheel on a card that scrolls one way should do nothing rather
+    /// than something surprising.
+    ///
+    /// `value120` is the kernel's 120-units-per-detent convention, so the
+    /// accumulator is exact integer arithmetic and a high-resolution wheel
+    /// emits one step per detent rather than one per fractional event.
+    fn navigate_scroll(&mut self, petition: PetitionId, axis: Axis, value120: i32) {
+        if !matches!(axis, Axis::Vertical) {
+            return;
+        }
+        let Some(open) = self.open() else { return };
+        let Some(panel) = open.panel.as_mut() else {
+            return;
+        };
+        // Saturating: a wheel cannot legitimately deliver enough in one
+        // session to overflow, and a hostile driver must not be able to wrap
+        // this into a step in the opposite direction.
+        panel.accum = panel.accum.saturating_add(value120);
+        let steps = panel.accum / SCROLL_DETENT;
+        if steps == 0 {
+            return;
+        }
+        panel.accum -= steps * SCROLL_DETENT;
+        let steps = steps.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+        self.push_navigation(Navigation {
+            petition,
+            step: Step::Scroll(steps),
+        });
+    }
+
+    /// Which panel slot the human's pointer is over, if any.
+    ///
+    /// The panel's twin of [`Self::hit_test`], and it derives the card's
+    /// origin the same way, from the current view size — so neither can hold
+    /// a stale position.
+    fn slot_hit_test(&self) -> Option<u16> {
+        let prompt = self.prompt.as_ref()?;
+        let Answerable::Open(ref open) = prompt.answerable else {
+            return None;
+        };
+        let panel = open.panel.as_ref()?;
+        let (px, py) = self.pointer?;
+        let (ox, oy) = centered(prompt.card.0, prompt.card.1, self.view.0, self.view.1);
+        let cx = card_local(px, ox)?;
+        let cy = card_local(py, oy)?;
+        panel
+            .slots
+            .iter()
+            .find(|s| s.rect.contains(cx, cy))
+            .map(|s| s.index)
+    }
+
     /// Commit the armed decision if `button`'s release still lands on the
     /// choice its press armed. Any mismatch — a different button code, the
     /// pointer slid off, nothing armed at all — disarms without deciding,
     /// which is the "slide off to cancel" affordance the module docs
     /// justify.
     fn commit(&mut self, button: u32) {
+        // The panel's press first, and it never produces a decision: an
+        // activation is a navigation. Runs before the choice arm because the
+        // two are disjoint by geometry -- a slot and a button cannot both
+        // contain the pointer -- so ordering decides nothing, and putting the
+        // non-granting one first keeps the granting one last in the file.
+        self.commit_slot(button);
+
         let Some((armed_button, armed_choice)) = self.armed.take() else {
             return;
         };
         if armed_button != button || self.hit_test() != Some(armed_choice) {
             return;
         }
+        // Everything fallible is above this line. From here the transition is
+        // one infallible assignment: `Answered` drops the rectangles a second
+        // decision would have to hit, so there is no flag to check and no
+        // window in which `self.prompt` is absent.
         let Some(prompt) = self.prompt.as_mut() else {
             return;
         };
-        if prompt.decided {
+        if matches!(prompt.answerable, Answerable::Answered) {
             return;
         }
-        prompt.decided = true;
+        prompt.answerable = Answerable::Answered;
         self.decisions.push_back(Decision {
             petition: prompt.petition,
             choice: armed_choice,
         });
     }
 
+    /// Commit a panel press if its release still lands on the slot it armed,
+    /// against content that has not changed since.
+    ///
+    /// The epoch check is the whole of the "content moved under a resting
+    /// finger" defence: a press armed against one listing must not activate
+    /// a slot that now means something else. See [`Panel::epoch`].
+    fn commit_slot(&mut self, button: u32) {
+        let landed = self.slot_hit_test();
+        let Some(open) = self.open() else { return };
+        let Some(panel) = open.panel.as_mut() else {
+            return;
+        };
+        let Some((armed_button, armed_slot, armed_epoch)) = panel.pressed.take() else {
+            return;
+        };
+        let current_epoch = panel.epoch;
+        let petition = match self.prompt.as_ref() {
+            Some(prompt) => prompt.petition,
+            None => return,
+        };
+        if armed_button != button || landed != Some(armed_slot) {
+            // Slid off, or a different button: the "slide off to cancel"
+            // affordance the choice row already has.
+            return;
+        }
+        if armed_epoch != current_epoch {
+            tracing::debug!(
+                %petition,
+                slot = armed_slot,
+                "panel press discarded: the listing changed between press and release"
+            );
+            return;
+        }
+        self.push_navigation(Navigation {
+            petition,
+            step: Step::Activate(armed_slot),
+        });
+    }
+
     /// Which choice the human's pointer is over, if any: view coordinates →
     /// card-local through the same centering the compositor draws with,
     /// then the renderer's own rectangles.
+    ///
+    /// `None` once the prompt is answered — not by a check, but because
+    /// [`Answerable::Answered`] holds no rectangles to search.
     fn hit_test(&self) -> Option<Choice> {
         let prompt = self.prompt.as_ref()?;
+        let Answerable::Open(ref open) = prompt.answerable else {
+            return None;
+        };
         let (px, py) = self.pointer?;
         let (ox, oy) = centered(prompt.card.0, prompt.card.1, self.view.0, self.view.1);
         let cx = card_local(px, ox)?;
         let cy = card_local(py, oy)?;
-        prompt
-            .buttons
+        open.buttons
             .iter()
             .find(|b| b.rect.contains(cx, cy))
             .map(|b| b.choice)
@@ -1181,8 +1693,9 @@ mod tests {
     fn center_of(grab: &ConsentGrab, choice: Choice) -> (f64, f64) {
         let prompt = grab.prompt.as_ref().expect("a prompt is up");
         let (ox, oy) = centered(prompt.card.0, prompt.card.1, VIEW.0, VIEW.1);
-        let button = prompt
-            .buttons
+        let button = grab
+            .buttons()
+            .expect("the prompt is still answerable")
             .iter()
             .find(|b| b.choice == choice)
             .unwrap_or_else(|| panic!("the prompt offers {choice:?}"));
@@ -2272,7 +2785,12 @@ mod tests {
         // The button's new position decides.
         let prompt_card = {
             let prompt = grab.prompt.as_ref().unwrap();
-            (prompt.card, prompt.buttons.clone())
+            (
+                prompt.card,
+                grab.buttons()
+                    .expect("the prompt is still answerable")
+                    .to_vec(),
+            )
         };
         let (ox, oy) = centered(prompt_card.0 .0, prompt_card.0 .1, BIGGER.0, BIGGER.1);
         let deny = prompt_card
@@ -2316,10 +2834,8 @@ mod tests {
         )
         .expect("pending");
         let offered: Vec<Choice> = grab
-            .prompt
-            .as_ref()
-            .unwrap()
-            .buttons
+            .buttons()
+            .expect("the prompt is still answerable")
             .iter()
             .map(|b| b.choice)
             .collect();
@@ -2487,5 +3003,355 @@ mod tests {
                 .get(),
             2
         );
+    }
+
+    // -- the interactive panel (P2.6.6's prerequisite) ----------------------
+    //
+    // Every test below drives a card no deployment can raise: nothing in the
+    // shipped tree constructs a `PanelContent` (see
+    // `PetitionRegistry::prompt_content`), so these prove the mechanism and
+    // are not evidence that anything reaches it. `give_panel_for_test` is the
+    // seam, and it is `#[cfg(test)]` so it cannot become that reach.
+
+    /// A panel with eight filled slots out of forty, nothing hovered.
+    fn panel() -> PanelContent {
+        PanelContent {
+            filled: super::super::render::PANEL_ROWS,
+            highlight: None,
+            offset: 0,
+            total: 40,
+        }
+    }
+
+    /// Raise an ordinary prompt and then give it a panel.
+    fn panelled() -> (
+        ConsentGrab,
+        ConsentSurface,
+        PetitionRegistry,
+        PetitionId,
+        Instant,
+    ) {
+        let (mut grab, mut surface, registry, petition, t0) = armed();
+        grab.give_panel_for_test(&mut surface, panel());
+        (grab, surface, registry, petition, t0)
+    }
+
+    /// The centre of panel slot `index`, in view coordinates.
+    fn slot_center(grab: &ConsentGrab, index: u16) -> (f64, f64) {
+        let prompt = grab.prompt.as_ref().expect("a prompt is up");
+        let Answerable::Open(ref open) = prompt.answerable else {
+            panic!("the prompt is still answerable");
+        };
+        let slot = open
+            .panel
+            .as_ref()
+            .expect("the card drew a panel")
+            .slots
+            .iter()
+            .find(|s| s.index == index)
+            .expect("the panel drew this slot");
+        let (ox, oy) = centered(prompt.card.0, prompt.card.1, VIEW.0, VIEW.1);
+        (
+            f64::from(ox + slot.rect.x) + f64::from(slot.rect.w) / 2.0,
+            f64::from(oy + slot.rect.y) + f64::from(slot.rect.h) / 2.0,
+        )
+    }
+
+    fn scroll(value120: i32) -> SeatInputKind {
+        SeatInputKind::Scroll {
+            axis: Axis::Vertical,
+            value120,
+        }
+    }
+
+    /// Past the guard interval, where a press may arm something.
+    fn past_guard(t0: Instant) -> Instant {
+        t0 + GUARD_INTERVAL + Duration::from_millis(1)
+    }
+
+    /// **A card is navigable because a panel was painted, never because a
+    /// flag said so.**
+    ///
+    /// The two halves of the claim in one test: the prompt every petition in
+    /// this tree can actually raise draws no panel and navigates nothing, and
+    /// the same prompt given one navigates. If a future change makes
+    /// `Card::panel` and the grab's idea of interactivity separate values,
+    /// this is where they diverge.
+    #[test]
+    fn only_a_card_that_drew_a_panel_navigates() {
+        let (mut grab, _surface, _registry, _petition, t0) = armed();
+        assert!(
+            grab.prompt
+                .as_ref()
+                .and_then(|p| match p.answerable {
+                    Answerable::Open(ref open) => open.panel.as_ref(),
+                    Answerable::Answered => None,
+                })
+                .is_none(),
+            "an ordinary petition's card must draw no panel: nothing in this tree builds a \
+             PanelContent, so a card that had one would mean the production path grew a way to"
+        );
+        grab.judge_parts(Origin::Physical, &motion(100.0, 100.0), t0);
+        grab.judge_parts(Origin::Physical, &scroll(SCROLL_DETENT), t0);
+        assert!(
+            grab.take_navigation().is_none(),
+            "a card with no panel must produce no navigation from any event"
+        );
+
+        let (mut grab, _surface, _registry, petition, t0) = panelled();
+        let (x, y) = slot_center(&grab, 3);
+        grab.judge_parts(Origin::Physical, &motion(x, y), t0);
+        assert_eq!(
+            grab.take_navigation(),
+            Some(Navigation {
+                petition,
+                step: Step::Hover(Some(3))
+            }),
+            "the same prompt, given a painted panel, reports the slot under the pointer"
+        );
+    }
+
+    /// **An agent's pointer navigates nothing**, exactly as it answers
+    /// nothing.
+    ///
+    /// The `origin != Physical` early return is the whole "an agent cannot
+    /// answer its own prompt" property, and navigation had to go below it
+    /// rather than beside it. An agent that could scroll a human's picker
+    /// could put a different entry under the human's finger — the same hazard
+    /// as sliding a button, one layer in.
+    #[test]
+    fn an_emulated_pointer_cannot_navigate_a_panel() {
+        let (mut grab, _surface, _registry, _petition, t0) = panelled();
+        let (x, y) = slot_center(&grab, 2);
+        for kind in [
+            motion(x, y),
+            scroll(SCROLL_DETENT),
+            press(BTN_LEFT),
+            release(BTN_LEFT),
+        ] {
+            grab.judge_parts(Origin::Emulated, &kind, past_guard(t0));
+        }
+        assert!(
+            grab.take_navigation().is_none(),
+            "an emulated event navigated a human's panel"
+        );
+    }
+
+    /// Press and release on one slot activates it; sliding off does not.
+    #[test]
+    fn a_slot_activates_on_press_and_release_and_cancels_on_slide_off() {
+        let (mut grab, _surface, _registry, petition, t0) = panelled();
+        let now = past_guard(t0);
+        let (x, y) = slot_center(&grab, 4);
+        grab.judge_parts(Origin::Physical, &motion(x, y), now);
+        grab.judge_parts(Origin::Physical, &press(BTN_LEFT), now);
+        grab.judge_parts(Origin::Physical, &release(BTN_LEFT), now);
+        let steps: Vec<Step> = std::iter::from_fn(|| grab.take_navigation())
+            .map(|n| {
+                assert_eq!(n.petition, petition);
+                n.step
+            })
+            .collect();
+        assert!(
+            steps.contains(&Step::Activate(4)),
+            "press and release on one slot must activate it; got {steps:?}"
+        );
+
+        // Slide off between press and release: the same affordance the choice
+        // row has, and it must cancel.
+        let (mut grab, _surface, _registry, _petition, t0) = panelled();
+        let now = past_guard(t0);
+        let (x, y) = slot_center(&grab, 4);
+        let (ox, oy) = slot_center(&grab, 6);
+        grab.judge_parts(Origin::Physical, &motion(x, y), now);
+        grab.judge_parts(Origin::Physical, &press(BTN_LEFT), now);
+        grab.judge_parts(Origin::Physical, &motion(ox, oy), now);
+        grab.judge_parts(Origin::Physical, &release(BTN_LEFT), now);
+        let steps: Vec<Step> = std::iter::from_fn(|| grab.take_navigation())
+            .map(|n| n.step)
+            .collect();
+        assert!(
+            !steps.iter().any(|s| matches!(s, Step::Activate(_))),
+            "a press that slid off its slot must activate nothing; got {steps:?}"
+        );
+    }
+
+    /// **The panel is inside the guard interval too.**
+    ///
+    /// A navigable card is still a card that just appeared, so a press
+    /// arriving before the human could have read it must arm nothing on the
+    /// panel either — not just nothing on the choice row.
+    #[test]
+    fn a_press_inside_the_guard_interval_arms_no_slot() {
+        let (mut grab, _surface, _registry, _petition, t0) = panelled();
+        let (x, y) = slot_center(&grab, 1);
+        grab.judge_parts(Origin::Physical, &motion(x, y), t0);
+        grab.judge_parts(Origin::Physical, &press(BTN_LEFT), t0);
+        grab.judge_parts(Origin::Physical, &release(BTN_LEFT), t0);
+        let steps: Vec<Step> = std::iter::from_fn(|| grab.take_navigation())
+            .map(|n| n.step)
+            .collect();
+        assert!(
+            !steps.iter().any(|s| matches!(s, Step::Activate(_))),
+            "a press inside the guard interval activated a slot; got {steps:?}"
+        );
+    }
+
+    /// **Content that changed under a resting finger activates nothing.**
+    ///
+    /// The panel's half of the guard argument. Stepping into a directory
+    /// relabels every row while the human's finger is still down on one; a
+    /// press armed against the old listing must not commit against the new.
+    #[test]
+    fn a_refresh_between_press_and_release_discards_the_press() {
+        let (mut grab, mut surface, _registry, _petition, t0) = panelled();
+        let now = past_guard(t0);
+        let (x, y) = slot_center(&grab, 2);
+        grab.judge_parts(Origin::Physical, &motion(x, y), now);
+        grab.judge_parts(Origin::Physical, &press(BTN_LEFT), now);
+        assert_eq!(
+            grab.refresh_panel(
+                PanelContent {
+                    highlight: Some(2),
+                    ..panel()
+                },
+                &mut surface
+            ),
+            Applied::Redrawn,
+            "a changed panel must repaint"
+        );
+        grab.judge_parts(Origin::Physical, &release(BTN_LEFT), now);
+        let steps: Vec<Step> = std::iter::from_fn(|| grab.take_navigation())
+            .map(|n| n.step)
+            .collect();
+        assert!(
+            !steps.iter().any(|s| matches!(s, Step::Activate(_))),
+            "a press survived a content change under the finger; got {steps:?}"
+        );
+    }
+
+    /// **A refresh never resizes the card**, which is what keeps the Deny
+    /// button still while a list scrolls under it.
+    ///
+    /// The panel's height is a constant, so every content the panel can hold
+    /// produces the same card. `Applied::Reshaped` is unreachable, and this
+    /// is where that is checked rather than asserted in a comment.
+    #[test]
+    fn no_panel_content_can_resize_the_card() {
+        let (mut grab, mut surface, _registry, _petition, _t0) = panelled();
+        let size = grab.prompt.as_ref().expect("a prompt is up").card;
+        for (filled, highlight, offset, total) in [
+            (0u16, None, 0u32, 0u32),
+            (1, Some(0), 0, 1),
+            (super::super::render::PANEL_ROWS, Some(7), 32, 40),
+            (super::super::render::PANEL_ROWS, None, 999, 100_000),
+        ] {
+            let applied = grab.refresh_panel(
+                PanelContent {
+                    filled,
+                    highlight,
+                    offset,
+                    total,
+                },
+                &mut surface,
+            );
+            assert_ne!(
+                applied,
+                Applied::Reshaped,
+                "panel content {filled}/{total} resized the card"
+            );
+            assert_eq!(
+                grab.prompt.as_ref().expect("a prompt is up").card,
+                size,
+                "the card's size moved with its panel content"
+            );
+        }
+    }
+
+    /// An unchanged panel is not repainted, so a pointer resting inside one
+    /// slot does not re-rasterize the card on every motion event.
+    #[test]
+    fn an_unchanged_panel_does_not_repaint() {
+        let (mut grab, mut surface, _registry, _petition, _t0) = panelled();
+        let generation = surface.generation();
+        assert_eq!(
+            grab.refresh_panel(panel(), &mut surface),
+            Applied::Unchanged,
+            "refreshing with the content already on screen must do nothing"
+        );
+        assert_eq!(
+            surface.generation(),
+            generation,
+            "an unchanged panel bumped the generation, which re-uploads the whole window texture"
+        );
+    }
+
+    /// Scroll is emitted per detent, not per event.
+    #[test]
+    fn scroll_accumulates_to_whole_detents() {
+        let (mut grab, _surface, _registry, petition, t0) = panelled();
+        // Three sub-detent events that together make one detent.
+        for _ in 0..3 {
+            grab.judge_parts(Origin::Physical, &scroll(SCROLL_DETENT / 3), t0);
+        }
+        assert_eq!(
+            grab.take_navigation(),
+            Some(Navigation {
+                petition,
+                step: Step::Scroll(1)
+            }),
+            "three thirds of a detent must produce exactly one step"
+        );
+        assert!(grab.take_navigation().is_none(), "and nothing more");
+    }
+
+    /// **An answered prompt navigates nothing and decides nothing.**
+    ///
+    /// Both halves come from the same fact rather than from two checks:
+    /// answering replaces `Answerable::Open` — which held the choice
+    /// rectangles *and* the panel — with `Answered`, which holds neither. A
+    /// second decision has no button to hit and a navigation has no slot.
+    #[test]
+    fn an_answered_prompt_has_neither_buttons_nor_a_panel() {
+        let (mut grab, _surface, _registry, _petition, t0) = panelled();
+        let now = past_guard(t0);
+        let deny = center_of(&grab, Choice::Deny);
+        click(&mut grab, deny, now);
+        assert!(
+            grab.take_decision().is_some(),
+            "the click must have decided"
+        );
+        assert!(
+            grab.buttons().is_none(),
+            "an answered prompt still holds choice rectangles a second click could hit"
+        );
+        // Drain the navigations the click itself produced, then try to make
+        // more against the answered card.
+        while grab.take_navigation().is_some() {}
+        let (x, y) = slot_center_after_answer(&grab);
+        grab.judge_parts(Origin::Physical, &motion(x, y), now);
+        grab.judge_parts(Origin::Physical, &scroll(SCROLL_DETENT), now);
+        grab.judge_parts(Origin::Physical, &press(BTN_LEFT), now);
+        grab.judge_parts(Origin::Physical, &release(BTN_LEFT), now);
+        assert!(
+            grab.take_navigation().is_none(),
+            "an answered prompt produced a navigation"
+        );
+        assert!(
+            grab.take_decision().is_none(),
+            "an answered prompt produced a second decision"
+        );
+    }
+
+    /// Somewhere inside the card of an answered prompt. The slots are gone,
+    /// so this cannot ask the panel where they were — it uses the card's
+    /// centre, which was inside the panel's column when it was drawn.
+    fn slot_center_after_answer(grab: &ConsentGrab) -> (f64, f64) {
+        let prompt = grab.prompt.as_ref().expect("a prompt is up");
+        let (ox, oy) = centered(prompt.card.0, prompt.card.1, VIEW.0, VIEW.1);
+        (
+            f64::from(ox) + f64::from(prompt.card.0) / 2.0,
+            f64::from(oy) + f64::from(prompt.card.1) / 2.0,
+        )
     }
 }

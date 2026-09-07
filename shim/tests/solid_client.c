@@ -56,9 +56,14 @@
  * compositor never comes up, which is what stops "the probe never ran" from
  * being indistinguishable from "the probe ran and found nothing".
  *
- *   PROBE-VERSION 3
+ *   PROBE-VERSION 4
  *   PROBE-GROUPS n=<count> gids=<g,g,...>
  *   PROBE-USERNS created=<yes|no|error> errno=<n>
+ *   PROBE-NET-IFACES names=<a,b,...|error>
+ *   PROBE-NET-LO up=<yes|no|error> running=<yes|no|error> errno=<n>
+ *   PROBE-NET-LOOPBACK rc=<0|-1> errno=<n>
+ *   PROBE-NET-CONNECT target=<host:port> rc=<0|-1> errno=<n>    (--net-connect)
+ *   PROBE-NET-ABSTRACT name=<nonce> rc=<0|-1> errno=<n>         (--net-abstract)
  *   PROBE path=<abs> open=<ok|fail> errno=<n> dev=<u> ino=<u>   (one per --probe)
  *   PROBE-SYSCALL name=<key> rc=<n> errno=<n>          (one per row, --syscall-probe)
  *   PROBE-END
@@ -69,6 +74,13 @@
  * could have measured it. It is reported unconditionally alongside
  * PROBE-GROUPS because it costs one fork and because a report that carried it
  * only on request would let the interesting run be the one nobody asked for.
+ *
+ * The PROBE-NET-* block arrived with version 4 (P2.7.1, issue #195), and is
+ * about the realm's NETWORK NAMESPACE -- again a property no `--probe` path
+ * could reach. The first three are unconditional on PROBE-USERNS's reasoning;
+ * the last two take a target because only the harness knows what it bound.
+ * See the block above `probe_net_ifaces` for why `lo` is up, and for why the
+ * "was it reachable at all" half deliberately is not measured here.
  *
  * THE SYSCALL PROBE (--syscall-probe), added by P2.6.4 (issue #188).
  *
@@ -105,10 +117,15 @@
  */
 #define _GNU_SOURCE
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <inttypes.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <stddef.h>
 #include <linux/audit.h>
 #include <linux/bpf.h>
 #include <linux/filter.h>
@@ -121,11 +138,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/ptrace.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -466,6 +485,302 @@ static void probe_userns(FILE *out) {
 }
 
 /* ---------------------------------------------------------------------------
+ * The network-namespace probe (P2.7.1, issue #195)
+ * ---------------------------------------------------------------------------
+ *
+ * The realm's network confinement is one clone flag and one ioctl:
+ * `CLONE_NEWNET` in `vitrin-realm-init`'s single `unshare`, and a
+ * `SIOCSIFFLAGS` bringing `lo` up. That is a CONFIGURATION rather than a
+ * mechanism -- PRD Doc 2 §12 -- and these five lines are what measures it
+ * from inside, because every part of it is invisible from the host.
+ *
+ * WHY `lo` IS UP AND WHY THAT IS NOT A HOLE. Firefox, dbus-daemon and the
+ * accessibility stack all bind or connect on 127.0.0.1 for their own
+ * plumbing, and a realm whose loopback is down fails in ways that look like
+ * Vitrin bugs. It is safe because nothing of the HOST's is listening on it:
+ * "`ssh localhost` reaches the realm's own empty loopback" is a claim about
+ * what is BOUND, not about what is routable. So this probe reports both --
+ * that loopback works (or the realm is broken) and that the host's is
+ * unreachable (or the confinement is).
+ *
+ * WHY THE HOST HALF IS NOT HERE. `--net-connect` and `--net-abstract` report
+ * an attempt and its errno and nothing else. Whether the target was
+ * reachable AT ALL is the harness's to establish, from outside, in the same
+ * run -- `tests/integration/test_real_confinement.py`. A refusal against a
+ * port nothing was listening on proves nothing, and this file cannot tell
+ * the two apart: it is inside the realm, which is the whole point. */
+
+/* PROBE-NET-IFACES names=<comma-separated>: every interface in this
+ * process's network namespace, from `/proc/self/net/dev`.
+ *
+ * Reported as a SET for the gate to compare exactly, never as a
+ * "does it contain eth0" question: a host that happened to name an interface
+ * something else would walk straight through a containment check, and a
+ * realm is supposed to have exactly one. `names=` with nothing after it is a
+ * namespace with no interfaces, which is distinguishable from
+ * `names=error`. */
+static void probe_net_ifaces(FILE *out) {
+	FILE *dev = fopen("/proc/self/net/dev", "re");
+	if (dev == NULL) {
+		fprintf(out, "PROBE-NET-IFACES names=error errno=%d\n", errno);
+		return;
+	}
+	char line[512];
+	int lineno = 0;
+	int written = 0;
+	fprintf(out, "PROBE-NET-IFACES names=");
+	while (fgets(line, sizeof(line), dev) != NULL) {
+		/* Two header lines, then one row per interface: leading spaces, the
+		 * name, a colon, then counters. */
+		if (++lineno <= 2) {
+			continue;
+		}
+		char *start = line;
+		while (*start == ' ' || *start == '\t') {
+			start++;
+		}
+		char *colon = strchr(start, ':');
+		if (colon == NULL) {
+			continue;
+		}
+		*colon = '\0';
+		fprintf(out, "%s%s", written++ ? "," : "", start);
+	}
+	fclose(dev);
+	fprintf(out, "\n");
+}
+
+/* PROBE-NET-LO up=<yes|no> running=<yes|no> errno=<n>: `lo`'s flags, read
+ * back rather than assumed from the helper having tried.
+ *
+ * UP and RUNNING are reported separately because they are different facts:
+ * UP is the administrative flag the helper sets, RUNNING is the kernel
+ * saying the interface is actually operational. A gate that only checked UP
+ * would pass on an interface configured but not carrying. */
+static void probe_net_lo(FILE *out) {
+	int sock = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+	if (sock < 0) {
+		fprintf(out, "PROBE-NET-LO up=error running=error errno=%d\n", errno);
+		return;
+	}
+	struct ifreq req;
+	memset(&req, 0, sizeof(req));
+	strncpy(req.ifr_name, "lo", IFNAMSIZ - 1);
+	if (ioctl(sock, SIOCGIFFLAGS, &req) < 0) {
+		int e = errno;
+		close(sock);
+		fprintf(out, "PROBE-NET-LO up=error running=error errno=%d\n", e);
+		return;
+	}
+	close(sock);
+	fprintf(out, "PROBE-NET-LO up=%s running=%s errno=0\n",
+			(req.ifr_flags & IFF_UP) ? "yes" : "no",
+			(req.ifr_flags & IFF_RUNNING) ? "yes" : "no");
+}
+
+/* Connect `fd` to `addr` with a bounded wait, so a probe can never hang the
+ * run it is reporting on. Returns 0, or the errno.
+ *
+ * Non-blocking plus `poll` rather than a bare `connect`: inside an empty
+ * netns every interesting answer (ECONNREFUSED, ENETUNREACH) arrives at
+ * once, but this file also runs OUTSIDE a realm as its own control, where a
+ * blocking connect to something unreachable is a stall that reads as a
+ * crashed app. */
+static int connect_bounded(int fd, const struct sockaddr *addr, socklen_t len) {
+	int flags = fcntl(fd, F_GETFL, 0);
+	if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+		return errno;
+	}
+	if (connect(fd, addr, len) == 0) {
+		return 0;
+	}
+	if (errno != EINPROGRESS) {
+		return errno;
+	}
+	struct pollfd pfd = {.fd = fd, .events = POLLOUT, .revents = 0};
+	int ready;
+	do {
+		ready = poll(&pfd, 1, 2000);
+	} while (ready < 0 && errno == EINTR);
+	if (ready == 0) {
+		return ETIMEDOUT;
+	}
+	if (ready < 0) {
+		return errno;
+	}
+	int err = 0;
+	socklen_t errlen = sizeof(err);
+	if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &errlen) < 0) {
+		return errno;
+	}
+	if (err == 0) {
+		/* Put it back. The caller may write on this socket, and a write that
+		 * returned EAGAIN because the probe left it non-blocking would be a
+		 * failure invented by the measurement. */
+		(void)fcntl(fd, F_SETFL, flags);
+	}
+	return err;
+}
+
+/* PROBE-NET-LOOPBACK rc=<0|-1> errno=<n>: a byte round-trip between two
+ * processes inside THIS namespace, over 127.0.0.1.
+ *
+ * This is what separates "there is a network namespace" from "there is a
+ * network namespace with a working loopback". Both halves are needed: the
+ * negatives below are equally satisfied by a realm whose networking is
+ * simply broken, and a gate that only asserted the negatives would call that
+ * confinement. */
+static void probe_net_loopback(FILE *out) {
+	int listener = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+	if (listener < 0) {
+		fprintf(out, "PROBE-NET-LOOPBACK rc=-1 errno=%d\n", errno);
+		return;
+	}
+	struct sockaddr_in addr;
+	memset(&addr, 0, sizeof(addr));
+	addr.sin_family = AF_INET;
+	addr.sin_port = 0; /* any free port */
+	addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	socklen_t addrlen = sizeof(addr);
+	if (bind(listener, (struct sockaddr *)&addr, addrlen) < 0 || listen(listener, 1) < 0 ||
+			getsockname(listener, (struct sockaddr *)&addr, &addrlen) < 0) {
+		int e = errno;
+		close(listener);
+		fprintf(out, "PROBE-NET-LOOPBACK rc=-1 errno=%d\n", e);
+		return;
+	}
+	pid_t pid = fork();
+	if (pid < 0) {
+		int e = errno;
+		close(listener);
+		fprintf(out, "PROBE-NET-LOOPBACK rc=-1 errno=%d\n", e);
+		return;
+	}
+	if (pid == 0) {
+		int peer = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+		if (peer < 0) {
+			_exit(1);
+		}
+		if (connect_bounded(peer, (struct sockaddr *)&addr, addrlen) != 0) {
+			_exit(1);
+		}
+		ssize_t wrote = write(peer, "v", 1);
+		close(peer);
+		_exit(wrote == 1 ? 0 : 1);
+	}
+	/* BOUNDED, and the bound is not defensive tidiness: with `lo` DOWN the
+	 * child's connect fails and the child exits, so a bare blocking `accept`
+	 * waits for a peer that will never arrive and the whole run hangs until
+	 * something kills it. That is not a hypothetical -- it is what this
+	 * function did when it was first run inside a real `unshare -rn`, where
+	 * "loopback is down" is precisely the state being measured. A probe must
+	 * report the broken case, never become it. */
+	struct pollfd waiting = {.fd = listener, .events = POLLIN, .revents = 0};
+	int ready;
+	do {
+		ready = poll(&waiting, 1, 2000);
+	} while (ready < 0 && errno == EINTR);
+	int result = -1;
+	int err = ETIMEDOUT;
+	int served = -1;
+	if (ready > 0) {
+		served = accept(listener, NULL, NULL);
+		err = errno;
+	} else if (ready < 0) {
+		err = errno;
+	}
+	if (served >= 0) {
+		/* Bounded for the same reason the accept above is: the peer could
+		 * connect and then die before writing, and an unbounded read would
+		 * turn that into a hang instead of a reported failure. */
+		struct timeval limit = {.tv_sec = 2, .tv_usec = 0};
+		(void)setsockopt(served, SOL_SOCKET, SO_RCVTIMEO, &limit, sizeof(limit));
+		char byte = 0;
+		if (read(served, &byte, 1) == 1 && byte == 'v') {
+			result = 0;
+			err = 0;
+		} else {
+			err = errno;
+		}
+		close(served);
+	}
+	close(listener);
+	int status = 0;
+	while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+		/* retry */
+	}
+	fprintf(out, "PROBE-NET-LOOPBACK rc=%d errno=%d\n", result, err);
+}
+
+/* PROBE-NET-CONNECT target=<host:port> rc=<0|-1> errno=<n>: one TCP connect
+ * to an address the HARNESS chose, reported with the exact errno.
+ *
+ * The errno is part of the claim and not colour: ECONNREFUSED means a stack
+ * answered and nothing was listening, ENETUNREACH means there was no route
+ * to try. Both are the confinement; a gate that accepted "not zero" would
+ * also accept ETIMEDOUT from a firewall on the host, which is a different
+ * and much weaker fact. */
+static void probe_net_connect(FILE *out, const char *target) {
+	char host[64];
+	const char *sep = strrchr(target, ':');
+	if (sep == NULL || (size_t)(sep - target) >= sizeof(host)) {
+		fprintf(out, "PROBE-NET-CONNECT target=%s rc=-1 errno=%d\n", target, EINVAL);
+		return;
+	}
+	memcpy(host, target, (size_t)(sep - target));
+	host[sep - target] = '\0';
+	int port = atoi(sep + 1);
+	struct sockaddr_in addr;
+	memset(&addr, 0, sizeof(addr));
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons((uint16_t)port);
+	if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
+		fprintf(out, "PROBE-NET-CONNECT target=%s rc=-1 errno=%d\n", target, EINVAL);
+		return;
+	}
+	int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+	if (fd < 0) {
+		fprintf(out, "PROBE-NET-CONNECT target=%s rc=-1 errno=%d\n", target, errno);
+		return;
+	}
+	int err = connect_bounded(fd, (struct sockaddr *)&addr, sizeof(addr));
+	close(fd);
+	fprintf(out, "PROBE-NET-CONNECT target=%s rc=%d errno=%d\n", target, err == 0 ? 0 : -1, err);
+}
+
+/* PROBE-NET-ABSTRACT name=<nonce> rc=<0|-1> errno=<n>: one connect to an
+ * abstract-namespace UNIX socket the harness bound on the host.
+ *
+ * The third of PRD Doc 2 §12's three socket closures, and the one that
+ * belongs to the NETWORK namespace rather than the mount namespace: an
+ * abstract socket has no filesystem path for a mount table to remove, and is
+ * scoped to a netns instead. So this is the only one of the three that would
+ * survive P2.6.2's mount work and still need this task. */
+static void probe_net_abstract(FILE *out, const char *name) {
+	struct sockaddr_un addr;
+	memset(&addr, 0, sizeof(addr));
+	addr.sun_family = AF_UNIX;
+	size_t len = strlen(name);
+	if (len + 1 > sizeof(addr.sun_path)) {
+		fprintf(out, "PROBE-NET-ABSTRACT name=%s rc=-1 errno=%d\n", name, EINVAL);
+		return;
+	}
+	/* Abstract: a leading NUL, then the name, and the address length stops at
+	 * the end of the name -- it is NOT NUL-terminated the way a path is. */
+	addr.sun_path[0] = '\0';
+	memcpy(addr.sun_path + 1, name, len);
+	socklen_t addrlen = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + len);
+	int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+	if (fd < 0) {
+		fprintf(out, "PROBE-NET-ABSTRACT name=%s rc=-1 errno=%d\n", name, errno);
+		return;
+	}
+	int err = connect_bounded(fd, (struct sockaddr *)&addr, addrlen);
+	close(fd);
+	fprintf(out, "PROBE-NET-ABSTRACT name=%s rc=%d errno=%d\n", name, err == 0 ? 0 : -1, err);
+}
+
+/* ---------------------------------------------------------------------------
  * The syscall probe (P2.6.4, issue #188)
  * ------------------------------------------------------------------------- */
 
@@ -791,8 +1106,8 @@ static void probe_syscalls(FILE *out) {
 /* Write the whole report, and return false if anything about writing it
  * failed. A probe whose report never landed must not be mistaken for a probe
  * that ran, so the caller exits non-zero. */
-static bool write_probe_report(const char *out_name, char *const *paths, int count,
-		bool syscalls) {
+static bool write_probe_report(const char *out_name, char *const *paths, int count, bool syscalls,
+		const char *net_connect, const char *net_abstract) {
 	char resolved[4096];
 	if (out_name[0] == '/') {
 		if ((size_t)snprintf(resolved, sizeof(resolved), "%s", out_name) >= sizeof(resolved)) {
@@ -827,7 +1142,7 @@ static bool write_probe_report(const char *out_name, char *const *paths, int cou
 		close(fd);
 		return false;
 	}
-	fprintf(out, "PROBE-VERSION 3\n");
+	fprintf(out, "PROBE-VERSION 4\n");
 	/* The supplementary groups this process still holds. D-037(5): they cannot
 	 * be dropped -- `setgroups=deny` blocks the CALL and drops nothing -- so
 	 * the realm keeps `video`, `render`, `input` and the rest as kgids, and
@@ -842,6 +1157,21 @@ static bool write_probe_report(const char *out_name, char *const *paths, int cou
 	}
 	fprintf(out, "\n");
 	probe_userns(out);
+	/* Unconditional, on `PROBE-USERNS`'s own reasoning: these are facts about
+	 * the namespace this process is IN, they cost two reads and one fork
+	 * between them, and a report that carried them only on request would let
+	 * the interesting run be the one nobody asked for. The two that take an
+	 * argument cannot be unconditional -- only the harness knows what it
+	 * bound. */
+	probe_net_ifaces(out);
+	probe_net_lo(out);
+	probe_net_loopback(out);
+	if (net_connect != NULL) {
+		probe_net_connect(out, net_connect);
+	}
+	if (net_abstract != NULL) {
+		probe_net_abstract(out, net_abstract);
+	}
 	for (int i = 0; i < count; i++) {
 		probe_one(out, paths[i]);
 	}
@@ -868,6 +1198,8 @@ int main(int argc, char **argv) {
 	int probe_count = 0;
 	const char *probe_out = NULL;
 	bool syscall_probe = false;
+	const char *net_connect = NULL;
+	const char *net_abstract = NULL;
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--run-ms") == 0 && i + 1 < argc) {
 			run_ms = atoi(argv[++i]);
@@ -887,10 +1219,15 @@ int main(int argc, char **argv) {
 			probe_out = argv[++i];
 		} else if (strcmp(argv[i], "--syscall-probe") == 0) {
 			syscall_probe = true;
+		} else if (strcmp(argv[i], "--net-connect") == 0 && i + 1 < argc) {
+			net_connect = argv[++i];
+		} else if (strcmp(argv[i], "--net-abstract") == 0 && i + 1 < argc) {
+			net_abstract = argv[++i];
 		} else {
 			fprintf(stderr,
 					"usage: %s [--run-ms MS] [--colour RRGGBB] "
-					"[--probe PATH]... [--syscall-probe] [--probe-out FILE]\n",
+					"[--probe PATH]... [--syscall-probe] "
+					"[--net-connect HOST:PORT] [--net-abstract NAME] [--probe-out FILE]\n",
 					argv[0]);
 			return 2;
 		}
@@ -901,11 +1238,23 @@ int main(int argc, char **argv) {
 		fprintf(stderr, "--syscall-probe needs --probe-out\n");
 		return 2;
 	}
-	if (syscall_probe && probe_count == 0) {
+	if ((net_connect != NULL || net_abstract != NULL) && probe_out == NULL) {
+		/* And the same rule again, for the same reason. These two are the
+		 * only probes here whose target the harness chose, so a run that
+		 * attempted them and reported nowhere would leave the harness holding
+		 * a listener nobody ever tried to reach -- which reads exactly like a
+		 * confinement. */
+		fprintf(stderr, "--net-connect and --net-abstract need --probe-out\n");
+		return 2;
+	}
+	if ((syscall_probe || net_connect != NULL || net_abstract != NULL) && probe_count == 0) {
 		/* `--syscall-probe` alone is legal and is how the seccomp gate runs:
-		 * it wants the PROBE-SYSCALL lines and no path probes. The pairing
-		 * rule below is relaxed for exactly that case, and only that one. */
-		if (!write_probe_report(probe_out, NULL, 0, true)) {
+		 * it wants the PROBE-SYSCALL lines and no path probes. A bare
+		 * `--net-connect`/`--net-abstract` is legal for the same reason. The
+		 * pairing rule below is relaxed for exactly those cases and no other
+		 * -- in particular a lone `--probe-out` is still refused, as it was
+		 * before this task: something must have been ASKED for. */
+		if (!write_probe_report(probe_out, NULL, 0, syscall_probe, net_connect, net_abstract)) {
 			return 3;
 		}
 	} else if ((probe_count > 0) != (probe_out != NULL)) {
@@ -916,7 +1265,8 @@ int main(int argc, char **argv) {
 		fprintf(stderr, "--probe and --probe-out are used together or not at all\n");
 		return 2;
 	} else if (probe_count > 0 &&
-			!write_probe_report(probe_out, probes, probe_count, syscall_probe)) {
+			!write_probe_report(
+					probe_out, probes, probe_count, syscall_probe, net_connect, net_abstract)) {
 		return 3;
 	}
 	signal(SIGINT, on_signal);

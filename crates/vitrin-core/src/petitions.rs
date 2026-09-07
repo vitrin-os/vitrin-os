@@ -1012,6 +1012,15 @@ impl PetitionRegistry {
             // Resolved at admission, from the registry, for `realm_launch`
             // petitions only -- see [`PendingPetition::launch_command`].
             command: pending.launch_command.clone(),
+            // **Always `None`, and this is the site that makes that true.**
+            // A petition is an ask the core can answer with yes or no; it
+            // carries nothing to browse. The interactive panel exists for a
+            // surface that has something to choose FROM -- the core-drawn
+            // file picker (P2.6.6 / issue #190) -- and that surface does not
+            // exist yet. Written out rather than left to a `..Default`
+            // precisely so the day something does construct a panel, it is
+            // a visible edit here and not an inherited default.
+            panel: None,
         })
     }
 

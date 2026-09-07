@@ -43,7 +43,7 @@
 
 use vitrin_protocol::generated::vitrin_grant::Verb;
 
-use super::{Choice, PromptContent};
+use super::{Choice, PanelContent, PromptContent};
 use crate::paint::canvas::{Canvas, Rect};
 use crate::paint::text::Text;
 use crate::scene::BYTES_PER_PIXEL;
@@ -90,6 +90,30 @@ const MAX_VALUE_LINES: usize = 3;
 const CONTENT_X: u32 = BORDER + PAD_X;
 /// Width available to content inside the border and padding.
 const CONTENT_W: u32 = CARD_WIDTH - 2 * CONTENT_X;
+
+/// How many slots an interactive panel draws — **always**, whatever it holds.
+///
+/// Fixed, and the fixedness is the security property rather than a layout
+/// convenience. [`row_height`] returns [`PANEL_H`] for `Row::Panel` without
+/// consulting the content, so a panel refresh cannot change the card's
+/// height; the card's origin comes from [`crate::paint::centered`] over that
+/// height, so the origin cannot move either; and the choice row sits below a
+/// constant, so **the Deny button cannot travel under a human's finger
+/// between the press and the release**. That is the same hazard
+/// [`super::grab::GUARD_INTERVAL`] exists for, one step further in: the guard
+/// stops a card appearing under a descending finger, and this stops the card
+/// re-laying itself out under a resting one.
+///
+/// The cost is stated rather than hidden: a panel with fewer entries than
+/// this draws empty slots, and one with more scrolls. Neither is free, and
+/// both are cheaper than a card that resizes while it is being read.
+pub(crate) const PANEL_ROWS: u16 = 8;
+/// Height of one panel slot.
+const PANEL_ROW_H: u32 = 22;
+/// The panel's total height. A constant, by [`PANEL_ROWS`]' argument.
+const PANEL_H: u32 = PANEL_ROWS as u32 * PANEL_ROW_H;
+/// Width of the scroll thumb's gutter, inset from the content column's right.
+const PANEL_THUMB_W: u32 = 4;
 
 // ---------------------------------------------------------------------------
 // Palette (RGB; the card is opaque, so no alpha travels with these)
@@ -283,6 +307,32 @@ pub(crate) struct Card {
     pub height: u32,
     /// Every choice offered, in render order (left to right).
     pub buttons: Vec<ChoiceBox>,
+    /// Every interactive slot and where it was drawn, card-local, in render
+    /// order — `Some` **exactly when [`draw_panel`] ran**.
+    ///
+    /// This field is the interactive-mode switch, and it is deliberately not
+    /// a flag beside one. A card is navigable because a panel was *painted*,
+    /// on [`ChoiceBox`]' own reasoning one field up: the rectangles come from
+    /// the same pass that paints them, so what the human clicks and what the
+    /// human sees cannot diverge. A separate `interactive: bool` could
+    /// disagree with the pixels; this cannot.
+    pub panel: Option<Vec<SlotBox>>,
+}
+
+/// One rendered interactive slot: which slot it is and where it was drawn, in
+/// **card-local** pixels.
+///
+/// [`ChoiceBox`]' sibling and produced the same way, by the pass that paints
+/// it. `index` is the slot's position in the panel, never an index into the
+/// content behind it — the panel draws [`PANEL_ROWS`] slots whatever the
+/// content holds, and mapping a slot back to a thing is the embedder's job.
+/// Keeping that translation outside the grab is what lets the grab stay
+/// ignorant of what is being chosen, which is the same separation
+/// [`super::PromptContent`] keeps by having no string field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SlotBox {
+    pub index: u16,
+    pub rect: Rect,
 }
 
 /// One laid-out element of the card, in vertical order.
@@ -295,6 +345,9 @@ enum Row {
     Line { text: String, px: f32, rgb: [u8; 3] },
     /// The choice row.
     Buttons,
+    /// The interactive panel. Its height is [`PANEL_H`] and does not depend
+    /// on what it holds — see [`PANEL_ROWS`].
+    Panel,
 }
 
 /// Lay out and draw `prompt`.
@@ -314,6 +367,7 @@ pub(crate) fn rasterize(prompt: &PromptContent) -> Card {
 
     let mut rgba = vec![0u8; CARD_WIDTH as usize * height as usize * BYTES_PER_PIXEL];
     let mut buttons = Vec::new();
+    let mut panel = None;
     // A canvas of the exact size we just allocated cannot be refused; the
     // `else` arm keeps a core bug from becoming a panic in a compositor loop
     // and returns a card that is merely empty.
@@ -323,6 +377,11 @@ pub(crate) fn rasterize(prompt: &PromptContent) -> Card {
             width: CARD_WIDTH,
             height,
             buttons,
+            // An empty card drew no panel, so it is not navigable. Stated
+            // rather than defaulted: the alternative -- reporting slots that
+            // were never painted -- is the exact divergence `Card::panel`'s
+            // doc says this field cannot have.
+            panel,
         };
     };
 
@@ -378,6 +437,15 @@ pub(crate) fn rasterize(prompt: &PromptContent) -> Card {
             Row::Buttons => {
                 buttons = draw_buttons(&mut canvas, &mut text, prompt, y);
             }
+            Row::Panel => {
+                // `Row::Panel` is only ever pushed when `prompt.panel` is
+                // `Some` (see `rows`), so the `else` arm is unreachable; it
+                // leaves `panel` as `None` rather than reporting slots
+                // nothing painted.
+                if let Some(content) = prompt.panel.as_ref() {
+                    panel = Some(draw_panel(&mut canvas, content, y));
+                }
+            }
         }
         y += row_height(row, &text) as i32;
     }
@@ -387,7 +455,71 @@ pub(crate) fn rasterize(prompt: &PromptContent) -> Card {
         width: CARD_WIDTH,
         height,
         buttons,
+        panel,
     }
+}
+
+/// Paint the interactive panel and report where each slot landed.
+///
+/// Paints and reports in one pass, for [`ChoiceBox`]' reason: a slot the human
+/// can hit is a slot that was drawn, and there is no second traversal that
+/// could compute a rectangle the pixels disagree with.
+///
+/// **Draws no text.** Every slot is a rectangle, and the highlighted one is
+/// stroked. That is not a placeholder for a nicer panel later — it is the
+/// boundary this type keeps: [`super::PromptContent`] has no string field, so
+/// nothing here has a string to draw. Whatever eventually puts *names* in
+/// these slots has to make its own honest argument about attacker-influenced
+/// bytes on a trusted surface, and it must make it in its own type rather
+/// than inheriting this one's silence.
+fn draw_panel(canvas: &mut Canvas<'_>, content: &PanelContent, y: i32) -> Vec<SlotBox> {
+    let mut slots = Vec::with_capacity(PANEL_ROWS as usize);
+    let slot_w = CONTENT_W - PANEL_THUMB_W - 4;
+    for index in 0..PANEL_ROWS {
+        let rect = Rect {
+            x: CONTENT_X as i32,
+            y: y + (index as u32 * PANEL_ROW_H) as i32,
+            w: slot_w,
+            h: PANEL_ROW_H,
+        };
+        // A slot beyond what the content fills is drawn as background: it is
+        // still a rectangle and still reported, so the geometry a refresh
+        // produces never changes shape, only appearance.
+        let filled = index < content.filled;
+        if filled {
+            canvas.fill_rect(rect, RULE_RGBA);
+        }
+        if content.highlight == Some(index) && filled {
+            // Stroked, not filled: a highlight marks where the pointer is
+            // resting and confers nothing. Filling it in the accent colour
+            // would make a hover look like the armed state a press produces.
+            canvas.stroke_rect(rect, ACCENT, BORDER);
+        }
+        slots.push(SlotBox { index, rect });
+    }
+
+    // The thumb: a proportional marker in the right-hand gutter. Drawn from
+    // `offset`/`total` rather than from `filled`, so a panel showing eight of
+    // eight hundred says so.
+    if content.total > PANEL_ROWS as u32 {
+        let track_h = PANEL_H;
+        let thumb_h = ((PANEL_ROWS as u64 * track_h as u64) / content.total as u64).max(4) as u32;
+        let travel = track_h.saturating_sub(thumb_h);
+        let scrollable = content.total.saturating_sub(PANEL_ROWS as u32).max(1);
+        let thumb_y =
+            ((content.offset.min(scrollable) as u64 * travel as u64) / scrollable as u64) as u32;
+        canvas.fill_rect(
+            Rect {
+                x: (CONTENT_X + CONTENT_W - PANEL_THUMB_W) as i32,
+                y: y + thumb_y as i32,
+                w: PANEL_THUMB_W,
+                h: thumb_h,
+            },
+            ACCENT,
+        );
+    }
+
+    slots
 }
 
 /// The card's rows, top to bottom.
@@ -439,6 +571,18 @@ fn rows(prompt: &PromptContent, text: &mut Text) -> Vec<Row> {
     field(&mut rows, text, LABEL_REQUESTS, &verb_lines(prompt.verbs));
     field(&mut rows, text, LABEL_EXPIRES, &[expiry_line(prompt)]);
 
+    // The interactive panel, between the fields and the choice row: what is
+    // being chosen sits above the choice, and the choice row stays last so
+    // its position in the card is the same whether or not a panel is drawn.
+    //
+    // **The only condition anywhere that makes a card navigable.** Nothing in
+    // the shipped tree constructs a `PanelContent`, so this is `None` in
+    // every card this core can build today -- see `PromptContent::panel`.
+    if prompt.panel.is_some() {
+        rows.push(Row::Space(12));
+        rows.push(Row::Panel);
+    }
+
     // The last field's trailing gap plus this one give the separator the same
     // breathing room the header's has.
     rows.push(Row::Space(4));
@@ -455,6 +599,10 @@ fn row_height(row: &Row, text: &Text) -> u32 {
         Row::Rule => RULE_H,
         Row::Line { px, .. } => text.line_metrics(*px).height,
         Row::Buttons => BUTTON_H,
+        // A CONSTANT, and never a function of the panel's content. See
+        // `PANEL_ROWS`: this is what keeps a refresh from resizing the card,
+        // moving its origin, or moving the choice row under a finger.
+        Row::Panel => PANEL_H,
     }
 }
 

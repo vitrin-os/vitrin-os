@@ -271,6 +271,52 @@ pub(crate) struct PromptContent {
     /// prompt that did not show the program would be asking for consent to
     /// the one fact it hid.
     pub command: Option<crate::realm::AuditedCommand>,
+    /// **The interactive panel this card draws**, or `None` for the ordinary
+    /// one-shot prompt.
+    ///
+    /// `Some` makes the card navigable — and it does so by making the
+    /// renderer *paint* slots, never by setting a mode flag: see
+    /// [`super::render::Card::panel`]. So a card is interactive exactly when
+    /// there is a panel on the screen, and the two cannot come apart.
+    ///
+    /// **Nothing in the shipped tree constructs one.** Every
+    /// [`crate::petitions::PetitionRegistry::prompt_content`] leaves it
+    /// `None`, so every card this core can build today is one-shot, and the
+    /// interactive path below is unreachable in a production build rather
+    /// than merely untaken. That is deliberate and it is the honest reading
+    /// of this commit: the capability exists, the thing that would use it
+    /// (the core-drawn file picker, P2.6.6 / issue #190) does not, and a
+    /// reviewer should hold this to "unreachable and tested" rather than to
+    /// "in service".
+    pub panel: Option<PanelContent>,
+}
+
+/// What an interactive panel draws this round.
+///
+/// **No string field, on [`PromptContent`]'s own terms** — and here the
+/// omission costs something, so it is worth being plain about. A panel of
+/// eight numbered slots can be navigated but not *read*: the human sees which
+/// slot is highlighted and how far down a list they are, and not what any
+/// slot contains. Whatever puts names in these slots is a separate change
+/// that has to argue its own way past the rule this type is keeping, because
+/// a filename is attacker-influenced bytes on the one surface whose entire
+/// purpose is being trustworthy. It is not smuggled in here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PanelContent {
+    /// How many of [`super::render::PANEL_ROWS`] slots carry an entry.
+    /// Clamped by the renderer; the panel's height never depends on it.
+    pub filled: u16,
+    /// Which slot draws highlighted, if any.
+    ///
+    /// Presentation only. A highlight is where the pointer is resting, and
+    /// it confers nothing: it is not a selection, it grants no authority,
+    /// and nothing downstream may read it as a decision.
+    pub highlight: Option<u16>,
+    /// First visible entry, for the scroll thumb.
+    pub offset: u32,
+    /// Total entries behind the panel, for the scroll thumb. `total` greater
+    /// than [`super::render::PANEL_ROWS`] is what draws a thumb at all.
+    pub total: u32,
 }
 
 impl PromptContent {
@@ -422,6 +468,40 @@ impl ConsentSurface {
     pub(in crate::consent) fn show(&mut self, prompt: PromptContent) {
         self.prompt = Some(prompt);
         self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// Replace the raised prompt's **panel and nothing else**.
+    ///
+    /// The only mutable part of a card a human is already reading, and that
+    /// is enforced by the parameter type rather than by discipline: this
+    /// takes a [`PanelContent`], so a changed principal, realm, verb set,
+    /// rung, expiry or program is *not expressible* here. The card's ask
+    /// cannot change under the human — only what they are browsing with it.
+    ///
+    /// `false`, having changed nothing, when there is no prompt up, when the
+    /// prompt drew no panel, or when the content already equals what is on
+    /// screen. The last case matters: it keeps a pointer resting inside one
+    /// slot from re-rasterizing the card and re-uploading its texture on
+    /// every motion event, which at pointer cadence is the difference between
+    /// a hover and a stall.
+    ///
+    /// Private to `crate::consent` for [`Self::show`]'s reason, and narrowed
+    /// one step further: the only caller is
+    /// [`grab::ConsentGrab::refresh_panel`], which pairs this with
+    /// re-snapshotting the geometry the grab hit-tests. Content and geometry
+    /// change in one call or not at all.
+    pub(in crate::consent) fn set_panel(&mut self, panel: PanelContent) -> bool {
+        let Some(prompt) = self.prompt.as_mut() else {
+            return false;
+        };
+        // A prompt that drew no panel is not navigable, and giving it one
+        // here would resize the card behind the grab's back.
+        if prompt.panel.is_none() || prompt.panel == Some(panel) {
+            return false;
+        }
+        prompt.panel = Some(panel);
+        self.generation = self.generation.wrapping_add(1);
+        true
     }
 
     /// Take the prompt down (a decision, a timeout, the petitioner
@@ -690,6 +770,11 @@ pub(crate) mod tests {
             // named -- the golden card stays what it was, and the launch
             // card is a separate fixture beside it.
             command: None,
+            // No panel: this fixture backs `consent_prompt_golden`, and the
+            // golden is the load-bearing proof that adding the interactive
+            // path changed nothing about the card this core actually draws.
+            // A panelled card gets its own fixture and its own golden.
+            panel: None,
         }
     }
 

@@ -218,6 +218,8 @@ from __future__ import annotations
 import errno
 import os
 import pathlib
+import socket
+import threading
 import time
 
 from harness import (
@@ -327,6 +329,19 @@ class _Probe:
         #: asserted on rather than defaulted to either verdict.
         self.userns_created: str | None = None
         self.userns_errno: int | None = None
+        #: `PROBE-NET-*` (report version 4, P2.7.1). Every one of these is
+        #: `None` when its line is absent, never a default: a stale
+        #: `solid-client` beside a new gate is the failure that must not be
+        #: readable as a measurement, which is the lesson `userns_created`
+        #: records one version earlier.
+        self.net_ifaces: list[str] | None = None
+        self.net_lo_up: str | None = None
+        self.net_lo_running: str | None = None
+        self.net_loopback_rc: int | None = None
+        self.net_loopback_errno: int | None = None
+        #: target -> (rc, errno), one entry per `--net-connect`/`--net-abstract`.
+        self.net_connect: dict[str, tuple[int, int]] = {}
+        self.net_abstract: dict[str, tuple[int, int]] = {}
         self.complete = False
         for line in text.splitlines():
             fields = line.split()
@@ -338,6 +353,30 @@ class _Probe:
                 kv = dict(f.split("=", 1) for f in fields[1:] if "=" in f)
                 self.userns_created = kv.get("created")
                 self.userns_errno = int(kv.get("errno", "0"))
+            elif fields[0] == "PROBE-NET-IFACES":
+                kv = dict(f.split("=", 1) for f in fields[1:] if "=" in f)
+                raw = kv.get("names", "")
+                # `names=` with nothing after it is a namespace with no
+                # interfaces at all, which is a different fact from
+                # `names=error` and from the line being absent. All three stay
+                # distinguishable here.
+                self.net_ifaces = ["error"] if raw == "error" else [n for n in raw.split(",") if n]
+            elif fields[0] == "PROBE-NET-LO":
+                kv = dict(f.split("=", 1) for f in fields[1:] if "=" in f)
+                self.net_lo_up = kv.get("up")
+                self.net_lo_running = kv.get("running")
+            elif fields[0] == "PROBE-NET-LOOPBACK":
+                kv = dict(f.split("=", 1) for f in fields[1:] if "=" in f)
+                self.net_loopback_rc = int(kv.get("rc", "-1"))
+                self.net_loopback_errno = int(kv.get("errno", "0"))
+            elif fields[0] in ("PROBE-NET-CONNECT", "PROBE-NET-ABSTRACT"):
+                kv = dict(f.split("=", 1) for f in fields[1:] if "=" in f)
+                key = kv.get("target") or kv.get("name") or ""
+                value = (int(kv.get("rc", "-1")), int(kv.get("errno", "0")))
+                if fields[0] == "PROBE-NET-CONNECT":
+                    self.net_connect[key] = value
+                else:
+                    self.net_abstract[key] = value
             elif fields[0] == "PROBE-GROUPS":
                 kv = dict(f.split("=", 1) for f in fields[1:] if "=" in f)
                 self.group_count = int(kv.get("n", "0"))
@@ -919,6 +958,253 @@ class RealConfinementNestedUserns(_RealChain):
             errno.ENOSPC,
             f"the same mechanism must produce the same errno with no ruleset in the picture; "
             f"report:\n{unruled.raw}",
+        )
+
+
+class RealConfinementNetns(_RealChain):
+    """The realm's **network namespace**, measured from inside it (P2.7.1,
+    issue #195).
+
+    The mechanism has been shipped since P2.6.2 landed `CLONE_NEWNET` in
+    `vitrin-realm-init`'s six-flag `unshare` and `bring_loopback_up()` next to
+    it. Nothing mock-free had ever asserted it does what the task claims, which
+    is what this class is: PRD Doc 2 §12 groups path sockets, abstract sockets
+    and TCP-localhost as one closure, the mount namespace closes the first, and
+    the network namespace closes the other two.
+
+    ## Four claims, and every negative carries its positive control
+
+    1. **The interface set is exactly `{lo}`** -- set equality, never "does not
+       contain eth0". A host whose interface happened to be named something
+       this gate did not think of would walk straight through the second form.
+       On the development box the `--isolation=off` arm reports nine.
+    2. **`lo` is up and functional**: `IFF_UP` and `IFF_RUNNING`, plus a byte
+       round-trip between two processes inside the realm over `127.0.0.1`. This
+       is not a nicety -- claims 3 and 4 are equally satisfied by a realm whose
+       networking is simply broken, and without this one the gate would call
+       that confinement. `vitrin-realm-init` brings `lo` up on purpose (Firefox,
+       `dbus-daemon` and the a11y stack all bind on loopback for their own
+       plumbing) and it is safe because nothing of the host's is *bound* there.
+    3. **A host loopback listener is unreachable from inside**, where the port
+       is one this harness chose and is serving in the same run.
+    4. **A host abstract-namespace socket is unreachable from inside**, under a
+       per-run nonce. This is the closure that belongs to the *network*
+       namespace specifically: an abstract socket has no filesystem path, so no
+       mount table could have removed it, and it would have survived P2.6.2
+       untouched.
+
+    ## Three independent positive controls, because one is not enough here
+
+    * **The harness reaches its own listeners**, checked in this process before
+       and after the realm runs. A refusal against a port nothing was listening
+       on proves nothing, and a listener that died mid-run would leave the
+       negative looking identical to a confinement.
+    * **The `--isolation=off` app reaches them**, from inside the app, with
+       byte-identical argv. This is what separates "the realm cannot" from
+       "this binary cannot" -- a probe broken into always failing would satisfy
+       every negative above.
+    * **The confined app's own loopback works** (claim 2), which separates
+       "confined" from "no networking at all".
+
+    Both runs use the same argv, asserted through the two `realm.toml` files,
+    so the only difference between them is the `--isolation` flag.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        # Bound before either core boots and served for the whole test, so
+        # "reachable" is a property of the same run that measures the refusal
+        # rather than of a moment before it.
+        self.host_tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.host_tcp.bind(("127.0.0.1", 0))
+        self.host_tcp.listen(8)
+        self.host_port = self.host_tcp.getsockname()[1]
+        self.addCleanup(self.host_tcp.close)
+
+        # Unique per run for the same reason the canary is: two suites in
+        # parallel must not bind each other's name, and an abstract name is
+        # global to a network namespace with no directory to separate them.
+        self.abstract_name = f"vitrin-netns-{os.getpid()}-{time.time_ns()}"
+        self.host_abstract = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.host_abstract.bind("\0" + self.abstract_name)
+        self.host_abstract.listen(8)
+        self.addCleanup(self.host_abstract.close)
+
+        self._serving = True
+        self.addCleanup(setattr, self, "_serving", False)
+        for sock in (self.host_tcp, self.host_abstract):
+            threading.Thread(target=self._serve, args=(sock,), daemon=True).start()
+
+    def _serve(self, sock: socket.socket) -> None:
+        """Accept and echo a byte, until the test tears the listener down."""
+        while self._serving:
+            try:
+                conn, _ = sock.accept()
+            except OSError:
+                return
+            with conn:
+                try:
+                    if conn.recv(1):
+                        conn.sendall(b"v")
+                except OSError:
+                    pass
+
+    def probe_argv(self) -> list[str]:
+        """The base argv plus the two targets. **Identical in both modes**:
+        computed once in `setUp` and read twice, so the `realm.toml` equality
+        below is a real assertion and not a coincidence of formatting."""
+        return super().probe_argv() + [
+            "--net-connect",
+            f"127.0.0.1:{self.host_port}",
+            "--net-abstract",
+            self.abstract_name,
+        ]
+
+    def assert_harness_can_reach_its_own_listeners(self, when: str) -> None:
+        """The outermost positive control, run in this process."""
+        with socket.create_connection(("127.0.0.1", self.host_port), timeout=5) as conn:
+            conn.sendall(b"v")
+            self.assertEqual(
+                conn.recv(1),
+                b"v",
+                f"{when} the run, the harness could not round-trip a byte to its own TCP "
+                f"listener on 127.0.0.1:{self.host_port}. Every refusal this gate reads from "
+                "inside the realm would then be a fact about a dead listener",
+            )
+        peer = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        with peer:
+            peer.settimeout(5)
+            peer.connect("\0" + self.abstract_name)
+            peer.sendall(b"v")
+            self.assertEqual(
+                peer.recv(1),
+                b"v",
+                f"{when} the run, the harness could not round-trip a byte to its own abstract "
+                f"socket {self.abstract_name!r}; the abstract refusal below would be vacuous",
+            )
+
+    def test_the_realm_has_its_own_loopback_only_network_namespace(self):
+        self.assert_harness_can_reach_its_own_listeners("before")
+
+        confined_core = self.real_core("default")
+        confined = self.await_report(confined_core)
+        confined_realm_toml = confined_core.realm.read_text()
+        confined_core.terminate()
+
+        unconfined_core = self.real_core("off")
+        unconfined = self.await_report(unconfined_core)
+        unconfined_realm_toml = unconfined_core.realm.read_text()
+        unconfined_core.terminate()
+
+        self.assert_harness_can_reach_its_own_listeners("after")
+
+        self.assertEqual(
+            confined_realm_toml,
+            unconfined_realm_toml,
+            "the two runs must differ ONLY in --isolation; their realm configurations differ, "
+            "so every comparison below is between different experiments",
+        )
+
+        target = f"127.0.0.1:{self.host_port}"
+
+        # A stale solid-client beside a new gate reads as a total absence of
+        # network facts, and absence must never be readable as a refusal.
+        for label, probe in (("default", confined), ("--isolation=off", unconfined)):
+            self.assertIsNotNone(
+                probe.net_ifaces,
+                f"the {label} report carries no PROBE-NET-IFACES line, so the network probe "
+                "never ran. That is a STALE solid-client beside a new gate (report version 4 "
+                f"added the PROBE-NET-* block); rebuild the shim tree. Report:\n{probe.raw}",
+            )
+            self.assertIn(
+                target,
+                probe.net_connect,
+                f"the {label} report has no PROBE-NET-CONNECT line for {target}; the app was "
+                f"asked to try it and did not report. Report:\n{probe.raw}",
+            )
+            self.assertIn(
+                self.abstract_name,
+                probe.net_abstract,
+                f"the {label} report has no PROBE-NET-ABSTRACT line for "
+                f"{self.abstract_name!r}. Report:\n{probe.raw}",
+            )
+
+        # -- the in-app positive control, before any negative is read --------
+        self.assertEqual(
+            unconfined.net_connect[target],
+            (0, 0),
+            "at --isolation=off the app must REACH the harness's loopback listener. It could "
+            "not, so this binary cannot connect at all and the confined refusal below would be "
+            f"a fact about the probe rather than about the realm. Report:\n{unconfined.raw}",
+        )
+        self.assertEqual(
+            unconfined.net_abstract[self.abstract_name],
+            (0, 0),
+            "at --isolation=off the app must reach the harness's abstract socket, for the same "
+            f"reason. Report:\n{unconfined.raw}",
+        )
+
+        # -- claim 1: the interface set is exactly {lo} ----------------------
+        self.assertEqual(
+            confined.net_ifaces,
+            ["lo"],
+            "the confined realm's network namespace must hold EXACTLY one interface, and it "
+            "must be lo. Set equality rather than an absence check, so an unexpected interface "
+            f"name cannot pass by not being on anybody's list. Report:\n{confined.raw}",
+        )
+
+        # -- claim 2: lo is up and functional --------------------------------
+        self.assertEqual(
+            (confined.net_lo_up, confined.net_lo_running),
+            ("yes", "yes"),
+            "lo must be UP and RUNNING inside the realm: vitrin-realm-init's K7 brings it up on "
+            "purpose, because Firefox, dbus-daemon and the accessibility stack all bind on "
+            "127.0.0.1 for their own plumbing and a realm whose loopback is down fails in ways "
+            f"that look like Vitrin bugs. Report:\n{confined.raw}",
+        )
+        self.assertEqual(
+            confined.net_loopback_rc,
+            0,
+            "two processes inside the realm must complete a byte round-trip over 127.0.0.1 "
+            f"(errno {confined.net_loopback_errno}). Without this the two refusals below are "
+            "equally well explained by a realm with no working networking at all, and this "
+            f"gate would be calling that confinement. Report:\n{confined.raw}",
+        )
+
+        # -- claim 3: the host's loopback listener is unreachable ------------
+        confined_rc, confined_errno = confined.net_connect[target]
+        self.assertEqual(
+            confined_rc,
+            -1,
+            f"the confined realm's app CONNECTED to the host's loopback listener at {target}. "
+            "That is the whole `ssh localhost` escape class PRD Doc 2 §12 closes with "
+            f"CLONE_NEWNET. Report:\n{confined.raw}",
+        )
+        self.assertIn(
+            confined_errno,
+            (errno.ECONNREFUSED, errno.ENETUNREACH),
+            f"the refusal must be ECONNREFUSED ({errno.ECONNREFUSED}) or ENETUNREACH "
+            f"({errno.ENETUNREACH}), not {confined_errno}. The exact value is part of the "
+            "claim: ECONNREFUSED is the realm's own empty loopback answering, ENETUNREACH is "
+            "there being no route to try, and both are the namespace. ETIMEDOUT would be a "
+            f"firewall somewhere and a much weaker fact. Report:\n{confined.raw}",
+        )
+
+        # -- claim 4: the host's abstract socket is unreachable --------------
+        abstract_rc, abstract_errno = confined.net_abstract[self.abstract_name]
+        self.assertEqual(
+            abstract_rc,
+            -1,
+            "the confined realm's app reached the host's ABSTRACT socket "
+            f"{self.abstract_name!r}. Abstract sockets have no filesystem path, so no mount "
+            "table closes them -- they are scoped to a network namespace, which is why this is "
+            f"P2.7.1's to prove and not P2.6.2's. Report:\n{confined.raw}",
+        )
+        self.assertEqual(
+            abstract_errno,
+            errno.ECONNREFUSED,
+            f"an abstract name that does not exist in this namespace refuses ECONNREFUSED "
+            f"({errno.ECONNREFUSED}), not {abstract_errno}. Report:\n{confined.raw}",
         )
 
 

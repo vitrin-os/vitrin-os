@@ -135,8 +135,16 @@ PROPERTY_GATES=(
                                 # --landlock=off, so it is the realm's own
                                 # max_user_namespaces and not the ruleset),
                                 # against an --isolation=off positive control in
-                                # the same run. No new CI wiring and no cargo
-                                # feature.
+                                # the same run. And since P2.7.1 (#195), the
+                                # NETWORK namespace measured from inside it: the
+                                # interface set is exactly {lo} by set equality,
+                                # `lo` is up and carries a byte round-trip
+                                # between two processes in the realm, and a host
+                                # loopback listener AND a host abstract socket --
+                                # both bound and served by the harness for the
+                                # whole run -- are unreachable from inside while
+                                # the --isolation=off app reaches both. No new CI
+                                # wiring and no cargo feature.
   test_real_seccomp.py          # P2.6.4 (#188): the TABLE-DRIVEN seccomp gate.
                                 # It reads the shipped filter table out of
                                 # `vitrind --print-seccomp` rather than

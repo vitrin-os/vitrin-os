@@ -170,6 +170,14 @@ mod dmabuf;
 /// the CI stand-in for the hold, never compiled into a deployment binary
 /// (`deadman`'s module docs, "the test injector proves the consequence half").
 mod deadman;
+/// Obligations the chokepoint owes (issue #343): the ledger of admitted
+/// designation asks whose one terminal waits on a human. The chokepoint
+/// answers every other use inside the call it was asked in; a designation
+/// cannot, so the admission mints a ticket here and the terminal is produced
+/// by redeeming it — against the grant and the realm **re-read at the instant
+/// of delivery**, because a delivered descriptor is authority the core cannot
+/// recall.
+mod designation;
 /// Input intake & routing (P1.3.7): origin tagging at intake (backward
 /// requirement B2), view→surface coordinate mapping, and the preemption
 /// hook point. The nested backend feeds it host input at runtime, and the

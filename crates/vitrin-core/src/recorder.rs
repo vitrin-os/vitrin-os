@@ -551,7 +551,7 @@ impl ActuationDetail {
             UseKind::Capture
             | UseKind::Launch
             | UseKind::LayoutFocus
-            | UseKind::Designate
+            | UseKind::Designate(_)
             | UseKind::Egress => None,
             UseKind::LayoutArrange(mode) => Some(Self::Arrange {
                 fullscreen: matches!(mode, crate::enforcement::LayoutMode::Fullscreen),
@@ -1646,6 +1646,30 @@ impl Event<'_> {
                         field_null(out, "refusal");
                         field_null(out, "refusal_voiced");
                         write_frame(out, frame);
+                    }
+                    // **`owed`, never `allowed`** (issue #343). The authority
+                    // chain said yes and the rung is spent, so this is an
+                    // admission -- but nothing has been delivered, and a line
+                    // that said `allowed` for a descriptor no client has
+                    // received would be exactly the gap between a journal and
+                    // the world this log exists to close. A reader can tell
+                    // the two apart on the decision field alone, and can join
+                    // this line to its outcome on `designation_id`.
+                    UseOutcome::Owed {
+                        grant,
+                        designation,
+                        expires_in_ms,
+                        ..
+                    } => {
+                        field_str(out, "decision", "owed");
+                        field_display(out, "grant_id", grant);
+                        field_display(out, "designation_id", designation);
+                        field_u64(out, "expires_in_ms", u64::from(expires_in_ms));
+                        field_null(out, "refusal");
+                        field_null(out, "refusal_voiced");
+                        // No frame: an admission whose terminal is owed has
+                        // delivered no observation to identify.
+                        write_frame(out, None);
                     }
                     UseOutcome::Refused { code, voiced } => {
                         field_str(out, "decision", "refused");
@@ -2987,11 +3011,19 @@ impl Recorder {
             Event::UseDecision {
                 connection,
                 grant_wire_id,
-                outcome: &UseOutcome::Admitted { .. },
+                outcome: &UseOutcome::Admitted { .. } | &UseOutcome::Owed { .. },
                 ..
             } => {
                 // A success ends the run, exactly as it clears the
                 // chokepoint's wire-side coalescing marks.
+                //
+                // **`Owed` belongs in this arm and not the other** (issue
+                // #343). The run this ends is a run of *refusals*, and an
+                // admission whose terminal is owed is not one: the chain said
+                // yes, the rung is spent, and the client is going to be
+                // answered. Folding it in with the refusals would let a
+                // successful ask be suppressed as a repeat, which is the one
+                // thing B1 says this function may never do.
                 self.flush_refusal_run(&(connection, grant_wire_id));
                 true
             }
@@ -4105,6 +4137,150 @@ pub(crate) mod tests {
             // (the Display of the same cause would embed the scheme).
             assert!(!class.contains("spiffe"));
         }
+    }
+
+    /// **An owed admission ends a refusal run; it is never suppressed as
+    /// one** (issue #343).
+    ///
+    /// The flood bound folds repeated refusals on one grant into a summary.
+    /// An admission whose terminal is owed is not a refusal — the chain said
+    /// yes and the rung is spent — so it must break the run and be written.
+    /// Classifying it with the refusals would let a successful ask vanish
+    /// into a count, which is the one thing B1 says this bound may never do.
+    #[test]
+    fn an_owed_admission_breaks_a_refusal_run_rather_than_joining_it() {
+        let _fd = crate::capture::tests::fd_lock();
+        let (mut rec, path) = scratch_recorder("owed-breaks-run");
+        let refused = UseOutcome::Refused {
+            code: Refusal::RateLimited,
+            voiced: true,
+        };
+        let owed = UseOutcome::Owed {
+            grant: GrantId::from_u64_for_test(9),
+            designation: crate::designation::DesignationId::from_u32_for_test(2),
+            expires_in_ms: 90_000,
+            spent_once: false,
+            attention_claimed: false,
+        };
+        let record = |rec: &mut Recorder, outcome: &UseOutcome| {
+            rec.record(Event::UseDecision {
+                connection: ConnectionId::from_u64_for_test(1),
+                facet_wire_id: 20,
+                grant_wire_id: 10,
+                verb: Verb::DESIGNATE_FILE,
+                grant_row: Some(GrantId::from_u64_for_test(9)),
+                detail: None,
+                outcome,
+            });
+        };
+        // Open a run on this grant: the first refusal writes, the rest fold.
+        for _ in 0..4 {
+            record(&mut rec, &refused);
+        }
+        // Then an owed admission on the same grant.
+        record(&mut rec, &owed);
+
+        let entries = read_log(&path);
+        let decisions: Vec<&str> = entries
+            .iter()
+            .filter(|e| e.str("kind") == "use_decision")
+            .map(|e| e.str("decision"))
+            .collect();
+        assert!(
+            decisions.contains(&"owed"),
+            "the owed admission was suppressed as a repeat refusal; decisions seen: {decisions:?}"
+        );
+        assert_eq!(
+            decisions.last(),
+            Some(&"owed"),
+            "the admission must be the last decision written, after the run it ended"
+        );
+
+        // **The run must be ENDED, not merely interrupted.** The line above
+        // would be written either way, because an unclassified outcome still
+        // reaches the log -- so the property that actually distinguishes the
+        // two is what happens next: a refusal after the admission opens a
+        // FRESH run and therefore writes its own line. If the admission left
+        // the old run standing, this one folds into it silently.
+        record(&mut rec, &refused);
+        let after: Vec<&str> = read_log(&path)
+            .iter()
+            .filter(|e| e.str("kind") == "use_decision")
+            .map(|e| e.str("decision").to_string())
+            .collect::<Vec<_>>()
+            .iter()
+            .map(|s| Box::leak(s.clone().into_boxed_str()) as &str)
+            .collect();
+        assert_eq!(
+            after.last(),
+            Some(&"refused"),
+            "a refusal after an owed admission must start a fresh run and write its own \
+             line; it folded into the run the admission should have ended: {after:?}"
+        );
+    }
+
+    /// **An owed terminal journals `owed`, never `allowed`** (issue #343).
+    ///
+    /// The honesty requirement this variant exists for. The authority chain
+    /// said yes and the rung is spent, so the line is an admission — but
+    /// nothing has been delivered, and a reader who saw `allowed` would
+    /// conclude a descriptor reached a client that has received nothing. The
+    /// decision field alone must separate the two, and the line must carry
+    /// the name a later outcome can be joined on.
+    #[test]
+    fn an_owed_use_journals_owed_and_never_allowed() {
+        let _fd = crate::capture::tests::fd_lock();
+        let (mut rec, path) = scratch_recorder("owed-decision");
+        let owed = UseOutcome::Owed {
+            grant: GrantId::from_u64_for_test(9),
+            designation: crate::designation::DesignationId::from_u32_for_test(4),
+            expires_in_ms: 90_000,
+            spent_once: true,
+            attention_claimed: false,
+        };
+        let delivered = UseOutcome::Admitted {
+            grant: GrantId::from_u64_for_test(9),
+            frame: None,
+            spent_once: true,
+            attention_claimed: false,
+        };
+        for outcome in [&owed, &delivered] {
+            rec.record(Event::UseDecision {
+                connection: ConnectionId::from_u64_for_test(1),
+                facet_wire_id: 20,
+                grant_wire_id: 10,
+                verb: Verb::DESIGNATE_FILE,
+                grant_row: Some(GrantId::from_u64_for_test(9)),
+                detail: None,
+                outcome,
+            });
+        }
+
+        let entries = read_log(&path);
+        assert_eq!(entries.len(), 2, "an owed admission is never suppressed");
+        assert_eq!(
+            entries[0].str("decision"),
+            "owed",
+            "an admission whose terminal has not been produced must not read as `allowed`"
+        );
+        assert_eq!(
+            entries[0].str("designation_id"),
+            "designation-4",
+            "the line must name the obligation, or its outcome cannot be joined to it"
+        );
+        assert_eq!(entries[0].u64("expires_in_ms"), 90_000);
+        assert!(
+            entries[0].is_null("frame"),
+            "nothing was delivered, so there is no observation to identify"
+        );
+        // And the contrast, in the same run: the two decisions are
+        // distinguishable on the field a reader actually keys on.
+        assert_eq!(entries[1].str("decision"), "allowed");
+        assert_ne!(
+            entries[0].str("decision"),
+            entries[1].str("decision"),
+            "owed and delivered must not render identically"
+        );
     }
 
     #[test]

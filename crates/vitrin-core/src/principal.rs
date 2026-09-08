@@ -265,7 +265,8 @@ use vitrin_protocol::generated::vitrin_view as view;
 use vitrin_protocol::generated::PROTOCOL_VERSION;
 
 use crate::capture::RealmViewFrame;
-use crate::enforcement::{Chokepoint, LayoutMode, UseEnv, UseKind, UseOutcome, UseRequest};
+use crate::designation::AskedFor;
+use crate::enforcement::{Chokepoint, LayoutMode, UseEnv, UseKind, UseRequest};
 use crate::grants::{GrantId, GrantTable, InsertError, RealmId};
 use crate::identity::{PresentedCredential, PrincipalIdentity, Verifier, VerifyOutcome};
 use crate::input::{PhysicalPresenceMap, SeatInput, SeatInputKind};
@@ -1002,6 +1003,21 @@ pub(crate) struct ServerCtx<'a> {
             crate::enforcement::LaunchAsk<'_>,
         )
             -> Result<crate::realm::MintedRealmId, crate::enforcement::LaunchRefusal>,
+    /// **Where an admitted designation raises the picker** (issue #343), or
+    /// `None` in a deployment that has none -- which is every deployment
+    /// until P2.6.6 ships one.
+    ///
+    /// A fourth sink rather than a widened `launch`, on the grounds that kept
+    /// `launch` out of `layout`: this one is **asynchronous**. It returns the
+    /// name of an obligation rather than the terminal itself, which is a
+    /// different contract from every other sink here and must not be reachable
+    /// through one of theirs.
+    pub designate: &'a mut dyn FnMut(
+        crate::enforcement::DesignateAsk<'_>,
+    ) -> Result<
+        crate::designation::DesignationId,
+        crate::enforcement::DesignateRefusal,
+    >,
     /// The core's single flight-recorder handle (P1.4.5,
     /// [`crate::recorder`]): every handshake outcome, petition lifecycle
     /// transition, consent transition, and enforcement decision this
@@ -1489,16 +1505,25 @@ impl PrincipalServer {
                         // that would act on it is P2.6.6's.
                         ObjectKind::Powerbox { grant } => match opcode {
                             powerbox::requests::RequestFile::OPCODE => {
-                                let (_, _req) =
+                                let (_, req) =
                                     powerbox::requests::RequestFile::decode(&msg.bytes, msg.fd)
                                         .map_err(|source| PrincipalViolation::Malformed {
                                             object_id,
                                             source,
                                         })?;
+                                // The mode the ask is *for*. A ceiling, never
+                                // a promise: the human may narrow it at the
+                                // card, and `designated.mode` carries what was
+                                // actually approved. The decoder already
+                                // rejected any value outside the enum, so
+                                // nothing client-controlled survives past here
+                                // except this one bit.
                                 self.serve_facet_use(
                                     object_id,
                                     grant,
-                                    UseKind::Designate,
+                                    UseKind::Designate(AskedFor::File {
+                                        write: matches!(req.mode, powerbox::Mode::ReadWrite),
+                                    }),
                                     ctx,
                                     send,
                                 )
@@ -1510,10 +1535,14 @@ impl PrincipalServer {
                                             object_id,
                                             source,
                                         })?;
+                                // No mode argument exists on `request_dir`, by
+                                // decision: a subtree is delivered as a
+                                // directory fd and the app's own `openat`
+                                // walks it under the kernel's containment.
                                 self.serve_facet_use(
                                     object_id,
                                     grant,
-                                    UseKind::Designate,
+                                    UseKind::Designate(AskedFor::Dir),
                                     ctx,
                                     send,
                                 )
@@ -1724,6 +1753,7 @@ impl PrincipalServer {
             grant_realm: grant_realm.as_ref(),
             layout: &mut *ctx.layout,
             launch: &mut *ctx.launch,
+            designate: &mut *ctx.designate,
         };
         let outcome = self
             .chokepoint
@@ -1743,16 +1773,20 @@ impl PrincipalServer {
         // (A transport death inside `enforce_use` returns above, so a use
         // whose frame never reached the wire records nothing -- the
         // connection is already dying and its teardown entry follows.)
-        if let UseOutcome::Admitted {
-            grant,
-            spent_once: true,
-            ..
-        } = outcome
-        {
-            ctx.recorder.record(Event::GrantSpent {
-                connection: self.connection,
-                grant_id: grant,
-            });
+        //
+        // **Read through `admission()`, not by matching `Admitted`** (issue
+        // #343). A use whose terminal is owed spent the rung at the same
+        // instant a synchronous one does -- in the same step 6, before either
+        // knew how its terminal would arrive -- so it owes exactly the same
+        // line. Matching the variant here is how the deferred arm would have
+        // silently stopped journaling a spend.
+        if let Some(admission) = outcome.admission() {
+            if admission.spent_once {
+                ctx.recorder.record(Event::GrantSpent {
+                    connection: self.connection,
+                    grant_id: admission.grant,
+                });
+            }
         }
         // The human's attention window, if this admission spent it (WS-E.1.7):
         // read off the same outcome, so the chokepoint still never learns a
@@ -1761,18 +1795,15 @@ impl PrincipalServer {
         // window (issue #232 decision 10): the core cannot tell which of two
         // layout holders the human meant, so what it can do is say afterwards
         // which one actually took it.
-        if let UseOutcome::Admitted {
-            grant,
-            attention_claimed: true,
-            ..
-        } = outcome
-        {
-            ctx.recorder.record(Event::AttentionClaimed {
-                connection: self.connection,
-                principal: &identity,
-                grant_id: grant,
-                verb,
-            });
+        if let Some(admission) = outcome.admission() {
+            if admission.attention_claimed {
+                ctx.recorder.record(Event::AttentionClaimed {
+                    connection: self.connection,
+                    principal: &identity,
+                    grant_id: admission.grant,
+                    verb,
+                });
+            }
         }
         Ok(())
     }
@@ -2983,6 +3014,12 @@ pub(crate) mod tests {
                         height: *height,
                     })
             };
+            // No picker in the harness, matching every shipped deployment:
+            // an admitted designation is answered `internal` here, which is
+            // what `a_designation_with_no_picker_is_refused_internal` reads.
+            let mut designate_sink = |_ask: crate::enforcement::DesignateAsk<'_>| {
+                Err(crate::enforcement::DesignateRefusal::Unavailable)
+            };
             let mut ctx = ServerCtx {
                 verifier,
                 petitions,
@@ -2999,6 +3036,7 @@ pub(crate) mod tests {
                 actuations: &mut sink,
                 layout: &mut layout_sink,
                 launch: &mut launch_sink,
+                designate: &mut designate_sink,
                 recorder,
             };
             server.handle_message(msg, &mut ctx, &mut |frame, fd| core.send_message(frame, fd))?;

@@ -79,6 +79,62 @@
 //! `consent`'s interactive panel (issue #341) is held. What its tests prove is
 //! that the ledger's rules are the ones written above; they prove nothing about
 //! anything reaching them.
+//!
+//! # Four questions issue #343 had to answer, answered here
+//!
+//! Recorded at the site rather than only in a tracker, because each is a
+//! constraint on the code that redeems these tickets and a reader of that code
+//! is the one who needs them.
+//!
+//! **1. Which route carries the descriptor to the agent.** Not `Outbox`.
+//! `vitrin_ipc`'s outbox refuses fds by a written decision, whose stated
+//! ground is that "everything version 1 pushes this way is pure wire bytes,
+//! and the one event that carries an fd is a reply". A `designated` event is
+//! `since="2"` and is by construction *not* a reply to the message in flight,
+//! so that decision does not cover this case — but widening the outbox to
+//! carry descriptors would put an fd-bearing queue behind every push in the
+//! core, to serve one event. **The redemption instead owns the connection at
+//! the moment it delivers** and writes through the same one-fd-per-frame path
+//! `capture` already uses for sealed frame memfds. That keeps fd delivery on
+//! exactly two call sites in the core rather than latent on every push, and it
+//! is why this ledger deliberately holds **no descriptor**: nothing here can
+//! pin a file open while it waits for a queue.
+//!
+//! **2. Whether a deferred use holds `consent_held` for its whole life.** No,
+//! and the code says so by omission that is checked:
+//! `UseKind::Designate` stays outside `contends_for_attention`, which is what
+//! `each_use_kind_answers_every_classification_predicate_as_documented` pins.
+//! A raised picker holds the human's *input* through the consent grab, which
+//! is a different mechanism from the chokepoint's `consent_held` gate, and the
+//! IDL leaves `preempted` and `consent_held` open for designation while
+//! forbidding a server to read that silence as licence. Answering it inside an
+//! enforcement change would settle a protocol question in the wrong place.
+//!
+//! **3. Who sends the realm's copy, and under what check** (owner scope call,
+//! 2026-09-07: decided here, implemented by P2.6.7 / issue #191). The IDL
+//! requires the *same* descriptor to reach the realm's shim as
+//! `vitrin_shim_session.designation`, and the agent's copy is the explicitly
+//! optional one. **The decision: one `openat2`, one descriptor, `dup`'d for
+//! the second receiver — never two opens.** Two opens are two race windows and
+//! can yield two different inodes, which would make the single `(st_dev,
+//! st_ino)` pair this obligation journals a claim about only one of them. The
+//! realm's copy is sent by the redemption caller, after [`Redeemed`] exists
+//! and therefore after the grant and the realm have both been re-judged —
+//! **the shim half must not be sent on a bare transport `Ok`**, because
+//! `enforce_use` answers a revoked grant with `Ok(UseOutcome::Refused)` and a
+//! delivery gated on `Result::Ok` would hand a descriptor to an app under a
+//! grant that had just been killed.
+//!
+//! **4. Terminal ordering under pipelining — open, and named.** The IDL says
+//! terminals pair in request order. A `capacity` refusal for a second ask is
+//! sent inside its own dispatch turn while the first ask's terminal is still
+//! owed, so the second terminal precedes the first on the wire. That is a
+//! genuine inversion and it is **not fixed here**: closing it needs either
+//! per-facet terminal-ordering state the chokepoint does not have, or a
+//! paired IDL and prose amendment widening the ordering carve-out. Both are
+//! larger than this issue and one of them is a protocol change. Recorded so
+//! the next reader meets it as a known gap rather than discovering it from a
+//! client that pairs positionally.
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
@@ -101,6 +157,16 @@ impl DesignationId {
     /// The wire value.
     pub(crate) fn get(self) -> u32 {
         self.0
+    }
+
+    /// Test-only: a name without an obligation behind it, so unit tests of
+    /// pure consumers (the chokepoint's arm, the journal's entry shape) need
+    /// not stand up a ledger. Never available outside `cfg(test)`: outside
+    /// tests, ids are minted by [`Ledger::open`] and nowhere else, which is
+    /// what makes "never reused" a property rather than a convention.
+    #[cfg(test)]
+    pub(crate) fn from_u32_for_test(raw: u32) -> Self {
+        Self(raw)
     }
 }
 
@@ -437,6 +503,25 @@ impl Ledger {
     /// still answered: the client is owed exactly one terminal, and a refusal
     /// is one. Leaving it in the ledger so it could be retried would be an
     /// obligation that outlives its own answer.
+    ///
+    /// # The caller owes a journal line before it owes a send
+    ///
+    /// This removes the obligation and hands back either a judgement or the
+    /// ticket, and **the caller must record the outcome before it attempts to
+    /// send anything.** The reason is a real hazard rather than tidiness:
+    /// `Outbox::send` refuses at its frame cap without queueing, and
+    /// `send_or_queue` refuses at its byte and fd caps, so a send can fail
+    /// after the obligation is already gone. A caller that recorded only on
+    /// success would leave a journal showing an `owed` decision that never
+    /// closes, against a rung that was spent and a descriptor that was
+    /// dropped.
+    ///
+    /// The petition path solved this shape already: `deliver_resolution`
+    /// "refuses it typed and records `PetitionUndelivered` itself, from the
+    /// one funnel that covers every refusal reason". Whoever writes the
+    /// redemption caller (P2.6.6) owes the same funnel, and
+    /// [`Redeemed`]'s `#[must_use]` is only half a reminder — it catches a
+    /// dropped judgement, not an unrecorded send failure.
     pub(crate) fn redeem(
         &mut self,
         id: DesignationId,

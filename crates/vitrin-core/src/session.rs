@@ -2955,6 +2955,17 @@ fn dispatch_principal<H: RuntimeHost>(
                 // reachable from both.
                 let registry = &kernel.realms;
                 let shim_bin = shim.as_path();
+                // **No picker exists in any deployment yet** (P2.6.6 /
+                // issue #190), so every admitted designation is answered
+                // `internal` here and says so in the log. Written as a real
+                // sink returning `Unavailable` rather than as an absent one,
+                // because the chokepoint's arm must be reachable and exercised
+                // -- a verb that is served with no mechanism behind it is a
+                // condition the IDL names, and it should be visible in the
+                // journal of any deployment that somehow serves the bit.
+                let mut designate = |_ask: crate::enforcement::DesignateAsk<'_>| {
+                    Err(crate::enforcement::DesignateRefusal::Unavailable)
+                };
                 let mut launch = |ask: LaunchAsk<'_>| {
                     // Resolved per launch rather than per dispatch: this
                     // reads `$XDG_RUNTIME_DIR` and can fail, and a launch is
@@ -3001,6 +3012,7 @@ fn dispatch_principal<H: RuntimeHost>(
                     actuations: &mut actuations,
                     layout: &mut layout,
                     launch: &mut launch,
+                    designate: &mut designate,
                     recorder: &mut kernel.recorder,
                 };
                 let mut send =

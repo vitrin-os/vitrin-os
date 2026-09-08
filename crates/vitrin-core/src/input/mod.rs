@@ -5770,6 +5770,7 @@ pub(crate) mod tests {
                         // would be the bug, so it panics rather than
                         // silently answering.
                         launch: &mut |ask| panic!("no launch expected: {ask:?}"),
+                        designate: &mut |ask| panic!("no designation expected: {ask:?}"),
                     },
                     now,
                     &mut |_principal_frame, _fd| Ok(()),

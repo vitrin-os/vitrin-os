@@ -268,7 +268,8 @@ use vitrin_protocol::generated::vitrin_grant::{self as grant, Refusal, Verb};
 use vitrin_protocol::generated::vitrin_launcher as launcher;
 
 use crate::capture::{self, RealmViewFrame};
-use crate::grants::{GrantId, GrantTable};
+use crate::designation::{AskedFor, DesignationId};
+use crate::grants::{GrantId, GrantTable, RealmId};
 use crate::identity::PrincipalIdentity;
 use crate::input::{PhysicalPresenceMap, SeatInput, SeatInputKind};
 use crate::petitions::PetitionRegistry;
@@ -277,6 +278,29 @@ use crate::recorder::ObservedFrame;
 
 /// Nanoseconds per second, for exact integer bucket arithmetic.
 const NANOS_PER_SEC: u64 = 1_000_000_000;
+
+/// How long an admitted designation's terminal may stay owed (issue #343).
+///
+/// The IDL defines `timed_out` as expiring "on the deployment's own
+/// deadline", so a number has to be chosen somewhere and this is the choice.
+/// **Ninety seconds**, and the reasoning is that it is bounded by what a
+/// human doing the thing actually takes, not by what is convenient:
+///
+/// - The floor is the task. Reading a card, finding a file and confirming is
+///   tens of seconds for anyone not already looking at the right directory.
+///   A thirty-second deadline would time out real people mid-decision, and a
+///   timeout is not a neutral event -- with the default
+///   [`crate::designation::TimeoutPolicy::Spends`] it costs the agent its
+///   rung.
+/// - The ceiling is the grab. A raised card holds the human's input, so an
+///   abandoned one is a session the human has to notice and dismiss. Minutes
+///   would make forgetting expensive.
+///
+/// Not configurable, and that is deliberate rather than an omission: what a
+/// deployment gets to choose is what a timeout *means*
+/// ([`crate::designation::TimeoutPolicy`]), which is a policy question about
+/// authority. How long a human takes to pick a file is not.
+const PICKER_DEADLINE: Duration = Duration::from_secs(90);
 
 /// One facet-borne use, as the connection server resolved it from its
 /// object table before calling the chokepoint (steps 1-2 of the chain:
@@ -345,13 +369,17 @@ pub(crate) enum UseKind {
     /// always legal, and the *ask* is what is judged -- the launcher's shape
     /// exactly, one rung earlier in its life.
     ///
-    /// Whoever lands the core-drawn picker (P2.6.6) owns the arguments this
-    /// variant does not carry -- `request_file`'s `mode`, and which of the
-    /// two asks it was, both of which the picker needs -- along with the
-    /// two use-context questions the IDL's `refusal` enum deliberately
-    /// leaves open for designation (`preempted` and `consent_held`; see
-    /// [`Self::contends_for_attention`]).
-    Designate,
+    /// Carries [`AskedFor`] since issue #343: which of the two requests it
+    /// was, and `request_file`'s `mode`. Both are things the picker needs
+    /// and neither is a claim about *what* may be designated -- that is the
+    /// human's to say at the card.
+    ///
+    /// Still open, and deliberately not settled here: the two use-context
+    /// questions the IDL's `refusal` enum leaves open for designation
+    /// (`preempted` and `consent_held`; see
+    /// [`Self::contends_for_attention`]). This variant stays out of that
+    /// set, so the silence is preserved rather than read as licence.
+    Designate(AskedFor),
     /// `vitrin_egress.request_connect` (reply-bearing, since version 2):
     /// open one outbound connection to the single endpoint this grant's
     /// `net:` resource selector names.
@@ -420,7 +448,7 @@ impl UseKind {
             UseKind::Launch => Verb::REALM_LAUNCH,
             UseKind::LayoutFocus => Verb::LAYOUT_FOCUS,
             UseKind::LayoutArrange(_) => Verb::LAYOUT_ARRANGE,
-            UseKind::Designate => Verb::DESIGNATE_FILE,
+            UseKind::Designate(_) => Verb::DESIGNATE_FILE,
             UseKind::Egress => Verb::EGRESS,
         }
     }
@@ -439,7 +467,7 @@ impl UseKind {
     fn coalescible(&self) -> bool {
         !matches!(
             self,
-            UseKind::Capture | UseKind::Launch | UseKind::Designate | UseKind::Egress
+            UseKind::Capture | UseKind::Launch | UseKind::Designate(_) | UseKind::Egress
         )
     }
 
@@ -463,7 +491,10 @@ impl UseKind {
     /// Capture, both actuations and both layout verbs are refused, each for
     /// the reason the module docs give at step 5a.
     fn refused_by_a_vacant_realm(&self) -> bool {
-        !matches!(self, UseKind::Launch | UseKind::Designate | UseKind::Egress)
+        !matches!(
+            self,
+            UseKind::Launch | UseKind::Designate(_) | UseKind::Egress
+        )
     }
 
     /// Whether this use **contends for the human's attention**: it moves, or
@@ -526,7 +557,7 @@ impl UseKind {
     /// realm's shim, so P2.6.6 moves `Designate` into this set in the same
     /// change that gives it somewhere to deliver.
     pub(crate) fn names_a_realm(&self) -> bool {
-        self.contends_for_attention() || matches!(self, UseKind::Launch)
+        self.contends_for_attention() || matches!(self, UseKind::Launch | UseKind::Designate(_))
     }
 
     /// The two **layout** uses, and only those — the exact set the human's
@@ -673,6 +704,96 @@ pub(crate) struct UseEnv<'a> {
     ///   registration, the registry insert), none of which can turn a
     ///   forked realm back into a refusal.
     pub launch: &'a mut dyn FnMut(LaunchAsk<'_>) -> Result<MintedRealmId, LaunchRefusal>,
+    /// **Where an admitted designation raises the picker** (issue #343);
+    /// `None` in a deployment that has no picker.
+    ///
+    /// The inverse of [`Self::launch`] in exactly one of that field's three
+    /// properties, and identical in the other two.
+    ///
+    /// - **It takes a realm and the ask, and nothing else off the wire.**
+    ///   Same as `launch`: the realm comes from [`Self::grant_realm`].
+    /// - **It returns a [`DesignationId`]**, a type only
+    ///   `designation::Ledger::open` constructs -- so the chokepoint cannot
+    ///   name an obligation a client supplied.
+    /// - **It is asynchronous, and that is the whole point.** The picker goes
+    ///   up and this returns; the human has not answered. `Ok` means the
+    ///   obligation was recorded and its terminal will arrive through a
+    ///   redemption. `Err` means no card was raised at all, and the terminal
+    ///   is produced in this same call.
+    ///
+    /// **`None` answers `internal`, loudly**, on exactly the terms the
+    /// unreachable arm did before it: a verb served with no mechanism behind
+    /// it is the condition the IDL forbids. Presence of this sink -- not
+    /// `SERVED_VERB_BITS` alone -- is what a deployment must add, so widening
+    /// the verb bit without shipping a picker cannot silently start
+    /// admitting.
+    pub designate: &'a mut dyn FnMut(DesignateAsk<'_>) -> Result<DesignationId, DesignateRefusal>,
+}
+
+/// Why an admitted designation raised no picker.
+///
+/// [`LaunchRefusal`]'s sibling and deliberately not [`Refusal`] itself, for
+/// that type's reason: letting a mechanism name an authority code would let
+/// the embedder invent an authority answer no authority check produced.
+/// Three variants, mapped at one site.
+///
+/// **`Busy` and `Full` are constructed by no shipped sink**, because the only
+/// sink any deployment installs returns `Unavailable` — there is no picker to
+/// be busy with. They are here because the ledger that produces them exists
+/// and is tested, and because a mechanism enum that named only the case the
+/// core is currently in would have to be widened by whoever lands the picker,
+/// at exactly the moment they are least likely to notice the chokepoint needs
+/// a new arm.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DesignateRefusal {
+    /// **This deployment has no picker at all.** Not a policy answer: a verb
+    /// served with no mechanism behind it is the condition the IDL forbids,
+    /// so it maps to `internal` and says so in the log. Every deployment
+    /// answers this today.
+    Unavailable,
+    /// A picker for this principal is already up -- the ledger's
+    /// per-principal rule.
+    Busy,
+    /// The ledger is at its resource bound.
+    Full,
+}
+
+/// Everything the embedder is told about an admitted designation ask.
+///
+/// [`LaunchAsk`]'s sibling, and the enumeration is the security claim in the
+/// same way. Only one field came off the wire -- `ask`, whose two shapes the
+/// generated decoder validated -- and it names *which of the two requests*,
+/// never *what to designate*. What may be designated is the human's to say,
+/// at the card, and nothing here narrows or widens it.
+///
+/// **Several fields are read by no shipped sink**, for the reason above: the
+/// only sink installed today refuses without looking. They are carried anyway
+/// because they are what a redemption will need, and because a struct that
+/// grew them later would grow them at the call site rather than here, where
+/// the "nothing off the wire but `ask`" claim is stated and checked.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DesignateAsk<'a> {
+    /// The realm the designated descriptor will be delivered into: the realm
+    /// the *grant row* names, never a client's choice.
+    pub realm: &'a RealmId,
+    /// The verifier-canonical identity bound at `hello`.
+    pub principal: &'a PrincipalIdentity,
+    /// The row the chain judged.
+    pub grant: GrantId,
+    /// The `vitrin_powerbox` facet the ask arrived on, and the
+    /// `vitrin_grant` handle a refusal is addressed to.
+    pub facet_id: u32,
+    pub grant_wire_id: u32,
+    /// Which of the two asks, from the wire.
+    pub ask: AskedFor,
+    /// Whether this admission spent a `once` rung -- the fact a redemption
+    /// needs to tell "this row reads `Spent` because I spent it" from "this
+    /// row died". See [`crate::designation::DesignationTicket`].
+    pub spent_once: bool,
+    /// When the obligation dies unredeemed.
+    pub deadline: Instant,
 }
 
 /// Everything the embedder is told about an admitted launch — and the
@@ -740,10 +861,82 @@ pub(crate) enum UseOutcome {
         /// appears inside it, so a journal exists without a third code path.
         attention_claimed: bool,
     },
+    /// **Admitted, and the one terminal is owed** (issue #343).
+    ///
+    /// The chain said yes and step 6 committed -- the `once` rung is spent,
+    /// the rate token is taken, the coalescing marks are cleared -- and the
+    /// operation's terminal cannot be produced inside this dispatch, because
+    /// it waits on a human.
+    ///
+    /// **This is the variant the launch arm's docs said could not exist**,
+    /// and the reason it can exist here is that same argument in reverse.
+    /// `launched` is a terminal whose *failure* is discovered in the fork, so
+    /// deferring it would mean replying success and finding out afterwards
+    /// with no way to voice `internal`. A designation has no such failure to
+    /// discover: the ask either was admitted or was not, and what happens
+    /// next is the human's answer, which the IDL already models as a
+    /// separate voice.
+    ///
+    /// The obligation itself lives in [`crate::designation::Ledger`], not
+    /// here -- this variant carries its *name*, so the outcome stays `Copy`
+    /// and the recorder still observes the chokepoint through a value.
+    Owed {
+        grant: GrantId,
+        /// The obligation's name in the ledger.
+        designation: DesignationId,
+        /// How long it has, as a duration: this module reads no clock and
+        /// the journal writes no absolute times.
+        expires_in_ms: u32,
+        spent_once: bool,
+        attention_claimed: bool,
+    },
     /// Refused with this code; `voiced` says whether a `refused` event
     /// was actually emitted (`false` = coalesced away under the delivery
     /// classification's MAY-bounds -- possible only for actuations).
     Refused { code: Refusal, voiced: bool },
+}
+
+/// What an admission reports, whether its terminal was produced or is owed.
+///
+/// **One accessor so the two consumers cannot drift.** `serve_facet_use`
+/// journals `grant_spent` and `attention_claimed` off the outcome, and a use
+/// whose terminal is deferred spent exactly the same rung and exactly the
+/// same attention window a synchronous one did -- at the same instant, in the
+/// same step 6. Reading those facts through a `match` at each site is how one
+/// of them would eventually forget the new arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Admission {
+    pub grant: GrantId,
+    pub spent_once: bool,
+    pub attention_claimed: bool,
+}
+
+impl UseOutcome {
+    /// The admission facts, for an outcome that admitted anything.
+    ///
+    /// Exhaustive by intent: a new outcome variant has to decide here whether
+    /// it admitted, rather than falling through a wildcard into "it did not".
+    pub(crate) fn admission(self) -> Option<Admission> {
+        match self {
+            UseOutcome::Admitted {
+                grant,
+                spent_once,
+                attention_claimed,
+                ..
+            }
+            | UseOutcome::Owed {
+                grant,
+                spent_once,
+                attention_claimed,
+                ..
+            } => Some(Admission {
+                grant,
+                spent_once,
+                attention_claimed,
+            }),
+            UseOutcome::Refused { .. } => None,
+        }
+    }
 }
 
 /// A refusal decided by the chain, before emission. `retry_after_ms` is
@@ -1322,7 +1515,7 @@ impl Chokepoint {
             // Written out rather than left to a wildcard so that neither can
             // land by widening `SERVED_VERB_BITS` alone: the verb becomes
             // servable and this arm still refuses, loudly, in the log.
-            UseKind::Designate | UseKind::Egress => {
+            UseKind::Egress => {
                 tracing::warn!(
                     ?verb,
                     "a use of an unserved verb was admitted; refusing internal"
@@ -1339,6 +1532,111 @@ impl Chokepoint {
                     code: Refusal::Internal,
                     voiced,
                 })
+            }
+            // **The one arm whose terminal is not produced here** (issue
+            // #343). Everything above completes its operation inside this
+            // call; a designation raises a card and waits on a human.
+            //
+            // Step 6 has already run, so the `once` rung is spent, the rate
+            // token is taken and the coalescing marks are cleared -- exactly
+            // as they would be for a synchronous admission, at the same
+            // instant, because the admission *is* the same admission. What
+            // differs is only when the answer arrives.
+            UseKind::Designate(ask) => {
+                // `names_a_realm` is true for this kind, so the realm is
+                // populated by the same resolution the layout and launch
+                // arms use. Its absence is a core bug, not a client one.
+                let Some(realm) = env.grant_realm else {
+                    tracing::error!(
+                        ?verb,
+                        "a designation reached the sink with no realm resolved; refusing internal"
+                    );
+                    let voiced = self.voice_refusal(
+                        req.grant_wire_id,
+                        verb,
+                        Refuse::code(Refusal::Internal),
+                        false,
+                        now,
+                        send,
+                    )?;
+                    return Ok(UseOutcome::Refused {
+                        code: Refusal::Internal,
+                        voiced,
+                    });
+                };
+                match (env.designate)(DesignateAsk {
+                    realm,
+                    principal: req.principal,
+                    grant: allowed.grant_id,
+                    facet_id: req.facet_id,
+                    grant_wire_id: req.grant_wire_id,
+                    ask,
+                    spent_once,
+                    deadline: now + PICKER_DEADLINE,
+                }) {
+                    Ok(designation) => Ok(UseOutcome::Owed {
+                        grant: allowed.grant_id,
+                        designation,
+                        expires_in_ms: PICKER_DEADLINE.as_millis().min(u128::from(u32::MAX)) as u32,
+                        spent_once,
+                        attention_claimed,
+                    }),
+                    // No card went up, so the terminal IS produced here, in
+                    // this same dispatch, and the client is answered once.
+                    //
+                    // **Both ledger refusals voice `capacity`, and the choice
+                    // is deliberate.** `vitrin_powerbox.refusal` has its own
+                    // `busy` entry for the per-principal single-picker rule,
+                    // and it is tempting to reach for it -- but that enum is
+                    // the *picker's* terminal vocabulary, sent on the facet by
+                    // whatever raises and dismisses a card. Building one here
+                    // would put a second terminal voice inside the chokepoint,
+                    // and `single_enforcement_path_is_grep_provable` counts
+                    // refusal-event construction sites precisely so that a
+                    // second one cannot appear unnoticed.
+                    //
+                    // `vitrin_grant.refusal.capacity` already means what this
+                    // situation is -- the mechanism has no room right now, and
+                    // asking later is legal -- and the launch arm set the
+                    // precedent by mapping `LaunchRefusal::Capacity` to it for
+                    // the same class of answer. So the authority voice says
+                    // `capacity` through the one existing site, and the
+                    // powerbox's `busy` stays with the picker that will send
+                    // it (P2.6.6), where the card it describes actually exists.
+                    Err(refusal) => {
+                        let code = match refusal {
+                            // A verb served with no mechanism behind it. Loud,
+                            // because it is a deployment error rather than an
+                            // answer the human or the policy gave.
+                            DesignateRefusal::Unavailable => {
+                                tracing::warn!(
+                                    ?verb,
+                                    "a designation was admitted but this deployment has no \
+                                     picker; refusing internal"
+                                );
+                                Refusal::Internal
+                            }
+                            DesignateRefusal::Full => {
+                                tracing::warn!(
+                                    ?verb,
+                                    "the designation ledger is at its resource bound; refusing \
+                                     capacity"
+                                );
+                                Refusal::Capacity
+                            }
+                            DesignateRefusal::Busy => Refusal::Capacity,
+                        };
+                        let voiced = self.voice_refusal(
+                            req.grant_wire_id,
+                            verb,
+                            Refuse::code(code),
+                            false,
+                            now,
+                            send,
+                        )?;
+                        Ok(UseOutcome::Refused { code, voiced })
+                    }
+                }
             }
         }
     }
@@ -1519,7 +1817,7 @@ mod tests {
             UseKind::Launch => USE_KIND_NAMES[3],
             UseKind::LayoutFocus => USE_KIND_NAMES[4],
             UseKind::LayoutArrange(_) => USE_KIND_NAMES[5],
-            UseKind::Designate => USE_KIND_NAMES[6],
+            UseKind::Designate(_) => USE_KIND_NAMES[6],
             UseKind::Egress => USE_KIND_NAMES[7],
         }
     }
@@ -1611,13 +1909,29 @@ mod tests {
                 UseKind::LayoutArrange(LayoutMode::Windowed),
                 layout.to_vec(),
             ),
-            // A designation ask and an egress connection: reply-bearing
-            // (a coalesced-away terminal leaves the client waiting forever
-            // for a resource it asked for), and exempt from every
-            // use-context question -- the descriptor goes to the realm's
-            // shim, which exists from the moment the realm does, and a
-            // connection is not made to a window.
-            (UseKind::Designate, Vec::new()),
+            // A designation ask: reply-bearing (a coalesced-away terminal
+            // leaves the client waiting forever for a resource it asked
+            // for), exempt from every use-context question -- the
+            // descriptor goes to the realm's shim, which exists from the
+            // moment the realm does -- and, since issue #343, it NAMES A
+            // REALM.
+            //
+            // That last one is the change, and it is not bookkeeping. A
+            // designated descriptor is delivered *into* a realm, so the
+            // obligation has to record which one and the redemption has to
+            // re-ask whether that realm is still the same live realm. The
+            // realm name is therefore resolved at admission, from the grant
+            // row, exactly as a launch's template is -- and the cost is the
+            // one realm-name clone this predicate exists to ration.
+            //
+            // `contends_for_attention` stays FALSE, deliberately. The IDL
+            // leaves `preempted` and `consent_held` open for designation and
+            // says a server must not read the silence as licence to give
+            // either code a meaning; answering it here would settle a
+            // protocol question inside an enforcement change.
+            (UseKind::Designate(AskedFor::Dir), vec!["names_a_realm"]),
+            // An egress connection: unchanged, and exempt from all four --
+            // a connection is not made to a window.
             (UseKind::Egress, Vec::new()),
         ];
 
@@ -2178,5 +2492,293 @@ mod tests {
                 "the trailing tests module is excluded"
             );
         }
+    }
+
+    // -- the deferred terminal (issue #343) --------------------------------
+
+    /// A grant row carrying `designate_file`.
+    ///
+    /// **Test-only, and it widens something the shipped build does not.**
+    /// `designate_file` is outside `SERVED_VERB_BITS`, so no petition can
+    /// mint a row that carries it and step 4 refuses every real designation
+    /// `not_granted` long before the arm below is reached. That is asserted
+    /// in `a_designation_is_unreachable_in_the_shipped_build`, which is what
+    /// stops these tests from being read as evidence that anything serves it.
+    fn designation_row(
+        table: &mut crate::grants::GrantTable,
+        who: &PrincipalIdentity,
+        rung: crate::grants::PersistenceRung,
+        at: Instant,
+    ) -> GrantId {
+        table
+            .insert(
+                crate::grants::GrantSpec {
+                    principal_id: who.clone(),
+                    realm_id: RealmId::new("realm-0"),
+                    resource_ref: crate::grants::ResourceRef::WholeRealm,
+                    verbs: Verb::DESIGNATE_FILE,
+                    expiry: None,
+                    max_event_rate: std::num::NonZeroU32::new(20).unwrap(),
+                    persistence: rung,
+                    issuer: crate::grants::Issuer::HumanConsent,
+                },
+                at,
+            )
+            .expect("a valid row")
+    }
+
+    /// What the designation sink was handed, recorded for assertion.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct SinkSaw {
+        realm: RealmId,
+        grant: GrantId,
+        ask: AskedFor,
+        spent_once: bool,
+        facet_id: u32,
+        grant_wire_id: u32,
+    }
+
+    /// Drive one designation ask through the real chokepoint against a sink
+    /// the caller supplies, and hand back the outcome plus what the sink saw.
+    fn designate_once(
+        rung: crate::grants::PersistenceRung,
+        ask: AskedFor,
+        answer: Result<DesignationId, DesignateRefusal>,
+    ) -> (UseOutcome, Option<SinkSaw>) {
+        let now = Instant::now();
+        let who = PrincipalIdentity::parse("vitrin://local/principal/agent")
+            .expect("fixture identity parses");
+        let mut grants = crate::grants::GrantTable::new();
+        let row = designation_row(&mut grants, &who, rung, now);
+        let registry = PetitionRegistry::new(
+            crate::petitions::ConsentPolicy::Interactive,
+            crate::petitions::PetitionConfig::default(),
+        );
+        let presence = crate::input::PhysicalPresenceMap::new();
+        let realm = RealmId::new("realm-0");
+        let mut seen = None;
+        let mut chokepoint = Chokepoint::new();
+        let outcome = chokepoint
+            .enforce_use(
+                UseRequest {
+                    facet_id: 20,
+                    grant_wire_id: 10,
+                    grant_row: Some(row),
+                    principal: &who,
+                    kind: UseKind::Designate(ask),
+                },
+                &mut grants,
+                &registry,
+                UseEnv {
+                    // No view: a designation is not refused by a vacant realm
+                    // (`refused_by_a_vacant_realm` is false for it), and a
+                    // test that supplied one could not tell the difference.
+                    realm_view: None,
+                    presence: &presence,
+                    attention: &std::cell::RefCell::new(
+                        crate::attention::AttentionSignal::detached(),
+                    ),
+                    physical_realm: None,
+                    actuations: &mut |_realm, _input| panic!("no actuation expected"),
+                    grant_realm: Some(&realm),
+                    layout: &mut |act| panic!("no layout act expected: {act:?}"),
+                    launch: &mut |ask| panic!("no launch expected: {ask:?}"),
+                    designate: &mut |ask: DesignateAsk<'_>| {
+                        seen = Some(SinkSaw {
+                            realm: ask.realm.clone(),
+                            grant: ask.grant,
+                            ask: ask.ask,
+                            spent_once: ask.spent_once,
+                            facet_id: ask.facet_id,
+                            grant_wire_id: ask.grant_wire_id,
+                        });
+                        answer
+                    },
+                },
+                now,
+                &mut |_frame, _fd| Ok(()),
+            )
+            .expect("transport is healthy");
+        (outcome, seen)
+    }
+
+    /// **The shipped build never reaches the arm the tests below exercise**,
+    /// and that is asserted rather than assumed.
+    ///
+    /// `designate_file` is outside `SERVED_VERB_BITS`, so no petition resolves
+    /// `granted` for it, no row carries the bit, and step 4 refuses every real
+    /// designation `not_granted`. Everything below runs against a row this
+    /// module built by hand. If this assertion ever fails, the tests below
+    /// stopped being statements about a mechanism and became statements about
+    /// a deployment, and each needs re-reading.
+    #[test]
+    fn a_designation_is_unreachable_in_the_shipped_build() {
+        assert_eq!(
+            Verb::DESIGNATE_FILE.bits() & crate::grants::SERVED_VERB_BITS,
+            0,
+            "SERVED_VERB_BITS gained `designate_file` without the picker (P2.6.6) or its \
+             consent copy (P2.6.8); the deferred-terminal tests below are now claims about a \
+             live path and must be re-read as such"
+        );
+    }
+
+    /// **An admitted ask whose card goes up is `Owed`, not `Admitted`.**
+    ///
+    /// The whole point of the variant: the chain said yes and the rung is
+    /// spent, and nothing has been delivered. A journal line saying `allowed`
+    /// here would name a descriptor no client has received.
+    #[test]
+    fn an_admitted_designation_owes_its_terminal_rather_than_producing_one() {
+        let (outcome, seen) = designate_once(
+            crate::grants::PersistenceRung::WhileRunning,
+            AskedFor::File { write: true },
+            Ok(DesignationId::from_u32_for_test(7)),
+        );
+        let UseOutcome::Owed {
+            designation,
+            expires_in_ms,
+            spent_once,
+            ..
+        } = outcome
+        else {
+            panic!("an admitted designation must owe its terminal, got {outcome:?}");
+        };
+        assert_eq!(designation.get(), 7, "the ledger's name, not the core's");
+        assert_eq!(
+            expires_in_ms,
+            PICKER_DEADLINE.as_millis() as u32,
+            "the client is told how long it has, and it is the deadline this build uses"
+        );
+        assert!(!spent_once, "a while_running rung is not spent by one use");
+        let saw = seen.expect("the sink was consulted");
+        assert_eq!(
+            saw.realm.as_str(),
+            "realm-0",
+            "the realm comes from the grant row"
+        );
+        assert_eq!(
+            saw.ask,
+            AskedFor::File { write: true },
+            "request_file's mode must reach the picker, or it cannot open as asked"
+        );
+        assert!(!saw.spent_once);
+        assert_eq!((saw.facet_id, saw.grant_wire_id), (20, 10));
+    }
+
+    /// **A `once` rung is spent at admission, and the sink is told.**
+    ///
+    /// This is the fact a redemption cannot work without: `commit_use` marks
+    /// the row `Spent` before the operation, and `refusal_for` reports
+    /// `Spent` as `Expired` — so a redemption that re-asked the table naively
+    /// would refuse every single-use designation. The ticket carries
+    /// `spent_once` precisely so the forgiveness can be narrow, and this is
+    /// where the chokepoint hands that fact over.
+    #[test]
+    fn a_once_rung_is_spent_at_admission_and_the_sink_is_told() {
+        let (outcome, seen) = designate_once(
+            crate::grants::PersistenceRung::Once,
+            AskedFor::Dir,
+            Ok(DesignationId::from_u32_for_test(1)),
+        );
+        let UseOutcome::Owed { spent_once, .. } = outcome else {
+            panic!("expected an owed terminal, got {outcome:?}");
+        };
+        assert!(
+            spent_once,
+            "a once rung is spent by the ask, so the journal owes a grant_spent line"
+        );
+        let saw = seen.expect("the sink was consulted");
+        assert_eq!(saw.ask, AskedFor::Dir, "request_dir carries no mode");
+        assert!(
+            saw.spent_once,
+            "the sink must be told the rung was spent, or the redemption cannot tell \\
+             \"this row is Spent because of me\" from \"this row died\""
+        );
+    }
+
+    /// **A deployment with no picker refuses `internal`, loudly**, and does
+    /// not owe anything.
+    ///
+    /// Every deployment today. A verb served with no mechanism behind it is
+    /// the condition the IDL forbids, so the answer must be the one that says
+    /// the core is broken — never a policy-shaped refusal that would read as
+    /// the human having decided something.
+    #[test]
+    fn a_designation_with_no_picker_is_refused_internal() {
+        let (outcome, seen) = designate_once(
+            crate::grants::PersistenceRung::WhileRunning,
+            AskedFor::Dir,
+            Err(DesignateRefusal::Unavailable),
+        );
+        assert!(
+            matches!(
+                outcome,
+                UseOutcome::Refused {
+                    code: Refusal::Internal,
+                    voiced: true
+                }
+            ),
+            "no picker must answer internal and voice it, got {outcome:?}"
+        );
+        assert!(seen.is_some(), "the sink is consulted before the refusal");
+    }
+
+    /// A card already up, or a full ledger, answers `capacity` — the code
+    /// that means "no room now, asking later is legal".
+    ///
+    /// **Not the powerbox's own `busy`.** That enum is the picker's terminal
+    /// vocabulary, sent on the facet by whatever raises and dismisses a card;
+    /// building one inside the chokepoint would add a second terminal voice
+    /// to a function whose single-voice property is grep-proved.
+    #[test]
+    fn a_busy_or_full_ledger_answers_capacity() {
+        for refusal in [DesignateRefusal::Busy, DesignateRefusal::Full] {
+            let (outcome, _) = designate_once(
+                crate::grants::PersistenceRung::WhileRunning,
+                AskedFor::Dir,
+                Err(refusal),
+            );
+            assert!(
+                matches!(
+                    outcome,
+                    UseOutcome::Refused {
+                        code: Refusal::Capacity,
+                        voiced: true
+                    }
+                ),
+                "{refusal:?} must answer capacity, got {outcome:?}"
+            );
+        }
+    }
+
+    /// **An owed admission reports its admission facts**, so the journal
+    /// still records a spent rung and a claimed attention window.
+    ///
+    /// The accessor exists because matching `UseOutcome::Admitted` at those
+    /// two sites is how the deferred arm would have silently stopped
+    /// journaling either one.
+    #[test]
+    fn an_owed_outcome_reports_the_same_admission_facts_a_synchronous_one_does() {
+        let grant = GrantId::from_u64_for_test(3);
+        let owed = UseOutcome::Owed {
+            grant,
+            designation: DesignationId::from_u32_for_test(1),
+            expires_in_ms: 1000,
+            spent_once: true,
+            attention_claimed: true,
+        };
+        let admission = owed.admission().expect("an owed use admitted something");
+        assert_eq!(admission.grant, grant);
+        assert!(admission.spent_once);
+        assert!(admission.attention_claimed);
+        assert!(
+            UseOutcome::Refused {
+                code: Refusal::Internal,
+                voiced: true
+            }
+            .admission()
+            .is_none(),
+            "a refusal admitted nothing"
+        );
     }
 }

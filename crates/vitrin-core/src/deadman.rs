@@ -2649,6 +2649,7 @@ mod tests {
                         // Likewise for launch: no test here exercises it,
                         // and one reaching this sink is a defect.
                         launch: &mut |ask| panic!("no launch expected: {ask:?}"),
+                        designate: &mut |ask| panic!("no designation expected: {ask:?}"),
                     },
                     now,
                     &mut |_frame, _fd| Ok(()),

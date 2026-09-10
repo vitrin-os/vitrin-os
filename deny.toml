@@ -267,8 +267,12 @@ already names for re-auditing fontdue's four `unsafe` blocks.""" },
 #     never linked into `vitrin-shim`. A GPL-3.0 crate entering the Rust graph
 #     is exactly the event that would silently relicense the TCB, so it must
 #     fail loudly here.
-#   * `OFL-1.1` covers the vendored font under
-#     `crates/vitrin-core/assets/fonts/`. Vendored data, not a crate.
+#   * `OFL-1.1` covers the two vendored assets under
+#     `crates/vitrin-core/assets/fonts/` -- Liberation Sans, and the
+#     kana atlas rasterized from Noto Sans CJK JP. Vendored data, not
+#     crates: neither is in the Cargo graph, so neither is cargo-deny's to
+#     see, and `cargo xtask kana-atlas --check` is what holds the second
+#     one to its NOTICE entry.
 #
 # Anything not on the list fails. The four crates that need something else get
 # a per-crate exception below rather than widening the list for everybody --

@@ -63,6 +63,8 @@ pub(crate) enum Group {
 pub(crate) enum Route {
     /// Rasterize the glyph from the embedded vector face.
     Vector,
+    /// Take the bitmap from the pre-rasterized Japanese atlas.
+    Atlas,
     /// Transcribe it. Never a fallthrough from a failed coverage query —
     /// always the explicit default, so a codepoint nobody considered is
     /// transcribed rather than drawn on a guess.
@@ -169,18 +171,34 @@ pub(crate) fn route(ch: char) -> Route {
     if ch.is_control() || is_denied_class(ch) {
         return Route::Escape;
     }
-    match ch {
-        // ASCII printables, minus the classes above.
-        ' '..='~' => Route::Vector,
-        // The vector face's covered scripts. Japanese is deliberately absent:
-        // the face carries no kana or Han, so it transcribes today. That is
-        // stated rather than implied — `group_of` already names the group so
-        // the mixed-script rule is correct in advance of the glyphs.
-        '\u{00A1}'..='\u{024F}' | '\u{0370}'..='\u{03FF}' | '\u{0400}'..='\u{04FF}' => {
-            Route::Vector
-        }
-        _ => Route::Escape,
+    // Two questions, and both must answer yes.
+    //
+    // **May this script be drawn at all?** A range decides that, because it is
+    // a decision about shaping and bidi rather than about the asset. Liberation
+    // carries 78% of the Hebrew block and Hebrew is still refused: it would
+    // render in logical order, backwards.
+    //
+    // **Does a glyph actually exist?** The *source* decides that, and it must
+    // be asked rather than assumed. The Greek block holds seventeen codepoints
+    // the face has no glyph for, and every one of them rasterizes to the same
+    // `.notdef` box — so a router that trusted the range would draw seventeen
+    // distinct filenames identically and break injectivity on the widened path
+    // it exists to guard.
+    let in_vector_script = matches!(ch,
+        ' '..='~'
+        | '\u{00A1}'..='\u{024F}'
+        | '\u{0370}'..='\u{03FF}'
+        | '\u{0400}'..='\u{04FF}'
+    );
+    if in_vector_script && super::text::face_covers(ch) {
+        return Route::Vector;
     }
+    // Japanese comes from the atlas, which is asked the same way: `covers` is
+    // a lookup in the shipped asset, not a range.
+    if matches!(group_of(ch), Some(Group::Japanese)) && super::atlas::covers(ch) {
+        return Route::Atlas;
+    }
+    Route::Escape
 }
 
 /// Categories denied wholesale, checked without a Unicode database.
@@ -227,7 +245,7 @@ mod tests {
             // rediscover every row from the face alone.
             if DENIED_APPEARANCE.contains(&ch) {
                 // fall through: still partitioned, so a stale row is caught
-            } else if route(ch) != Route::Vector {
+            } else if route(ch) == Route::Escape {
                 continue;
             }
             let Some((coverage, w, h, advance)) = text.raster_signature_for_test(ch, NAME_PX)
@@ -311,7 +329,7 @@ mod tests {
             let Some(ch) = char::from_u32(cp) else {
                 continue;
             };
-            if route(ch) == Route::Vector {
+            if route(ch) != Route::Escape {
                 assert!(
                     !is_denied_class(ch) && !ch.is_control(),
                     "U+{cp:04X} routes to Vector but is in a denied class"

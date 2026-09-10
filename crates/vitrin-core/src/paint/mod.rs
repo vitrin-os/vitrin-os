@@ -41,6 +41,7 @@
 //! surface to share it: the *authority* claims live in [`crate::consent`] and
 //! [`crate::lock`], and this module cannot participate in one.
 
+pub(crate) mod atlas;
 pub(crate) mod canvas;
 pub(crate) mod script;
 pub(crate) mod transcript;

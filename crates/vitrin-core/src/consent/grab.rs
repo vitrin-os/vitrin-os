@@ -881,7 +881,18 @@ impl ConsentGrab {
                 // Anything armed under the stale guard is disarmed with it: a
                 // press that landed while the card was hidden must not survive
                 // into the visible round.
+                //
+                // **Both** presses, not just the choice row's. A panel slot
+                // arms `Panel::pressed` (issue #346), and clearing only
+                // `self.armed` left that one to commit on the first release
+                // after the human came back. [`Panel::epoch`] cannot catch it:
+                // its sole writer is the panel-refresh path, and a seat pause
+                // refreshes nothing, so the stale stamp still matches. The
+                // release goes through `disarm_slot` rather than a second
+                // hand-written `pressed = None`, so the two cannot drift apart
+                // again.
                 self.armed = None;
+                self.disarm_slot();
                 true
             }
             None => false,
@@ -3173,6 +3184,68 @@ mod tests {
         assert!(
             !steps.iter().any(|s| matches!(s, Step::Activate(_))),
             "a press that slid off its slot must activate nothing; got {steps:?}"
+        );
+    }
+
+    /// **A press armed before a seat pause must not commit after it**
+    /// (issue #346).
+    ///
+    /// `restart_guard` runs on every not-visible -> visible transition: a
+    /// lock lowering over a live prompt, and the seat handing the devices
+    /// back after a VT switch. It cleared the choice row's `armed` and left
+    /// the panel's `pressed` behind, so a finger that went down before the
+    /// switch committed on the first release after the human returned.
+    ///
+    /// The epoch stamp is deliberately asserted to be *unchanged* across the
+    /// pause. That is what makes this test non-vacuous: `Panel::epoch`'s only
+    /// writer is the panel-refresh path, so if a future change made a pause
+    /// refresh content, the epoch guard would start catching this on its own
+    /// and the test would keep passing while `restart_guard` silently
+    /// regressed. Pinning the epoch means this test can only be satisfied by
+    /// the disarm it is actually about.
+    #[test]
+    fn a_slot_press_does_not_survive_a_seat_pause() {
+        let (mut grab, _surface, _registry, _petition, t0) = panelled();
+        let now = past_guard(t0);
+        let (x, y) = slot_center(&grab, 4);
+        grab.judge_parts(Origin::Physical, &motion(x, y), now);
+        grab.judge_parts(Origin::Physical, &press(BTN_LEFT), now);
+
+        let epoch_before = grab
+            .open()
+            .and_then(|o| o.panel.as_ref())
+            .expect("the card drew a panel")
+            .epoch;
+
+        // The seat goes away and comes back: a VT switch, or a lock lowering
+        // over the live prompt. Only the guard restarts.
+        assert!(
+            grab.restart_guard(now),
+            "a prompt is up, so the guard restarts"
+        );
+
+        let epoch_after = grab
+            .open()
+            .and_then(|o| o.panel.as_ref())
+            .expect("the panel survives the pause")
+            .epoch;
+        assert_eq!(
+            epoch_before, epoch_after,
+            "a seat pause refreshes no content, so the epoch guard is not what \
+             defends this; if this ever fails, this test has stopped checking \
+             what it was written for"
+        );
+
+        // The human comes back and lifts the finger, on the same slot.
+        let after = past_guard(now);
+        grab.judge_parts(Origin::Physical, &release(BTN_LEFT), after);
+
+        let steps: Vec<Step> = std::iter::from_fn(|| grab.take_navigation())
+            .map(|n| n.step)
+            .collect();
+        assert!(
+            !steps.iter().any(|s| matches!(s, Step::Activate(_))),
+            "a press armed before the pause must activate nothing after it; got {steps:?}"
         );
     }
 

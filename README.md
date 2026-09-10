@@ -424,6 +424,38 @@ is a different promise from one that is scheduled.
   never written, and libinput synthesizes none. Nested, the host repeats and you
   never see it. **No issue tracks it**, and no run has confirmed it: this one was
   found by reading the tree during this sweep.
+- **The core-drawn file picker will not draw Arabic, Hebrew, Devanagari or
+  Thai.** The chooser a realm asks for over
+  [`vitrin_powerbox`](docs/protocol/13-vitrin_powerbox.md)
+  ([#190](https://github.com/vitrin-os/vitrin-os/issues/190)) rasterizes names
+  itself, through a text path with **no shaping engine and no bidi algorithm**,
+  so a name in one of those four scripts is **transcribed** as `\u{XXXX}`
+  escapes rather than drawn in its own script. That is permanent: drawing them
+  needs GSUB joining and GPOS mark positioning, and **a bidi algorithm on the
+  trusted surface is the RTL-override filename spoof** — the absence of shaping
+  is what makes that attack inert, and the override codepoint is itself
+  transcribed rather than obeyed. Hebrew shows this is a decision rather than a
+  missing asset: the shipped face covers 87 of that block's 112 codepoints and
+  it is refused anyway, because without bidi it would render in logical order,
+  backwards. **No issue tracks it**, deliberately — an issue would imply a
+  schedule, and there is none.
+- **A kanji outside the shipped subset is transcribed too.** Japanese is drawn
+  from a pre-rasterized atlas of 3152 glyphs at one size rather than from a
+  font: kana complete at 187 codepoints, plus the 2965 ideographs of **JIS X
+  0208 level 1**, with level 2's further 3390 deliberately out. So **a kanji
+  outside that set is transcribed** as an escape in the middle of a name whose
+  other characters draw normally, and the two *combining* kana sound marks are
+  absent like every other combining mark. **No issue tracks it**: the subset is
+  a decided bound with its derivation written beside the asset.
+- **Row distinctness is per listing, not global.** Two files in *different*
+  directories may render alike. Global pixel-injectivity is impossible — a row
+  is a bounded raster, and the set of legal filenames is not finite — so what
+  the picker guarantees is that **no two rows of one listing** render alike:
+  each row is digested by the pixels it actually draws, and where two rows
+  collide the core marks them apart in a reserved gutter — or refuses the
+  listing when the gutter cannot label the group. It does not claim a name is
+  unique across the filesystem, and it cannot. **No issue tracks it**, because
+  it is a boundary rather than a gap.
 - **The trusted band's automated witness covers the headless backend only.** The
   band's unspoofability is machine-checked where CI can read a framebuffer and
   asserted, not checked, on the bare-metal backend a human would actually look

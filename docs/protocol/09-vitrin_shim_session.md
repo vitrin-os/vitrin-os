@@ -605,11 +605,20 @@ core-drawn picker, and this event delivers the resulting descriptor into the
 realm. The shim relays it to its app over the realm's own designation socket
 (P2.6.7); it is the app, not the shim, that the descriptor is for.
 
-**The shipped shim does not implement receiving this event.** Its transport
-(`shim/include/wire.h`) carries `SCM_RIGHTS` on the send side only, because
-until this event no core→shim message had ever carried a descriptor: an
-arriving fd is a violation, closed immediately, and then fatal. A `designation`
-sent to today's shim therefore closes the descriptor and kills the connection
+**The shipped shim receives this event as of P2.6.6.** It was the first
+fd-bearing core→shim event this protocol ever defined, and until it landed the
+shim's transport carried `SCM_RIGHTS` on the send side only — an arriving
+descriptor was a violation, closed immediately, and then fatal. That is no
+longer true: `shim/include/wire.h` now carries a pending-fd queue, and a
+handler claims the descriptor by writing `-1` through its `int *fd`. A handler
+that does not claim one still closes it, so the transport leaks nothing when a
+message it does not serve arrives bearing a descriptor.
+
+What the shim does **not** yet have is the relay: the per-realm
+`designation.sock` that hands the descriptor on to the app is P2.6.7 (#191),
+and until it lands the shim receives the descriptor and closes it. A
+`designation` sent to today's shim is therefore received and accounted for,
+and does not reach the app
 rather than delivering it. Nothing is lost by it today — no deployment serves
 `designate_file`, so the core never sends the event — and the receive-side
 machinery is part of what **P2.6.7** owes alongside the designation socket.

@@ -813,6 +813,12 @@ impl ConsentGrab {
             // navigable because there is a panel on the screen -- never
             // because a flag beside the pixels said so.
             answerable: Answerable::Open(Open {
+                // **`Card::buttons` is already narrowed to petition
+                // decisions** (`ButtonBox::as_choice`, applied in
+                // `draw_card`). A picker card paints Confirm and Cancel;
+                // neither is a `Choice`, so neither can be hit-tested into a
+                // `Decision` -- which names a `PetitionId` a designation does
+                // not have.
                 buttons: card.buttons.clone(),
                 panel: card.panel.clone().map(Panel::new),
             }),
@@ -1028,26 +1034,38 @@ impl ConsentGrab {
     /// [`Self::raise`]'s rule and for its reason: one prompt at a time is the
     /// property, and it is enforced here rather than trusted to the caller.
     ///
-    /// # This raise composites nothing, and that is the honest state
+    /// # This raise composites nothing; [`Self::show_picker`] does
     ///
     /// [`Self::raise`] does five things at once so "visible", "input
     /// grabbed", "`consent_held` holds" and "the log says so" cannot drift
-    /// apart. This one does exactly **one** of them — the grab — because
-    /// there is nothing in this tree that can draw a picker: the card
-    /// renderer's panel ([`super::PanelContent`]) carries no strings by an
-    /// argued decision, so it can show *that* there are rows and not *what
-    /// any row is*, and widening it is a change that has to make its own
-    /// argument about drawing attacker-influenced filenames on the one
-    /// surface whose whole purpose is being trustworthy. So a raised picker
-    /// today is a seized keyboard with nothing on screen explaining it. What
-    /// bounds that is the `deadline` this copies: the backstop in
-    /// [`Self::judge_parts`] stops consuming at it whatever else happens.
+    /// apart. This one does exactly **one** of them — the grab — and the
+    /// pixels arrive in a second call, because the two have different
+    /// cadences: a designation is raised once and then *redrawn on every
+    /// keystroke*, so folding the card into the raise would have meant a
+    /// second, differently-shaped path for every redraw after the first.
     ///
-    /// This is stated rather than hidden because the alternative shapes are
-    /// both worse: raising the *petition* card for a designation would draw
-    /// Allow/Deny buttons under a card that grants nothing, and not raising
-    /// the grab at all would let the app behind the picker read every key of
-    /// the human's navigation.
+    /// This used to be the whole story rather than half of it: for one
+    /// release a raised picker was a seized keyboard with nothing on screen
+    /// explaining it, because the panel type carried no strings and drawing
+    /// attacker-influenced filenames on the trusted surface was a change that
+    /// had to make its own argument first. [`super::PanelContent`] now makes
+    /// that argument, in the type.
+    ///
+    /// # The second call is not yet made, so the seizure is still blind
+    ///
+    /// **State this plainly rather than let the paragraph above imply
+    /// otherwise.** [`Self::show_picker`] exists, is tested, and is the only
+    /// door to the pixels — and *nothing outside `crate::consent`'s own tests
+    /// calls it*. `crate::session::service_picker_round` calls
+    /// `raise_picker_for`, which calls this and stops; it never reaches for
+    /// the card. So in a shipped binary a raised designation is, still, a
+    /// seized keyboard with nothing behind it.
+    ///
+    /// What bounds that — now as before — is the `deadline` this copies: the
+    /// backstop in [`Self::judge_parts`] stops consuming at it whatever else
+    /// happens. Closing the gap is two calls in `crate::session`: one after
+    /// this returns `true`, and one wherever a step changed what the human
+    /// should be seeing.
     ///
     /// # The prompt it arms carries no choice rectangles, and cannot
     ///
@@ -1057,6 +1075,13 @@ impl ConsentGrab {
     /// [`Decision`] — not by a check, but because the geometry a decision
     /// would need does not exist. That matters: `Decision` names a
     /// `PetitionId`, and a designation has none.
+    ///
+    /// **A picker card really does paint buttons now, and this stays true.**
+    /// They are Confirm and Cancel, and
+    /// [`super::render::ButtonBox::as_choice`] returns `None` for both, so
+    /// the narrowing that fills `Open::buttons` cannot admit them. The
+    /// property is kept by the type rather than by this function continuing
+    /// to pass an empty vector.
     pub fn raise_picker(
         &mut self,
         designation: DesignationId,
@@ -1088,6 +1113,47 @@ impl ConsentGrab {
         // arming requires a press this gate consumed.
         self.armed = None;
         true
+    }
+
+    /// **Draw (or redraw) the raised picker's card** (P2.6.6, issue #190).
+    ///
+    /// The pixel half of [`Self::raise_picker`], and the one call an embedder
+    /// would make to put a designation on screen: once straight after the
+    /// raise, and again on every round in which a step changed what the human
+    /// should be seeing. **No embedder in this tree makes it yet** — see
+    /// [`Self::raise_picker`] — so every caller below is a test.
+    /// `content` comes from
+    /// [`crate::picker::session::PickerSession::card`], which derives it from
+    /// the same `shown`/`cursor` a confirm settles from — so the highlight on
+    /// screen and the row that would be handed over cannot be different rows.
+    ///
+    /// Refuses, and draws nothing, unless a **picker** holds the grab. A
+    /// petition's card is not redrawable this way and must not be: its
+    /// content is the ask, and an ask that changed under a human mid-decision
+    /// is the hazard [`Self::refresh_panel`] and [`GUARD_INTERVAL`] exist for.
+    ///
+    /// Returns whether anything visible changed, so an embedder can skip a
+    /// recomposite on an inert keystroke.
+    ///
+    /// # It does not re-snapshot geometry, because there is none to snapshot
+    ///
+    /// [`Self::refresh_panel`] pairs content with geometry in one call so the
+    /// rectangles the grab hit-tests are the ones the renderer just painted.
+    /// This deliberately does not, and the difference is
+    /// [`Self::raise_picker`]'s: the armed prompt for a designation holds no
+    /// buttons and no panel, so there is nothing to hit-test and nothing that
+    /// could go stale. A picker is driven by the keyboard
+    /// ([`crate::picker::keys`]) and the card's own rectangles are reported
+    /// for the renderer's tests, not for a pointer.
+    pub fn show_picker(
+        &mut self,
+        content: crate::consent::PickerContent,
+        surface: &mut ConsentSurface,
+    ) -> bool {
+        if self.raised_designation().is_none() {
+            return false;
+        }
+        surface.show_picker(content)
     }
 
     /// Take the picker down and release the grab, without touching the
@@ -3324,12 +3390,29 @@ mod tests {
     // seam, and it is `#[cfg(test)]` so it cannot become that reach.
 
     /// A panel with eight filled slots out of forty, nothing hovered.
+    ///
+    /// The names are ordinary ASCII, because these tests are about the grab's
+    /// geometry and arming rules rather than about transcription -- what the
+    /// rows *say* is `consent::render`'s subject and is tested there.
     fn panel() -> PanelContent {
+        panel_of(super::super::render::PANEL_ROWS)
+    }
+
+    /// A panel with `filled` rows out of forty.
+    fn panel_of(filled: u16) -> PanelContent {
+        use crate::consent::PanelRow;
+
         PanelContent {
-            filled: super::super::render::PANEL_ROWS,
+            rows: (0..filled)
+                .map(|i| PanelRow {
+                    name: crate::paint::transcript::encode(format!("row-{i}.txt").as_bytes()),
+                    tag: None,
+                })
+                .collect(),
             highlight: None,
             offset: 0,
             total: 40,
+            query: crate::paint::transcript::encode(b""),
         }
     }
 
@@ -3620,10 +3703,10 @@ mod tests {
         ] {
             let applied = grab.refresh_panel(
                 PanelContent {
-                    filled,
                     highlight,
                     offset,
                     total,
+                    ..panel_of(filled)
                 },
                 &mut surface,
             );
@@ -3960,5 +4043,120 @@ mod tests {
         let drained: Vec<_> = std::iter::from_fn(|| grab.take_step()).collect();
         assert_eq!(drained.len(), MAX_PICKER_STEPS);
         assert!(drained.iter().all(|(step_id, _)| *step_id == id));
+    }
+
+    /// **A raised picker really gets pixels** (P2.6.6, issue #190).
+    ///
+    /// `raise_picker` seizes input; `show_picker` is what puts a card behind
+    /// the seizure. This drives the pair the way an embedder does — raise,
+    /// then draw, then redraw as the human navigates — and checks each half.
+    #[test]
+    fn a_raised_picker_can_be_drawn_and_redrawn() {
+        let (mut grab, _id, _t0) = picking(Duration::from_secs(90));
+        let mut surface = ConsentSurface::new(crate::consent::TrustedIndicator::for_test());
+        assert!(surface.prompt().is_none());
+
+        assert!(
+            grab.show_picker(crate::consent::tests::picker_fixture(), &mut surface),
+            "a raised picker must be drawable"
+        );
+        let generation = surface.generation();
+
+        // A redraw with the same content changes nothing visible, so an inert
+        // keystroke does not re-rasterize the card.
+        assert!(!grab.show_picker(crate::consent::tests::picker_fixture(), &mut surface));
+        assert_eq!(surface.generation(), generation);
+
+        // A moved cursor does.
+        let mut moved = crate::consent::tests::picker_fixture();
+        moved.panel.highlight = Some(4);
+        assert!(grab.show_picker(moved, &mut surface));
+        assert_ne!(surface.generation(), generation);
+
+        // Lowering takes it down.
+        grab.lower_picker(&mut surface);
+        assert_eq!(grab.raised(), None);
+        let mut view = vec![0u8; 64 * 48 * 4];
+        let before = view.clone();
+        surface.composite_over(&mut view, 64, 48);
+        assert_eq!(view, before, "a lowered picker leaves nothing composited");
+    }
+
+    /// **Nothing but a raised picker can draw a picker card.**
+    ///
+    /// `show_picker`'s half of the rule `show`/`raise` keep for a petition: a
+    /// surface that could be painted without the grab holding the human's
+    /// input would be a security question an app can act around.
+    #[test]
+    fn a_picker_card_cannot_be_drawn_without_the_grab_holding_one() {
+        let mut grab = ConsentGrab::new();
+        grab.set_view(VIEW);
+        let mut surface = ConsentSurface::new(crate::consent::TrustedIndicator::for_test());
+        assert!(
+            !grab.show_picker(crate::consent::tests::picker_fixture(), &mut surface),
+            "nothing is raised, so there is nothing to draw"
+        );
+        assert_eq!(surface.generation(), 0, "and nothing was drawn");
+
+        // A raised *petition* is not a raised picker either.
+        let (mut registry, petition) = pending_petition(WirePersistence::WhileRunning);
+        let t0 = t0();
+        grab.raise(
+            petition,
+            t0,
+            &mut registry,
+            &mut surface,
+            &mut Scratch::new().recorder,
+        )
+        .expect("the petition is pending");
+        assert!(
+            !grab.show_picker(crate::consent::tests::picker_fixture(), &mut surface),
+            "a consent card must not be replaced by a picker under the human's hand"
+        );
+        assert!(
+            surface.prompt().is_some(),
+            "the petition's card is still up"
+        );
+    }
+
+    /// **A picker card still produces no `Decision`, now that it paints
+    /// buttons.**
+    ///
+    /// `raise_picker` arms an `Open` with no buttons, and the card's Confirm
+    /// and Cancel are not `Choice`s — `ButtonBox::as_choice` returns `None`
+    /// for both, so `Card::buttons` is empty and there is nothing for
+    /// `hit_test` to find. Checked by clicking every pixel of both painted
+    /// buttons, in view coordinates, and finding nothing queued.
+    #[test]
+    fn clicking_a_picker_cards_buttons_resolves_no_petition() {
+        let (mut grab, _id, t0) = picking(Duration::from_secs(90));
+        let mut surface = ConsentSurface::new(crate::consent::TrustedIndicator::for_test());
+        assert!(grab.show_picker(crate::consent::tests::picker_fixture(), &mut surface));
+
+        let card =
+            crate::consent::render::rasterize_picker(&crate::consent::tests::picker_fixture());
+        assert!(
+            card.buttons.is_empty(),
+            "a picker card must offer no petition decision"
+        );
+        assert_eq!(card.controls.len(), 2, "...but it does paint two buttons");
+        let (ox, oy) = crate::paint::centered(card.width, card.height, VIEW.0, VIEW.1);
+        let now = past_guard(t0);
+        for control in &card.controls {
+            let x = f64::from(ox + control.rect.x) + f64::from(control.rect.w) / 2.0;
+            let y = f64::from(oy + control.rect.y) + f64::from(control.rect.h) / 2.0;
+            grab.judge_parts(Origin::Physical, &motion(x, y), now);
+            grab.judge_parts(Origin::Physical, &press(BTN_LEFT), now);
+            grab.judge_parts(Origin::Physical, &release(BTN_LEFT), now);
+        }
+        assert!(
+            grab.take_decision().is_none(),
+            "a click on a picker card produced a petition decision, which names a \
+             PetitionId a designation does not have"
+        );
+        assert!(
+            grab.take_navigation().is_none(),
+            "and it navigated no panel either: a picker is driven by the keyboard"
+        );
     }
 }

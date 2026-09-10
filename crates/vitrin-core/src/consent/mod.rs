@@ -209,8 +209,10 @@ use crate::grants::{PersistenceRung, RealmId};
 use crate::identity::PrincipalIdentity;
 use crate::paint::canvas::{Canvas, Rect};
 use crate::paint::centered;
+use crate::paint::transcript::Transcript;
 pub(crate) use indicator::TrustedIndicator;
 use render::Card;
+pub(crate) use render::PickerContent;
 
 /// The trusted frame's width, in view pixels (issue #85). Wide enough to read
 /// as a deliberate coloured band around the card rather than a hairline a
@@ -279,44 +281,128 @@ pub(crate) struct PromptContent {
     /// [`super::render::Card::panel`]. So a card is interactive exactly when
     /// there is a panel on the screen, and the two cannot come apart.
     ///
-    /// **Nothing in the shipped tree constructs one.** Every
-    /// [`crate::petitions::PetitionRegistry::prompt_content`] leaves it
-    /// `None`, so every card this core can build today is one-shot, and the
-    /// interactive path below is unreachable in a production build rather
-    /// than merely untaken. That is deliberate and it is the honest reading
-    /// of this commit: the capability exists, the thing that would use it
-    /// (the core-drawn file picker, P2.6.6 / issue #190) does not, and a
-    /// reviewer should hold this to "unreachable and tested" rather than to
-    /// "in service".
+    /// **Nothing in the shipped tree constructs a *grant-request* card with
+    /// one.** Every [`crate::petitions::PetitionRegistry::prompt_content`]
+    /// leaves it `None`, so every petition card this core builds is one-shot.
+    ///
+    /// The thing that draws a panel is the **picker card**
+    /// ([`PickerContent`]), which is a different card with a different
+    /// question and different buttons — Confirm and Cancel, never Allow and
+    /// Deny, because a designation grants nothing. It shares this panel type
+    /// and this renderer rather than growing a second one, on
+    /// [`crate::paint`]'s rule that two rasterizers in one TCB is two places
+    /// for a golden to drift.
+    ///
+    /// So this field stays as the panelled *petition* card's seam: reachable
+    /// only from a test, exercised by the grab's navigation tests, and not in
+    /// service. A reviewer should hold it to "unreachable and tested".
     pub panel: Option<PanelContent>,
 }
 
 /// What an interactive panel draws this round.
 ///
-/// **No string field, on [`PromptContent`]'s own terms** — and here the
-/// omission costs something, so it is worth being plain about. A panel of
-/// eight numbered slots can be navigated but not *read*: the human sees which
-/// slot is highlighted and how far down a list they are, and not what any
-/// slot contains. Whatever puts names in these slots is a separate change
-/// that has to argue its own way past the rule this type is keeping, because
-/// a filename is attacker-influenced bytes on the one surface whose entire
-/// purpose is being trustworthy. It is not smuggled in here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// # The rule this type kept, what replaced it, and what that cost
+///
+/// This type used to carry **no string field, on [`PromptContent`]'s own
+/// terms**, and the cost was stated plainly: a panel of eight numbered slots
+/// could be navigated but not *read*. The human saw which slot was
+/// highlighted and how far down a list they were, and not what any slot
+/// contained. The doc said that whatever put names in these slots would have
+/// to argue its own way past that rule, because a filename is
+/// attacker-influenced bytes on the one surface whose entire purpose is being
+/// trustworthy, and that it was not to be smuggled in here.
+///
+/// P2.6.6's picker (issue #190) is that change, and the argument is made **in
+/// the type**: a row's name is a [`Transcript`], and a `Transcript` can only
+/// be produced by [`crate::paint::transcript::encode`]. There is still no
+/// `String` here for a name. So the surface cannot draw bytes that have not
+/// been through transcription — not because a caller remembers to transcribe,
+/// but because the only way to obtain the thing this field holds is to call
+/// the function that does it. The type *is* the evidence, which is the same
+/// shape [`crate::paint::text::Vetted`] uses one layer down and the same
+/// shape [`PromptContent`] itself uses for a petition's fields.
+///
+/// What that buys, precisely:
+///
+/// - `encode` is **injective**, witnessed by `decode` being a total left
+///   inverse — so two distinct filenames can never produce the same drawn
+///   text.
+/// - Every character it emits is drawable: bidi overrides, combining marks,
+///   zero-width formats and undecodable bytes come out as ASCII escape forms,
+///   so there is no shaping or reordering for a filename to hide behind.
+/// - A minority script inside one *word* is escaped
+///   ([`crate::paint::script::permitted`]), so `rеsume.pdf` cannot read as
+///   `resume.pdf`.
+///
+/// What it does **not** buy, and what still has to hold elsewhere: two
+/// distinct transcripts can still rasterize alike. That is caught by
+/// [`crate::paint::script::DENIED_APPEARANCE`] for same-group confusables and
+/// by [`crate::picker::listing`]'s per-listing digest for everything else —
+/// the digest being the reason [`Self::rows`] carries a `tag`.
+///
+/// The price paid for reading the names is real and worth naming: a panel
+/// that is drawn draws attacker-chosen *shapes* on the trusted surface, where
+/// before it drew none. Transcription bounds which shapes, injectivity bounds
+/// how they may be reused, and the gutter separates the ones that survive
+/// both. It does not make the surface's pixels core-authored again, and no
+/// future change should read this doc as saying it does.
+///
+/// **Present tense would overstate this tree.** The renderer exists, is
+/// golden-pinned and is exercised end to end from
+/// [`grab::ConsentGrab::show_picker`], but no shipped code path calls that
+/// method — see [`grab::ConsentGrab::raise_picker`] for exactly what is and
+/// is not wired. So today the argument above is a statement about a card that
+/// is built and tested, not about pixels a human has seen.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PanelContent {
-    /// How many of [`super::render::PANEL_ROWS`] slots carry an entry.
-    /// Clamped by the renderer; the panel's height never depends on it.
-    pub filled: u16,
+    /// The rows to draw, in order, at most [`render::PANEL_ROWS`] of them.
+    /// A shorter list draws empty slots; a longer one is clamped by the
+    /// renderer. The panel's height never depends on it — see
+    /// [`render::PANEL_ROWS`] for why that is a security property and not a
+    /// layout convenience.
+    pub rows: Vec<PanelRow>,
     /// Which slot draws highlighted, if any.
     ///
-    /// Presentation only. A highlight is where the pointer is resting, and
-    /// it confers nothing: it is not a selection, it grants no authority,
-    /// and nothing downstream may read it as a decision.
+    /// Presentation only. It is a picture of where the caller's own cursor
+    /// is; it confers nothing, grants no authority, and nothing downstream
+    /// reads it as a decision — the picker settles from
+    /// [`crate::picker::session::PickerSession::chosen`], which consults its
+    /// own state and never this.
     pub highlight: Option<u16>,
     /// First visible entry, for the scroll thumb.
     pub offset: u32,
     /// Total entries behind the panel, for the scroll thumb. `total` greater
-    /// than [`super::render::PANEL_ROWS`] is what draws a thumb at all.
+    /// than [`render::PANEL_ROWS`] is what draws a thumb at all.
     pub total: u32,
+    /// The type-to-filter query, echoed on the surface.
+    ///
+    /// A [`Transcript`] like the rows, and for a weaker reason honestly
+    /// stated: these are the human's *own* keystrokes, already narrowed to
+    /// characters [`crate::paint::script::route`] admits by
+    /// [`crate::picker::keys`], so nobody is spoofing them with it. It goes
+    /// through `encode` anyway so that **every glyph of variable text on this
+    /// card has one provenance**; a second, looser path to the same surface
+    /// would be the thing a later change widens by accident.
+    pub query: Transcript,
+}
+
+/// One row of a panel: what it says, and the mark that tells it apart from a
+/// row that would otherwise look the same.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PanelRow {
+    /// The transcribed filename. See [`PanelContent`] for why this is a
+    /// [`Transcript`] and not a `String`.
+    pub name: Transcript,
+    /// The gutter mark, present exactly when
+    /// [`crate::picker::listing::build`] found this row rendering the same as
+    /// another in the same listing.
+    ///
+    /// A `Transcript` too, though its content is core-minted (`#1`..`#999`)
+    /// and could not be anything else. Uniformity is the point: "every glyph
+    /// of variable text on this card came out of `encode`" is a claim a
+    /// reviewer can check by reading the field types, and one exception would
+    /// cost that.
+    pub tag: Option<Transcript>,
 }
 
 impl PromptContent {
@@ -417,6 +503,21 @@ impl Choice {
 /// and the human-visible output is the realm view unchanged.
 pub(crate) struct ConsentSurface {
     prompt: Option<PromptContent>,
+    /// The **picker card** currently up, if one is (P2.6.6, issue #190).
+    ///
+    /// A second field rather than a second surface, and rather than an enum
+    /// over the two: both cards composite through exactly the same scrim,
+    /// trusted ring and blit, and that is the property worth keeping — a
+    /// picker is a trusted surface asking a security question, so it must be
+    /// framed in this session's secret exactly as a prompt is, or a human who
+    /// learned the colour would have no check on it.
+    ///
+    /// **At most one of `prompt` and `picker` is ever `Some`.** That is held
+    /// one level up by [`grab::ConsentGrab`], which refuses to raise either
+    /// over the other, and by [`Self::show`]/[`Self::show_picker`] refusing
+    /// here as well — belt and braces, because two cards centred on one view
+    /// would put two security questions in the same pixels.
+    picker: Option<PickerContent>,
     /// Bumped on every change to `prompt` — the [`crate::scene::Scene`]
     /// pattern (module docs), which is what forces a recomposite when a
     /// prompt appears or disappears.
@@ -441,6 +542,7 @@ impl ConsentSurface {
     pub fn new(indicator: TrustedIndicator) -> Self {
         Self {
             prompt: None,
+            picker: None,
             generation: 0,
             card: None,
             card_generation: 0,
@@ -466,8 +568,44 @@ impl ConsentSurface {
     /// Replacing a prompt is legal at this level and is how a queue
     /// advances; `raise`/`lower` own which petition is at the front.
     pub(in crate::consent) fn show(&mut self, prompt: PromptContent) {
+        if self.picker.is_some() {
+            // Unreachable: `ConsentGrab::raise` refuses over a raised picker
+            // before it gets here. Refused rather than asserted, because the
+            // failure mode of getting it wrong is two security questions in
+            // one rectangle, and an assertion vanishes in a release build.
+            tracing::error!("refusing to draw a consent card over a raised picker");
+            return;
+        }
         self.prompt = Some(prompt);
         self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// Put the **picker card** up, or replace the one that is up (P2.6.6,
+    /// issue #190).
+    ///
+    /// Unlike [`Self::show`] this is called *repeatedly* — once per dispatch
+    /// round in which the human moved — because every navigation step changes
+    /// what the card says. It is idempotent on unchanged content for
+    /// [`Self::set_panel`]'s reason: re-rasterizing a 560-pixel-wide card and
+    /// re-uploading its texture on every inert keystroke is the difference
+    /// between a picker that tracks the keyboard and one that stalls.
+    ///
+    /// Visible only inside `crate::consent`, so
+    /// [`grab::ConsentGrab::show_picker`] is the only way the rest of the
+    /// core can put one on screen — [`Self::show`]'s rule, for its reason.
+    ///
+    /// `true` when something visible changed.
+    pub(in crate::consent) fn show_picker(&mut self, content: PickerContent) -> bool {
+        if self.prompt.is_some() {
+            tracing::error!("refusing to draw a picker over a raised consent card");
+            return false;
+        }
+        if self.picker.as_ref() == Some(&content) {
+            return false;
+        }
+        self.picker = Some(content);
+        self.generation = self.generation.wrapping_add(1);
+        true
     }
 
     /// Replace the raised prompt's **panel and nothing else**.
@@ -496,7 +634,7 @@ impl ConsentSurface {
         };
         // A prompt that drew no panel is not navigable, and giving it one
         // here would resize the card behind the grab's back.
-        if prompt.panel.is_none() || prompt.panel == Some(panel) {
+        if prompt.panel.is_none() || prompt.panel.as_ref() == Some(&panel) {
             return false;
         }
         prompt.panel = Some(panel);
@@ -514,7 +652,11 @@ impl ConsentSurface {
     /// releasing the input grab and clearing the registry's `prompt_shown`
     /// flag.
     pub(in crate::consent) fn dismiss(&mut self) {
-        if self.prompt.take().is_some() {
+        // Both cards, in one call: `lower` and `lower_picker` each know which
+        // subject they own, and a dismiss that cleared only one of them would
+        // leave the other composited with nothing holding the grab.
+        let was_up = self.prompt.take().is_some() | self.picker.take().is_some();
+        if was_up {
             self.card = None;
             self.generation = self.generation.wrapping_add(1);
         }
@@ -551,14 +693,36 @@ impl ConsentSurface {
     }
 
     /// The rasterized card, rendering it if the cache is cold or stale.
+    ///
+    /// One cache for two card kinds, keyed on the one generation counter that
+    /// both [`Self::show`] and [`Self::show_picker`] bump — so a picker
+    /// replacing a prompt (or the reverse) can no more present a stale raster
+    /// than a second petition can.
     fn card(&mut self) -> Option<&Card> {
-        self.prompt.as_ref()?;
+        if self.prompt.is_none() && self.picker.is_none() {
+            return None;
+        }
         if self.card.is_none() || self.card_generation != self.generation {
-            let prompt = self.prompt.as_ref().expect("checked immediately above");
-            self.card = Some(render::rasterize(prompt));
+            self.card = match (self.prompt.as_ref(), self.picker.as_ref()) {
+                (Some(prompt), _) => Some(render::rasterize(prompt)),
+                (None, Some(picker)) => Some(render::rasterize_picker(picker)),
+                (None, None) => unreachable!("checked immediately above"),
+            };
             self.card_generation = self.generation;
         }
         self.card.as_ref()
+    }
+
+    /// **Test seam.** The rasterized card's dimensions and pixels.
+    ///
+    /// Exists because every other picker assertion is about the grab or the
+    /// session, and none of them can tell a drawn card from an undrawn one —
+    /// which is exactly how the card came to exist, be tested, and be reached
+    /// by no session path at all.
+    #[cfg(test)]
+    pub(crate) fn card_raster_for_test(&mut self) -> Option<(u32, u32, Vec<u8>)> {
+        let card = self.card()?;
+        Some((card.width, card.height, card.rgba.clone()))
     }
 
     /// Where the card's top-left corner sits in a `view_width x view_height`
@@ -625,6 +789,33 @@ impl ConsentSurface {
     /// So the human-visible output restricted to *this* rectangle is
     /// byte-identical to `render::rasterize(prompt)`, which is indicator-free
     /// by construction.
+    ///
+    /// **The picker card composites through the same three writes** (P2.6.6),
+    /// so the same conclusion holds for it with `rasterize_picker` in place of
+    /// `rasterize`: it too is filled from the fixed palette constants and
+    /// never reads [`TrustedIndicator`], so this rectangle is indicator-free
+    /// whichever card is behind it. **The conclusion rests on that and on
+    /// nothing else** — deliberately, because every reachability argument
+    /// anyone might reach for here is either false or about to stop being
+    /// true:
+    ///
+    /// - It is **not** true that a picker cannot be raised in the build this
+    ///   accessor exists for. The occlusion export is `consent-injector`, and
+    ///   that is exactly the feature under which
+    ///   `crate::backend::headless::HeadlessBackend` *overrides*
+    ///   `Backend::service_picker` (the no-op default lives on the trait in
+    ///   `crate::session`) and drives `session::service_picker_round`, which
+    ///   raises a picker for the front of the designation ledger. The injector
+    ///   build is the one headless build where a picker **can** hold the grab.
+    /// - What keeps a picker card off this rectangle *today* is narrower and
+    ///   more fragile: nothing outside `crate::consent`'s own tests calls
+    ///   [`Self::show_picker`], so `self.picker` is never `Some` in a shipped
+    ///   binary and this accessor reports a petition card or nothing. That is
+    ///   an unfinished wiring, not a guard, and it is expected to go away.
+    ///
+    /// Recorded at this length because the argument above is a secrecy claim,
+    /// and a secrecy claim that leans on a reachability premise is one
+    /// refactor away from being false. This one leans on none.
     ///
     /// **The lock screen would falsify that sentence, and cannot be up here**
     /// (WS-E.2.2). [`crate::lock::LockSurface::composite_over`] runs one step
@@ -778,6 +969,69 @@ pub(crate) mod tests {
         }
     }
 
+    /// The picker fixture's rows, as the raw filename **bytes** a directory
+    /// would really hold — never as transcripts, so every test starts where
+    /// the core does.
+    ///
+    /// Chosen to exercise each thing the card has to get right at once:
+    ///
+    /// | bytes | what it tests |
+    /// |---|---|
+    /// | `notes.txt` | the ordinary row: ASCII, untinted, no label, no mark |
+    /// | `отчёт.pdf` | a natively-drawn non-Latin run, and the script label |
+    /// | `rеsume.pdf` (Cyrillic `е`) | the mixed-script rule inside one word: the minority escapes, and the label does **not** say Cyrillic because nothing Cyrillic was drawn |
+    /// | `\u{202E}txt.exe` | the RTL-override spoof, transcribed |
+    /// | `a\u{0301}.txt` | a combining mark, transcribed |
+    /// | `論文2026.docx` | Japanese — wholly escaped today; see `render::script_label` on the atlas gap |
+    /// | two long shared-prefix names | elision, and the gutter marks that separate what elision made identical |
+    pub(crate) fn picker_row_names() -> Vec<Vec<u8>> {
+        vec![
+            b"notes.txt".to_vec(),
+            "отчёт.pdf".as_bytes().to_vec(),
+            "rеsume.pdf".as_bytes().to_vec(),
+            "\u{202E}txt.exe".as_bytes().to_vec(),
+            "a\u{0301}.txt".as_bytes().to_vec(),
+            "論文2026.docx".as_bytes().to_vec(),
+            b"quarterly-report-for-the-board-of-directors-2026-draft-a.pdf".to_vec(),
+            b"quarterly-report-for-the-board-of-directors-2026-draft-b.pdf".to_vec(),
+        ]
+    }
+
+    /// The fixture every picker-card test starts from.
+    ///
+    /// Deliberately the *widest* case, on `prompt_fixture`'s reasoning: eight
+    /// filled rows, a scrolled position so the thumb draws, a non-empty
+    /// filter query, a location the human navigated into, and two rows
+    /// carrying gutter marks. A golden pinned to the empty case would pin
+    /// almost nothing.
+    pub(crate) fn picker_fixture() -> PickerContent {
+        use crate::paint::transcript::encode;
+        let names = picker_row_names();
+        PickerContent {
+            principal: PrincipalIdentity::parse(PROMPT_IDENTITY).expect("fixture identity parses"),
+            realm: RealmId::new(PROMPT_REALM),
+            ask: crate::designation::AskedFor::File { write: false },
+            location: encode(b"work/2026"),
+            panel: PanelContent {
+                rows: names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, name)| PanelRow {
+                        name: encode(name),
+                        // The last two share every character elision leaves,
+                        // which is exactly when the repair marks a pair.
+                        tag: (i >= 6).then(|| encode(format!("#{}", i - 5).as_bytes())),
+                    })
+                    .collect(),
+                highlight: Some(1),
+                offset: 4,
+                total: 40,
+                query: encode("réport".as_bytes()),
+            },
+            focus: crate::picker::session::Focus::Listing,
+        }
+    }
+
     /// A `width x height` opaque mid-grey RGBA view — a stand-in for a
     /// composed realm view whose every pixel is known, so any change the
     /// overlay makes is unambiguous.
@@ -912,6 +1166,90 @@ pub(crate) mod tests {
             "the rendered consent prompt no longer matches \
              crates/vitrin-core/tests/golden/consent_prompt.txt; if the prompt's design changed \
              deliberately, regenerate with VITRIN_REGEN_GOLDEN=1 and check the ink-map diff"
+        );
+    }
+
+    /// **The P2.6.6 visual golden: the picker card, pinned exactly** (issue
+    /// #190).
+    ///
+    /// Same harness as [`consent_prompt_golden`], same determinism argument,
+    /// and a separate file — the consent card is unchanged by this work and
+    /// its golden must not move, so the two cards do not share one committed
+    /// artifact.
+    ///
+    /// # The ink map cannot witness a tint; the `blake3` line is what does
+    ///
+    /// This matters more here than it does on the consent card. The picker's
+    /// central safety feature is that a transcribed run is drawn in a
+    /// *different colour* from an ASCII one, and the ink map is a **mean-luma
+    /// reduction over 8x8 blocks** — it collapses colour to brightness, so a
+    /// palette change that made an escaped run indistinguishable from an
+    /// ASCII one could leave every character of the map identical. The
+    /// `blake3` line covers the full RGBA buffer and is what actually pins
+    /// the colours.
+    ///
+    /// So a reviewer reading a blessed diff of this file should expect the
+    /// **one changed hex line** to be the whole evidence of a tint change,
+    /// and should treat "the picture looks the same" as saying nothing about
+    /// it. `the_three_run_classes_are_three_distinct_colours` in
+    /// [`render`] is the independent check that does not go through a
+    /// luminance reduction at all.
+    ///
+    /// Regeneration, when the design deliberately changes:
+    ///
+    /// ```sh
+    /// VITRIN_REGEN_GOLDEN=1 cargo test -p vitrin-core picker_card_golden
+    /// ```
+    #[test]
+    fn picker_card_golden() {
+        let card = render::rasterize_picker(&picker_fixture());
+        let rendered = format!(
+            "# vitrind file-picker card -- P2.6.6 visual golden\n\
+             # Regenerate: VITRIN_REGEN_GOLDEN=1 cargo test -p vitrin-core picker_card_golden\n\
+             # One character per 8x8 block of the rasterized card, by MEAN LUMINANCE -- so the\n\
+             # picture below cannot witness a tint. The blake3 line covers the full RGBA buffer\n\
+             # and is what pins the run colours; expect a tint change to show up there alone.\n\
+             size {}x{}\n\
+             blake3 {}\n\
+             controls {}\n\
+             choices {}\n\
+             {}",
+            card.width,
+            card.height,
+            ObservationDigest::of(&card.rgba).to_hex(),
+            card.controls
+                .iter()
+                .map(|b| format!(
+                    "{}@{},{},{}x{}",
+                    b.action.label().replace(' ', "-"),
+                    b.rect.x,
+                    b.rect.y,
+                    b.rect.w,
+                    b.rect.h
+                ))
+                .collect::<Vec<_>>()
+                .join(" "),
+            // Always empty, and pinned so it stays that way: a picker card
+            // that grew a petition decision would be a card offering to grant
+            // authority it does not have.
+            card.buttons.len(),
+            ink_map(&card)
+        );
+
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/picker_card.txt");
+        if std::env::var_os("VITRIN_REGEN_GOLDEN").is_some() {
+            std::fs::create_dir_all(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden"))
+                .expect("golden directory");
+            std::fs::write(path, &rendered).expect("golden regeneration must be writable");
+        }
+        let committed = std::fs::read_to_string(path)
+            .expect("committed picker golden exists (regenerate: VITRIN_REGEN_GOLDEN=1)");
+        assert_eq!(
+            committed, rendered,
+            "the rendered picker card no longer matches \
+             crates/vitrin-core/tests/golden/picker_card.txt; if the card's design changed \
+             deliberately, regenerate with VITRIN_REGEN_GOLDEN=1 -- and read the blake3 line, \
+             not only the ink map, because the map cannot show a colour change"
         );
     }
 
@@ -1538,5 +1876,283 @@ pub(crate) mod tests {
             [10, 20, 30, 0xff],
             "below the band the realm view is untouched"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // The picker card on the surface (P2.6.6, issue #190)
+    // ------------------------------------------------------------------
+
+    /// **The picker never reaches a capture — proved in that order.**
+    ///
+    /// The same guarantee `test_real_consent.py` holds for the consent card,
+    /// and the same structural argument (this module's docs):
+    /// [`crate::scene::Scene::compose`] is the realm view and knows nothing
+    /// about this module, the overlay is applied afterwards inside
+    /// [`crate::backend::human_visible_from_view`], and no capture path calls
+    /// it. This is that argument turned into a checked fact for the second
+    /// card.
+    ///
+    /// # The order of the two halves is the point (the #138 lesson)
+    ///
+    /// The criterion here is the **absence** of something from a delivered
+    /// artifact, and an absence is equally satisfied by no artifact at all: a
+    /// capture with no picker in it and a capture of nothing are the same
+    /// assertion unless something separately establishes that a picker was
+    /// drawn. So this asserts provenance **first** — the human-visible output
+    /// at the rectangle the core itself names
+    /// ([`ConsentSurface::card_rect`]) is byte-identical to
+    /// `render::rasterize_picker` of the content that was shown — and only
+    /// then looks for the absence. Reversing the two would leave a test that
+    /// passes if the picker silently stopped being drawn at all.
+    #[test]
+    fn the_picker_card_never_reaches_a_capture() {
+        const W: u32 = 900;
+        const H: u32 = 800;
+        const CLIENT: [u8; 3] = [90, 90, 90];
+
+        let indicator = TrustedIndicator::for_test();
+        let mut consent = ConsentSurface::new(indicator);
+        assert!(consent.show_picker(picker_fixture()), "the picker goes up");
+
+        let mut scene = crate::scene::Scene::new();
+        scene.commit(
+            crate::scene::SurfaceContent::from_rgba(flat_view(W, H, CLIENT), W, H)
+                .expect("client surface"),
+        );
+
+        let capture = scene.compose((W, H).into());
+        let human = crate::backend::compose_human_visible(
+            &scene,
+            &mut consent,
+            &mut crate::lock::LockSurface::new(TrustedIndicator::for_test()),
+            &crate::backend::blank::BlankSurface::for_test(),
+            &mut crate::status::StatusStrip::new(crate::status::StatusConfig::off()),
+            (W, H).into(),
+            false,
+        );
+
+        // 1. PROVENANCE. There is a picker card in the human-visible output,
+        //    at the rectangle the core named, and it is the card for the
+        //    content that was shown -- byte for byte, every row.
+        let (x, y, cw, ch) = consent
+            .card_rect(W, H)
+            .expect("a picker is up, so it has a footprint");
+        assert!(
+            x >= 0 && y >= 0,
+            "the fixture card fits this view: ({x},{y}) {cw}x{ch}"
+        );
+        let card = render::rasterize_picker(&picker_fixture());
+        assert_eq!((cw, ch), (card.width, card.height));
+        for row in 0..ch {
+            let d = ((y as u32 + row) as usize * W as usize + x as usize) * BYTES_PER_PIXEL;
+            let s = row as usize * card.width as usize * BYTES_PER_PIXEL;
+            let run = card.width as usize * BYTES_PER_PIXEL;
+            assert_eq!(
+                &human[d..d + run],
+                &card.rgba[s..s + run],
+                "the human-visible output must carry the picker card verbatim at row {row}"
+            );
+        }
+        // ...and it is not a card of nothing: the fixture's rows really inked
+        // the raster, so "the picker was drawn" is a claim about pixels.
+        assert!(
+            card.rgba
+                .chunks_exact(BYTES_PER_PIXEL)
+                .filter(|p| p[..3] != [0x14, 0x16, 0x1c])
+                .count()
+                > 10_000,
+            "the fixture card must actually contain drawn content"
+        );
+
+        // 2. ...and not one pixel of it reached the capture.
+        //
+        //    Stated as a colour-set claim rather than as "the capture is the
+        //    client's flat grey", which is false for an honest reason: the
+        //    scene reserves the trusted band's rows, so a capture of a
+        //    full-view surface carries the letterbox colour in them. What the
+        //    guarantee actually says is that *nothing of the card* is there,
+        //    and a card is many colours.
+        assert_ne!(capture, human, "the overlay must have changed something");
+        let seen: std::collections::HashSet<[u8; 4]> = capture
+            .chunks_exact(BYTES_PER_PIXEL)
+            .map(|p| [p[0], p[1], p[2], p[3]])
+            .collect();
+        assert!(
+            seen.len() <= 2,
+            "the captured frame carries {} distinct colours; the realm view has the \
+             client's own and the reserved band's, and a card would add dozens",
+            seen.len()
+        );
+        assert!(seen.contains(&[CLIENT[0], CLIENT[1], CLIENT[2], 0xff]));
+        // Named colours of the card, taken from the card itself rather than
+        // from the renderer's private palette: the border at its corner, and
+        // the brightest pixel it drew.
+        let border: [u8; 4] = card.rgba[..BYTES_PER_PIXEL].try_into().unwrap();
+        let brightest = card
+            .rgba
+            .chunks_exact(BYTES_PER_PIXEL)
+            .max_by_key(|p| u32::from(p[0]) + u32::from(p[1]) + u32::from(p[2]))
+            .map(|p| [p[0], p[1], p[2], p[3]])
+            .expect("the card has pixels");
+        for colour in [border, brightest] {
+            assert!(
+                !seen.contains(&colour),
+                "{colour:?} is a colour of the picker card and it reached a captured frame: \
+                 an agent with an observe grant must not be able to watch a human pick a file"
+            );
+            assert!(
+                human
+                    .chunks_exact(BYTES_PER_PIXEL)
+                    .any(|p| p == colour.as_slice()),
+                "{colour:?} is absent from the human-visible output too, so its absence from \
+                 the capture says nothing"
+            );
+        }
+    }
+
+    /// A picker and a consent card cannot be on screen at once.
+    ///
+    /// Held by [`grab::ConsentGrab`] one level up; refused here as well,
+    /// because two security questions centred on one view is not a state this
+    /// surface should be able to reach even by a caller's mistake.
+    #[test]
+    fn a_picker_and_a_prompt_cannot_both_be_up() {
+        let mut surface = ConsentSurface::new(TrustedIndicator::for_test());
+        assert!(surface.show_picker(picker_fixture()));
+        let generation = surface.generation();
+
+        surface.show(prompt_fixture());
+        assert!(surface.prompt().is_none(), "the prompt must be refused");
+        assert_eq!(
+            surface.generation(),
+            generation,
+            "a refusal changes nothing"
+        );
+
+        surface.dismiss();
+        surface.show(prompt_fixture());
+        assert!(surface.prompt().is_some());
+        assert!(
+            !surface.show_picker(picker_fixture()),
+            "and the refusal runs in the other direction too"
+        );
+    }
+
+    /// Redrawing is idempotent on unchanged content, so a keystroke that
+    /// moved nothing does not re-rasterize a 560-pixel card and re-upload its
+    /// texture.
+    #[test]
+    fn an_unchanged_picker_does_not_redraw() {
+        let mut surface = ConsentSurface::new(TrustedIndicator::for_test());
+        assert!(surface.show_picker(picker_fixture()));
+        let generation = surface.generation();
+        assert!(
+            !surface.show_picker(picker_fixture()),
+            "identical content is not a visible change"
+        );
+        assert_eq!(surface.generation(), generation);
+
+        let mut moved = picker_fixture();
+        moved.panel.highlight = Some(3);
+        assert!(
+            surface.show_picker(moved),
+            "a moved cursor is a visible change"
+        );
+        assert_ne!(surface.generation(), generation);
+    }
+
+    /// Dismissing takes the picker down and leaves no pixels behind — the
+    /// same contract `dismissing_restores_the_view_and_bumps_the_generation`
+    /// holds for a prompt, for the surface's second card.
+    #[test]
+    fn dismissing_a_picker_restores_the_view() {
+        const W: u32 = 900;
+        const H: u32 = 800;
+        let mut surface = ConsentSurface::new(TrustedIndicator::for_test());
+        let clean = flat_view(W, H, [0x40, 0x50, 0x60]);
+
+        surface.show_picker(picker_fixture());
+        let mut with = clean.clone();
+        surface.composite_over(&mut with, W, H);
+        assert_ne!(with, clean, "the picker must have been visible");
+
+        surface.dismiss();
+        let mut after = clean.clone();
+        surface.composite_over(&mut after, W, H);
+        assert_eq!(after, clean, "a dismissed picker leaves no pixels behind");
+    }
+
+    /// **A picker card is framed in this session's secret too.**
+    ///
+    /// It asks a security question — hand this app a descriptor, or not — so
+    /// a human has to be able to tell it from a replica an app draws. The
+    /// frame is the one check they have, and it comes from compositing
+    /// through the same [`ConsentSurface::composite_over`] rather than from
+    /// the picker remembering to ask for it.
+    #[test]
+    fn a_picker_card_is_framed_in_the_session_secret() {
+        const W: u32 = 900;
+        const H: u32 = 800;
+        let indicator = TrustedIndicator::for_test();
+        let mut surface = ConsentSurface::new(indicator);
+        surface.show_picker(picker_fixture());
+        let mut view = flat_view(W, H, [40, 40, 40]);
+        surface.composite_over(&mut view, W, H);
+
+        let card = render::rasterize_picker(&picker_fixture());
+        let (cx, cy) = centered(card.width, card.height, W, H);
+        let rx = (cx - TRUST_FRAME_THICKNESS as i32 / 2) as u32;
+        let ry = (cy - TRUST_FRAME_THICKNESS as i32 / 2) as u32;
+        assert_eq!(
+            px(&view, W, rx, ry),
+            indicator.color(),
+            "a picker card must carry the trusted ring, or a forged one is indistinguishable"
+        );
+        // ...and the secret is nowhere inside the card itself, on
+        // `card_rect`'s reasoning.
+        let (x, y, cw, ch) = surface.card_rect(W, H).expect("a picker is up");
+        for row in 0..ch {
+            for col in 0..cw {
+                assert_ne!(
+                    px(&view, W, x as u32 + col, y as u32 + row),
+                    indicator.color(),
+                    "the picker card's own footprint must carry no pixel of the secret"
+                );
+            }
+        }
+    }
+
+    /// **Every glyph of variable text on a picker card came out of `encode`.**
+    ///
+    /// The claim [`PanelContent`]'s doc makes by choosing its field types,
+    /// restated as a check a reviewer can run: the only non-`const` text this
+    /// card can draw is a [`Transcript`], and a `Transcript`'s text always
+    /// round-trips through [`crate::paint::transcript::decode`] back to the
+    /// bytes it was made from. A field that had taken a `String` instead
+    /// would have no such witness.
+    #[test]
+    fn every_transcript_a_picker_card_draws_inverts_to_its_own_bytes() {
+        use crate::paint::transcript::{decode, encode};
+        let content = picker_fixture();
+        let names = picker_row_names();
+        assert_eq!(content.panel.rows.len(), names.len());
+        for (row, name) in content.panel.rows.iter().zip(names.iter()) {
+            assert_eq!(
+                decode(&row.name.text).as_ref(),
+                Some(name),
+                "the drawn text for {name:?} does not invert to it"
+            );
+            if let Some(tag) = row.tag.as_ref() {
+                assert!(decode(&tag.text).is_some());
+            }
+        }
+        assert_eq!(decode(&content.location.text), Some(b"work/2026".to_vec()));
+        assert_eq!(
+            decode(&content.panel.query.text),
+            Some("réport".as_bytes().to_vec())
+        );
+        // And the transcript really transformed something, so the round trip
+        // above is not a statement about a pass-through.
+        assert_ne!(encode("\u{202E}txt.exe".as_bytes()).text, "\u{202E}txt.exe");
     }
 }

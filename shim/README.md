@@ -334,7 +334,8 @@ the published site is fetched with no checksum at all
 meson setup build            # uses system wlroots-0.19 if available
 ninja -C build
 meson test -C build          # header-compiles, loader-independence, idle-inhibit,
-                             # xdg-conformance, focus-succession, inventories
+                             # xdg-conformance, focus-succession, wire-designation,
+                             # designation-receive, inventories
 
 # Build the vendored wlroots from source (e.g. CI, or no system wlroots-0.19),
 # taking wlroots' own dependencies from the system:
@@ -422,9 +423,11 @@ reasoning for each assertion is in its header comment, and the wlcs failures
 that provoked it are annotated in
 [`wlcs/README.md`](wlcs/README.md). It and
 [`tests/acceptance/focus_succession.sh`](tests/acceptance/focus_succession.sh),
-[`tests/acceptance/idle_inhibit.sh`](tests/acceptance/idle_inhibit.sh) and
+[`tests/acceptance/idle_inhibit.sh`](tests/acceptance/idle_inhibit.sh),
 [`tests/acceptance/loader_independence.sh`](tests/acceptance/loader_independence.sh)
-are the four scripts in `tests/acceptance/` wired into `meson test`, because
+and
+[`tests/acceptance/designation_receive.sh`](tests/acceptance/designation_receive.sh)
+are the five scripts in `tests/acceptance/` wired into `meson test`, because
 they are the ones that need nothing but this tree's own binaries —
 `idle_inhibit.sh` only where
 `wayland-protocols` ships the idle-inhibit XML `idle-probe` is generated from

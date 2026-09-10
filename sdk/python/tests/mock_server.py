@@ -15,6 +15,10 @@ steps against one accepted connection:
                                    created at *execution* time — building
                                    a script therefore pre-opens no fds,
                                    which the fd-count-flatness tests need
+    ("sleep", seconds)             wait before the next step, so a test can
+                                   pin that the client has no deadline of its
+                                   own on a wait the protocol says is
+                                   human-long
     ("close",)                     close the connection immediately
     ("linger",)                    hold the connection open, discarding any
                                    inbound bytes, until the client closes
@@ -30,6 +34,7 @@ import os
 import socket
 import struct
 import threading
+import time
 
 # What a conformant core seals every frame memfd with before sending
 # (restated from linux/fcntl.h, independent of the SDK's own constants).
@@ -98,6 +103,8 @@ class MockServer:
                         [(socket.SOL_SOCKET, socket.SCM_RIGHTS, struct.pack("i", fd))],
                     )
                     os.close(fd)  # sender closes its own copy after sending
+                case ("sleep", seconds):
+                    time.sleep(seconds)
                 case ("close",):
                     return
                 case ("linger",):

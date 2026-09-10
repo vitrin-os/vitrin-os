@@ -49,6 +49,15 @@ MAX_ERROR_MESSAGE_BYTES = 1024
 MAX_REALM_NAME_BYTES = 64
 MAX_RESOURCE_BYTES = 256
 MAX_TEXT_BYTES = 4096
+# vitrin_powerbox.designated.name — the basename of what the human designated,
+# for display only. 255 bytes is the bound the IDL states for that argument:
+# this dialect has no `max` attribute, it carries the bound as the
+# machine-readable "(max N bytes)" token in the argument's own summary, which
+# `protocol/vitrin-v0.rng` requires of every string argument by pattern. It is
+# also the longest name a Linux filesystem holds, so the bound is the thing
+# itself rather than a policy: a longer value on the wire is a server contract
+# violation (`MessageDecoder.string` raises), not a name to truncate here.
+MAX_DESIGNATION_NAME_BYTES = 255
 
 
 class ErrorCode(enum.IntEnum):
@@ -94,7 +103,7 @@ class Verb(enum.IntFlag):
     OBSERVE_CURSOR = 8  # refused "unsupported" by every deployment at version 2
     LAYOUT_ARRANGE = 16  # served by the reference core since WS-E.1.4
     LAYOUT_FOCUS = 32  # served by the reference core since WS-E.1.4
-    DESIGNATE_FILE = 64  # refused "unsupported" by every deployment (P2.6.6/P2.6.8 owed)
+    DESIGNATE_FILE = 64  # served by the reference core since P2.6.6's picker landed
     EGRESS = 128  # refused "unsupported" by every deployment at version 2
     REALM_LAUNCH = 512  # resolves "unsupported" until a deployment serves it
 
@@ -131,12 +140,20 @@ VERB_MASK = int(
 # grant carrying the bit to be exercised through. The IDL says exactly that,
 # and this constant is derived from the IDL's own summaries.
 #
-# `designate_file` (P2.6.5, issue #189) is out for BOTH reasons at once, which
-# is why the constant did not move when the bit landed: a version-1 connection
-# cannot mint `vitrin_powerbox` either, AND no deployment serves the verb at
-# any version until the core-drawn picker (P2.6.6) and its consent copy
-# (P2.6.8) exist. A petition naming it resolves "unsupported" everywhere
-# today.
+# `designate_file` (P2.6.5, issue #189) was out for BOTH reasons at once and is
+# now out for the version one alone — which is why this constant did not move
+# when the second reason went away. A version-1 connection cannot mint
+# `vitrin_powerbox` (`get_powerbox` is `since="2"`), so a version-1 grant
+# carrying the bit has nothing to be exercised through, exactly as
+# `realm_launch` has not. The other half — "no deployment serves it at any
+# version" — ended when P2.6.6 landed the core-drawn picker and
+# `crates/vitrin-core/src/grants.rs` added the bit to `SERVED_VERB_BITS`; the
+# reference core serves the verb at version 2 today, so a petition naming it is
+# put to the human there instead of being resolved `unsupported` unasked. Two
+# things that did NOT change with it: the considered consent copy for the verb
+# is still owed (P2.6.8, Q13 — the card carries a minimum honest line, which is
+# what let the verb be served at all), and whether any OTHER deployment serves
+# it remains a deployment property no constant in this file can state.
 #
 # `egress` (128, P2.7.2 / issue #196) is out on the same two counts, and its
 # IDL summary carries the same marker phrase for a reason that goes further
@@ -278,6 +295,69 @@ class LayoutMode(enum.IntEnum):
 
     WINDOWED = 0
     FULLSCREEN = 1
+
+
+# The powerbox's three enums (`vitrin_powerbox.mode`, `.kind`, `.refusal`).
+# The IDL spells them `mode`, `kind` and `refusal`; this module is flat, and two
+# of those three names are already taken by other interfaces' enums
+# (`vitrin_layout_arrange.mode` is `LayoutMode`, `vitrin_grant.refusal` is
+# `Refusal`), so each is prefixed with what it belongs to. `Refusal` and
+# `PowerboxRefusal` are NOT two spellings of one thing: they are the two
+# different voices the IDL is at pains to keep apart — `Refusal` answers
+# whether the grant may ask at all, and comes from the enforcement chokepoint;
+# `PowerboxRefusal` answers what happened after an ask was allowed, and comes
+# from the human or from the core's own refusal to designate what they chose.
+
+
+class DesignationMode(enum.IntEnum):
+    """vitrin_powerbox.mode — the access a designation carries.
+
+    On ``request_file`` it is what the ask is *for* and what chrome the picker
+    opens with (an open dialog, or one that also offers to create). On
+    ``designated`` it is the **effective** access the human approved, which may
+    be narrower: a ``READ_WRITE`` ask answered ``READ`` is an approval, not a
+    refusal. There is deliberately no write-only rung — the pair exists to be
+    put to a human in one sentence.
+    """
+
+    READ = 0
+    READ_WRITE = 1
+
+
+class DesignationKind(enum.IntEnum):
+    """vitrin_powerbox.kind — what a designated descriptor names.
+
+    Redundant with which request was answered (terminals pair in request
+    order), and carried anyway so a receiver that logs or hands the descriptor
+    onward need not reconstruct it from a request it may no longer have.
+    """
+
+    FILE = 0
+    DIRECTORY = 1
+
+
+class PowerboxRefusal(enum.IntEnum):
+    """vitrin_powerbox.refusal — why an ADMITTED ask produced no descriptor.
+
+    Never an authority verdict: every code here is compatible with a perfectly
+    live grant, and an authority answer arrives as ``vitrin_grant.refused``
+    instead. The set is deliberately small and says nothing about the
+    filesystem — no code distinguishes "you chose a file you may not open" from
+    "you cancelled", because that would let an agent probe the human's
+    filesystem one prompt at a time.
+    """
+
+    CANCELLED = 0
+    TIMED_OUT = 1
+    #: No card could be raised: this principal already has one up, or the
+    #: deployment's designation ledger is full. The two are deliberately not
+    #: distinguished; the retry advice is identical.
+    BUSY = 2
+    #: The human chose and the core would not designate it — the entry could
+    #: not be resolved without following a symlink, or it lost the race between
+    #: the confirmation and the open. It says nothing about whether the entry
+    #: exists.
+    UNRESOLVABLE = 3
 
 
 # Linux evdev button codes for convenience (the wire carries the raw code).

@@ -433,7 +433,6 @@ impl Text {
     /// text can never disagree — holds on the widened path because this is the
     /// same [`Self::pen_run`] with the same characters, not because the two
     /// are kept in step.
-    #[allow(dead_code)] // the picker (#190) is the caller; see `Vetted`.
     pub fn width_vetted(&mut self, v: &Vetted<'_>) -> u32 {
         let mut pen = 0.0f32;
         self.pen_run(
@@ -469,7 +468,6 @@ impl Text {
     ///
     /// This is what tinting a script run costs: the picker names a filename's
     /// minority script by colouring it, and colouring it must not move it.
-    #[allow(dead_code)] // the picker (#190) is the caller; see `Vetted`.
     pub fn draw_runs(
         &mut self,
         canvas: &mut Canvas<'_>,
@@ -490,6 +488,63 @@ impl Text {
             );
         }
         pen.max(0.0).round() as u32
+    }
+
+    /// Where to cut a [`Vetted`] string so that it plus [`ELLIPSIS`] fits in
+    /// `max_w` pixels at [`NAME_PX`]: the **byte length of the longest prefix
+    /// that fits**, or `None` when the whole string already fits and must not
+    /// be cut at all.
+    ///
+    /// # Why the cut point is returned rather than the cut string
+    ///
+    /// Two callers need the same cut for different things, and they must not
+    /// compute it twice. [`crate::picker::session`] digests the pixels of the
+    /// elided name — that digest is what the per-listing collision repair
+    /// keys on — while [`crate::consent::render`] draws the same elided name
+    /// with each of its [`super::transcript::Class`] runs in its own colour,
+    /// which means it needs the cut expressed as an offset it can clip run
+    /// ranges against. A function returning a `String` would have forced the
+    /// renderer to re-derive that offset, and a renderer that cut one
+    /// character differently from the digest would be drawing rows the repair
+    /// had judged as something else.
+    ///
+    /// # Every candidate is measured whole, not accumulated
+    ///
+    /// The loop re-measures `prefix + ELLIPSIS` from scratch on each step
+    /// rather than adding one advance at a time. That is `O(n²)` in the
+    /// prefix length — bounded in practice by the field width, some forty
+    /// characters — and it is the shape that keeps this in exact agreement
+    /// with [`Self::width_vetted`]: the pen accumulates in `f32` and is
+    /// rounded **once**, so an incremental version would compute
+    /// `round(P) + round(q)` where the measurement it must agree with
+    /// computes `round(P + q)`. That is [`Self::draw_runs`]' argument, one
+    /// level up.
+    pub fn elide_vetted(&mut self, v: &Vetted<'_>, max_w: u32) -> Option<usize> {
+        if self.width_vetted(v) <= max_w {
+            return None;
+        }
+        let s = v.as_str();
+        let mut cut = 0usize;
+        for (at, ch) in s.char_indices() {
+            let end = at + ch.len_utf8();
+            let mut pen = 0.0f32;
+            self.pen_run(
+                None,
+                s[..end]
+                    .chars()
+                    .chain(ELLIPSIS.chars())
+                    .map(|c| (c, MEASURE_RGB)),
+                NAME_PX,
+                0,
+                0,
+                &mut pen,
+            );
+            if pen.max(0.0).round() as u32 > max_w {
+                break;
+            }
+            cut = end;
+        }
+        Some(cut)
     }
 
     /// Break `s` into at most `max_lines` lines no wider than `max_width`.
@@ -615,15 +670,17 @@ impl Text {
 /// ([`script::permitted`]) and the per-listing digest are separate defences
 /// that a caller applies before it gets here. `Vetted` says "these glyphs
 /// exist and this renderer can place them", nothing more.
-/// Nothing constructs one yet: the picker that will is #190's remaining half,
-/// and this is the door it will come through. Held to the same standard
-/// [`super::script`] states for its own unreached table — proven mechanism,
-/// not in service — which is why the tests below exercise the pen identity and
-/// the router agreement rather than waiting for a caller.
-#[allow(dead_code)]
+///
+/// **Two callers construct one, and both are the picker** (#190):
+/// [`crate::picker::session`] rasterizes a row to digest it, and
+/// [`crate::consent::render`] draws the picker card's rows. Both hand in a
+/// [`super::transcript::Transcript`]'s text, which is drawable by
+/// construction — every character `encode` emits routes to something other
+/// than [`Route::Escape`] — so neither has a failure path here to get wrong.
+/// This doc used to say nothing constructed one; that stopped being true when
+/// the digest landed, and stopped being true a second time when the card did.
 pub(crate) struct Vetted<'a>(&'a str);
 
-#[allow(dead_code)]
 impl<'a> Vetted<'a> {
     /// `None` if any character routes to [`Route::Escape`] — which is the
     /// negative form on purpose: a future third route (an atlas route, say)
@@ -649,7 +706,12 @@ const BREAK_AFTER: &str = "/-_.:";
 /// ELLIPSIS` would be the typographically correct glyph and is the one
 /// character that would force the whole ASCII-only rule to carry an
 /// exception.
-const ELLIPSIS: &str = "...";
+///
+/// Shared rather than private, because [`Text::elide_vetted`] returns a *cut
+/// point* and its callers append this themselves: the picker's row digest and
+/// the picker's renderer must produce the same characters, and two spellings
+/// of "..." in two modules is exactly the drift that would make them differ.
+pub(crate) const ELLIPSIS: &str = "...";
 
 #[cfg(test)]
 mod tests {

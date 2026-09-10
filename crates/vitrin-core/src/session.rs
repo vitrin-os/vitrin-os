@@ -2558,6 +2558,24 @@ pub(crate) fn service_picker_round<H: PreemptionHook>(
         }
     }
 
+    // A listing that changed and did not redraw is worse than no listing: the
+    // human would navigate against a picture of where they used to be, and the
+    // row they confirm is chosen by the session rather than by the pixels. So
+    // the card is refreshed from the same value the session just mutated,
+    // whenever anything the human could see moved.
+    if changed && settle.is_none() {
+        if let (Some(id), Some(session)) =
+            (grab.raised_designation(), runtime.kernel.picker.as_ref())
+        {
+            if let Some(ticket) = runtime.kernel.designations.peek(id) {
+                let content = session.card(&ticket.principal().clone(), &ticket.realm().clone());
+                if !grab.show_picker(content, consent) {
+                    tracing::error!(%id, "the picker card could not be refreshed");
+                }
+            }
+        }
+    }
+
     if let Some((id, outcome)) = settle {
         // The card comes down before the funnel runs, so a funnel that takes
         // a slow path cannot leave the human's input seized behind a picker
@@ -2594,7 +2612,7 @@ pub(crate) fn service_picker_round<H: PreemptionHook>(
     // confirmed designation would sit unsettled until the seat came back.
     if visibility == PromptVisibility::Reachable && grab.raised().is_none() {
         if let Some(id) = runtime.kernel.designations.front_open() {
-            match raise_picker_for(grab, runtime, id, now) {
+            match raise_picker_for(grab, runtime, consent, id, now) {
                 Ok(()) => changed = true,
                 Err(failure) => settle_refused(runtime, id, failure, now),
             }
@@ -2641,6 +2659,7 @@ enum SettleOutcome {
 fn raise_picker_for<H: PreemptionHook>(
     grab: &mut ConsentGrab,
     runtime: &mut Runtime<H>,
+    consent: &mut ConsentSurface,
     id: crate::designation::DesignationId,
     now: Instant,
 ) -> Result<(), SettleFailure> {
@@ -2652,8 +2671,13 @@ fn raise_picker_for<H: PreemptionHook>(
         tracing::error!(%id, "a designation was owed with no picker root; refusing it");
         return Err(SettleFailure::Unresolvable);
     };
-    let (ask, deadline) = match runtime.kernel.designations.peek(id) {
-        Some(ticket) => (ticket.ask(), ticket.deadline()),
+    let (ask, deadline, principal, realm) = match runtime.kernel.designations.peek(id) {
+        Some(ticket) => (
+            ticket.ask(),
+            ticket.deadline(),
+            ticket.principal().clone(),
+            ticket.realm().clone(),
+        ),
         None => return Err(SettleFailure::TimedOut),
     };
     let session =
@@ -2666,6 +2690,21 @@ fn raise_picker_for<H: PreemptionHook>(
         // cover two principals, so this is ordinary: the ask waits, and the
         // deadline bounds the wait.
         return Ok(());
+    }
+    // **Draw it.** Raising seizes the human's physical input; drawing is what
+    // makes that seizure legible rather than a frozen keyboard behind whatever
+    // was on screen before. The two are done together, and a card that cannot
+    // be drawn takes the grab back down rather than holding input for a
+    // surface nobody can see.
+    let content = session.card(&principal, &realm);
+    if !grab.show_picker(content, consent) {
+        tracing::error!(
+            %id,
+            "the picker card could not be rasterized; lowering rather than \
+             holding the human's input behind a surface that is not there"
+        );
+        grab.lower_picker(consent);
+        return Err(SettleFailure::Unresolvable);
     }
     runtime.kernel.picker = Some(session);
     Ok(())
@@ -7861,6 +7900,79 @@ mod tests {
         let entry = settled(&mut rig);
         assert_eq!(entry.str("outcome"), "timed_out");
         assert!(!entry.bool("delivered"));
+    }
+
+    /// **A raised picker is DRAWN, not merely raised.**
+    ///
+    /// Raising seizes the human's physical input. For most of this feature's
+    /// construction the card existed, was tested, and was reached by no
+    /// session path at all — so a shipped deployment would have frozen the
+    /// keyboard for the ticket's whole life behind whatever happened to be on
+    /// screen. Every other picker test passed throughout, because they all
+    /// assert about the grab and the session rather than about pixels.
+    ///
+    /// This asserts the surface actually carries a card, and that the card
+    /// changes when the human navigates — a listing that did not redraw would
+    /// let them navigate against a picture of where they used to be.
+    #[test]
+    fn a_raised_picker_is_drawn_and_redrawn_as_it_moves() {
+        let _fd = crate::capture::tests::fd_lock();
+        let mut rig = Rig::new(
+            "designate-drawn",
+            ConsentPolicyArg {
+                policy: crate::petitions::ConsentPolicy::AutoApprove,
+                config: PetitionConfig::default(),
+            },
+        );
+        let (_dir, root) = picker_fixture("drawn");
+        rig.host.runtime.kernel.picker_root = Some(root);
+        let grab = rig.attach_grab();
+        let now = Instant::now();
+        let who = PrincipalIdentity::parse(DEMO_IDENTITY).unwrap();
+        let grant = designation_grant(&mut rig, &who, now);
+        let id = open_designation(&mut rig, &who, grant, now + Duration::from_secs(90));
+
+        let mut surface =
+            crate::consent::ConsentSurface::new(crate::consent::TrustedIndicator::for_test());
+        assert!(service_picker_round(
+            &mut grab.borrow_mut(),
+            &mut rig.host.runtime,
+            &mut surface,
+            now,
+            PromptVisibility::Reachable,
+        ));
+        assert_eq!(grab.borrow().raised_designation(), Some(id));
+
+        let (w, h, first) = surface
+            .card_raster_for_test()
+            .expect("a raised picker must have put a card on the surface");
+
+        // Move the selection and drain another round.
+        grab.borrow_mut().queue_step(
+            id,
+            crate::picker::keys::PickerStep::Move(crate::picker::keys::Motion::Down),
+        );
+        service_picker_round(
+            &mut grab.borrow_mut(),
+            &mut rig.host.runtime,
+            &mut surface,
+            now,
+            PromptVisibility::Reachable,
+        );
+        let (w2, h2, after) = surface
+            .card_raster_for_test()
+            .expect("the card is still up");
+        assert_eq!(
+            (w, h),
+            (w2, h2),
+            "the card must not resize under a finger when the selection moves"
+        );
+        assert_ne!(
+            first, after,
+            "moving the selection must change what is drawn; a picker that did \
+             not redraw would let a human navigate against a stale picture and \
+             confirm a row they were not looking at"
+        );
     }
 
     /// **Decision 9: a screen that stopped being the human's cancels a raised

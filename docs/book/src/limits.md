@@ -2609,6 +2609,84 @@ different thing again from restoring the toolkit's. **Serving portals has no
 issue and appears in no plan document**, so read this as an absence nobody has
 scheduled rather than as work in a queue.
 
+**The core-drawn file picker will not draw Arabic, Hebrew, Devanagari or
+Thai.** That chooser — the one a realm asks for over `vitrin_powerbox`, drawn
+by the core so a designation cannot be faked by the application asking for it
+([#190](https://github.com/vitrin-os/vitrin-os/issues/190)) — rasterizes each
+filename itself, through a text path with no shaping engine and no bidi
+algorithm: one glyph per codepoint, left to right. A name in one of those four
+scripts is therefore not drawn in its own script. It is **transcribed**, one
+character at a time, as `\u{XXXX}` escapes — four hex digits inside the BMP,
+six above it — tinted so that an escape is visible as an escape. `ملف.txt` is
+shown as `\u{0645}\u{0644}\u{0641}.txt`, and a human designating that file
+approves a name they were shown a transcription of.
+
+**Read that as permanent rather than as work owed, because the missing half is
+also an attack.** Drawing those scripts correctly needs GSUB joining and GPOS
+mark positioning, and Arabic and Hebrew need a bidi algorithm on top — and **a
+bidi algorithm on the trusted surface is the RTL-override filename spoof**, in
+which a name carrying `U+202E` reorders its own visible tail so the extension a
+human reads is not the extension the file has: `annexe.txt` would display as
+`txt.exenna`, and the version of the trick worth attacking with is the one that
+makes a real `.exe` read as `.txt`. The picker is the one surface here that must
+never misstate what a name is, so **neither the shaping engine nor the bidi
+algorithm may ever be added**, and the absence of shaping is what makes that
+spoof inert.
+Belt and braces: the bidi controls are themselves refused at routing, so an
+override embedded in a filename is drawn as `\u{202E}` rather than obeyed.
+Hebrew is the case that shows this is a decision and not a missing asset — the
+shipped face covers **87 of that block's 112 codepoints** (78%, a reading of
+the vendored file rather than a number anything recomputes), and Hebrew is
+refused anyway, because drawing it without bidi would lay it out in logical
+order, backwards. Arabic, Devanagari and Thai are refused twice over: that same
+face has no glyph for any of them. **No issue tracks any of this**, deliberately
+— an issue would imply a schedule, and there is none.
+
+**A kanji outside the shipped subset is transcribed too, and kana are
+complete.** Japanese is drawn from a pre-rasterized atlas of 3152 glyphs at one
+size rather than from a font, and its alphabet is declared, not discovered:
+the whole katakana block, every assigned hiragana letter, and the spacing sound
+and iteration marks — 187 codepoints in all — plus the 2965 ideographs of
+**JIS X 0208 level 1**. Level 2's further 3390 characters are deliberately out,
+and **a kanji outside that set is transcribed** exactly like an Arabic one, as
+a `\u{XXXX}` escape in the middle of a name whose other characters draw
+normally. So `論文2026.docx` draws as
+itself and a rarer ideograph does not. Two smaller edges of the same rule: the
+two *combining* kana sound marks (`U+3099`, `U+309A`) are absent from the
+alphabet like every other combining mark, because nothing here positions a mark
+over its base; and Japanese from outside the atlas's three blocks was never in
+scope at all. That second edge is wider than "the CJK extensions", and it is
+the one a real filename meets first: the atlas holds `U+3041`–`U+30FF` and a
+subset of `U+4E00`–`U+9F8D` and nothing else, so alongside the extensions it
+excludes the **CJK punctuation and fullwidth forms a Japanese IME actually
+emits** — `、` `。` `「` `」` (`U+3001`, `U+3002`, `U+300C`, `U+300D`) and the
+fullwidth brackets and digits of `U+FF01`–`U+FF5E`, every one of them below or
+above the atlas's ranges and transcribed like any other undrawable character.
+`会議メモ（2026）.txt` draws its kana, its kanji and its ASCII, and escapes its
+two brackets. Say that plainly rather than let a reader infer that only rare
+ideographs are affected. **No issue tracks the subset**: it is a decided bound
+with a written derivation beside the asset, not a gap somebody forgot to fill.
+
+**Row distinctness is per listing, not global: two files in *different*
+directories may render alike.** Global pixel-injectivity is impossible and it
+is worth saying so plainly rather than letting the stronger claim be assumed —
+a row is a bounded raster, so there are finitely many images it can be, while
+the set of legal filenames is not finite. Some pair of names must collide. What
+the picker guarantees instead is the property that protects the human in front
+of it: **no two rows of one listing render alike.** The core rasterizes each
+row's name field, digests those pixels, and where two rows digest alike it marks
+them apart in a reserved gutter (`#1`, `#2`) that elision cannot eat — and a
+collision group bigger than the gutter can label refuses the listing outright
+rather than drawing two rows it cannot tell apart. Filtering as you type
+inherits that, because distinctness survives taking a subset. What is *not*
+claimed: that a name is unique across the filesystem, or that a name you
+approved in one directory cannot be imitated in another one you visit later.
+The half that *is* global is weaker than pixels and is proven: distinct bytes
+produce distinct transcript *text*, witnessed by a decoder that inverts the
+encoder for every input. **No issue tracks this**, because it is a boundary
+rather than a gap — there is no version of this picker in which the global
+property holds.
+
 <!-- limit: no-x11 -->
 **No X11 shim.** Wayland only. Per-app X11 with an embedded WM is Phase 3.
 There is no X server anywhere in this stack — not in the core, not among the
@@ -2766,7 +2844,8 @@ carries it **and** still be true of the code — a page that overstates a gap
 fails as loudly as one that hides it, and both directions have caught real
 drift here. Every value with a single canonical definition — the Landlock ABI
 floor, the advisory wlcs counts, the wlcs release they were measured against,
-the kernel the AppArmor run was taken on, the size of the booted-kernel set —
+the kernel the AppArmor run was taken on, the size of the booted-kernel set, the
+number of glyphs the picker's Japanese atlas holds —
 has to appear in **every** place each surface renders it, not merely somewhere
 on the page, so a surface cannot contradict itself the way this project's own
 site once did. Constants duplicated between two files under a comment promising

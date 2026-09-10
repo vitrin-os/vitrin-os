@@ -43,13 +43,24 @@
 //! text-keyed digest finds no collisions ever and the gutter would stay empty
 //! by construction while claiming to protect against look-alikes.
 //!
-//! **One obligation is owed and unmet**: [`NAME_FIELD_PX`] is the width this
-//! module elides and digests at, and **nothing checks it against a renderer**,
-//! because there is no renderer — no surface in this tree draws a picker (see
-//! [`crate::consent::grab::ConsentGrab::raise_picker`]). Whoever draws one
-//! owes making its name column that width or making this constant follow it;
-//! until then the collision repair is computed for a column width that is
-//! declared here and drawn nowhere.
+//! **That obligation used to be owed and unmet**, and it is met now.
+//! [`NAME_FIELD_PX`] is the width this module elides and digests at, and
+//! until P2.6.6's renderer landed nothing checked it against a renderer,
+//! because there was no renderer. [`crate::consent::render`] is that
+//! renderer: it imports this constant and lays the picker card's name column
+//! out at exactly it, and
+//! `the_name_column_is_exactly_the_width_the_digest_elides_at` in that module
+//! measures the *painted* geometry against this constant rather than
+//! restating it.
+//!
+//! The direction was chosen rather than defaulted: the constant stays
+//! declared **here**, and the renderer follows it, because the width is a
+//! property of the collision repair (it is what "renders alike" is judged at)
+//! and only incidentally a property of a layout. The elision itself is shared
+//! outright — [`crate::paint::text::Text::elide_vetted`] returns the cut
+//! point, this module appends the marker to digest it, and the renderer
+//! clips its run ranges at it — so the two cannot cut at different
+//! characters.
 
 #![allow(dead_code)]
 
@@ -58,10 +69,14 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
+use crate::consent::render::PANEL_ROWS;
+use crate::consent::{PanelContent, PanelRow, PickerContent};
 use crate::designation::{AskedFor, DesignationId};
+use crate::grants::RealmId;
+use crate::identity::PrincipalIdentity;
 use crate::paint::canvas::Canvas;
 use crate::paint::text::{Text, Vetted};
-use crate::paint::transcript::Transcript;
+use crate::paint::transcript::{encode, Transcript};
 use crate::scene::BYTES_PER_PIXEL;
 
 use super::keys::{Motion, PickerStep};
@@ -70,16 +85,23 @@ use super::resolve::{self, EffectiveMode, ResolveError};
 
 /// The width, in pixels, of the name field a row is drawn in.
 ///
-/// See the module docs' last paragraph: this is a **declared** width with no
-/// renderer to check it against. It is the elision width and therefore the
-/// width at which two rows are judged to render alike.
+/// The elision width, and therefore the width at which two rows are judged to
+/// render alike. [`crate::consent::render`] imports this and paints the
+/// picker card's name column at exactly it — see the module docs on why the
+/// constant lives here and the renderer follows, rather than the reverse.
 pub(crate) const NAME_FIELD_PX: u32 = 320;
 
 /// The tallest a single row's raster can be, for the scratch canvas.
 ///
-/// Generous rather than tight: the digest is over a fixed-size buffer, so a
-/// glyph that ascends or descends further than expected must land inside it
-/// or two rows differing only in that overflow would digest alike.
+/// Generous rather than tight, and the margin is load-bearing rather than
+/// defensive. The card draws its rows in a 22-pixel slot at a baseline of its
+/// own choosing, and this box has to **contain** the ink of every glyph the
+/// card could put in that slot — because the implication the collision repair
+/// needs is "two rows digest alike ⇒ the human sees the same two rows". If a
+/// glyph's ink reached outside this box, two names differing only there would
+/// digest alike and be drawn differently, and the gutter mark would go to the
+/// wrong pair. `no_drawable_glyph_reaches_outside_the_digest_box` measures the
+/// containment against the shipped face and atlas rather than assuming it.
 const ROW_H: u32 = 32;
 
 /// The baseline within [`ROW_H`].
@@ -379,6 +401,76 @@ impl PickerSession {
         })
     }
 
+    /// **What this session puts in front of the human** (P2.6.6, issue #190):
+    /// the card [`crate::consent::grab::ConsentGrab::show_picker`] draws.
+    ///
+    /// A pure function of the session's state, so a redraw can never disagree
+    /// with the state a confirm settles from — `chosen()` reads `shown` and
+    /// `cursor`, and so does this. The alternative, a card the embedder
+    /// assembles field by field, is the shape in which a highlight can end up
+    /// one row away from the row that will actually be handed over.
+    ///
+    /// `principal` and `realm` come from the designation ticket rather than
+    /// from here, because this type never learns them: a picker walks
+    /// directories and knows nothing about who asked, which is the separation
+    /// that keeps [`super::resolve`] free of any notion of authority.
+    pub(crate) fn card(&self, principal: &PrincipalIdentity, realm: &RealmId) -> PickerContent {
+        PickerContent {
+            principal: principal.clone(),
+            realm: realm.clone(),
+            ask: self.ask,
+            // The components joined by `/`, then transcribed. `/` cannot
+            // occur in a component, so the join is unambiguous, and the whole
+            // thing goes through `encode` because every one of those
+            // components was named by whoever created the directory.
+            location: encode(&joined(&self.path)),
+            panel: self.panel(),
+            focus: self.focus,
+        }
+    }
+
+    /// The window of rows the card draws, and where the cursor sits in it.
+    ///
+    /// # The scroll offset is computed, never stored
+    ///
+    /// `offset` is a function of the cursor alone: the window is the last
+    /// [`PANEL_ROWS`] rows ending at the cursor, or the first `PANEL_ROWS`
+    /// while the cursor is still inside them. Storing a scroll position would
+    /// be the more conventional design and it would add a second piece of
+    /// state that can disagree with the first — a cursor outside its own
+    /// window is a card showing a highlight the human cannot see, on the one
+    /// surface where "what is highlighted" is what gets handed to an agent.
+    /// Deriving it makes that unrepresentable.
+    ///
+    /// What it costs: scrolling down keeps the cursor pinned to the last
+    /// visible row rather than letting it travel to the middle. That is a
+    /// legible behaviour, and it is the cheaper half of the trade.
+    fn panel(&self) -> PanelContent {
+        let window = PANEL_ROWS as usize;
+        let offset = self.cursor.saturating_sub(window.saturating_sub(1));
+        let rows: Vec<PanelRow> = self
+            .shown
+            .iter()
+            .skip(offset)
+            .take(window)
+            .filter_map(|&row| self.listing.rows.get(row))
+            .map(|row| PanelRow {
+                name: row.transcript.clone(),
+                // The mark is core-minted (`#1`..`#999`) and goes through
+                // `encode` anyway -- see `PanelRow::tag` on why one exception
+                // would cost the claim the field types make.
+                tag: row.tag.as_ref().map(|tag| encode(tag.as_bytes())),
+            })
+            .collect();
+        PanelContent {
+            highlight: (!rows.is_empty()).then_some((self.cursor - offset) as u16),
+            rows,
+            offset: offset as u32,
+            total: self.shown.len() as u32,
+            query: encode(self.query.as_bytes()),
+        }
+    }
+
     /// Apply one step the human typed.
     ///
     /// **Opens no file.** The most this can do is open a *directory* the
@@ -574,6 +666,38 @@ impl PickerSession {
     }
 }
 
+/// **Test seam.** The digest [`listing::build`] would key `name`'s row on.
+///
+/// Exists so [`crate::consent::render`]'s tests can ask *this* module whether
+/// two names collide, instead of reimplementing the elide-and-rasterize
+/// pipeline and then proving something about their own copy of it. The
+/// property those tests need — the width the repair judges at and the width
+/// the card paints are the same width — is only meaningful if both sides come
+/// from the shipped code.
+#[cfg(test)]
+pub(crate) fn digest_for_test(name: &[u8]) -> RowDigest {
+    RowInk::new().digest(&encode(name))
+}
+
+/// The walked components joined by `/`, as raw bytes.
+///
+/// Bytes rather than a `String`, because a path component is not required to
+/// be UTF-8 and the thing that has to cope with that is
+/// [`crate::paint::transcript::encode`], which was written for it. Building a
+/// `String` here would mean choosing between `from_utf8_lossy` — which is
+/// **not** injective, so two different directories could print the same — and
+/// refusing to name the directory at all.
+fn joined(components: &[OsString]) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::new();
+    for (i, component) in components.iter().enumerate() {
+        if i > 0 {
+            out.push(b'/');
+        }
+        out.extend_from_slice(component.as_bytes());
+    }
+    out
+}
+
 /// Read one directory and build its distinguishable listing.
 fn read_and_build(dir: BorrowedFd<'_>) -> Result<(Vec<Entry>, Listing), PickerError> {
     let entries = read_entries(dir)?;
@@ -681,28 +805,27 @@ impl RowInk {
     /// in a reserved gutter rather than in a suffix: the rows that collide are
     /// exactly the ones sharing a long prefix, so a suffix mark would be the
     /// first thing this function removed.
+    ///
+    /// The cut point comes from [`Text::elide_vetted`] rather than from a
+    /// loop of its own, and the marker is appended here. That is the whole of
+    /// the agreement between this digest and
+    /// [`crate::consent::render::rasterize_picker`]: the renderer asks the
+    /// same function for the same cut and clips its coloured runs at it, so
+    /// the two cannot draw a different number of characters. A second
+    /// implementation of "cut until it fits" is exactly the drift that would
+    /// leave the repair judging a column the card does not draw.
     fn elide(&mut self, s: &str) -> String {
-        let whole = Vetted::new(s);
-        if let Some(v) = &whole {
-            if self.text.width_vetted(v) <= NAME_FIELD_PX {
-                return s.to_owned();
-            }
+        let Some(whole) = Vetted::new(s) else {
+            // A transcript is drawable by construction, so this is
+            // unreachable; an unvetted string digests as the blank row, which
+            // collides with every other such row and therefore lands in the
+            // gutter rather than passing silently.
+            return String::new();
+        };
+        match self.text.elide_vetted(&whole, NAME_FIELD_PX) {
+            None => s.to_owned(),
+            Some(cut) => format!("{}{}", &s[..cut], crate::paint::text::ELLIPSIS),
         }
-        let mut cut = String::new();
-        for ch in s.chars() {
-            let mut candidate = cut.clone();
-            candidate.push(ch);
-            candidate.push_str("...");
-            let fits = Vetted::new(&candidate)
-                .map(|v| self.text.width_vetted(&v) <= NAME_FIELD_PX)
-                .unwrap_or(false);
-            if !fits {
-                break;
-            }
-            cut.push(ch);
-        }
-        cut.push_str("...");
-        cut
     }
 }
 
@@ -1071,5 +1194,234 @@ mod tests {
         let gone = root.join("not-here");
         assert!(PickerRoot::open(&gone).is_err());
         fs::remove_dir_all(&root).ok();
+    }
+
+    /// **No glyph the picker can draw reaches outside the digest's box.**
+    ///
+    /// The containment [`ROW_H`] claims, measured rather than asserted. The
+    /// digest is over a [`NAME_FIELD_PX`] x [`ROW_H`] buffer at
+    /// [`ROW_BASELINE`], and the collision repair needs "two rows digest
+    /// alike ⇒ the human sees the same two rows". That implication only holds
+    /// if every glyph's ink lands *inside* the digested box: ink outside it
+    /// is ink the digest cannot see and the card can draw, and two names
+    /// differing only there would be marked as alike while looking different.
+    ///
+    /// Driven over every character [`crate::paint::script::route`] admits,
+    /// against the shipped face and the shipped atlas — so vendoring a
+    /// different font or widening a range reddens this rather than quietly
+    /// opening the hole.
+    #[test]
+    fn no_drawable_glyph_reaches_outside_the_digest_box() {
+        use crate::paint::script::{route, Route};
+
+        // A tall scratch canvas with generous room on both sides of the
+        // baseline, so ink *outside* the digest box is visible rather than
+        // clipped away by the measurement itself.
+        const W: u32 = 64;
+        const H: u32 = 96;
+        const BASELINE: i32 = 60;
+        let mut text = Text::new();
+        let mut buf = vec![0u8; W as usize * H as usize * BYTES_PER_PIXEL];
+
+        let alphabet = (0x20u32..=0x4FF)
+            .chain(0x3040..=0x30FF)
+            .chain(0x4E00..=0x9FFF)
+            .filter_map(char::from_u32)
+            .filter(|&ch| !matches!(route(ch), Route::Escape));
+
+        let mut checked = 0usize;
+        for ch in alphabet {
+            buf.iter_mut().for_each(|b| *b = 0);
+            let mut owned = String::new();
+            owned.push(ch);
+            let Some(vetted) = Vetted::new(&owned) else {
+                continue;
+            };
+            {
+                let mut canvas = Canvas::new(&mut buf, W, H).expect("scratch canvas");
+                text.draw_runs(&mut canvas, &[(vetted, [0xff, 0xff, 0xff])], 8, BASELINE);
+            }
+            checked += 1;
+            for row in 0..H {
+                let inked = (0..W).any(|col| {
+                    let off = (row as usize * W as usize + col as usize) * BYTES_PER_PIXEL;
+                    buf[off] != 0
+                });
+                if !inked {
+                    continue;
+                }
+                let above = BASELINE - row as i32;
+                assert!(
+                    above <= ROW_BASELINE && above > ROW_BASELINE - ROW_H as i32,
+                    "U+{:04X} inks {above} px above its baseline, outside the \
+                     [{}, {}) the digest box covers -- two names differing only there \
+                     would digest alike and draw differently",
+                    ch as u32,
+                    ROW_BASELINE - ROW_H as i32 + 1,
+                    ROW_BASELINE + 1
+                );
+            }
+        }
+        assert!(
+            checked > 500,
+            "only {checked} characters were exercised; the alphabet filter is wrong and \
+             this test is measuring almost nothing"
+        );
+    }
+
+    /// **The card shows the row a confirm would actually hand over.**
+    ///
+    /// The one coupling between the picture and the act. `chosen()` reads
+    /// `shown` and `cursor`; so does `card()`. Asserted by driving the
+    /// keyboard and checking, at every stop, that the highlighted row's drawn
+    /// name transcribes the same bytes the settle funnel would be handed.
+    #[test]
+    fn the_card_highlights_the_row_a_confirm_would_hand_over() {
+        let root = scratch("card-highlight");
+        for name in ["alpha.txt", "beta.txt", "gamma.txt", "delta.txt"] {
+            fs::write(root.join(name), b"x").unwrap();
+        }
+        let (_hold, mut s) = session(&root, AskedFor::File { write: false });
+        let who = PrincipalIdentity::parse("vitrin://local/agent/demo").expect("identity");
+        let realm = RealmId::new("realm-0");
+
+        for _ in 0..4 {
+            let card = s.card(&who, &realm);
+            let highlight = card
+                .panel
+                .highlight
+                .expect("a non-empty listing highlights a row");
+            let drawn = &card.panel.rows[highlight as usize].name;
+            let chosen = s.chosen().expect("something is selected");
+            assert_eq!(
+                crate::paint::transcript::decode(&drawn.text),
+                Some(chosen.name.clone()),
+                "the highlighted row's drawn text must transcribe exactly the bytes a \
+                 confirm would open"
+            );
+            s.apply(PickerStep::Move(Motion::Down));
+        }
+    }
+
+    /// The window always contains the cursor, at every position of a listing
+    /// longer than the panel.
+    ///
+    /// The property that makes the derived scroll offset admissible: there is
+    /// no state to fall out of step, so this is checking arithmetic rather
+    /// than a synchronisation.
+    #[test]
+    fn the_drawn_window_always_contains_the_cursor() {
+        let root = scratch("card-window");
+        for i in 0..30 {
+            fs::write(root.join(format!("file-{i:02}.txt")), b"x").unwrap();
+        }
+        let (_hold, mut s) = session(&root, AskedFor::File { write: false });
+        let who = PrincipalIdentity::parse("vitrin://local/agent/demo").expect("identity");
+        let realm = RealmId::new("realm-0");
+
+        for step in 0..40 {
+            let card = s.card(&who, &realm);
+            let panel = &card.panel;
+            assert_eq!(panel.total, 30);
+            assert!(
+                panel.rows.len() <= PANEL_ROWS as usize,
+                "the panel drew {} rows into {PANEL_ROWS} slots",
+                panel.rows.len()
+            );
+            let highlight = panel
+                .highlight
+                .expect("a non-empty listing highlights a row")
+                as usize;
+            assert!(
+                highlight < panel.rows.len(),
+                "step {step}: the cursor is outside the window the card draws, so the \
+                 human cannot see the row a confirm would take"
+            );
+            let chosen = s.chosen().expect("something is selected");
+            assert_eq!(
+                crate::paint::transcript::decode(&panel.rows[highlight].name.text),
+                Some(chosen.name.clone())
+            );
+            s.apply(PickerStep::Move(if step < 32 {
+                Motion::Down
+            } else {
+                Motion::Up
+            }));
+        }
+    }
+
+    /// An empty listing highlights nothing, so a confirm on it designates
+    /// nothing and the card does not point at a row that is not there.
+    #[test]
+    fn an_empty_listing_highlights_no_row() {
+        let root = scratch("card-empty");
+        let (_hold, s) = session(&root, AskedFor::File { write: false });
+        let card = s.card(
+            &PrincipalIdentity::parse("vitrin://local/agent/demo").expect("identity"),
+            &RealmId::new("realm-0"),
+        );
+        assert!(card.panel.rows.is_empty());
+        assert_eq!(card.panel.highlight, None);
+        assert!(s.chosen().is_none());
+    }
+
+    /// The location the card names is the directory the human walked into,
+    /// transcribed — and a directory whose name is not UTF-8 still names
+    /// itself rather than collapsing onto a replacement character.
+    #[test]
+    fn the_card_names_where_the_human_is_standing() {
+        let root = scratch("card-location");
+        let odd = OsString::from_vec(b"work\xFF".to_vec());
+        fs::create_dir(root.join(&odd)).unwrap();
+        fs::write(root.join(&odd).join("inside.txt"), b"x").unwrap();
+        let (_hold, mut s) = session(&root, AskedFor::File { write: false });
+        let who = PrincipalIdentity::parse("vitrin://local/agent/demo").expect("identity");
+        let realm = RealmId::new("realm-0");
+
+        assert_eq!(
+            s.card(&who, &realm).location.text,
+            "",
+            "at the root there is no path to name"
+        );
+        assert_eq!(s.apply(PickerStep::Move(Motion::In)), Applied::Changed);
+        let card = s.card(&who, &realm);
+        assert_eq!(
+            crate::paint::transcript::decode(&card.location.text),
+            Some(b"work\xFF".to_vec()),
+            "the location must invert to the directory's own bytes, not to a lossy \
+             rendering of them"
+        );
+        assert!(
+            card.location.text.contains("\\x{FF}"),
+            "the undecodable byte must be shown, not dropped: {:?}",
+            card.location.text
+        );
+    }
+
+    /// The gutter mark the repair computed reaches the card.
+    #[test]
+    fn a_marked_row_carries_its_mark_onto_the_card() {
+        let root = scratch("card-marks");
+        // Two names that share every character elision leaves.
+        let stem = "quarterly-report-for-the-board-of-directors-2026-draft";
+        fs::write(root.join(format!("{stem}-a.pdf")), b"x").unwrap();
+        fs::write(root.join(format!("{stem}-b.pdf")), b"x").unwrap();
+        let (_hold, s) = session(&root, AskedFor::File { write: false });
+        let card = s.card(
+            &PrincipalIdentity::parse("vitrin://local/agent/demo").expect("identity"),
+            &RealmId::new("realm-0"),
+        );
+        let marks: Vec<Option<String>> = card
+            .panel
+            .rows
+            .iter()
+            .map(|row| row.tag.as_ref().map(|t| t.text.clone()))
+            .collect();
+        assert_eq!(
+            marks,
+            vec![Some("#1".to_string()), Some("#2".to_string())],
+            "two rows that render alike must reach the card carrying the marks that \
+             tell them apart"
+        );
     }
 }

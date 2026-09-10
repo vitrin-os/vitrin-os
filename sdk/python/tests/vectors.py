@@ -102,13 +102,12 @@ GOLDEN_FRAME_READY = bytes(
 # independent implementation (decision D8), and a vector transcribed from the
 # transcription it is supposed to check would agree with it by construction.
 #
-# The object ids are chosen so the three structural mints THIS SDK ENCODES and
-# the three uses form one coherent trace: grant 4 mints launcher 11,
-# layout_focus 12 and layout_arrange 13, and the three use-vectors are
-# addressed to those ids. vitrin_grant carries two further mints --
-# `get_powerbox` (opcode 3, P2.6.5) and `get_egress` (opcode 4, P2.7.2) --
-# with no vector here, because messages.py has no codec for either to check;
-# see that module's docstring for why.
+# The object ids are chosen so the four structural mints THIS SDK ENCODES and
+# their uses form one coherent trace: grant 4 mints launcher 11,
+# layout_focus 12, layout_arrange 13 and powerbox 14, and the use-vectors are
+# addressed to those ids. vitrin_grant carries one further mint --
+# `get_egress` (opcode 4, P2.7.2) -- with no vector here, because messages.py
+# has no codec for it to check; see that module's docstring for why.
 # ---------------------------------------------------------------------------
 
 # vitrin_grant.get_launcher{launcher: 11} on grant object 4 -- request 0.
@@ -119,15 +118,13 @@ GOLDEN_GET_LAUNCHER = bytes([4, 0, 0, 0, 12, 0, 0, 0, 11, 0, 0, 0])
 # each one here is pinned: a reordering of the requests in the IDL would leave
 # each frame individually well-formed and silently mint the wrong facet.
 #
-# THREE OF FOUR, since P2.6.5 (#189). `vitrin_grant` now carries a fourth
-# structural mint, `get_powerbox` at request opcode 3, and it has no vector
-# here -- not an oversight and not a claim that it needs none. These vectors
-# are asserted against an SDK encoder (`messages.encode_get_layout_focus` and
-# its siblings), the SDK has no `encode_get_powerbox` because nothing serves
-# `designate_file` yet, and a vector with no encoder to compare against would
-# pin the transcription rather than the implementation. So the reordering
-# guard described above covers requests 0-2 and not request 3; whoever gives
-# the SDK a powerbox encoder adds the fourth vector in the same change.
+# FOUR OF FIVE. `get_powerbox` (request 3) joined them when the SDK gained a
+# powerbox client, which is what the previous note here said would have to
+# happen first: these vectors are asserted against an SDK encoder, and a vector
+# with no encoder to compare against would pin the transcription rather than
+# the implementation. `get_egress` (request 4) is the one still outside the
+# reordering guard, for exactly that reason -- no `encode_get_egress` exists,
+# because nothing serves `egress`.
 GOLDEN_GET_LAYOUT_FOCUS = bytes([4, 0, 0, 0, 12, 0, 1, 0, 12, 0, 0, 0])
 
 # vitrin_grant.get_layout_arrange{layout_arrange: 13} on grant object 4 --
@@ -164,3 +161,59 @@ GOLDEN_LAUNCHED = bytes(
     + [0x6B, 0x69, 0x6F, 0x73, 0x6B, 0x2E, 0x31]  # "kiosk.1"
     + [0]  # padding to the 4-byte boundary; never counted in the length
 )
+
+
+# ---------------------------------------------------------------------------
+# The version-2 powerbox corpus (P2.6.6 / #190), on the same terms as the
+# section above: written down from protocol/vitrin-v0.xml, never copied out of
+# vitrin_os.messages, and Python-side only -- the shim speaks the shim class
+# and `vitrin_shim_session.designation` is a DIFFERENT message from
+# `vitrin_powerbox.designated`, so there is no second copy of these bytes to
+# keep in step.
+#
+# The four ask/answer vectors are addressed to powerbox object 14, which grant
+# 4 mints just below.
+# ---------------------------------------------------------------------------
+
+# vitrin_grant.get_powerbox{powerbox: 14} on grant object 4 -- request 3.
+GOLDEN_GET_POWERBOX = bytes([4, 0, 0, 0, 12, 0, 3, 0, 14, 0, 0, 0])
+
+# vitrin_powerbox.request_file{mode: read_write} on object 14 -- request 0.
+# mode is the vitrin_powerbox.mode enum: read = 0, read_write = 1. The frame
+# carries the mode and NOTHING else -- no filename, no filter, no starting
+# directory -- and that absence is the interface rather than an omission from
+# this vector: an argument naming a file would defeat a powerbox, and a
+# signature is immutable forever, so this frame can never grow one.
+GOLDEN_REQUEST_FILE = bytes([14, 0, 0, 0, 12, 0, 0, 0, 1, 0, 0, 0])
+
+# vitrin_powerbox.request_dir{} on object 14 -- request 1, no arguments, so
+# the whole frame is the 8-byte header. Byte-identical to GOLDEN_REQUEST_FILE
+# in every field but the opcode and the vanished payload: `request_dir` takes
+# no mode because a subtree picker has one chrome.
+GOLDEN_REQUEST_DIR = bytes([14, 0, 0, 0, 8, 0, 1, 0])
+
+# vitrin_powerbox.designated{designation_id: 7, kind: file, mode: read_write,
+# name: "notes.txt"} on object 14 -- event 0, and the header declares ONE fd.
+# The descriptor rides SCM_RIGHTS: its bytes are never in the body, exactly as
+# in GOLDEN_FRAME_READY, and the fd_count byte is the whole of the pairing.
+#
+# `kind` and `mode` are adjacent uints and are given DIFFERENT values on
+# purpose: they are two enums in a row, so a decoder that read them in the
+# wrong order would be invisible to a vector where both happened to be zero.
+# (That the answer's mode may be NARROWER than the ask is a property of the
+# facet rather than of this frame, and is asserted end-to-end in
+# test_powerbox.py, where a `write=True` ask is answered `read`.)
+GOLDEN_DESIGNATED = bytes(
+    [14, 0, 0, 0, 36, 0, 0, 1]
+    + [7, 0, 0, 0]  # designation_id -- opaque, and the realm's copy carries it
+    + [0, 0, 0, 0]  # kind: file
+    + [1, 0, 0, 0]  # mode: read_write -- the EFFECTIVE access the human gave
+    + [9, 0, 0, 0]  # string length in BYTES
+    + [0x6E, 0x6F, 0x74, 0x65, 0x73, 0x2E, 0x74, 0x78, 0x74]  # "notes.txt"
+    + [0, 0, 0]  # padding to the 4-byte boundary; never counted in the length
+)
+
+# vitrin_powerbox.refused{code: busy} on object 14 -- event 1. `busy` (2)
+# rather than `cancelled` (0) so the payload is not all zeros: a decoder that
+# ignored the body entirely would still match a zero-valued code.
+GOLDEN_POWERBOX_REFUSED = bytes([14, 0, 0, 0, 12, 0, 1, 0, 2, 0, 0, 0])

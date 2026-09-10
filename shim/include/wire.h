@@ -26,27 +26,34 @@
  *     unexplained disconnect, so every send is checked before it reaches the
  *     kernel.
  *
- * THE ASYMMETRY THAT SIMPLIFIED THE RECEIVE PATH, AND THE MESSAGE THAT ENDS
- * IT. Every fd this transport has ever had to carry travels shim -> core (the
- * `attach` buffer). No version-1 core -> shim event carries one: `configure`,
- * `frame_done`, `buffer_done` and all five `vitrin_shim_seat` events are
- * fd-less. So this transport needs SCM_RIGHTS on the send side only; on the
- * receive side an arriving fd is a violation, closed immediately and then
- * fatal. That is why there is no pending-fd queue and no positional-matching
- * machinery here, unlike vitrin-ipc's `Connection`, which must serve both
- * directions.
+ * THE ASYMMETRY THAT SIMPLIFIED THE RECEIVE PATH, AND THE MESSAGE THAT ENDED
+ * IT. For this transport's first two phases every fd it carried travelled
+ * shim -> core (the `attach` buffer). No version-1 core -> shim event carries
+ * one: `configure`, `frame_done`, `buffer_done` and all five
+ * `vitrin_shim_seat` events are fd-less. So the receive side needed no
+ * pending-fd queue and no positional-matching machinery, unlike vitrin-ipc's
+ * `Connection`, which must serve both directions.
  *
  * P2.6.5 (issue #189) PUT THE FIRST FD-BEARING core -> shim EVENT ON THE
- * WIRE: `vitrin_shim_session.designation`, which delivers one designated
- * file or directory descriptor into the realm. THIS TRANSPORT DOES NOT
- * IMPLEMENT RECEIVING IT. A `designation` arriving here today takes the path
- * above -- the descriptor is closed and the connection dies -- which is safe
- * (nothing leaks) but is not the behaviour the protocol asks for. It costs
- * nothing today because no deployment serves the `designate_file` verb, so
- * the core never sends the event; it is the receive-side machinery P2.6.7
- * owes, alongside the per-realm designation socket it serves to the app. The
- * paragraph above is left standing rather than rewritten, because what it
- * describes is still exactly what this file does.
+ * WIRE: `vitrin_shim_session.designation`, which delivers one designated file
+ * or directory descriptor into the realm. This transport now RECEIVES it, and
+ * the machinery below is vitrin-ipc's transcribed rather than a second design:
+ * fds are harvested off the ancillary queue tagged with the byte-stream SPAN
+ * of the recvmsg that delivered them, claimed by the frame whose header
+ * declares `fd_count == 1`, and every disagreement between the two is fatal.
+ * See `struct vitrin_wire_pending_fd` for why a span and not an offset.
+ *
+ * OWNERSHIP, MADE STRUCTURAL BY THE CLAIM PROTOCOL. `designation`'s IDL says
+ * ownership transfers to the receiver, which MUST close the descriptor: a
+ * shim that cannot relay one closes it, and a leaked one pins a file open for
+ * the life of the realm. So the handler is handed `int *fd` and CLAIMS the
+ * descriptor by writing -1 back; whatever it leaves, this transport closes as
+ * soon as the handler returns. A handler that forgets the argument entirely
+ * therefore cannot leak, and neither can the fatal paths, which close the
+ * pending queue as they poison the connection. Relaying the descriptor onward
+ * to the app, over the realm's own designation socket, is P2.6.7's (issue
+ * #191); until that lands the shim logs the arrival and lets this transport
+ * close the fd, so the app never sees it.
  *
  * BLOCKING MODE. The descriptor is non-blocking from the moment it is
  * adopted, and stays that way. The one synchronous read the protocol
@@ -104,6 +111,46 @@
  * vitrin-ipc reaches for its own send-queue cap). */
 #define VITRIN_WIRE_QUEUE_SLOTS 64u
 
+/* The most received-but-unclaimed descriptors this transport holds at once.
+ *
+ * One is the protocol's own bound: `designation` is the only fd-bearing
+ * core -> shim event and the core sends one per completed designation. But the
+ * kernel delivers ancillary data per sendmsg, not per frame, so a second fd
+ * can legitimately be in flight while the frame that declares the first is
+ * still being reassembled. Four is that slack. Exceeding it means descriptors
+ * arrived that no frame declared, which is a violation to die on rather than a
+ * queue to grow -- the same conclusion vitrin-ipc's MAX_UNCLAIMED_FDS reaches.
+ *
+ * The recvmsg ancillary buffer is sized for exactly this many, so MORE fds in
+ * ONE sendmsg surface as MSG_CTRUNC -- a named fatal -- instead of as a silent
+ * drop of descriptors the kernel already installed somewhere. */
+#define VITRIN_WIRE_MAX_UNCLAIMED_FDS 4u
+
+/* One received SCM_RIGHTS descriptor awaiting the frame that declares it.
+ *
+ * WHY A SPAN AND NOT AN OFFSET. The kernel delivers an fd batch with the
+ * recvmsg that first consumes bytes of the sendmsg that carried it, and never
+ * delivers two batches in one recvmsg -- but it DOES glue preceding fd-less
+ * bytes from the same sender onto the head of that recvmsg
+ * (`unix_stream_read_generic` merges consecutive skbs whose credentials match,
+ * and the fd array is not part of that comparison). So a receiver can observe
+ * the byte-stream span of the delivering recvmsg and cannot observe the offset
+ * the sender attached the fd at. Positional matching is therefore enforced
+ * against the span, which is as tight as the kernel's delivery semantics
+ * allow. Same reasoning and same fields as vitrin-ipc's `PendingFd`; the two
+ * ends of this wire must agree about this or one of them mis-matches. */
+struct vitrin_wire_pending_fd {
+	/* Stream offset of the first byte of the recvmsg that delivered this
+	 * fd. The true attach offset is >= this. */
+	uint64_t span_start;
+	/* One past the last byte of that recvmsg. Because a recvmsg ends at, or
+	 * inside, the fd-bearing segment, the true attach offset is < this. */
+	uint64_t span_end;
+	/* Owned here from the moment `recvmsg` returned, close-on-exec from
+	 * birth (MSG_CMSG_CLOEXEC). -1 once claimed. */
+	int fd;
+};
+
 /* One outgoing frame the kernel would not take yet. */
 struct vitrin_wire_slot {
 	uint8_t bytes[VITRIN_WIRE_SLOT_BYTES];
@@ -118,9 +165,20 @@ struct vitrin_wire_slot {
 	int fd;
 };
 
-/* Called with one complete, framed message. Return false to declare the
- * connection dead (the transport then refuses every later operation). */
-typedef bool (*vitrin_wire_handler_t)(void *data, const uint8_t *frame, size_t len);
+/* Called with one complete, framed message, and with `*fd` set to the
+ * descriptor that rode alongside it iff its header declared one -- -1
+ * otherwise, which is every message on this wire but `designation`.
+ *
+ * OWNERSHIP. The handler CLAIMS the descriptor by writing -1 back through
+ * `fd`; anything it leaves behind the transport closes the instant this
+ * returns, on every path including a `false` return. That is the IDL's "a
+ * shim that cannot relay a descriptor closes it" made structural rather than
+ * conventional: a handler that ignores the argument entirely is correct, not
+ * leaky, and no future handler can leak by forgetting.
+ *
+ * Return false to declare the connection dead (the transport then refuses
+ * every later operation). */
+typedef bool (*vitrin_wire_handler_t)(void *data, const uint8_t *frame, size_t len, int *fd);
 
 /* Called once per event-loop wakeup, after every complete frame that wakeup
  * delivered has been handed to the handler above.
@@ -155,6 +213,19 @@ struct vitrin_wire {
 	/* Reassembly: bytes received but not yet handed on as whole frames. */
 	uint8_t rx[VITRIN_WIRE_MAX_FRAME];
 	size_t rx_len;
+
+	/* Total bytes already taken out of `rx` as completed frames -- i.e. the
+	 * byte-stream offset of `rx[0]`. This is the coordinate every span in
+	 * `pending` below is expressed in, and the only reason it is tracked. */
+	uint64_t consumed;
+
+	/* Received fds not yet claimed by a completed frame, oldest first, which
+	 * is frame order (positional matching, conventions 2.2). Closed both by
+	 * the fatal path and by `vitrin_wire_finish`, so no way this connection
+	 * can end leaves one open. */
+	struct vitrin_wire_pending_fd pending[VITRIN_WIRE_MAX_UNCLAIMED_FDS];
+	size_t pending_head;
+	size_t pending_len;
 
 	/* Parked frames, oldest first (FIFO preserves wire order). */
 	struct vitrin_wire_slot queue[VITRIN_WIRE_QUEUE_SLOTS];
@@ -212,14 +283,26 @@ bool vitrin_wire_send(struct vitrin_wire *w, const uint8_t *frame, size_t len, i
  * `out`. This exists for the ONE synchronous read the protocol mandates:
  * `configure`, the core's guaranteed-first message, read before the shim
  * serves its private Wayland socket (conventions 7.2). Returns false on
- * timeout, EOF, or a fatal condition. */
+ * timeout, EOF, or a fatal condition.
+ *
+ * There is no fd out-parameter, and a first frame that declares one is fatal:
+ * the only frame this ever reads is `configure`, which is fd-less, and the
+ * shim has nowhere to put a descriptor before it is armed. Descriptors
+ * belonging to LATER frames in the same batch are unaffected -- they stay in
+ * the pending queue and are claimed once `vitrin_wire_arm` starts dispatching. */
 bool vitrin_wire_recv_sync(struct vitrin_wire *w, int timeout_ms,
 	uint8_t *out, size_t out_cap, size_t *out_len);
 
 /* Hand the connection to the Wayland event loop: from here the core link is
  * pumped by the same loop that serves the app, so a message from the core
  * and a request from the app are dispatched by one thread with no locking
- * and no ordering questions between them. */
+ * and no ordering questions between them.
+ *
+ * Frames the core batched behind `configure` are dispatched HERE, before this
+ * returns, so `handler` can run before the caller regains control. They have to
+ * be: `vitrin_wire_recv_sync` leaves them in the reassembly buffer while the
+ * socket -- which is what the loop watches -- is empty, so nothing else would
+ * wake for them until the core's next message. */
 bool vitrin_wire_arm(struct vitrin_wire *w, struct wl_event_loop *loop,
 	vitrin_wire_handler_t handler, vitrin_wire_drained_t on_drained,
 	vitrin_wire_closed_t on_closed, void *data);

@@ -625,10 +625,106 @@ static void handle_offer_selection(struct vitrin_shim *s, const uint8_t *frame, 
 	vitrin_clipboard_handle_offer(s, mime, ev.data.data, ev.data.len);
 }
 
-static bool upstream_message(void *data, const uint8_t *frame, size_t len) {
+/* `vitrin_shim_session.designation` (P2.6.5, issue #189): the core's half of a
+ * completed designation. An agent holding `designate_file` asked, the human
+ * chose in the core-drawn picker, and this event delivers the resulting
+ * descriptor into this realm. It is the FIRST and so far only core -> shim
+ * event that carries one; wire.c's receive path exists for it.
+ *
+ * WHAT THIS DOES WITH THE DESCRIPTOR TODAY: nothing but close it, by leaving
+ * `*fd` for the transport (see the ownership rule on
+ * `vitrin_wire_handler_t`). The descriptor is for the APP, not for the shim,
+ * and the per-realm designation socket that relays it there is P2.6.7's
+ * (issue #191). Until that lands the app never sees a designated file, and
+ * the log line below says so rather than implying a delivery.
+ *
+ * That is a lossy disposition, not a placeholder that pretends otherwise --
+ * but it is the one the IDL asks for on any path that does not relay: "a shim
+ * that cannot relay a descriptor closes it", because the alternative pins a
+ * file open for the life of the realm, and because there is no message by
+ * which a shim declines one. The asking agent already has its own copy,
+ * delivered on its own connection before this event was sent, so closing here
+ * costs the app its half and costs the agent nothing.
+ *
+ * A malformed frame is logged and dropped rather than fatal, the posture every
+ * other event here takes: the core is the TCB, so this is version skew. */
+static void handle_designation(struct vitrin_shim *s, const uint8_t *frame, size_t len,
+		int *fd) {
+	/* Unused today because nothing here touches realm state -- the shim is
+	 * decoding, logging and dropping. Kept in the signature so P2.6.7 (#191),
+	 * which relays over a socket this struct will own, does not have to change
+	 * the call site to reach it. */
+	(void)s;
+	uint32_t object_id = 0;
+	vitrin_shim_session_evt_designation_t ev;
+	vitrin_decode_status_t st =
+		vitrin_shim_session_evt_designation_decode(frame, len, *fd, &object_id, &ev);
+	if (st != VITRIN_DECODE_OK) {
+		wlr_log(WLR_ERROR, "malformed designation: %s", vitrin_decode_status_string(st));
+		return;
+	}
+
+	/* The basename is deliberately NOT logged. It is display copy for a human
+	 * looking at a picker, the shim's log is not that surface, and the core's
+	 * journal already records what the human chose; writing a filename the
+	 * human picked into a per-realm log would put it somewhere the designation
+	 * itself never authorized. Its LENGTH is logged, because "a designation
+	 * arrived and its name decoded" is what a reader of this line needs. */
+	wlr_log(WLR_INFO,
+		"designation %u arrived (%s, %s, name %u bytes) and was CLOSED, not "
+		"relayed: this realm has no designation socket yet (P2.6.7, issue "
+		"#191), so the app never receives it",
+		ev.designation_id,
+		ev.kind == VITRIN_POWERBOX_KIND_DIRECTORY ? "directory subtree" : "file",
+		ev.mode == VITRIN_POWERBOX_MODE_READ_WRITE ? "read-write" : "read-only",
+		ev.name.len);
+
+	/* `*fd` is left set on purpose: the transport closes what a handler does
+	 * not claim, so this function has no close() and cannot forget one. */
+}
+
+static bool upstream_message(void *data, const uint8_t *frame, size_t len, int *fd) {
 	struct vitrin_shim *s = data;
 	vitrin_frame_header_t hdr;
 	if (vitrin_frame_header_decode(frame, len, &hdr) != VITRIN_DECODE_OK) {
+		return false;
+	}
+
+	/* Every event but `designation` is fd-less, so a descriptor on any other
+	 * one is `fd_violation`'s FIRST disjunct: "the header's `fd_count`
+	 * disagrees with the signature" (conventions 2.4, restated in the
+	 * generated decoder's own comment). The transport catches the second
+	 * disjunct -- fds attached to a frame declaring none -- and cannot catch
+	 * this one, which needs the signature table only this layer has.
+	 *
+	 * FATAL, not logged-and-dropped, which is the posture every other
+	 * malformed-event path here takes. Two reasons it is the exception:
+	 *
+	 *   - Conventions 2.4 is normative and unconditional -- "the connection
+	 *     dies fatal `fd_violation`" -- and 5.2 says how a shim connection
+	 *     delivers a fatal, which is log-and-CLOSE, there being no error
+	 *     message on this connection class. There is no log-and-CONTINUE
+	 *     category in that document. The pre-#189 transport was fatal on
+	 *     exactly this condition (`fd_count != 0` from the core); receiving
+	 *     `designation` narrowed which frames may carry a descriptor, and must
+	 *     not have relaxed what happens to the ones that may not.
+	 *   - Continuing is not actually safe. Positional fd matching (wire.c)
+	 *     pairs descriptors to frames by declaration order, so a core that
+	 *     declares one where its signature has none has a different model of
+	 *     this stream than we do; the NEXT descriptor is then matched against
+	 *     the wrong frame, and a designation could be handed to a decoder that
+	 *     is not `designation`'s. A decode failure poisons one event; this
+	 *     poisons every fd-bearing frame after it.
+	 *
+	 * The descriptor still cannot leak: the transport closes whatever this
+	 * function leaves in `*fd`, on the `false` path too. */
+	if (*fd >= 0 && !(hdr.object_id == VITRIN_SESSION_ID &&
+			hdr.opcode == VITRIN_SHIM_SESSION_EVT_DESIGNATION_OPCODE)) {
+		wlr_log(WLR_ERROR,
+			"fd_violation: event for object %u (opcode %u) carried a file "
+			"descriptor, which its signature does not declare. The descriptor "
+			"is closed and the core connection dies (conventions 2.4, 5.2)",
+			hdr.object_id, hdr.opcode);
 		return false;
 	}
 
@@ -640,6 +736,8 @@ static bool upstream_message(void *data, const uint8_t *frame, size_t len) {
 			handle_request_selection(s, frame, len);
 		} else if (hdr.opcode == VITRIN_SHIM_SESSION_EVT_OFFER_SELECTION_OPCODE) {
 			handle_offer_selection(s, frame, len);
+		} else if (hdr.opcode == VITRIN_SHIM_SESSION_EVT_DESIGNATION_OPCODE) {
+			handle_designation(s, frame, len, fd);
 		} else if (hdr.opcode ==
 				VITRIN_SHIM_SESSION_EVT_POINTER_CONSTRAINT_STATE_OPCODE) {
 			/* The core's verdict on a pointer constraint, and its running

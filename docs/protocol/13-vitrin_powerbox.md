@@ -228,12 +228,16 @@ the least-trusted process a socket into the TCB would add an attacker-facing
 surface to the core for no gain, while the shim is already the app's
 confinement peer and holds nothing it did not already hold.
 
-**The shipped shim cannot receive the second half yet.** `designation` is the
-first fd-bearing core→shim event this protocol has ever defined, and
-`shim/include/wire.h` says in as many words that its transport implements
-`SCM_RIGHTS` on the **send side only**: an arriving descriptor is a violation,
-closed immediately, and then fatal. So a `designation` delivered to today's
-shim would close the descriptor and kill the realm's connection. It costs
+**The shipped shim receives the second half as of P2.6.6.** `designation` is
+the first fd-bearing core→shim event this protocol ever defined, and until it
+landed the shim's transport implemented `SCM_RIGHTS` on the send side only: an
+arriving descriptor was a violation, closed immediately, and then fatal. The
+transport now carries a pending-fd queue and a handler claims a descriptor by
+writing `-1` through its `int *fd`; one that does not claim it closes it, so
+nothing leaks. What is still owed is the **relay** — the per-realm
+`designation.sock` that hands the descriptor to the app is P2.6.7 (#191), so
+today's shim receives the descriptor and closes it rather than passing it on.
+It costs
 nothing today — no deployment serves the verb, so the core never sends the
 event — and the receive-side machinery, along with the per-realm designation
 socket, is what **P2.6.7** owes.

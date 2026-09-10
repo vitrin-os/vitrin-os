@@ -37,6 +37,9 @@ LAYOUT_ARRANGE_ID = 10
 #: The launch facet, likewise minted on demand. Tests that mint only this
 #: one get 9, because ids are allocated in the order a client first asks.
 LAUNCHER_ID = 9
+#: The powerbox facet, on the same rule: a test that mints only this one
+#: gets 9 too. The ids collide because the allocator counts asks, not kinds.
+POWERBOX_ID = 9
 
 
 def hello_frame(version: int = protocol.PROTOCOL_VERSION) -> bytes:
@@ -150,6 +153,58 @@ def focus_frame(facet_id: int = LAYOUT_FOCUS_ID) -> bytes:
 
 def set_fullscreen_frame(*, mode: int, facet_id: int = LAYOUT_ARRANGE_ID) -> bytes:
     return frame(facet_id, 0, u32(mode))
+
+
+def get_powerbox_frame(facet_id: int = POWERBOX_ID) -> bytes:
+    """`vitrin_grant.get_powerbox` — request opcode 3, since version 2."""
+    return frame(GRANT_ID, 3, u32(facet_id))
+
+
+def request_file_frame(*, mode: int, facet_id: int = POWERBOX_ID) -> bytes:
+    """`vitrin_powerbox.request_file` — request 0, one enum argument.
+
+    `mode` is what the ask is FOR (0 read, 1 read_write), and the frame carries
+    nothing else: no filename, no filter, no starting directory. There is no
+    argument here that names a file, which is the interface's whole point.
+    """
+    return frame(facet_id, 0, u32(mode))
+
+
+def request_dir_frame(facet_id: int = POWERBOX_ID) -> bytes:
+    """`vitrin_powerbox.request_dir` — request 1, no arguments at all."""
+    return frame(facet_id, 1)
+
+
+def designated_frame(
+    *,
+    designation_id: int,
+    kind: int,
+    mode: int,
+    name: str,
+    facet_id: int = POWERBOX_ID,
+) -> bytes:
+    """`vitrin_powerbox.designated` — event 0, and it declares one fd.
+
+    The descriptor rides SCM_RIGHTS and its bytes are never in the body; the
+    header's fd_count is what pairs the two.
+    """
+    return frame(
+        facet_id,
+        0,
+        u32(designation_id) + u32(kind) + u32(mode) + string(name),
+        fd_count=1,
+    )
+
+
+def powerbox_refused_frame(*, code: int, facet_id: int = POWERBOX_ID) -> bytes:
+    """`vitrin_powerbox.refused` — event 1, the other terminal of an ask.
+
+    Deliberately NOT `refused_frame` above: that one is `vitrin_grant.refused`,
+    the enforcement chokepoint's single voice, and these two events answer
+    different questions asked of different parties. Naming them apart here is
+    the same separation the SDK keeps between `Refusal` and `PowerboxRefusal`.
+    """
+    return frame(facet_id, 1, u32(code))
 
 
 def sync_frame(cookie: int) -> bytes:

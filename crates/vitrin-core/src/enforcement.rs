@@ -752,11 +752,21 @@ pub(crate) enum DesignateRefusal {
     /// so it maps to `internal` and says so in the log. Every deployment
     /// answers this today.
     Unavailable,
-    /// A picker for this principal is already up -- the ledger's
-    /// per-principal rule.
-    Busy,
-    /// The ledger is at its resource bound.
-    Full,
+    // `Busy` (a card is already up for this principal) and `Full` (the
+    // ledger is at its resource bound) deliberately do NOT live here.
+    //
+    // Both are real conditions and both were once mapped to `capacity`. The
+    // IDL forbids that in as many words: `capacity` means the deployment is
+    // at its REALM capacity and is reachable only through `realm_launch`, so
+    // a server voicing it for a full picker ledger "would answer a question
+    // about cards with a code about realms, and an agent reading it
+    // correctly would conclude the deployment could launch no realm".
+    //
+    // They are not chokepoint refusals at all: both are discovered *after*
+    // the ask was admitted, which is exactly the boundary between the two
+    // voices. So they are answered on the facet by
+    // `vitrin_powerbox.refusal "busy"`, sent by the sink that discovers
+    // them. Keeping a variant here would invite the mapping back.
 }
 
 /// Everything the embedder is told about an admitted designation ask.
@@ -1616,15 +1626,6 @@ impl Chokepoint {
                                 );
                                 Refusal::Internal
                             }
-                            DesignateRefusal::Full => {
-                                tracing::warn!(
-                                    ?verb,
-                                    "the designation ledger is at its resource bound; refusing \
-                                     capacity"
-                                );
-                                Refusal::Capacity
-                            }
-                            DesignateRefusal::Busy => Refusal::Capacity,
                         };
                         let voiced = self.voice_refusal(
                             req.grant_wire_id,
@@ -2721,34 +2722,6 @@ mod tests {
             "no picker must answer internal and voice it, got {outcome:?}"
         );
         assert!(seen.is_some(), "the sink is consulted before the refusal");
-    }
-
-    /// A card already up, or a full ledger, answers `capacity` — the code
-    /// that means "no room now, asking later is legal".
-    ///
-    /// **Not the powerbox's own `busy`.** That enum is the picker's terminal
-    /// vocabulary, sent on the facet by whatever raises and dismisses a card;
-    /// building one inside the chokepoint would add a second terminal voice
-    /// to a function whose single-voice property is grep-proved.
-    #[test]
-    fn a_busy_or_full_ledger_answers_capacity() {
-        for refusal in [DesignateRefusal::Busy, DesignateRefusal::Full] {
-            let (outcome, _) = designate_once(
-                crate::grants::PersistenceRung::WhileRunning,
-                AskedFor::Dir,
-                Err(refusal),
-            );
-            assert!(
-                matches!(
-                    outcome,
-                    UseOutcome::Refused {
-                        code: Refusal::Capacity,
-                        voiced: true
-                    }
-                ),
-                "{refusal:?} must answer capacity, got {outcome:?}"
-            );
-        }
     }
 
     /// **An owed admission reports its admission facts**, so the journal

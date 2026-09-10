@@ -106,6 +106,70 @@ confidentiality: whoever holds the descriptor can read its path out of
 `/proc/self/fd`. It is withheld so that no path is ever part of this
 interface's contract.
 
+## What the human sees, and four scripts it will not draw
+
+*This section and [the next](#while-an-ask-is-pending) say what a conformant
+picker does. Whether any deployment has one is a different question, answered
+under [Served status](#served-status): none serves `designate_file` today.*
+
+The picker is drawn by the core, with the core's own **shaping-free** text
+path. It draws real Unicode where it can, and it draws **Arabic, Hebrew,
+Devanagari and Thai as a transcription of their bytes** rather than as their own
+glyphs. Which repertoire a deployment's face covers is that deployment's — the
+reference core's is Latin, Greek and Cyrillic plus kana and subsetted kanji —
+but the two prohibitions below are normative, and so is the injectivity
+guarantee that follows from them.
+
+**That is permanent, and it is a published limit rather than work owed.**
+Drawing those four correctly needs a shaping engine (GSUB joining, GPOS mark
+positioning) and a bidi algorithm, and **a bidi algorithm on the trusted surface
+is itself the RTL-override filename spoof** — the attack in which a filename
+reorders its own visible extension in front of the human. The picker is the one
+surface in this system that must never misstate what a name is, so neither the
+shaping engine nor the bidi algorithm is added, at any version.
+
+**The transcription is a property of the pixels and never of the wire.**
+[`designated.name`](#designated) carries the exact basename bytes, unchanged and
+unmarked, at every version; a receiver that re-renders it gets whatever its own
+text stack can do, which may be more than the picker's. Two consequences a
+client must accept:
+
+- a human designating a file whose name is in one of those four scripts
+  approves a name they were shown a **transcription** of, so what the core
+  guarantees is **injectivity** — distinct bytes are drawn distinctly, and the
+  human is never shown one name for two different files — rather than
+  legibility;
+- an agent must not infer anything about a filename from what the picker drew,
+  because it never sees what the picker drew.
+
+## While an ask is pending
+
+While a designation of this principal's own is waiting on the human — the
+chokepoint admitted the ask and no terminal has arrived — that principal's
+**actuation is muted and its observation is not**:
+
+| this principal's use | while its own designation is pending |
+|---|---|
+| `actuate_pointer`, `actuate_text` | refused [`vitrin_grant.refused(verb, consent_held)`](./04-vitrin_grant.md#refusal) |
+| `layout_focus`, `layout_arrange` | refused `consent_held` |
+| `observe` (`capture_frame`) | **not refused** — a human answering a security question does not stop agents watching |
+| `designate_file` (another ask) | admitted by the chokepoint, then [`refused(busy)`](#refusal) on this facet |
+
+Other principals are unaffected in every row.
+
+**`consent_held` is reused rather than duplicated**, and the reuse is argued on
+[its own entry](./04-vitrin_grant.md#refusal): a pending petition of this
+principal's already raises it, the retry advice is identical, both prompts end
+with a terminal the agent is already waiting for, and an agent knows which of
+its own asks are outstanding — so a distinct code would buy a distinction no
+client can act on and would oblige every SDK to name a second exception.
+
+**What it must be distinguished from is "no".** `consent_held` means *wait, a
+human is choosing*; `not_granted`, `expired` and `revoked` mean the authority is
+gone. An agent that folds the first into the second stops asking when it should
+have waited, and one that folds the second into the first retries against a
+wall. That distinction, not which prompt is up, is the one the code carries.
+
 ## Two parties receive the same designation
 
 One designation, two connections:
@@ -121,6 +185,37 @@ the two halves together. Neither is derived from the other on the wire.
 An agent that only wanted the *app* to have the file may close its own
 descriptor immediately; holding it is not required for the realm's copy to
 work, and closing it does not revoke the realm's.
+
+### The two halves share one file offset
+
+The core resolves the human's choice **once** and sends that one descriptor
+twice. `SCM_RIGHTS` installs in each receiver a descriptor referring to the
+**same open file description** — which is what `dup(2)` produces, not what a
+second `open` would — so the agent's fd and the realm's fd are not two
+independent handles. They share the file position:
+
+- a `read` by either **advances the other's cursor**, and an `lseek` by either
+  moves the other;
+- for a **directory** designation the shared position is the `getdents` cursor,
+  so an agent and an app that both walk the subtree each see part of it and
+  neither sees all of it — the failure most likely to be misread as a corrupt
+  filesystem;
+- `O_APPEND` and a truncation seen through one are seen through both.
+
+A receiver that must not be disturbed by the other uses **positional I/O**
+(`pread`, `pwrite`, which never touch the shared offset) or, for a directory,
+opens a fresh description from the descriptor it already holds
+(`openat(dirfd, ".", O_RDONLY|O_DIRECTORY)`), which stays inside the designated
+subtree. **`dup` and `dup2` do not help**: they make another descriptor onto the
+very description being shared.
+
+**This is inherent to the one-resolution rule rather than a defect to be fixed
+by opening twice.** Two opens would resolve the human's choice twice, and
+between the two resolutions the name could come to mean a different file — so
+one confirmation could hand the agent and the realm two different files, which
+is exactly what a core-drawn picker exists to make impossible. A shared cursor
+is the price of both halves naming the same object, and it is by a wide margin
+the cheaper of the two costs.
 
 **The realm is never told which principal asked.** Naming the agent would make
 every designation a cross-principal identifier the app could fingerprint and
@@ -221,8 +316,8 @@ request order, never coalesced — and it is one of **three**:
 | terminal | when | answered by |
 |---|---|---|
 | [`designated(…)`](#designated) | the human chose and the core resolved the choice safely | the human |
-| [`refused(code)`](#refused) | the picker was raised and produced no descriptor | the human, or the core's own safety check |
-| [`vitrin_grant.refused(designate_file, …)`](./04-vitrin_grant.md#refused) | the chokepoint declined the ask; **no picker was raised** | the chokepoint |
+| [`refused(code)`](#refused) | the ask was **admitted** and still produced no descriptor | the human, the core's own safety check, or the core declining to raise a card ([`busy`](#refusal)) |
+| [`vitrin_grant.refused(designate_file, …)`](./04-vitrin_grant.md#refused) | the chokepoint declined the ask; **nothing reached the human** | the chokepoint |
 
 A three-way one-of rather than the usual pair, because there are genuinely two
 different questions with two different answerers: the chokepoint decides
@@ -252,8 +347,37 @@ Pipelining is legal and terminals pair in request order, exactly as
 [`capture_frame`](./06-vitrin_view.md)'s do. Asks are rate-limited by the
 grant's `max_event_rate` like every other use of a grant, which is what stops
 an agent raising pickers faster than a human can dismiss them; the
-per-principal single-picker rule ([`busy`](#refusal)) is the other half of the
+per-principal single-card rule ([`busy`](#refusal)) is the other half of the
 same protection.
+
+**Request-order pairing is normative, and it is a named open gap here.** The
+rule above binds every implementation, and **the reference core's designation
+machinery does not meet it** — which costs nothing while no deployment serves
+the verb, and costs a mispairing the day one does; recording it now rather than
+then is the point. The shape of the miss is structural rather than a slip: an
+ask that is
+*admitted* has its terminal owed across human time — seconds, or the whole
+deadline — while a second ask arriving behind it is refused
+[`busy`](#refusal) inside its own dispatch turn and answered immediately, so the
+second terminal precedes the first and a client pairing positionally mispairs
+them. Closing it needs **per-facet ordering state** — a queue that holds a
+synchronous refusal until every earlier ask on the same facet has been answered
+— which the enforcement chokepoint does not have and which no other verb has
+ever needed, because every other admitted use completes inside the call it was
+asked in. **That last clause is true of today rather than of the protocol.**
+[`request_connect`](./19-vitrin_egress.md#request_connect)'s admitted terminal
+is the *far end's* answer and cannot complete in the dispatch turn either, so
+egress takes this exact shape the day a proxy exists for it to admit anything.
+It admits nothing today, which is the only reason designation is the sole
+instance.
+
+Until it closes, **do not pipeline designation asks**: send one, wait for its
+terminal, send the next. [`refused`](#refused) carries **no `designation_id`**
+— its only argument is the code — so out-of-order terminals cannot be re-paired
+after the fact, and a signature is immutable forever, so the id cannot be added
+to that event; a `since`-gated sibling event would be the only route and none is
+reserved for. This is written down so the condition is met as a known one rather
+than found through a client that pairs positionally.
 
 ### request_dir
 
@@ -298,7 +422,10 @@ Exactly one per successful ask, in request order, never coalesced, carrying
 after use; the core closes its own copy after sending.
 
 **This fd outlives the grant** — see [revocation cannot recall a delivered
-descriptor](#revocation-cannot-recall-a-delivered-descriptor).
+descriptor](#revocation-cannot-recall-a-delivered-descriptor) — and **it shares
+its file offset with the realm's copy**, so a read by either party moves the
+other's cursor; see [the two halves share one file
+offset](#the-two-halves-share-one-file-offset).
 
 `kind` is redundant with which request was answered, since terminals pair in
 request order, and is carried anyway so a receiver that logs — or that hands
@@ -318,8 +445,11 @@ underneath any holder.
 | `code` | `uint` — enum [`refusal`](#refusal) | why the ask produced no descriptor |
 
 The terminal of an ask that the chokepoint **allowed** and that still yielded
-nothing — the human's answer, or the core's own refusal to designate what they
-chose. Exactly one per refused ask, in request order, never coalesced.
+nothing — the human's answer, the core's own refusal to designate what they
+chose, or the core's refusal to raise a card for this ask at all
+([`busy`](#refusal), the one code of the four for which nothing reached the
+human). Exactly one per refused ask, in request order, never coalesced — and
+[request order is the one rule here no implementation yet keeps](#request_file).
 
 **Not a second enforcement voice.** Authority questions are answered by
 [`vitrin_grant.refused`](./04-vitrin_grant.md#refused), from the one
@@ -367,7 +497,7 @@ out-of-range value is fatal `invalid_argument`.
 
 ### refusal
 
-Why a raised picker produced no descriptor. Answers are exhaustive rather than
+Why an admitted ask produced no descriptor. Answers are exhaustive rather than
 optional: every ask the chokepoint allows gets exactly one terminal, and an ask
 that designated nothing says why.
 
@@ -375,12 +505,31 @@ that designated nothing says why.
 |---|---|---|
 | `cancelled` | 0 | the human dismissed the picker without choosing — the ordinary answer; asking again later is legal |
 | `timed_out` | 1 | the picker was raised and expired unanswered, on the deployment's own deadline; distinct from `cancelled` because **nobody decided anything** |
-| `busy` | 2 | a picker for this principal is already up; at most one at a time, because two stacked in front of one human is the consent-fatigue shape [`busy`](./04-vitrin_grant.md#outcome) already names at petition time |
+| `busy` | 2 | **no card could be raised for this principal right now**, so nothing reached the human and asking again later is legal — either one is already up for it (at most one at a time, the consent-fatigue shape [`busy`](./04-vitrin_grant.md#outcome) already names at petition time), or the deployment's designation ledger is at its own resource bound |
 | `unresolvable` | 3 | the human chose, and the core **would not** designate it: the entry could not be resolved without following a symlink, or the path lost a race between the confirmation and the open. The core refuses rather than delivering a descriptor that may not name what the human saw. It says **nothing** about whether the entry exists |
 
 The set is deliberately small, and each entry is distinguished only because it
 means something different to a client deciding whether to ask again — which is
 the only decision this event informs.
+
+**This enum is where "no card could be raised" is answered**, which the header
+sentence would otherwise hide: three of the four codes describe a card that
+*was* raised, and `busy` describes an admitted ask for which none was. It
+belongs here rather than in
+[`vitrin_grant.refusal`](./04-vitrin_grant.md#refusal) because it is discovered
+*after* the chokepoint admitted the ask — the boundary between the two voices —
+and because that enum's `capacity` means the deployment is at its **realm**
+limit, an answer about a different mechanism.
+
+**`busy`'s two conditions are deliberately not distinguished.** The retry advice
+is identical, and merging them refuses to widen a cross-principal observation.
+It does not *remove* one, and saying so is the honest version: an agent with no
+ask of its own outstanding that hears `busy` learns that the deployment's
+designation capacity is exhausted by somebody else — one bit, at whatever rate
+its `max_event_rate` allows, on the same terms
+[`capacity`](./04-vitrin_grant.md#refusal) states for `realm_launch`. A
+deployment that cannot afford it bounds its ledger per principal, which the
+one-card rule already very nearly does.
 
 **No SDK typed-exception mapping exists yet**, and that is recorded rather than
 invented: the Python SDK does not implement the powerbox, so naming four
@@ -409,17 +558,34 @@ must actually accompany the frame; either disjunct alone failing is
 | `rate_limited` | the grant's token bucket is empty; `retry_after_ms` > 0 |
 | `internal` | a server-side failure while carrying the ask out |
 
-`no_surface` is never produced: a designation reaches the realm's *shim*, which
-exists whether or not its app has committed a surface. `capacity` is never
-produced either — it concerns creating a realm. `preempted` and
-`consent_held` are attention-shaped — they reach actuation and the layout
-verbs — and whether they should reach a request that *raises a prompt of its
-own* is a question P2.6.6 has to answer when it builds the picker; nothing here
-forecloses either answer. That open question is **normative** and now says so
-in the IDL, at [`vitrin_grant.refusal`](04-vitrin_grant.md#refusal), which
-carries designation's reachable set alongside every other class's: leaving it
-open in prose while the IDL's own enumeration silently closed it was the state
-this page inherited.
+**That set is now closed**, and the four codes it excludes are excluded for
+three different reasons rather than one. `no_surface` is never produced: a
+designation reaches the realm's *shim*, which exists whether or not its app has
+committed a surface. **`capacity` is never produced**, and it is the code most
+likely to be reached for by mistake — a card already up for this principal, or
+a designation ledger at its own resource bound, both genuinely resemble it.
+Both are answered on **this** facet by [`refused(busy)`](#refusal), because both
+are discovered *after* the chokepoint admitted the ask; `capacity` means the
+deployment is at its **realm** limit, and a server that voiced it here would
+tell an agent it could launch no realm. **`preempted` is never produced**: it
+mutes something delivered *into* the human's realm past the human, and an ask
+whose whole purpose is to put a card in front of that same human is refused by
+their presence only if presence is read backwards. **`consent_held` is never
+produced *for a designation ask*** — a second card in front of one human is a
+real hazard, and it is answered by `busy` where the card is. The reason is the
+**admission boundary**, not any ignorance on the chokepoint's part: the
+chokepoint can perfectly well learn that a card of this principal's is up — it
+learns exactly that from the mechanism it consults, and it acts on that
+knowledge to mute the same principal's actuation, one paragraph down. What it
+may not do is answer the ask's *own* terminal for a condition found **after** it
+admitted the ask; and `busy`'s second condition, a ledger at its resource bound,
+is deployment-wide state rather than anything about this principal's screen.
+
+`consent_held` **does** reach this facet in the other direction, and reading the
+paragraph above as covering both is the misreading to avoid — see
+[while an ask is pending](#while-an-ask-is-pending). P2.6.6 closed the set; it
+was left open by P2.6.5, and the IDL's own note that a server "must not read the
+silence as licence" is what the closure discharges.
 
 ## Flows
 

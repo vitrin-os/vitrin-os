@@ -329,7 +329,7 @@ pub mod events {
 
     /// Event `refused` (opcode 1) on `vitrin_powerbox`.
     ///
-    /// the picker was raised and produced no descriptor
+    /// an admitted ask produced no descriptor
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct Refused {
         /// why the ask produced no descriptor
@@ -504,7 +504,7 @@ impl Kind {
 
 /// Enum `refusal` on `vitrin_powerbox`.
 ///
-/// why a raised picker produced no descriptor
+/// why an admitted ask produced no descriptor
 ///
 /// Plain enum: a wire value MUST exactly equal one defined entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -514,7 +514,7 @@ pub enum Refusal {
     Cancelled = 0,
     /// the picker was raised and expired unanswered, on the deployment's own deadline; distinct from cancelled because nobody decided anything
     TimedOut = 1,
-    /// a picker for this principal is already up; at most one at a time, because two stacked in front of one human is the consent-fatigue shape the busy petition outcome already names
+    /// no card could be raised for this principal right now, so nothing was put in front of the human and asking again later is legal. TWO conditions produce it and they are deliberately not distinguished: a card for this principal is already up (at most one at a time, because two stacked in front of one human is the consent-fatigue shape the busy petition outcome already names), or the deployment's designation ledger is at its own resource bound. Merging them keeps the retry advice identical - which it is - and refuses to widen a cross-principal observation, though it does not remove one: an agent with no ask of its own outstanding that hears busy learns that the deployment's designation capacity is exhausted by somebody else, one bit, at whatever rate its max_event_rate allows. That is named here rather than left to be discovered, on vitrin_grant.refusal.capacity's terms; a deployment that cannot afford it bounds its ledger per principal, which the one-card rule already very nearly does
     Busy = 2,
     /// the human chose, and the core would not designate it: the entry could not be resolved without following a symlink or losing a race between the confirmation and the open, so the core refuses rather than delivering a descriptor that may not name what the human saw; says nothing about whether the entry exists
     Unresolvable = 3,

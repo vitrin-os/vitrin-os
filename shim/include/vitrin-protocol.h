@@ -537,13 +537,13 @@ typedef enum {
     VITRIN_GRANT_REFUSAL_RATE_LIMITED = 3,
     /* physical human input owns the target right now */
     VITRIN_GRANT_REFUSAL_PREEMPTED = 4,
-    /* the principal's own pending petition has a prompt up; that principal's actuation is refused (never delivered to the app) until the prompt closes; other principals' grants are unaffected */
+    /* a prompt of that principal's OWN is up, and that principal's actuation is refused (never delivered to the app) until it closes; other principals' grants are unaffected. TWO prompts raise it, not one: the principal's own pending petition, and a designation of its own still waiting on the human - an ask the chokepoint admitted whose terminal (designated, or the powerbox's refused) has not arrived. Its OBSERVATION is refused by neither, which is the standing posture that a human answering a security question does not stop agents watching. The two prompts are deliberately NOT distinguished by this code: both mean WAIT rather than NO, both end with a terminal the agent is already waiting for, and an agent knows which of its own asks are outstanding - so a distinct entry would buy a distinction no client can act on and would oblige every SDK to name a second exception. What a client must never do is read this as a lifecycle answer and stop asking; that is what not_granted, expired and revoked are for */
     VITRIN_GRANT_REFUSAL_CONSENT_HELD = 5,
     /* the realm has no surface (its shim crashed or exited); never a stale frame */
     VITRIN_GRANT_REFUSAL_NO_SURFACE = 6,
     /* server-side failure during this use (renderer, memfd, delivery) */
     VITRIN_GRANT_REFUSAL_INTERNAL = 7,
-    /* the deployment is at its realm capacity, so no new realm can be created; a policy answer rather than a server-side failure, which is why it is not internal - retrying is legal once a realm exits, and retry_after_ms is 0 because the core cannot know when that will be. NOTE, a deliberate exception: every other code answers from the asking principal's OWN grant, but this one answers from deployment-wide state, so a principal holding one launch grant can poll launch and watch the answer flip - observing that SOME other principal created or exited a realm. That is a low-bandwidth cross-principal side channel, inherent to answering the question at all, and it is named here rather than left to be discovered; a deployment that cannot afford it must not serve realm_launch, because no attenuation of a launch grant removes it */
+    /* the deployment is at its realm capacity, so no new realm can be created; a policy answer rather than a server-side failure, which is why it is not internal - retrying is legal once a realm exits, and retry_after_ms is 0 because the core cannot know when that will be. NOTE, a deliberate exception: every other code answers from the asking principal's OWN grant, but this one answers from deployment-wide state, so a principal holding one launch grant can poll launch and watch the answer flip - observing that SOME other principal created or exited a realm. That is a low-bandwidth cross-principal side channel, inherent to answering the question at all, and it is named here rather than left to be discovered; a deployment that cannot afford it must not serve realm_launch, because no attenuation of a launch grant removes it. REALM capacity, and only that: a designation ask that finds a card already up or the picker ledger full is answered on the powerbox's own facet by refusal busy, never here */
     VITRIN_GRANT_REFUSAL_CAPACITY = 8,
 } vitrin_grant_refusal_t;
 
@@ -1133,7 +1133,7 @@ static inline bool vitrin_powerbox_kind_is_valid(uint32_t v) {
 
 /* Enum `refusal` on `vitrin_powerbox`.
  *
- * why a raised picker produced no descriptor
+ * why an admitted ask produced no descriptor
  *
  * Plain enum: a wire value MUST exactly equal one defined entry. */
 typedef enum {
@@ -1141,7 +1141,7 @@ typedef enum {
     VITRIN_POWERBOX_REFUSAL_CANCELLED = 0,
     /* the picker was raised and expired unanswered, on the deployment's own deadline; distinct from cancelled because nobody decided anything */
     VITRIN_POWERBOX_REFUSAL_TIMED_OUT = 1,
-    /* a picker for this principal is already up; at most one at a time, because two stacked in front of one human is the consent-fatigue shape the busy petition outcome already names */
+    /* no card could be raised for this principal right now, so nothing was put in front of the human and asking again later is legal. TWO conditions produce it and they are deliberately not distinguished: a card for this principal is already up (at most one at a time, because two stacked in front of one human is the consent-fatigue shape the busy petition outcome already names), or the deployment's designation ledger is at its own resource bound. Merging them keeps the retry advice identical - which it is - and refuses to widen a cross-principal observation, though it does not remove one: an agent with no ask of its own outstanding that hears busy learns that the deployment's designation capacity is exhausted by somebody else, one bit, at whatever rate its max_event_rate allows. That is named here rather than left to be discovered, on vitrin_grant.refusal.capacity's terms; a deployment that cannot afford it bounds its ledger per principal, which the one-card rule already very nearly does */
     VITRIN_POWERBOX_REFUSAL_BUSY = 2,
     /* the human chose, and the core would not designate it: the entry could not be resolved without following a symlink or losing a race between the confirmation and the open, so the core refuses rather than delivering a descriptor that may not name what the human saw; says nothing about whether the entry exists */
     VITRIN_POWERBOX_REFUSAL_UNRESOLVABLE = 3,
@@ -6903,7 +6903,7 @@ static inline vitrin_decode_status_t vitrin_powerbox_evt_designated_decode(
 
 /* Event `refused` (opcode 1) on `vitrin_powerbox`.
  *
- * the picker was raised and produced no descriptor
+ * an admitted ask produced no descriptor
  */
 typedef struct {
     /* why the ask produced no descriptor */

@@ -869,10 +869,10 @@ NoSurface, OperationFailed, AtCapacity).
 | `revoked` | 2 | revoked by hold-Esc, panel, or policy; effective on the very next request |
 | `rate_limited` | 3 | the token bucket is empty; `retry_after_ms` hints the refill |
 | `preempted` | 4 | physical human input owns the target right now — **conditional for the two layout verbs**, see below |
-| `consent_held` | 5 | the principal's **own** pending petition has a prompt up; that principal's actuation is refused (never delivered to the app) until the prompt closes — other principals' grants are unaffected |
+| `consent_held` | 5 | a prompt of that principal's **own** is up — its pending petition, **or** a designation of its own still waiting on the human — and that principal's actuation is refused (never delivered to the app) until the prompt closes; its observation is refused by neither, and other principals' grants are unaffected |
 | `no_surface` | 6 | the realm has no surface (its shim crashed or exited); never a stale frame |
 | `internal` | 7 | server-side failure during this use (renderer, memfd, delivery) |
-| `capacity` | 8 | the deployment is at its realm capacity, so no new realm can be created |
+| `capacity` | 8 | the deployment is at its **realm** capacity, so no new realm can be created — never an answer about pickers |
 
 This enum types `refused.code`.
 
@@ -892,22 +892,60 @@ so reaches only `realm_launch`. A code's absence from a verb's reachable set
 is a property of the operation, never a promise the code is unused.
 
 **`designate_file` reaches the grant-lifecycle four** (`not_granted`,
-`expired`, `revoked`, `rate_limited`) **and `internal`** — and it is the one
-class whose set this document does **not** yet close. Never `no_surface`, for a
-reason that is neither launch's nor egress's: a designation is delivered to the
-realm's *shim*, which exists from the moment the realm does, whether or not its
-app has ever committed a surface. Never `capacity`. **What is not settled is
-`preempted` and `consent_held`.** Both are attention-shaped, and
+`expired`, `revoked`, `rate_limited`) **and `internal`, and nothing else.**
+That set was left open when the powerbox landed; **P2.6.6 closes it**, because
+leaving it open once the picker existed would have made the silence the licence
+the IDL already said it was not. Never `no_surface`, for a reason that is
+neither launch's nor egress's: a designation is delivered to the realm's *shim*,
+which exists from the moment the realm does, whether or not its app has ever
+committed a surface.
+
+**Never `capacity`, and that is the code most likely to be reached for by
+mistake.** Two conditions genuinely resemble it — a card already up for this
+principal, or the deployment's designation ledger at its own resource bound —
+and both are answered on the facet, by
+[`vitrin_powerbox.refusal`](13-vitrin_powerbox.md#refusal)'s `busy`, because
+both are discovered *after* the chokepoint admitted the ask. That is the
+boundary between the two voices. `capacity` stays what its row says: the
+deployment is at its **realm** limit, reachable only through `realm_launch`. A
+server that voiced it for a full picker ledger would answer a question about
+cards with a code about realms, and an agent reading it correctly would conclude
+the deployment could launch no realm — the sharpest kind of wrong answer,
+because it is actionable.
+
+**Never `preempted`.** The argument that mutes an actuation while the human's
+hand is on the input does not transfer.
 [`request_file`](13-vitrin_powerbox.md#request_file)/`request_dir` are the only
 **uses of a grant** in this protocol that *raise a prompt of their own* (a
-petition does too, but a petition is not a use), so the argument that mutes an
-actuation while the human's hand is on the input does not transfer unexamined
-to a request whose whole purpose is to put something in front of that same
-human. P2.6.6 answers it when it builds the picker; nothing here forecloses
-either answer, and a server must not read the silence as licence to give either
-code a third meaning. What *is* settled: two pickers colliding is already
-answered, by [`vitrin_powerbox.refusal`](13-vitrin_powerbox.md#refusal)'s
-`busy` on that interface's own event. Only the human's hand is undecided.
+petition does too, but a petition is not a use), and that is what makes them the
+exception rather than what leaves them undecided: `preempted` exists for
+something delivered *into* the human's realm past the human, and an ask whose
+whole purpose is to put a card in front of that same human is refused by their
+presence only if presence is read backwards.
+
+**Never `consent_held` — for a designation *ask*.** A second card in front of
+one human is a real hazard; it is answered where the card is, by that facet's
+`busy`. **The reason is the admission boundary, not any ignorance on the
+chokepoint's part** — the chokepoint can perfectly well learn that a card of
+this principal's is up, it learns exactly that from the mechanism it consults,
+and the next paragraph has it act on that knowledge; an argument from what the
+chokepoint cannot see would be false one paragraph later. What it may not do is
+answer the ask's *own* terminal for a condition found **after** it admitted the
+ask. And `busy`'s second condition is not principal-scoped at all: a designation
+ledger at its resource bound is deployment-wide state, which is the one thing
+`capacity` already means — about realms.
+
+**But `consent_held` does reach designation in the other direction**, and
+reading the paragraph above as covering both is the misreading to avoid. While a
+designation of *this* principal's own is pending, that principal's **actuation**
+is refused `consent_held` until the card closes — exactly as its own pending
+petition already refuses it — and its **observation** continues. The code is
+reused rather than duplicated: both prompts mean *wait* rather than *no*, both
+end with a terminal the agent is already waiting for, and an agent knows which
+of its own asks are outstanding, so a distinct entry would buy a distinction no
+client can act on and would oblige every SDK to name a second exception. See
+[`vitrin_powerbox` § while an ask is
+pending](13-vitrin_powerbox.md#while-an-ask-is-pending).
 
 **`egress` reaches the grant-lifecycle four** (`not_granted`, `expired`,
 `revoked`, `rate_limited`) **and `internal`, and nothing else.** Never
@@ -997,6 +1035,14 @@ than fixed. Three consequences worth being explicit about:
   `max_event_rate`; this paragraph was written while the enum entry was
   being frozen, and is now what a deployment declining to serve the verb
   is declining on.
+
+**"The only one here" means *in this enum*, and one more of the same shape lives
+one facet away.** [`vitrin_powerbox.refusal`](13-vitrin_powerbox.md#refusal)'s
+`busy` also answers partly from deployment-wide state: an agent with no
+designation ask of its own outstanding that hears it learns that somebody else
+has exhausted the deployment's designation capacity. It is named on that page,
+on these same terms, and it is stated here so this paragraph's "only" is not
+read as a claim about the protocol.
 
 ## Flows
 

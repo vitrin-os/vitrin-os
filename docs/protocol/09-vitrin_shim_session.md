@@ -624,6 +624,25 @@ adding one would buy nothing: a shim that cannot relay a descriptor closes it,
 and the agent's own answer was already delivered on its own connection before
 this event was sent.
 
+**This descriptor shares its file offset with the asking agent's**, and nothing
+about this signature suggests it. The core resolves the human's choice **once**
+and sends that one descriptor twice — to the agent as
+[`vitrin_powerbox.designated`](./13-vitrin_powerbox.md#designated), and to this
+realm here — and `SCM_RIGHTS` installs in each receiver a descriptor onto the
+**same open file description**, which is what `dup(2)` produces rather than what
+a second `open` would. So the app's reads advance the agent's cursor and the
+agent's advance the app's; for a **directory** designation the shared position is
+the `getdents` cursor, so an agent and an app that both walk the subtree each
+see part of it and neither sees all of it. A shim relaying this fd cannot repair
+that and must not try — the app's remedies are positional I/O (`pread`,
+`pwrite`) or a fresh description opened from the descriptor it was handed
+(`openat(dirfd, ".", …)`), and `dup` is not one, since it makes another
+descriptor onto the very description being shared. Resolving the choice twice
+instead would let the two halves name two different files, which is what a
+core-drawn picker exists to prevent, so the shared cursor is the deliberate half
+of that trade. Stated in full at
+[`vitrin_powerbox`](./13-vitrin_powerbox.md#the-two-halves-share-one-file-offset).
+
 **What the core cannot take back.** Once the fd crosses, it is kernel authority
 the core has no means to recall — no revocation, no expiry, and no dead-man
 chord closes a descriptor in another process. Revoking the grant stops *future*

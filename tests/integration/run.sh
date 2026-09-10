@@ -178,6 +178,35 @@ PROPERTY_GATES=(
                                 # names who asked (#207). The one gate covering
                                 # a wire-reachable path into `spawn.rs`, so its
                                 # silent absence is the costliest of any here.
+  test_real_powerbox.py         # P2.6.6 (#190): a real agent designates a real
+                                # file through the real core-drawn picker,
+                                # driven by the consent channel's four picker
+                                # verbs, and the descriptor that arrives over
+                                # SCM_RIGHTS is the INODE of the row the picker
+                                # displayed -- compared against a (st_dev,
+                                # st_ino) recorded before the core started,
+                                # never against a path re-resolved now, which
+                                # is the race the picker exists to close. The
+                                # bytes are then read (and, for a write=True
+                                # designation, written) through it, because a
+                                # descriptor held is not a descriptor proved.
+                                # A cancel answers refused(cancelled) and a
+                                # symlink row refused(unresolvable), neither
+                                # delivering a descriptor -- asserted by
+                                # counting this process's own /proc/self/fd.
+                                # And the picker reaches NO capture: the realm
+                                # view and the agent's own frame are
+                                # byte-identical to settled controls and carry
+                                # zero px of the card's two most distinctive
+                                # colours, both of which are counted, at that
+                                # same instant, in the human-visible export --
+                                # which is first shown to BE a picker raster at
+                                # the rectangle the core named, with its
+                                # selected-row highlight on the slot the
+                                # channel independently reported and moving
+                                # exactly one slot when the cursor does.
+                                # Deliberately NOT a milestone gate: M2.5's is
+                                # ★P2.6.9 (test_real_ransomware.py), unwritten.
 )
 # The rest of the suite: modules that are neither a milestone gate nor a named
 # property gate, but that `unittest discover` collects and this run is cited

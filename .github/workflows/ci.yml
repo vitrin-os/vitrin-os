@@ -1616,12 +1616,39 @@ jobs:
           # It had drifted AGAIN by P2.6.2: `test_real_gestures.py` (WS-E.4.2,
           # #222) was in run.sh's list and never here. Both are named now, plus
           # `test_real_confinement.py` (#186).
-          for gate in test_real_trust_band.py test_two_realms.py test_layout.py test_input_switch.py test_attention.py test_real_clipboard.py test_screenshot.py test_real_gestures.py test_real_confinement.py test_launch.py test_shell.py; do
+          #
+          # And a THIRD time, found while landing P2.6.6 (#190):
+          # `test_real_seccomp.py`, `test_real_ransomware.py` and
+          # `test_real_powerbox.py` were all in run.sh's array and none of them
+          # here, so three named property gates could have vanished with this
+          # job staying green. Three drifts is enough: the duplication is kept
+          # (it is deliberate -- this job answers in seconds without a build,
+          # a toolchain or the C shim), but the two lists are now COMPARED
+          # below, so a fourth drift is a red build rather than a discovery.
+          for gate in test_real_trust_band.py test_two_realms.py test_layout.py test_input_switch.py test_attention.py test_real_clipboard.py test_screenshot.py test_real_gestures.py test_real_confinement.py test_launch.py test_shell.py test_real_seccomp.py test_real_ransomware.py test_real_powerbox.py; do
             if [ ! -f "tests/integration/$gate" ]; then
               echo "::error::named property gate tests/integration/$gate is missing -- unittest discover would not collect it and this job would stay green with that property's evidence contributing nothing. Restore it, or retire it from run.sh's PROPERTY_GATES, this list, and tests/integration/README.md's gate table together."
               missing=1
             fi
           done
+          # The lists must AGREE, not merely both exist. Duplication for
+          # independence is only worth its cost while the copies are the same
+          # copy; this one had drifted three times before anything compared
+          # them.
+          runsh_gates=$(awk '/^PROPERTY_GATES=\(/,/^\)/' tests/integration/run.sh \
+            | grep -oE 'test_[a-z_]+\.py' | sort -u)
+          ci_gates=$(printf '%s\n' test_real_trust_band.py test_two_realms.py \
+            test_layout.py test_input_switch.py test_attention.py \
+            test_real_clipboard.py test_screenshot.py test_real_gestures.py \
+            test_real_confinement.py test_launch.py test_shell.py \
+            test_real_seccomp.py test_real_ransomware.py test_real_powerbox.py \
+            | sort -u)
+          if [ "$runsh_gates" != "$ci_gates" ]; then
+            echo "::error::this job's copy of run.sh's PROPERTY_GATES has drifted. It has drifted three times before, each time leaving named gates unguarded while this job stayed green. Diff follows; edit run.sh, this list and tests/integration/README.md's gate table together."
+            diff <(printf '%s\n' "$runsh_gates") <(printf '%s\n' "$ci_gates") || true
+            missing=1
+          fi
+
           # And the other direction, added for issue #288: a module ON DISK
           # that run.sh names in NONE of its three lists. Seven were in that
           # state -- test_real_firefox.py, test_real_gtk.py,

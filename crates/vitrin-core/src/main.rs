@@ -225,6 +225,7 @@ mod lock;
 /// with the consent surface's private tools. It confers nothing and holds no
 /// session state; the authority claims stay in `consent` and `lock`.
 mod paint;
+mod picker;
 /// **A notice the human can read on the panel they are trying to leave**
 /// (WS-E.3.5): a bounded, expiring, human-visible-only band the core raises
 /// when something it cannot fix has happened to the session itself. Its only

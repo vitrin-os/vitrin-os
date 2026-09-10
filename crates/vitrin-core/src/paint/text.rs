@@ -69,6 +69,11 @@ const _: () = assert!(
     "the vendored trusted-surface font changed; see crates/vitrin-core/assets/fonts/README.md"
 );
 
+/// Handed to the pen loop on the measure path, where no pixel is blended
+/// and therefore no colour is read. Named rather than inlined so a reader
+/// meets the reason instead of an arbitrary black.
+const MEASURE_RGB: [u8; 3] = [0, 0, 0];
+
 /// What [`Text::draw`] renders in place of any non-ASCII-printable character
 /// (module docs). Visible on purpose: a silently dropped character is a
 /// consent prompt quietly saying something other than what it was given.
@@ -167,14 +172,73 @@ impl Text {
         }
     }
 
+    /// The one pen loop: every measurement and every draw in this module
+    /// runs through it.
+    ///
+    /// Measured and drawn text agree here **by construction**, not because
+    /// two loops are kept in step — [`Self::width`] and [`Self::draw`] visit
+    /// the same characters in the same order through the same accumulator,
+    /// and differ only in whether a canvas was handed in.
+    ///
+    /// `pen` is borrowed rather than owned so a caller can carry one
+    /// accumulator across several calls. That is what makes a multi-run draw
+    /// *identical* to a single draw of the concatenation instead of merely
+    /// close to it: restarting the pen per run would replace
+    /// `round(P + q)` with `round(P) + round(q)`, which differs on the
+    /// majority of strings.
+    ///
+    /// The colour rides on each character rather than on the call so one
+    /// pass can change colour mid-string. It is unread when `canvas` is
+    /// `None`, since a measurement blends nothing.
+    fn pen_run<I>(
+        &mut self,
+        mut canvas: Option<&mut Canvas<'_>>,
+        chars: I,
+        px: f32,
+        x: i32,
+        baseline: i32,
+        pen: &mut f32,
+    ) where
+        I: Iterator<Item = (char, [u8; 3])>,
+    {
+        for (ch, rgb) in chars {
+            let glyph = self.glyph(ch, px);
+            let advance = glyph.metrics.advance_width;
+            if let Some(canvas) = canvas.as_deref_mut() {
+                let gx = x + pen.round() as i32 + glyph.metrics.xmin;
+                // fontdue reports `ymin` from the baseline upward, so the top
+                // of the bitmap sits `height + ymin` above it.
+                let gy = baseline - glyph.metrics.ymin - glyph.metrics.height as i32;
+                let (w, h) = (glyph.metrics.width, glyph.metrics.height);
+                // Copy out of the cache before touching the canvas: the borrow
+                // checker aside, this keeps the blend loop free of a hash lookup.
+                let coverage = glyph.coverage.clone();
+                for row in 0..h {
+                    for col in 0..w {
+                        let alpha = coverage[row * w + col];
+                        canvas.blend_pixel(gx + col as i32, gy + row as i32, rgb, alpha);
+                    }
+                }
+            }
+            *pen += advance;
+        }
+    }
+
     /// Advance width of `s` at `px`, in whole pixels — what the layout
     /// measures with and what [`Self::draw`] then advances by, so measured
     /// and drawn text can never disagree.
     pub fn width(&mut self, s: &str, px: f32) -> u32 {
         let mut pen = 0.0f32;
-        for ch in s.chars() {
-            pen += self.glyph(Self::renderable(ch), px).metrics.advance_width;
-        }
+        // `MEASURE_RGB` is never read: `canvas` is `None`, so no pixel is
+        // blended. It exists so measuring and drawing share one loop.
+        self.pen_run(
+            None,
+            s.chars().map(|ch| (Self::renderable(ch), MEASURE_RGB)),
+            px,
+            0,
+            0,
+            &mut pen,
+        );
         // `max(0.0)` before the cast: a negative accumulated advance is not
         // reachable with this font, but `as u32` on a negative float
         // saturates to 0 silently and a width is unsigned by nature.
@@ -217,25 +281,14 @@ impl Text {
         rgb: [u8; 3],
     ) {
         let mut pen = 0.0f32;
-        for ch in s.chars() {
-            let glyph = self.glyph(Self::renderable(ch), px);
-            let advance = glyph.metrics.advance_width;
-            let gx = x + pen.round() as i32 + glyph.metrics.xmin;
-            // fontdue reports `ymin` from the baseline upward, so the top of
-            // the bitmap sits `height + ymin` above it.
-            let gy = baseline - glyph.metrics.ymin - glyph.metrics.height as i32;
-            let (w, h) = (glyph.metrics.width, glyph.metrics.height);
-            // Copy out of the cache before touching the canvas: the borrow
-            // checker aside, this keeps the blend loop free of a hash lookup.
-            let coverage = glyph.coverage.clone();
-            for row in 0..h {
-                for col in 0..w {
-                    let alpha = coverage[row * w + col];
-                    canvas.blend_pixel(gx + col as i32, gy + row as i32, rgb, alpha);
-                }
-            }
-            pen += advance;
-        }
+        self.pen_run(
+            Some(canvas),
+            s.chars().map(|ch| (Self::renderable(ch), rgb)),
+            px,
+            x,
+            baseline,
+            &mut pen,
+        );
     }
 
     /// Break `s` into at most `max_lines` lines no wider than `max_width`.

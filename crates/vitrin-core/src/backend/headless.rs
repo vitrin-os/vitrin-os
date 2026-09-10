@@ -4079,6 +4079,10 @@ mod tests {
                     }
                     state.headless.loop_signal.stop();
                 }
+                // This harness asks for no turns, so one arriving would mean
+                // the source invented it. Panicking rather than ignoring keeps
+                // that from passing as a quiet no-op.
+                ConnectionEvent::Woken => panic!("a turn nobody asked for"),
                 ConnectionEvent::Fault(reason) => panic!("transport fault: {reason}"),
             })
             .expect("insert connection source");

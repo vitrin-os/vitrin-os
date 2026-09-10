@@ -269,6 +269,15 @@ fn start_server(path: &Path) -> (EventLoop<'static, Server>, Server) {
                                     }
                                 }
                             }
+                            // These connections are built with
+                            // `ConnectionSource::new`, so no `Outbox` for them
+                            // exists anywhere and nothing can ask for a turn
+                            // on one. Asserted rather than ignored: a source
+                            // that invented turns nobody requested would be a
+                            // regression this file should catch, not absorb.
+                            ConnectionEvent::Woken => {
+                                unreachable!("no outbox on this connection, so no wake is possible")
+                            }
                             ConnectionEvent::Disconnected => state.disconnects += 1,
                             ConnectionEvent::Fault(reason) => state.faults.push(reason),
                         })

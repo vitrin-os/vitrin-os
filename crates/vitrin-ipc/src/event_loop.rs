@@ -73,7 +73,7 @@
 //!   wire-format change belonging to `track:protocol` (see the crate docs).
 //!   Any parked replies to the dying peer are dropped with it.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::fmt;
 use std::io;
@@ -206,15 +206,27 @@ fn set_nonblocking(fd: BorrowedFd<'_>) -> io::Result<()> {
 /// What a [`ConnectionSource`] hands the core for one readiness.
 ///
 /// A single readiness fires the dispatch callback once per complete frame
-/// ([`Message`]), then at most once more with a terminal variant
-/// ([`Disconnected`](ConnectionEvent::Disconnected) or
-/// [`Fault`](ConnectionEvent::Fault)) after which the source removes itself
-/// from the loop.
+/// ([`Message`]), then -- if the core asked for a turn with [`Outbox::wake`]
+/// -- once with [`Woken`](ConnectionEvent::Woken), then at most once more
+/// with a terminal variant ([`Disconnected`](ConnectionEvent::Disconnected)
+/// or [`Fault`](ConnectionEvent::Fault)) after which the source removes
+/// itself from the loop.
 #[derive(Debug)]
 pub enum ConnectionEvent {
     /// One complete decoded frame. `bytes` + `fd` feed straight into the
     /// generated `decode` for the message's object/opcode.
     Message(Message),
+    /// A turn the core asked for with [`Outbox::wake`]. **Nothing was
+    /// received.** It carries nothing and confers nothing -- except the one
+    /// thing a silent peer cannot supply: an *occasion to write*, i.e. the
+    /// [`NoIoDrop<Connection>`](NoIoDrop) that [`reply`] needs and that only
+    /// a dispatch callback holds.
+    ///
+    /// Emitted at most once per [`Outbox::wake`], **after** every frame that
+    /// arrived in the same turn (so an inbound cancel is seen before the
+    /// write it would cancel), and never on a connection this turn has
+    /// already decided to remove.
+    Woken,
     /// The peer closed cleanly between frames. The source will be removed;
     /// the core should forget the connection. Any replies still parked in
     /// its send queue are dropped with it.
@@ -244,6 +256,18 @@ pub struct ConnectionSource {
     /// connection whose every reply is issued from inside its own dispatch
     /// callback, which is the ordinary principal-connection shape.
     outbox: Option<OutboxSink>,
+    /// A dispatch turn was requested by [`Outbox::wake`] and not yet
+    /// delivered as [`ConnectionEvent::Woken`].
+    ///
+    /// It lives on the source and **not** inside [`OutboxSink`] on purpose:
+    /// `process_events` sets `outbox` to `None` the moment every [`Ping`]
+    /// handle is dropped, so a flag stored in the sink would be destroyed by
+    /// that same dispatch and a wake requested just before the last `Outbox`
+    /// clone went away would be lost silently. Here it survives the sink and
+    /// is still read by the interest recomputation that delivers it. A
+    /// connection built with [`ConnectionSource::new`] holds the sole
+    /// reference to its flag, so nothing can ever set it.
+    wake: Rc<Cell<bool>>,
 }
 
 /// The source-side half of an [`Outbox`]: the queue itself plus the
@@ -304,10 +328,19 @@ pub const MAX_OUTBOX_FRAMES: usize = 64;
 /// connection, which already has [`reply`]. Refusing fds here keeps the
 /// queue plain `Vec<u8>` and means a parked outbox can never pin a
 /// descriptor open.
+///
+/// [`wake`](Self::wake) does not weaken that rule and is not an exception to
+/// it: it enqueues nothing and transmits nothing, so there is no wire on
+/// which an fd could ride. What it buys is the *dispatch* an fd-bearing
+/// [`reply`] needs, for a peer that is never going to speak first.
 #[derive(Clone)]
 pub struct Outbox {
     queue: Rc<RefCell<VecDeque<Vec<u8>>>>,
     ping: Ping,
+    /// Shared with the owning [`ConnectionSource`]; see
+    /// [`Outbox::wake`]. Distinct from `queue` because a wake is not a
+    /// queue entry: it carries no bytes at all.
+    wake: Rc<Cell<bool>>,
 }
 
 impl Outbox {
@@ -336,11 +369,92 @@ impl Outbox {
         Ok(())
     }
 
+    /// Ask the loop for a dispatch turn on this connection. No frame, no fd,
+    /// no queue entry -- just the occasion to write, delivered to the
+    /// dispatch callback as [`ConnectionEvent::Woken`].
+    ///
+    /// # This is a wakeup, not a write
+    ///
+    /// Nothing is queued and nothing is transmitted: this method takes no
+    /// bytes and no descriptor, and a peer watching the socket observes no
+    /// traffic from it at all. The "frames only, never fds" rule on
+    /// [`send`](Self::send) above therefore stands verbatim -- `wake` is not
+    /// a second, wider send path, because it is not a send path. Whatever
+    /// the core writes on the turn goes out through [`reply`], which is the
+    /// existing fd-capable call site and remains the only one.
+    ///
+    /// # Why the core needs it
+    ///
+    /// A reply carrying a descriptor can only be written through [`reply`],
+    /// which needs the [`NoIoDrop<Connection>`](NoIoDrop) that only a
+    /// dispatch callback holds -- so by construction the core can write an
+    /// fd to a peer only while that peer is speaking to it. When the answer
+    /// is produced by an event on a *different* source (a human's keypress
+    /// on the seat, an expiring deadline) there is no dispatch of this
+    /// connection to write from, and the peer is silent precisely because it
+    /// is waiting. `wake` manufactures the missing dispatch without
+    /// manufacturing a message.
+    ///
+    /// # When the turn arrives, and when it never does
+    ///
+    /// It never arrives inside this call: `wake` sets a flag and pings, and
+    /// nothing else. The ping only gets the source's `process_events` run;
+    /// the event itself is emitted from the *connection's* own dispatch,
+    /// which the source arranges by taking write-interest while a wake is
+    /// pending. An idle socket with room in its send buffer is write-ready at
+    /// once, so the normal case is the very next iteration of the loop. The
+    /// one exception to "a later iteration" is a `wake` issued from inside
+    /// *this* connection's own dispatch -- from a
+    /// [`Message`](ConnectionEvent::Message) handler, say: the emit sits
+    /// after that dispatch's receive drain, so such a turn lands at the end
+    /// of the same dispatch rather than a later one.
+    ///
+    /// Repeated calls before a delivery collapse into one turn, exactly as
+    /// repeated pings do. A peer whose receive buffer is full and which is
+    /// sending nothing *delays* the turn until it drains -- the same
+    /// condition under which the write the turn exists for could not have
+    /// gone out anyway.
+    ///
+    /// One case does not delay the turn but **loses** it outright, and a
+    /// caller holding a descriptor has to plan for it: an `Outbox` is
+    /// [`Clone`] and outlives its [`ConnectionSource`], so it can still be
+    /// woken after the source has left the loop -- the peer disconnected, or
+    /// faulted, and calloop dropped the source. This call then still
+    /// "succeeds": it sets the flag and pings an eventfd nobody is reading,
+    /// [`wake_pending`](Self::wake_pending) stays set for good, and no turn
+    /// ever comes. There is deliberately no error to return, because there is
+    /// nothing here that can fail and nothing on this side that can tell a
+    /// pending turn from a dead one. The death is reported where every other
+    /// death on this connection is -- as
+    /// [`ConnectionEvent::Disconnected`] or [`ConnectionEvent::Fault`] on its
+    /// last dispatch -- so a core that is holding an fd for a turn it asked
+    /// for must release it on that terminal event and must not wait on
+    /// `Woken` to arrive. Pinned by
+    /// `tests/woken.rs::a_wake_is_never_delivered_once_the_connection_is_condemned`.
+    pub fn wake(&self) {
+        // Flag first, then ping — the same discipline `send` states, for the
+        // same reason. A dispatch that observed the ping before the flag was
+        // set would find `wake.get()` false in the interest recomputation,
+        // take no write-interest, and leave the request sitting with nothing
+        // left to dispatch it: it would then wait for an unrelated readiness
+        // that a silent peer never produces. `Outbox` is `!Send` (it holds
+        // `Rc`s), so today nothing can interleave here — the order is written
+        // down rather than resting on that.
+        self.wake.set(true);
+        self.ping.ping();
+    }
+
     /// Frames queued but not yet handed to the connection. Zero on any
     /// quiescent loop; non-zero only between a [`send`](Self::send) and the
     /// dispatch it woke.
     pub fn pending(&self) -> usize {
         self.queue.borrow().len()
+    }
+
+    /// Whether a [`wake`](Self::wake) has been asked for and its
+    /// [`ConnectionEvent::Woken`] not yet delivered.
+    pub fn wake_pending(&self) -> bool {
+        self.wake.get()
     }
 }
 
@@ -348,6 +462,7 @@ impl fmt::Debug for Outbox {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Outbox")
             .field("pending", &self.pending())
+            .field("wake_pending", &self.wake_pending())
             .finish()
     }
 }
@@ -360,6 +475,9 @@ impl ConnectionSource {
         Ok(Self {
             inner: Generic::new(conn, Interest::READ, Mode::Level),
             outbox: None,
+            // Nobody else holds a clone, so this can never be set: without an
+            // `Outbox` there is no `wake` to call.
+            wake: Rc::new(Cell::new(false)),
         })
     }
 
@@ -382,14 +500,20 @@ impl ConnectionSource {
         set_nonblocking(conn.as_fd())?;
         let (ping, ping_source) = make_ping()?;
         let queue = Rc::new(RefCell::new(VecDeque::new()));
+        // One cell, cloned into both halves: the handle sets it
+        // ([`Outbox::wake`]) and the source clears it when it delivers the
+        // turn. It is deliberately *not* inside `OutboxSink` -- see the
+        // field's own comment on `ConnectionSource`.
+        let wake = Rc::new(Cell::new(false));
         let source = Self {
             inner: Generic::new(conn, Interest::READ, Mode::Level),
             outbox: Some(OutboxSink {
                 ping: ping_source,
                 queue: Rc::clone(&queue),
             }),
+            wake: Rc::clone(&wake),
         };
-        Ok((source, Outbox { queue, ping }))
+        Ok((source, Outbox { queue, ping, wake }))
     }
 
     /// The peer credentials captured when the connection was created --
@@ -422,12 +546,27 @@ impl EventSource for ConnectionSource {
     {
         // Split the borrow so the outbox drain can hold the queue and the
         // connection at once; `self` is reassembled implicitly at the end.
-        let Self { inner, outbox } = self;
+        let Self {
+            inner,
+            outbox,
+            wake,
+        } = self;
 
         // The outbox half of this source, if any. Its ping is a *second*
         // registered fd, so this dispatch may be for the ping alone, with
         // the connection's own fd not ready at all — hence the drain runs
         // before, and independently of, the read path below.
+        //
+        // The wake flag is deliberately *not* read in this branch. A pending
+        // wake must be delivered as an event to the dispatch callback, and
+        // the callback is only reachable through `inner`; calloop 0.14.4's
+        // `Generic::process_events` opens with `if self.token != Some(token)
+        // { return Ok(PostAction::Continue) }` (sources/generic.rs), so on a
+        // bare ping — a foreign token for the connection's own `Generic` —
+        // it short-circuits *without invoking the callback at all*. A ping
+        // therefore cannot itself deliver `Woken`; what carries the wake to
+        // a dispatch of the connection's own fd is the interest
+        // recomputation at the bottom of this function.
         //
         // Nothing here reports send failures: it does not have to. A frame
         // that could not be handed over leaves the connection's sticky
@@ -535,6 +674,27 @@ impl EventSource for ConnectionSource {
             // partial write followed by an error would leave a torn
             // frame on a still-registered connection.
             if matches!(action, PostAction::Continue) {
+                // The turn the core asked for, if it asked for one. Three
+                // placements are load-bearing:
+                //
+                // - **Cleared before the callback runs.** A core that
+                //   ignores `Woken` must not be able to spin the loop: the
+                //   flag is already false when the callback sees the event,
+                //   so nothing re-arms write-interest below. A core that
+                //   asks for another turn from inside the handler sets it
+                //   again and gets exactly one more.
+                // - **After the recv drain**, so a frame that arrived in the
+                //   same turn — an inbound cancel, say — has already been
+                //   dispatched and the core answers the wake knowing about
+                //   it.
+                // - **Inside this `Continue` arm, before the overflow and
+                //   poison checks**, so a `reply` issued from the woken
+                //   callback is classified by the machinery that already
+                //   exists for exactly that (and so no turn is handed out on
+                //   a connection this dispatch has already condemned).
+                if wake.replace(false) {
+                    callback(ConnectionEvent::Woken, conn_nodrop);
+                }
                 if conn_nodrop.send_queue_overflowed() {
                     let reason = DisconnectReason::SlowReader {
                         queued: conn_nodrop.queued_send_bytes(),
@@ -552,10 +712,26 @@ impl EventSource for ConnectionSource {
             Ok(action)
         })?;
         // Interest management: watch for write-readiness exactly while
-        // replies are parked. `Reregister` makes calloop call `reregister`,
-        // which re-registers with the updated `interest` field.
+        // replies are parked *or* a turn is owed. `Reregister` makes calloop
+        // call `reregister`, which re-registers with the updated `interest`
+        // field. calloop applies it only after `disp.process_events` has
+        // returned and its `RefCell` borrow has been released (0.14.4,
+        // loop_logic.rs `dispatch_events`: `let mut ret =
+        // disp.process_events(..)?;` then `match ret { Reregister =>
+        // disp.reregister(..) }`), so this is not re-entrant on the
+        // dispatcher.
+        //
+        // The `wake` term is what actually delivers `ConnectionEvent::Woken`,
+        // and it is not optional. `Outbox::wake` pings, but the ping's own
+        // dispatch cannot emit the event (see the ping branch above): the
+        // emit lives in `inner`'s callback, which a foreign token never
+        // reaches. Write-interest is what gets the *connection's* fd
+        // dispatched without the peer having said anything, and an idle
+        // socket with room in its send buffer is write-ready immediately.
+        // Drop `|| wake.get()` and a wake on a silent peer — the only kind
+        // worth asking for — is never delivered at all.
         if matches!(post, PostAction::Continue) {
-            let want_write = inner.get_ref().queued_send_bytes() > 0;
+            let want_write = inner.get_ref().queued_send_bytes() > 0 || wake.get();
             if inner.interest.writable != want_write {
                 inner.interest = if want_write {
                     Interest::BOTH

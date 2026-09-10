@@ -2810,6 +2810,20 @@ fn dispatch_principal<H: RuntimeHost>(
     conn: &mut calloop::generic::NoIoDrop<Connection>,
 ) {
     match event {
+        // A turn the core asked for. Nothing was received; it is an occasion
+        // to write, which is the one thing an fd-bearing `reply` needs that a
+        // silent peer cannot supply — see `Outbox::wake`.
+        //
+        // Unreachable today: nothing in this crate calls `wake()` yet. The
+        // picker's descriptor delivery (#190) is its only intended caller, and
+        // it attaches here. Logged rather than ignored, because a turn arriving
+        // with no caller would mean something else learned to ask for one.
+        ConnectionEvent::Woken => {
+            tracing::debug!(
+                "a connection was woken with no delivery owed; nothing asks \
+                 for turns yet"
+            );
+        }
         ConnectionEvent::Message(msg) => {
             // Chokepoint-admitted actuations land here first rather than
             // going straight to the shim: `ServerCtx` already borrows the
@@ -4767,6 +4781,20 @@ fn dispatch_shim<H: RuntimeHost>(
     conn: &mut calloop::generic::NoIoDrop<Connection>,
 ) {
     match event {
+        // A turn the core asked for. Nothing was received; it is an occasion
+        // to write, which is the one thing an fd-bearing `reply` needs that a
+        // silent peer cannot supply — see `Outbox::wake`.
+        //
+        // Unreachable today: nothing in this crate calls `wake()` yet. The
+        // picker's descriptor delivery (#190) is its only intended caller, and
+        // it attaches here. Logged rather than ignored, because a turn arriving
+        // with no caller would mean something else learned to ask for one.
+        ConnectionEvent::Woken => {
+            tracing::debug!(
+                "a connection was woken with no delivery owed; nothing asks \
+                 for turns yet"
+            );
+        }
         ConnectionEvent::Message(msg) => {
             let (runtime, view) = host.split();
             let Runtime { realms, dirty, .. } = runtime;

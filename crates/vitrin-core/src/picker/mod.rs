@@ -21,7 +21,7 @@
 //! * [`keys`] — which keys drive it, and the one that deliberately does not.
 //! * [`listing`] — one directory, in which no two rows may look alike.
 //! * [`resolve`] — the race-free walk from a held directory descriptor.
-//! * `delivery` — the obligation from admission to descriptor, and its funnel.
+//! * [`delivery`] — descriptors opened and not yet handed over.
 //!
 //! # What this module does not decide
 //!
@@ -33,6 +33,7 @@
 //! up. A card can be on screen for ninety seconds, and a grant can die in far
 //! less.
 
+pub(crate) mod delivery;
 pub(crate) mod keys;
 pub(crate) mod listing;
 pub(crate) mod resolve;

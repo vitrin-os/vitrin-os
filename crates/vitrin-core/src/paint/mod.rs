@@ -42,6 +42,7 @@
 //! [`crate::lock`], and this module cannot participate in one.
 
 pub(crate) mod canvas;
+pub(crate) mod script;
 pub(crate) mod text;
 
 /// Center a `w x h` box in a `view_w x view_h` view. Truncating division, so

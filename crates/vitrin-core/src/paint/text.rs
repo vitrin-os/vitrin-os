@@ -74,6 +74,20 @@ const _: () = assert!(
 /// meets the reason instead of an arbitrary black.
 const MEASURE_RGB: [u8; 3] = [0, 0, 0];
 
+/// The size a filename is drawn at on the picker.
+///
+/// A constant rather than a caller's choice because
+/// [`crate::paint::script::DENIED_APPEARANCE`] is measured at exactly this
+/// size: two glyphs that rasterize identically at 14 px need not do so at 19,
+/// so a picker drawing names at another size would be relying on a closure
+/// computed for a size it does not use.
+/// Used by the picker #190 has yet to land, and by the appearance closure in
+/// [`crate::paint::script`] today. Kept rather than deferred because the
+/// closure is measured *at* this size and would otherwise carry a literal
+/// that nothing ties to the renderer.
+#[allow(dead_code)]
+pub(crate) const NAME_PX: f32 = 14.0;
+
 /// What [`Text::draw`] renders in place of any non-ASCII-printable character
 /// (module docs). Visible on purpose: a silently dropped character is a
 /// consent prompt quietly saying something other than what it was given.
@@ -243,6 +257,30 @@ impl Text {
         // reachable with this font, but `as u32` on a negative float
         // saturates to 0 silently and a width is unsigned by nature.
         pen.max(0.0).round() as u32
+    }
+
+    /// **Test seam.** What `ch` actually rasterizes to at `px`: the coverage
+    /// bitmap, its dimensions, and the advance in 1/64ths.
+    ///
+    /// `None` when the face has no glyph for `ch`, which is distinct from a
+    /// glyph that happens to be blank — the appearance closure must not fold
+    /// every uncovered codepoint into one class with the space.
+    #[cfg(test)]
+    pub(crate) fn raster_signature_for_test(
+        &mut self,
+        ch: char,
+        px: f32,
+    ) -> Option<(Vec<u8>, usize, usize, u32)> {
+        if font().lookup_glyph_index(ch) == 0 {
+            return None;
+        }
+        let glyph = self.glyph(ch, px);
+        Some((
+            glyph.coverage.clone(),
+            glyph.metrics.width,
+            glyph.metrics.height,
+            (glyph.metrics.advance_width * 64.0).round() as u32,
+        ))
     }
 
     /// Vertical metrics at `px`, rounded up so successive lines never

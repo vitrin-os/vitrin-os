@@ -3317,6 +3317,62 @@ where
     };
     announce_realms(&realms);
 
+    // **The picker root, opened once, before anyone connects** (P2.6.6,
+    // issue #190).
+    //
+    // Here rather than at the first designation, for the reason
+    // `crate::picker::resolve::probe` gives: a deployment below the `openat2`
+    // floor, or one whose configured root does not exist, must say so when it
+    // comes up rather than at the moment a human is waiting for a card.
+    //
+    // A failure here is a **warning, not an abort**, and the asymmetry with
+    // every other startup audit is deliberate: designation is one verb, and a
+    // session that cannot serve it is still a session that composites, runs
+    // its apps and serves every other grant. What it must not do is serve the
+    // verb quietly -- so `picker_root` stays `None`, the chokepoint's sink
+    // refuses `Unavailable`, and every ask is answered `internal` with a log
+    // line saying which directory could not be opened.
+    let picker_root = {
+        // **Declared, never inferred.** There is deliberately no `$HOME`
+        // fallback: a picker root is what turns designation from a verb this
+        // build knows about into a verb this deployment serves, and a
+        // deployment that never asked for it must not acquire it by having a
+        // home directory.
+        //
+        // The cost of getting this backwards is not a missing feature. An
+        // admitted ask seizes the human's physical input until the ticket's
+        // deadline, so a deployment serving designations it cannot draw a card
+        // for would freeze the keyboard behind a blank screen. Opting in is
+        // one line of `realm.toml`; opting out by accident must not be
+        // possible at all.
+        let configured = realms.picker_root().map(std::path::Path::to_path_buf);
+        match configured {
+            Some(path) => match picker::session::PickerRoot::open(&path) {
+                Ok(root) => {
+                    tracing::info!(root = %root.shown().display(), "picker root opened");
+                    Some(root)
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        %err,
+                        "this session serves NO designations: every `vitrin_powerbox` ask \
+                         will be refused `internal`. Set `[[picker]]`'s `root` in realm.toml \
+                         to a directory this uid can open"
+                    );
+                    None
+                }
+            },
+            None => {
+                tracing::info!(
+                    "no picker root: realm.toml declares no [[picker]] table, so this \
+                     session serves no designations and every `vitrin_powerbox` ask is \
+                     refused `internal`"
+                );
+                None
+            }
+        }
+    };
+
     // One verifier for the whole session. Under auto-approve this is the
     // registry the R6 guard already loaded and audited, moved here rather
     // than re-read: see this function's startup-order note.
@@ -3651,6 +3707,7 @@ where
         capture_dump,
         screenshot_writer,
         backlight,
+        picker_root,
     };
 
     let (mut recorder, result) = backend(seed);

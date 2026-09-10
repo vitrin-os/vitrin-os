@@ -2424,7 +2424,7 @@ pub const CLAIMS: &[Claim] = &[
             },
             Evidence::Contains {
                 path: "crates/vitrin-core/src/grants.rs",
-                needle: "pub(crate) const SERVED_VERB_BITS: u32 = 1 | 2 | 4 | 16 | 32 | 512;",
+                needle: "pub(crate) const SERVED_VERB_BITS: u32 = 1 | 2 | 4 | 16 | 32 | 64 | 512;",
                 means: "the three verbs the page fences IN (layout_arrange 16, layout_focus 32, \
                         realm_launch 512) and the three it fences OUT (observe 1, \
                         actuate_pointer 2, actuate_text 4) are all six SERVED by this core, \
@@ -2432,7 +2432,11 @@ pub const CLAIMS: &[Claim] = &[
                         rather than a restatement of what the core already declines. If this \
                         constant moves, the fence is being drawn across a different set and \
                         the page has to be re-read -- in particular, a verb LEAVING this set \
-                        would make the page promise a shell an authority no deployment serves.",
+                        would make the page promise a shell an authority no deployment serves. \
+                        P2.6.6 added designate_file (64) and the page was re-read rather than \
+                        reworded: a verb JOINING the set cannot falsify the claim, which is \
+                        about those six being served, and the shell fence does not carry \
+                        designate_file either way. The needle moved; the sentence did not.",
             },
         ],
     },

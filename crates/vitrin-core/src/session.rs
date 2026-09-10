@@ -235,6 +235,22 @@ pub(crate) struct RuntimeSeed {
     /// [`crate::backlight::BacklightHook`], so a session cannot come up
     /// consuming a key it has nowhere to send.
     pub backlight: Option<crate::backlight::Backlight>,
+    /// **This session's picker root** (P2.6.6, issue #190), or `None` when
+    /// the deployment has none.
+    ///
+    /// Opened and probed once by `main` before the listener accepts anyone,
+    /// exactly as the trusted indicator is, and for a sharper version of the
+    /// same reason: it is a directory descriptor the picker walks from, and a
+    /// root re-resolved from a string at each ask is a root an attacker with
+    /// write access to a parent can re-point between asks.
+    ///
+    /// `None` means **this deployment does not serve designations**: the
+    /// chokepoint's sink refuses `Unavailable`, which is the IDL's `internal`,
+    /// loudly. That is the honest answer for a session that cannot open the
+    /// directory it was told to browse; the alternative -- serving the verb
+    /// and refusing every ask at the card -- would be a deployment error
+    /// wearing a human decision's clothes.
+    pub picker_root: Option<crate::picker::session::PickerRoot>,
 }
 
 /// Everything one running session owns that is not presentation, living in
@@ -512,6 +528,33 @@ pub(crate) struct Kernel {
     /// The dead-man switch deliberately does **not** clear it -- the off-switch
     /// destroys authority, and a human's own brightness key is not authority.
     pub backlight_device: Option<crate::backlight::Backlight>,
+    /// **Designation asks the chokepoint admitted whose terminal a human still
+    /// owes** (P2.6.6, issue #190, on issue #343's ledger).
+    ///
+    /// Kernel state on [`Self::clipboard_slot`]'s terms: it is session-wide,
+    /// it is about authority, and the router must learn about neither. It
+    /// holds **no descriptor** by construction, so an obligation waiting on a
+    /// human cannot pin a file open -- see [`crate::designation`].
+    pub designations: crate::designation::Ledger,
+    /// **Descriptors this core has opened and not yet handed over.**
+    ///
+    /// The other half of [`Self::designations`], and deliberately a different
+    /// table with a different clock: the ledger bounds a *human* interval and
+    /// holds nothing, this one bounds a *machine* interval (a wake, and the
+    /// dispatch turn it asks for) and holds the fd. Keeping them separate is
+    /// what makes "an outstanding ask never pins a file" a property of the
+    /// types rather than a rule.
+    pub deliveries: crate::picker::delivery::DeliveryTable,
+    /// **The directory the picker browses from**, from the seed. `None`
+    /// disables designation entirely; see [`RuntimeSeed::picker_root`].
+    pub picker_root: Option<crate::picker::session::PickerRoot>,
+    /// **The picker currently raised**, if one is.
+    ///
+    /// At most one, and that is two existing rules made storable rather than a
+    /// third: `Ledger::open` refuses a second ask from the same principal, and
+    /// `ConsentGrab::raise_picker` refuses a second raise from anyone. This
+    /// field is what [`service_picker_round`] drives steps into.
+    pub picker: Option<crate::picker::session::PickerSession>,
 }
 
 /// The realm's live shim session: the protocol server, the out-of-band send
@@ -981,6 +1024,27 @@ pub(crate) trait RuntimeHost: Sized + 'static {
     /// backend that could never raise a prompt to answer it.
     fn service_consent(&mut self, _now: Instant) {}
 
+    /// Service one turn of the core-drawn file picker (P2.6.6, issue #190):
+    /// retire a card whose obligation is gone, drain the keys the human typed
+    /// into the raised picker, settle a confirm or a cancel, and raise the
+    /// next outstanding designation. Called once per dispatch round from
+    /// [`post_dispatch`], immediately after [`Self::service_consent`].
+    ///
+    /// The default is a **no-op**, on `service_consent`'s terms and for its
+    /// reason: a backend with no grab cannot hold a picker in front of
+    /// anybody.
+    ///
+    /// **What that costs, stated rather than implied.** Unlike consent, there
+    /// is no startup refusal pairing this with the backend that can serve it:
+    /// a session that has a picker root but whose backend never overrides
+    /// this mints tickets no card is ever raised for. They are not lost — the
+    /// sweep expires each one at its deadline and answers the client
+    /// `timed_out` on the facet — so the failure is a slow, loud refusal
+    /// rather than a hang, which is the fail-closed direction. Closing it
+    /// properly means the picker root and the backend's ability to draw
+    /// becoming one decision at startup, and that is not this task's.
+    fn service_picker(&mut self, _now: Instant) {}
+
     /// Service one turn of the lock screen (WS-E.2.2, issue #214): raise it if
     /// the session has gone idle, mirror the gate's state onto the surface, and
     /// journal the facts the gate queued. Called once per dispatch round from
@@ -1090,6 +1154,7 @@ impl<H: PreemptionHook> Runtime<H> {
             capture_dump,
             screenshot_writer,
             backlight: backlight_device,
+            picker_root,
         } = seed;
         Self {
             kernel: Kernel {
@@ -1107,6 +1172,12 @@ impl<H: PreemptionHook> Runtime<H> {
                 screenshot_writer,
                 backlight,
                 backlight_device,
+                designations: crate::designation::Ledger::new(
+                    crate::designation::TimeoutPolicy::default(),
+                ),
+                deliveries: crate::picker::delivery::DeliveryTable::default(),
+                picker_root,
+                picker: None,
             },
             listener: Some(listener),
             conns: BTreeMap::new(),
@@ -1957,6 +2028,28 @@ fn sweep_at<H: RuntimeHost>(host: &mut H, now: Instant) {
     if runtime.kernel.clipboard_slot.expire(now) {
         tracing::debug!("clipboard slot expired on the sweep");
     }
+
+    // **The two designation clocks, and they are different clocks.**
+    //
+    // The ledger bounds a *human* interval: an ask whose card nobody answered
+    // inside `PICKER_DEADLINE`. Its expiry owes the client a terminal, which
+    // is why it goes through the same refusal funnel a cancel does rather
+    // than being dropped.
+    //
+    // The delivery table bounds a *machine* interval: a descriptor opened,
+    // woken for, and waiting on a dispatch turn that never came because the
+    // peer died between the wake and the turn. `Outbox` is `Clone` and
+    // outlives its source, so a wake on a dead connection succeeds and no
+    // turn ever comes -- without this sweep such a descriptor would pin a
+    // file for the rest of the session.
+    for ticket in runtime.kernel.designations.expire_due(now) {
+        let id = ticket.id();
+        journal_designation(runtime, id, Some(&ticket), None, SettleFailure::TimedOut);
+        voice_powerbox_refusal(runtime, &ticket, SettleFailure::TimedOut);
+    }
+    for (entry, why) in runtime.kernel.deliveries.expire_due(now) {
+        journal_abandoned(runtime, entry, why);
+    }
 }
 
 /// Route one deferred [`Resolution`] to the connection that petitioned.
@@ -2172,7 +2265,14 @@ pub(crate) fn service_consent_round<H: PreemptionHook>(
     // alone is gated: `retire_stale` and the decision drain above must keep
     // running through a pause, or a dead petition's card stays composited and
     // the queue never advances.
-    if visibility == PromptVisibility::Reachable && grab.armed_petition().is_none() {
+    // **[`ConsentGrab::raised`], not `raised_petition`** — the deliberate
+    // answer to the compile error the subject split produced here. The
+    // question this guard asks is "is the human's input already seized", and a
+    // raised picker seizes it exactly as a card does. Asking the narrower
+    // "is a *petition's* card up" would raise a consent prompt straight over a
+    // live designation: two security questions, one keyboard, and a card whose
+    // guard interval starts while the human is mid-keystroke in the other one.
+    if visibility == PromptVisibility::Reachable && grab.raised().is_none() {
         if let Some(front) = runtime.kernel.petitions.front_pending() {
             // `raise` borrows two disjoint fields of `runtime.kernel` (the
             // petition registry and the recorder) alongside the `consent`
@@ -2192,6 +2292,751 @@ pub(crate) fn service_consent_round<H: PreemptionHook>(
     }
 
     changed
+}
+
+/// Write the powerbox terminals one dispatch's designation sink produced.
+///
+/// Separate from the sink for the borrow reason its own comment gives, and a
+/// free function rather than an inline loop so both exits from
+/// [`dispatch_principal`]'s message arm can call it and neither can forget.
+fn flush_powerbox_refusals<H: RuntimeHost>(host: &mut H, id: ConnectionId, frames: Vec<Vec<u8>>) {
+    if frames.is_empty() {
+        return;
+    }
+    let runtime = host.runtime();
+    let Some(conn) = runtime.conns.get(&id) else {
+        // The connection went away inside its own dispatch. Nothing to tell.
+        return;
+    };
+    let outbox = conn.outbox.clone();
+    for frame in frames {
+        if let Err(err) = outbox.send(&frame) {
+            tracing::warn!(connection = %id, %err, "powerbox refusal could not be queued");
+        }
+    }
+}
+
+/// What the ledger asks the world at the instant of delivery.
+///
+/// A borrow of the two tables that answer, and nothing else: the redemption
+/// re-derives its answer here rather than trusting the one taken when the
+/// card went up, because a card can be on screen for ninety seconds and a
+/// grant can die in far less.
+struct DeliveryWorld<'a> {
+    grants: &'a GrantTable,
+    realms: &'a BTreeMap<RealmId, RealmRuntime>,
+    now: Instant,
+}
+
+impl crate::designation::Liveness for DeliveryWorld<'_> {
+    /// **Deliberately not the chokepoint's query.** `enforcement` owns the
+    /// one path that decides whether an operation may proceed, and
+    /// `single_enforcement_path_is_grep_provable` counts its identifier
+    /// precisely so a second one cannot appear. This is the *liveness* read
+    /// the panel and the flight recorder already use
+    /// ([`GrantTable::get`]) plus the row's own effective verb set — which is
+    /// what "is this row still usable for this verb" means, re-asked.
+    ///
+    /// The `Spent` arm is the sharp one and it is why the ticket carries
+    /// `spent_by_this_ticket` at all: `commit_use` marks a `once` row `Spent`
+    /// **at admission**, so by the table's own reckoning a single-use
+    /// designation grant is already dead at the moment its ticket is minted.
+    /// Forgiving `Spent` only for the ticket that spent it is the whole of
+    /// the distinction; forgiving it generally would resurrect every spent
+    /// row for anyone holding any ticket.
+    fn grant_is_live(&self, grant: crate::grants::GrantId, spent_by_this_ticket: bool) -> bool {
+        let Some((row, state)) = self.grants.get(grant, self.now) else {
+            // The row is gone: connection teardown removed it, or it never
+            // existed. Either way there is no authority behind this ticket.
+            return false;
+        };
+        if row.verbs.bits() & vitrin_protocol::generated::vitrin_grant::Verb::DESIGNATE_FILE.bits()
+            == 0
+        {
+            return false;
+        }
+        match state {
+            crate::grants::GrantState::Active => true,
+            crate::grants::GrantState::Spent => spent_by_this_ticket,
+            crate::grants::GrantState::Revoked | crate::grants::GrantState::Expired => false,
+        }
+    }
+
+    /// Whether this realm still has a live shim session.
+    ///
+    /// The ticket's own docs warn that a *declared* realm keeps its id across
+    /// a process death, so the same `RealmId` can name a new process — the
+    /// human's editor crashes mid-pick, they restart it, they confirm, and the
+    /// descriptor lands in a process they never approved. **That hazard is
+    /// closed upstream rather than here**: [`close_realm`] calls
+    /// `Ledger::forget_realm`, so a realm's death removes every ticket naming
+    /// it *before* anything could re-claim the id, and there is no window in
+    /// which this predicate could be asked about a replacement. This function
+    /// is therefore the second line, not the first, and it says so rather
+    /// than claiming to distinguish two processes it cannot tell apart.
+    fn realm_is_the_same(&self, realm: &RealmId) -> bool {
+        self.realms
+            .get(realm)
+            .is_some_and(|runtime| runtime.server.is_some())
+    }
+}
+
+/// Why a designation produced no descriptor for the client. Every variant is
+/// one word on the wire and one word in the journal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettleFailure {
+    /// The human dismissed the picker.
+    Cancelled,
+    /// Nobody answered inside the deadline.
+    TimedOut,
+    /// The grant died between the ask and the confirm.
+    AuthorityDied,
+    /// The realm died between the ask and the confirm.
+    RealmDied,
+    /// The asking connection went away.
+    ConnectionGone,
+    /// The kernel would not resolve what the human chose, or the picker had
+    /// nothing selected.
+    Unresolvable,
+}
+
+impl SettleFailure {
+    /// The `vitrin_powerbox.refusal` entry this maps to.
+    ///
+    /// Four wire codes for six conditions, and the collapses are the IDL's
+    /// own. `busy` is not reachable here at all — it belongs to the ask that
+    /// raised no card. The three "it died under the human" conditions become
+    /// `timed_out`, because from the agent's side nothing decided anything
+    /// and asking again later is legal; `cancelled` is reserved for the human
+    /// actually dismissing the card, which is a decision.
+    fn code(self) -> vitrin_protocol::generated::vitrin_powerbox::Refusal {
+        use vitrin_protocol::generated::vitrin_powerbox::Refusal;
+        match self {
+            Self::Cancelled => Refusal::Cancelled,
+            Self::TimedOut | Self::AuthorityDied | Self::RealmDied | Self::ConnectionGone => {
+                Refusal::TimedOut
+            }
+            Self::Unresolvable => Refusal::Unresolvable,
+        }
+    }
+
+    /// The journal's word, which is **finer than the wire's** on purpose: an
+    /// operator asking "why did this designation not land" must be able to
+    /// tell a revoked grant from a dead realm from a human who walked away,
+    /// and the wire deliberately does not tell an agent which.
+    fn word(self) -> &'static str {
+        match self {
+            Self::Cancelled => "cancelled",
+            Self::TimedOut => "timed_out",
+            Self::AuthorityDied => "authority_died",
+            Self::RealmDied => "realm_died",
+            Self::ConnectionGone => "connection_gone",
+            Self::Unresolvable => "unresolvable",
+        }
+    }
+}
+
+impl From<crate::designation::Undelivered> for SettleFailure {
+    fn from(err: crate::designation::Undelivered) -> Self {
+        use crate::designation::Undelivered;
+        match err {
+            Undelivered::AuthorityDied => Self::AuthorityDied,
+            Undelivered::RealmDied => Self::RealmDied,
+            Undelivered::TimedOut => Self::TimedOut,
+            Undelivered::ConnectionGone => Self::ConnectionGone,
+        }
+    }
+}
+
+/// **Drive the picker for one dispatch round** (P2.6.6, issue #190), beside
+/// [`service_consent_round`] and called from the same place.
+///
+/// Returns whether human-visible state changed, on that function's contract.
+///
+/// # The four steps, and why the order is forced
+///
+/// 1. **Retire a picker whose obligation is gone.** The ledger is the
+///    authority on whether a designation is still owed — a sweep may have
+///    expired it, a teardown withdrawn it, a realm death forgotten it — and a
+///    card must come down before anything else is considered, exactly as
+///    `retire_stale` runs first for a petition.
+/// 2. **Drain the steps the grab queued** into the session. Each carries the
+///    designation it was typed against and one that names anything else is
+///    dropped, which is [`crate::consent::grab::Decision`]'s fail-closed
+///    shape applied to a keystroke.
+/// 3. **Settle on a confirm or a cancel**, through the funnel below.
+/// 4. **Raise a picker for the front of the ledger** when none is up. Last,
+///    so a designation that settled this round frees the screen on this round
+///    rather than the next.
+pub(crate) fn service_picker_round<H: PreemptionHook>(
+    grab: &mut ConsentGrab,
+    runtime: &mut Runtime<H>,
+    consent: &mut ConsentSurface,
+    now: Instant,
+    visibility: PromptVisibility,
+) -> bool {
+    let mut changed = false;
+
+    // 1. A raised picker whose obligation has left the ledger.
+    if let Some(id) = grab.raised_designation() {
+        if !runtime.kernel.designations.is_open(id) {
+            grab.lower_picker(consent);
+            runtime.kernel.picker = None;
+            changed = true;
+        }
+    }
+
+    // **Decision 9: a VT switch CANCELS the designation**, it does not park
+    // it behind somebody else's screen.
+    //
+    // The alternative -- leaving the card up through the switch -- is what a
+    // consent prompt does, and it is wrong here for a reason consent does not
+    // have: this card holds an *exclusive input grab over a filesystem
+    // browser*, and the human who switched VT is at a different session
+    // entirely. Coming back to a half-navigated picker eighty seconds later,
+    // with no memory of which directory it was left in, is worse than being
+    // asked again.
+    //
+    // **And it follows `TimeoutPolicy` exactly as a walk-away does.** One
+    // rule, "nobody answered, so policy decides", rather than a second
+    // cancellation vocabulary: the outcome is `TimedOut`, which is what the
+    // sweep would have produced ninety seconds later anyway. It is
+    // deliberately NOT `Cancelled` -- that word is reserved for a human who
+    // dismissed the card, which is a decision, and nobody decided anything
+    // here.
+    //
+    // Note what today's policy makes that mean, plainly: `TimeoutPolicy`
+    // defaults to `Spends` and this core exposes no way to select
+    // `Restores` (which would need a way to move a grant row back to
+    // `Active`, and none exists), so a `once` rung spent by the admission is
+    // gone. That is fail-closed and it is the behaviour, not an aspiration.
+    if visibility != PromptVisibility::Reachable {
+        if let Some(id) = grab.raised_designation() {
+            tracing::info!(
+                %id,
+                ?visibility,
+                "cancelling a raised picker: the screen it is on is no longer the human's"
+            );
+            grab.lower_picker(consent);
+            runtime.kernel.picker = None;
+            settle_refused(runtime, id, SettleFailure::TimedOut, now);
+            changed = true;
+        }
+    }
+    // ...and the mirror: a session with no card behind it. Unreachable while
+    // this function is the only thing that raises and lowers one, and cleaned
+    // up rather than asserted because a stranded session holds two directory
+    // descriptors open for the life of the process.
+    if runtime.kernel.picker.is_some() && grab.raised_designation().is_none() {
+        runtime.kernel.picker = None;
+    }
+
+    // 2 and 3. Drain, apply, settle.
+    let mut settle: Option<(crate::designation::DesignationId, SettleOutcome)> = None;
+    while let Some((id, step)) = grab.take_step() {
+        if settle.is_some() {
+            // A step typed after the confirm that ended this picker. Dropped
+            // rather than applied: the session it named is finished.
+            continue;
+        }
+        let Some(session) = runtime.kernel.picker.as_mut() else {
+            continue;
+        };
+        if session.id() != id {
+            tracing::debug!(%id, "a picker step named a designation that is no longer raised");
+            continue;
+        }
+        match session.apply(step) {
+            crate::picker::session::Applied::Unchanged => {}
+            crate::picker::session::Applied::Changed => changed = true,
+            crate::picker::session::Applied::Confirmed => {
+                settle = Some((id, SettleOutcome::Confirmed));
+            }
+            crate::picker::session::Applied::Cancelled => {
+                settle = Some((id, SettleOutcome::Cancelled));
+            }
+        }
+    }
+
+    if let Some((id, outcome)) = settle {
+        // The card comes down before the funnel runs, so a funnel that takes
+        // a slow path cannot leave the human's input seized behind a picker
+        // that has already been answered.
+        grab.lower_picker(consent);
+        let session = runtime.kernel.picker.take();
+        let chosen = match outcome {
+            SettleOutcome::Confirmed => session.as_ref().and_then(|s| s.chosen()),
+            SettleOutcome::Cancelled => None,
+        };
+        // The session is dropped here, before the funnel opens anything. What
+        // the funnel needs from it is a **descriptor for the directory the
+        // human was standing in**, which `chosen()` duplicated out above --
+        // so dropping the session closes the picker's own copies without
+        // costing the funnel the anchor its open has to be made from. Handing
+        // the funnel a path to re-walk instead is what this used to do, and it
+        // is the race the picker exists to close.
+        drop(session);
+        match outcome {
+            SettleOutcome::Confirmed => settle_designation(runtime, id, chosen, now),
+            SettleOutcome::Cancelled => {
+                settle_refused(runtime, id, SettleFailure::Cancelled, now);
+            }
+        }
+        changed = true;
+    }
+
+    // 4. Raise the front of the ledger, onto a screen this session still owns.
+    //
+    // Gated on [`PromptVisibility`] for `service_consent_round`'s reason
+    // (D-030(4)): a card raised onto somebody else's VT spends its guard
+    // interval where nobody can see it. Steps 1-3 are deliberately NOT gated
+    // -- a picker already up must keep draining through a pause, or a
+    // confirmed designation would sit unsettled until the seat came back.
+    if visibility == PromptVisibility::Reachable && grab.raised().is_none() {
+        if let Some(id) = runtime.kernel.designations.front_open() {
+            match raise_picker_for(grab, runtime, id, now) {
+                Ok(()) => changed = true,
+                Err(failure) => settle_refused(runtime, id, failure, now),
+            }
+        }
+    }
+
+    changed
+}
+
+/// End every outstanding designation on the "nobody answered" rule, and
+/// return the ids that were ended.
+///
+/// One helper rather than a loop at each call site, so the two occasions that
+/// use it (a lock going up, and — through
+/// [`service_picker_round`] — a screen that stopped being the human's) cannot
+/// answer the client differently. Every one goes out as `timed_out`, which is
+/// what the sweep would have produced on its own.
+fn cancel_outstanding_designations<H: PreemptionHook>(
+    runtime: &mut Runtime<H>,
+    now: Instant,
+) -> Vec<crate::designation::DesignationId> {
+    let mut ended = Vec::new();
+    // Terminates because `settle_refused` takes the ticket out of the ledger,
+    // so `front_open` strictly shrinks. Written as a drain rather than a
+    // snapshot-then-loop so a ticket minted between the two could not be
+    // missed -- nothing can mint one here, and the loop shape means nothing
+    // has to prove that.
+    while let Some(id) = runtime.kernel.designations.front_open() {
+        settle_refused(runtime, id, SettleFailure::TimedOut, now);
+        ended.push(id);
+    }
+    runtime.kernel.picker = None;
+    ended
+}
+
+/// Which terminal a drained step asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettleOutcome {
+    Confirmed,
+    Cancelled,
+}
+
+/// Build a picker for `id` and put it in front of the human.
+fn raise_picker_for<H: PreemptionHook>(
+    grab: &mut ConsentGrab,
+    runtime: &mut Runtime<H>,
+    id: crate::designation::DesignationId,
+    now: Instant,
+) -> Result<(), SettleFailure> {
+    let Some(root) = runtime.kernel.picker_root.as_ref() else {
+        // Unreachable: the sink refuses `Unavailable` before minting a ticket
+        // when there is no root. Answered rather than asserted, because an
+        // assertion vanishes in the release build CI also runs and the honest
+        // answer costs one line.
+        tracing::error!(%id, "a designation was owed with no picker root; refusing it");
+        return Err(SettleFailure::Unresolvable);
+    };
+    let (ask, deadline) = match runtime.kernel.designations.peek(id) {
+        Some(ticket) => (ticket.ask(), ticket.deadline()),
+        None => return Err(SettleFailure::TimedOut),
+    };
+    let session =
+        crate::picker::session::PickerSession::open(id, ask, root.as_fd()).map_err(|err| {
+            tracing::warn!(%id, ?err, "the picker root could not be listed for this designation");
+            SettleFailure::Unresolvable
+        })?;
+    if !grab.raise_picker(id, deadline, now) {
+        // Something is already up. The ledger's per-principal rule does not
+        // cover two principals, so this is ordinary: the ask waits, and the
+        // deadline bounds the wait.
+        return Ok(());
+    }
+    runtime.kernel.picker = Some(session);
+    Ok(())
+}
+
+/// **The settle funnel** — the one path from a human's confirm to a
+/// descriptor, and the order of its four steps is forced rather than tidy.
+///
+/// 1. [`Ledger::redeem`](crate::designation::Ledger::redeem): grant liveness,
+///    then realm identity, then the deadline. **No file is touched on any
+///    refusal.** A revoked grant must not merely fail to send a descriptor;
+///    it must never cause the core to open one, because opening is itself an
+///    act on the human's filesystem — it updates atime, it can fire an
+///    inotify watch, and on some filesystems it is not free.
+/// 2. Resolve the agent's connection **and** the realm's live shim. Either
+///    missing is a refusal, still with nothing opened. The realm half matters
+///    as much as the agent half: the IDL requires the same descriptor to
+///    reach the shim, so a delivery that could only ever do half the job must
+///    not start.
+/// 3. `openat2`, once, and `fstat` once for the journal. One open, because
+///    two would be two race windows and could name two different inodes —
+///    which would make the single `(st_dev, st_ino)` pair recorded here a
+///    claim about only one of them.
+/// 4. Park the descriptor and **ask** the agent's connection for a turn.
+///    `reply` is the only fd-capable write and it needs a
+///    `&mut NoIoDrop<Connection>` that only a dispatch callback holds, so the
+///    turn is requested rather than taken.
+fn settle_designation<H: PreemptionHook>(
+    runtime: &mut Runtime<H>,
+    id: crate::designation::DesignationId,
+    chosen: Option<crate::picker::session::Chosen>,
+    now: Instant,
+) {
+    // 1. Authority, before anything touches a filesystem.
+    let redeemed = {
+        let world = DeliveryWorld {
+            grants: &runtime.kernel.grants,
+            realms: &runtime.realms,
+            now,
+        };
+        runtime.kernel.designations.redeem(id, &world, now)
+    };
+    let ticket = match redeemed {
+        Ok(judged) => judged.into_ticket(),
+        Err((ticket, why)) => {
+            journal_designation(runtime, id, ticket.as_ref(), None, why.into());
+            if let Some(ticket) = ticket {
+                voice_powerbox_refusal(runtime, &ticket, SettleFailure::from(why));
+            }
+            return;
+        }
+    };
+
+    // The human confirmed nothing resolvable -- an empty directory, a filter
+    // that matched no row. Answered before the open, so this path touches no
+    // filesystem either.
+    let Some(chosen) = chosen else {
+        journal_designation(
+            runtime,
+            id,
+            Some(&ticket),
+            None,
+            SettleFailure::Unresolvable,
+        );
+        voice_powerbox_refusal(runtime, &ticket, SettleFailure::Unresolvable);
+        return;
+    };
+
+    // 2. Both receivers, before the open.
+    let agent_alive = runtime.conns.contains_key(&ticket.connection());
+    let shim_alive = runtime
+        .realms
+        .get(ticket.realm())
+        .is_some_and(|realm| realm.server.is_some());
+    if !agent_alive || !shim_alive {
+        let why = if agent_alive {
+            SettleFailure::RealmDied
+        } else {
+            SettleFailure::ConnectionGone
+        };
+        journal_designation(runtime, id, Some(&ticket), None, why);
+        if agent_alive {
+            voice_powerbox_refusal(runtime, &ticket, why);
+        }
+        return;
+    }
+
+    // 3. The one openat2 -- **one component, from the descriptor the human was
+    // standing in**, which [`crate::picker::session::Chosen`] carries.
+    //
+    // Deliberately NOT a re-walk of a root-relative path, which is what stood
+    // here and which quietly undid the guarantee this whole module exists to
+    // provide: re-resolving `work/notes.txt` from the root at settle time is a
+    // resolution by NAME, and `RESOLVE_NO_SYMLINKS` does not close it --
+    // anything with write access to the root can `rename` a different real
+    // directory over `work` between the human's confirm and this open. Holding
+    // the directory descriptor removes the names from the question, and
+    // `Chosen` no longer carries a component list to re-walk, so this cannot
+    // regress by somebody rewriting these three lines.
+    let name =
+        <std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(chosen.name.clone());
+    let fd = match crate::picker::resolve::resolve(
+        std::os::fd::AsFd::as_fd(&chosen.dir),
+        &[name.as_os_str()],
+        chosen.mode,
+        chosen.directory,
+    ) {
+        Ok(fd) => fd,
+        Err(err) => {
+            tracing::info!(%id, ?err, "the designated entry would not resolve; refusing");
+            journal_designation(
+                runtime,
+                id,
+                Some(&ticket),
+                None,
+                SettleFailure::Unresolvable,
+            );
+            voice_powerbox_refusal(runtime, &ticket, SettleFailure::Unresolvable);
+            return;
+        }
+    };
+    let dev_ino = match crate::picker::resolve::identity(std::os::fd::AsFd::as_fd(&fd)) {
+        Ok(pair) => pair,
+        Err(err) => {
+            tracing::error!(%id, ?err, "a freshly opened descriptor would not fstat");
+            journal_designation(
+                runtime,
+                id,
+                Some(&ticket),
+                None,
+                SettleFailure::Unresolvable,
+            );
+            voice_powerbox_refusal(runtime, &ticket, SettleFailure::Unresolvable);
+            return;
+        }
+    };
+
+    // 4. Park it and ask for a turn.
+    let entry = crate::picker::delivery::InFlight {
+        id,
+        fd,
+        dev_ino,
+        ask: ticket.ask(),
+        grant: ticket.grant(),
+        principal: ticket.principal().clone(),
+        realm: ticket.realm().clone(),
+        facet_id: ticket.facet_id(),
+        grant_wire_id: ticket.grant_wire_id(),
+        agent: crate::picker::delivery::Half::Owed,
+        shim: crate::picker::delivery::Half::Owed,
+        deadline: now + crate::picker::delivery::DELIVERY_DEADLINE,
+        connection: ticket.connection(),
+        name: chosen.name,
+    };
+    runtime.kernel.deliveries.park(entry);
+    let Some(conn) = runtime.conns.get(&ticket.connection()) else {
+        // Checked alive two steps ago and gone now: impossible inside one
+        // synchronous round, and answered rather than asserted.
+        release_delivery(
+            runtime,
+            id,
+            crate::picker::delivery::Abandoned::ConnectionGone,
+        );
+        return;
+    };
+    conn.outbox.wake();
+}
+
+/// Answer a designation that produced no descriptor, on the facet.
+fn voice_powerbox_refusal<H: PreemptionHook>(
+    runtime: &mut Runtime<H>,
+    ticket: &crate::designation::DesignationTicket,
+    why: SettleFailure,
+) {
+    let Some(conn) = runtime.conns.get(&ticket.connection()) else {
+        return;
+    };
+    let frame = vitrin_protocol::terminals::powerbox_refusal_frame(ticket.facet_id(), why.code());
+    if let Err(err) = conn.outbox.send(&frame) {
+        tracing::warn!(%err, "a powerbox refusal could not be queued");
+    }
+}
+
+/// Refuse a designation the funnel never reached — a cancel, or a picker that
+/// could not be raised.
+fn settle_refused<H: PreemptionHook>(
+    runtime: &mut Runtime<H>,
+    id: crate::designation::DesignationId,
+    why: SettleFailure,
+    _now: Instant,
+) {
+    let Some(ticket) = runtime.kernel.designations.take(id) else {
+        return;
+    };
+    journal_designation(runtime, id, Some(&ticket), None, why);
+    voice_powerbox_refusal(runtime, &ticket, why);
+}
+
+/// The journal line every designation owes, delivered or not.
+fn journal_designation<H: PreemptionHook>(
+    runtime: &mut Runtime<H>,
+    id: crate::designation::DesignationId,
+    ticket: Option<&crate::designation::DesignationTicket>,
+    dev_ino: Option<(u64, u64)>,
+    why: SettleFailure,
+) {
+    let Some(ticket) = ticket else {
+        // The id named nothing: already redeemed, expired, or withdrawn.
+        // There is no principal, realm or grant to name, so there is no
+        // honest entry to write -- and the entry that *did* close this
+        // obligation was written by whatever removed it.
+        tracing::debug!(%id, outcome = why.word(), "a designation id named no obligation");
+        return;
+    };
+    runtime
+        .kernel
+        .recorder
+        .record(crate::recorder::Event::DesignationSettled {
+            connection: ticket.connection(),
+            designation: id,
+            principal: ticket.principal(),
+            realm: ticket.realm(),
+            grant_id: ticket.grant(),
+            target: designation_kind(ticket.ask()),
+            mode: designation_mode(ticket.ask()),
+            dev_ino,
+            delivered: false,
+            outcome: why.word(),
+        });
+}
+
+fn designation_kind(ask: crate::designation::AskedFor) -> &'static str {
+    match ask {
+        crate::designation::AskedFor::File { .. } => "file",
+        crate::designation::AskedFor::Dir => "directory",
+    }
+}
+
+fn designation_mode(ask: crate::designation::AskedFor) -> &'static str {
+    match ask {
+        crate::designation::AskedFor::File { write: true } => "read_write",
+        crate::designation::AskedFor::File { write: false } | crate::designation::AskedFor::Dir => {
+            "read"
+        }
+    }
+}
+
+/// Release a held descriptor and say so in the journal.
+///
+/// **The abandoned half of the record.** A descriptor the core opened and
+/// then closed is a designation the human made and the agent never received;
+/// journalling it is what keeps that from being silent.
+fn release_delivery<H: PreemptionHook>(
+    runtime: &mut Runtime<H>,
+    id: crate::designation::DesignationId,
+    why: crate::picker::delivery::Abandoned,
+) {
+    let Some(entry) = runtime.kernel.deliveries.take_any(id) else {
+        return;
+    };
+    journal_abandoned(runtime, entry, why);
+}
+
+/// Journal one released descriptor. The entry is **dropped afterwards**,
+/// which is what closes it.
+fn journal_abandoned<H: PreemptionHook>(
+    runtime: &mut Runtime<H>,
+    entry: crate::picker::delivery::InFlight,
+    why: crate::picker::delivery::Abandoned,
+) {
+    use crate::picker::delivery::{Abandoned, Half};
+    let word = match why {
+        Abandoned::NoTurn => "no_turn",
+        Abandoned::ConnectionGone => "connection_gone",
+        Abandoned::RealmDied => "realm_died",
+        Abandoned::SendFailed => "send_failed",
+    };
+    // `delivered` describes the AGENT's copy, because that is the client the
+    // terminal belongs to and the one whose absence makes a designation not
+    // have happened. A realm copy that failed after the agent's succeeded is
+    // a different, lesser fact, and it is visible in the outcome word.
+    let delivered = entry.agent == Half::Sent;
+    runtime
+        .kernel
+        .recorder
+        .record(crate::recorder::Event::DesignationSettled {
+            connection: entry.connection,
+            designation: entry.id,
+            principal: &entry.principal,
+            realm: &entry.realm,
+            grant_id: entry.grant,
+            target: designation_kind(entry.ask),
+            mode: designation_mode(entry.ask),
+            dev_ino: Some(entry.dev_ino),
+            delivered,
+            outcome: word,
+        });
+}
+
+/// Journal one fully delivered designation.
+fn journal_delivered<H: PreemptionHook>(
+    runtime: &mut Runtime<H>,
+    entry: &crate::picker::delivery::InFlight,
+) {
+    runtime
+        .kernel
+        .recorder
+        .record(crate::recorder::Event::DesignationSettled {
+            connection: entry.connection,
+            designation: entry.id,
+            principal: &entry.principal,
+            realm: &entry.realm,
+            grant_id: entry.grant,
+            target: designation_kind(entry.ask),
+            mode: designation_mode(entry.ask),
+            dev_ino: Some(entry.dev_ino),
+            delivered: true,
+            outcome: "delivered",
+        });
+}
+
+/// **Whether a raised picker is holding the screen awake** (P2.6.6, issue
+/// #190, decision 6).
+///
+/// A card that asks a human to browse their filesystem must not be blanked or
+/// locked out from under them mid-choice. So while one is up the idle blank
+/// and the idle lock are both suppressed — and the suppression is **bounded
+/// by the ticket's own deadline**, not by anything remembering to release it.
+///
+/// # Why this is a derivation and not a flag
+///
+/// The requirement is that no bug can hold the human's screen awake past the
+/// deadline. A `bool` field set at raise and cleared at settle fails that by
+/// construction: every path that forgets to clear it — a panic between the
+/// two, a settle arm added later, a teardown that removes the ticket without
+/// going through the round — leaves the screen awake forever, and nothing
+/// would say so.
+///
+/// This asks three live questions instead, every round, and **all three must
+/// answer yes**:
+///
+/// 1. the grab currently holds a picker (so the card is really on screen),
+/// 2. the ledger still holds that designation (so the obligation is real),
+/// 3. `now` is before that ticket's own deadline.
+///
+/// There is nothing to release. The ledger's sweep removes the ticket at its
+/// deadline, and even before the sweep runs, condition 3 reads the deadline
+/// off the ticket itself — so the answer flips to `false` at the deadline
+/// whatever else in this core has or has not happened.
+///
+/// # It is not an idle inhibit and must not be folded into one
+///
+/// [`crate::backend::blank::IdleInhibitTable`] answers a *confined app's*
+/// request, and D-033(1) forbids that one from touching the idle lock — an
+/// app that could suppress a security control would be an app that could
+/// disable it. This is the opposite party: the core's own card, in front of
+/// the human, for at most `PICKER_DEADLINE`. The two are kept as separate
+/// terms at the call sites for that reason, so that widening one can never
+/// silently widen the other.
+pub(crate) fn picker_holds_the_screen_awake<H: PreemptionHook>(
+    runtime: &Runtime<H>,
+    grab: &std::cell::RefCell<ConsentGrab>,
+    now: Instant,
+) -> bool {
+    let Some(id) = grab.borrow().raised_designation() else {
+        return false;
+    };
+    let Some(ticket) = runtime.kernel.designations.peek(id) else {
+        return false;
+    };
+    now < ticket.deadline()
 }
 
 /// Drive the lock screen for one dispatch round (WS-E.2.2, issue #214):
@@ -2232,9 +3077,16 @@ pub(crate) fn service_lock_round<H: PreemptionHook>(
     deadman_chord: &'static str,
     now: Instant,
 ) -> bool {
+    // **Decision 6's lock half** (P2.6.6): a raised picker holds the idle lock
+    // off, bounded by the ticket's own deadline. Recomputed here rather than
+    // stored, and passed as a parameter rather than written into the activity
+    // clock -- see [`picker_holds_the_screen_awake`] for why a flag would be
+    // the wrong shape, and `SessionActivity::tick` for why writing the clock
+    // would be worse still.
+    let held_by_picker = picker_holds_the_screen_awake(runtime, grab, now);
     // The idle raise first, so a session that went idle this round locks on
     // this round's frame rather than the next one.
-    screen.tick(now);
+    screen.tick(now, held_by_picker);
 
     // The realms named on the card: every realm still admitting petitions, in
     // registry order. Deliberately the *live* set rather than every configured
@@ -2280,11 +3132,34 @@ pub(crate) fn service_lock_round<H: PreemptionHook>(
     // entirely (a wrong passphrase changes no pixel).
     for entry in screen.take_journal() {
         let event = match entry {
-            crate::lock::LockJournal::Locked { cause } => crate::recorder::Event::SessionLocked {
-                cause: cause.label(),
-                passphrase: screen.unlock_method() == crate::lock::UnlockMethod::Passphrase,
-                realms: realms.len(),
-            },
+            crate::lock::LockJournal::Locked { cause } => {
+                // **Decision 9's other half**: the lock cancels a live picker
+                // rather than hiding one behind an opaque cover.
+                //
+                // The dead-man chord and the lock chord are never blockable
+                // and that is unchanged -- `LockGate` sits OUTSIDE the consent
+                // grab in every stack, so a raised picker cannot swallow
+                // either. What changes is what the lock *does* to a picker it
+                // finds: it ends it, on the same "nobody answered" terms a VT
+                // switch does, instead of leaving an exclusive input grab over
+                // a filesystem browser parked under a lock screen for the rest
+                // of the ticket's life.
+                //
+                // The card itself comes down on the next
+                // [`service_picker_round`], which finds the obligation gone --
+                // this function holds no consent surface, and threading one in
+                // to save a round would put lock-screen code in the business
+                // of lowering consent cards. The grab's own deadline backstop
+                // bounds the gap either way.
+                for id in cancel_outstanding_designations(runtime, now) {
+                    tracing::info!(%id, "cancelling a designation: the session just locked");
+                }
+                crate::recorder::Event::SessionLocked {
+                    cause: cause.label(),
+                    passphrase: screen.unlock_method() == crate::lock::UnlockMethod::Passphrase,
+                    realms: realms.len(),
+                }
+            }
             crate::lock::LockJournal::Attempted { accepted } => {
                 crate::recorder::Event::UnlockAttempted { accepted }
             }
@@ -2393,6 +3268,11 @@ pub(crate) fn service_lock_round<H: PreemptionHook>(
 pub(crate) fn service_blank_round<H: PreemptionHook>(
     runtime: &mut Runtime<H>,
     lock: &std::cell::RefCell<crate::lock::LockScreen>,
+    // Required, not `Option`, on [`service_lock_round`]'s own precedent and
+    // for its reason: decision 6 says a raised picker holds the blank off, and
+    // a parameter a caller may omit is the shape this codebase has already had
+    // to un-ship twice. A caller with no picker passes its grab anyway.
+    grab: &std::cell::RefCell<ConsentGrab>,
     activity: &mut crate::backend::blank::SessionActivity,
     surface: &mut crate::backend::blank::BlankSurface,
     now: Instant,
@@ -2414,7 +3294,15 @@ pub(crate) fn service_blank_round<H: PreemptionHook>(
         .holds(runtime.router.bound_realm());
     // The countdown first, so a session that went idle this round covers on
     // this round's frame rather than the next one.
-    activity.tick(now, inhibited);
+    // **Two suppression sources, one term, and they are deliberately not the
+    // same fact** (P2.6.6 decision 6). `inhibited` is a *confined app's*
+    // request; `held_by_picker` is the core's own card in front of the human,
+    // bounded by the designation's deadline. They are OR'd here, at the call
+    // site that already samples this round's instant, rather than merged into
+    // one record — so widening what an app may inhibit can never widen what a
+    // picker suppresses, or the reverse.
+    let held_by_picker = picker_holds_the_screen_awake(runtime, grab, now);
+    activity.tick(now, inhibited || held_by_picker);
     // A wake that outran its deadline with no flip behind it is abandoned, so
     // the session is not left in a state where every subsequent press is
     // swallowed as "still waking". Fail open on input; the property that stops
@@ -2790,6 +3678,31 @@ fn close_principal<H: RuntimeHost>(host: &mut H, id: ConnectionId, cause: CloseC
         &mut runtime.kernel.grants,
         &mut runtime.kernel.recorder,
     );
+    // **Both designation tables, not just the ledger.** A peer that
+    // disconnects is owed nothing, and neither an obligation nor a held
+    // descriptor may outlive the connection it names. The descriptor half is
+    // the one that cannot wait for a deadline: a wake on a dead connection
+    // succeeds and produces no turn, so leaving it would pin the human's file
+    // open for the full `DELIVERY_DEADLINE` every time an agent dies
+    // mid-designation.
+    //
+    // Journalled, both of them: a designation the human made and the agent
+    // never received is exactly the silence the record exists to prevent. No
+    // wire answer is attempted -- the connection this would address is the
+    // one that just went away.
+    for ticket in runtime.kernel.designations.withdraw_connection(id) {
+        let designation = ticket.id();
+        journal_designation(
+            runtime,
+            designation,
+            Some(&ticket),
+            None,
+            SettleFailure::ConnectionGone,
+        );
+    }
+    for (entry, why) in runtime.kernel.deliveries.withdraw_connection_by_id(id) {
+        journal_abandoned(runtime, entry, why);
+    }
     if let Some(deadline) = conn.deadline.take() {
         handle.remove(deadline);
     }
@@ -2814,15 +3727,19 @@ fn dispatch_principal<H: RuntimeHost>(
         // to write, which is the one thing an fd-bearing `reply` needs that a
         // silent peer cannot supply — see `Outbox::wake`.
         //
-        // Unreachable today: nothing in this crate calls `wake()` yet. The
-        // picker's descriptor delivery (#190) is its only intended caller, and
-        // it attaches here. Logged rather than ignored, because a turn arriving
-        // with no caller would mean something else learned to ask for one.
+        // **The agent's copy of a designated descriptor goes out here**
+        // (P2.6.6, issue #190), and this is the only place it can: `reply` is
+        // the one fd-capable write in this core and it needs the
+        // `NoIoDrop<Connection>` that only a dispatch callback holds.
+        //
+        // The agent's half goes **first**, and its failure stops the shim's.
+        // The IDL states as normative fact that "the agent's own answer was
+        // already delivered on its own connection before this event was
+        // sent", so sending the realm's copy after a failed agent write would
+        // make the wire's own premise false and hand a realm a descriptor its
+        // agent never received.
         ConnectionEvent::Woken => {
-            tracing::debug!(
-                "a connection was woken with no delivery owed; nothing asks \
-                 for turns yet"
-            );
+            deliver_agent_copy(host, id, conn);
         }
         ConnectionEvent::Message(msg) => {
             // Chokepoint-admitted actuations land here first rather than
@@ -2852,6 +3769,13 @@ fn dispatch_principal<H: RuntimeHost>(
             // [`PendingLaunch`]: the part that could *refuse* has already
             // run, inside the sink, because `launched` is a terminal.
             let mut launches: Vec<PendingLaunch> = Vec::new();
+            // Powerbox terminals the designation sink produced itself,
+            // collected for the borrow reason the three above are: `send`
+            // belongs to `handle_message` for the length of this message, and
+            // these are written afterwards through the connection's outbox.
+            // Never fd-bearing -- the one designation frame that carries a
+            // descriptor needs a dispatch turn, not a queue.
+            let mut powerbox_refusals: Vec<Vec<u8>> = Vec::new();
             let now = Instant::now();
             let outcome = {
                 let (runtime, view) = host.split();
@@ -2977,8 +3901,74 @@ fn dispatch_principal<H: RuntimeHost>(
                 // -- a verb that is served with no mechanism behind it is a
                 // condition the IDL names, and it should be visible in the
                 // journal of any deployment that somehow serves the bit.
-                let mut designate = |_ask: crate::enforcement::DesignateAsk<'_>| {
-                    Err(crate::enforcement::DesignateRefusal::Unavailable)
+                // **The designation sink** (P2.6.6, issue #190): the one
+                // closure through which a wire request can put a picker in
+                // front of the human.
+                //
+                // It mints an obligation and **raises nothing**. Raising is
+                // [`service_picker_round`]'s, which runs after this dispatch
+                // with the grab the backend owns; this closure holds no grab,
+                // no surface and no descriptor, and could not raise a card if
+                // it wanted to. What it owes is the *record* that a human is
+                // owed a card, which is exactly what the ledger is.
+                //
+                // Three answers, and the third is the one with a subtlety:
+                //
+                // - **No picker root** -> `Unavailable`, which the chokepoint
+                //   voices as `internal`. A verb served with no mechanism
+                //   behind it is the condition the IDL forbids, and this is
+                //   what makes widening `SERVED_VERB_BITS` alone insufficient
+                //   to start admitting.
+                // - **A ticket** -> the chokepoint answers `Owed` and says
+                //   nothing on the wire; the terminal arrives later.
+                // - **The ledger refuses** (a card already up for this
+                //   principal, or the ledger at its bound) -> the terminal is
+                //   `vitrin_powerbox.refusal busy`, sent HERE on the facet,
+                //   and the chokepoint is told
+                //   [`DesignateRefusal::Answered`] so it voices nothing. The
+                //   IDL is explicit that designation never reaches
+                //   `capacity`, which is a statement about *realms*.
+                //
+                // The frame is queued rather than written: `send` belongs to
+                // `handle_message`, which is borrowing the connection for this
+                // whole message. Queued frames go out through the outbox after
+                // the dispatch, on `seat` and `layout_acts`' precedent, and
+                // the outbox is the right route because this frame carries no
+                // descriptor -- unlike the `designated` terminal, which does
+                // and therefore needs a dispatch turn.
+                let picker_root = kernel.picker_root.as_ref();
+                let designations = &mut kernel.designations;
+                let mut designate = |ask: crate::enforcement::DesignateAsk<'_>| {
+                    if picker_root.is_none() {
+                        return Err(crate::enforcement::DesignateRefusal::Unavailable);
+                    }
+                    match designations.open(
+                        id,
+                        ask.facet_id,
+                        ask.grant_wire_id,
+                        ask.grant,
+                        ask.principal,
+                        ask.realm,
+                        ask.ask,
+                        ask.spent_once,
+                        ask.deadline,
+                    ) {
+                        Ok(designation) => Ok(designation),
+                        Err(refusal) => {
+                            tracing::debug!(
+                                ?refusal,
+                                "no picker could be raised for this ask; answering busy on the \
+                                 powerbox facet"
+                            );
+                            powerbox_refusals.push(
+                                vitrin_protocol::terminals::powerbox_refusal_frame(
+                                    ask.facet_id,
+                                    vitrin_protocol::generated::vitrin_powerbox::Refusal::Busy,
+                                ),
+                            );
+                            Err(crate::enforcement::DesignateRefusal::Answered)
+                        }
+                    }
                 };
                 let mut launch = |ask: LaunchAsk<'_>| {
                     // Resolved per launch rather than per dispatch: this
@@ -3066,6 +4056,15 @@ fn dispatch_principal<H: RuntimeHost>(
                 // connection that asked for it, exactly as one from
                 // `realm.toml` outlives the startup that read it.
                 apply_launches(host, launches);
+                // ...and the same argument for a powerbox refusal the sink
+                // already produced: the ask was admitted and answered, and
+                // dropping the answer because the socket faulted afterwards
+                // would leave the journal's obligation open against a client
+                // that will never hear anything. It goes out on the outbox,
+                // which a condemned connection simply drops -- the difference
+                // is that the attempt is made and logged rather than silently
+                // skipped.
+                flush_powerbox_refusals(host, id, powerbox_refusals);
                 // The goodbye is already on the wire and the violation is
                 // already logged; `handle_message` cannot run teardown
                 // because it holds no kernel state. This is the third close
@@ -3083,6 +4082,12 @@ fn dispatch_principal<H: RuntimeHost>(
             // where the realm being left is paid the physical presses it is
             // holding. Deferring that past the round's deliveries would leave
             // the drain chasing a binding that had already moved.
+            // **Before layout and input**, because it is a terminal an agent
+            // is already waiting for and neither of those can affect it. A
+            // refusal that went out after a round's worth of actuations would
+            // still be correct on the wire; sending it first keeps the client's
+            // one-terminal-per-ask pairing as prompt as the queue allows.
+            flush_powerbox_refusals(host, id, powerbox_refusals);
             apply_layout(host, layout_acts);
             route_seat(host, seat);
             // **Last**, and it does not compete with the two above: a
@@ -3101,6 +4106,110 @@ fn dispatch_principal<H: RuntimeHost>(
         ConnectionEvent::Fault(reason) => {
             tracing::info!(connection = %id, %reason, "principal connection terminated");
             close_principal(host, id, CloseCause::TransportInitiated);
+        }
+    }
+}
+
+/// Write the agent's `vitrin_powerbox.designated`, then wake the realm's shim
+/// for its copy.
+///
+/// Runs inside the turn [`settle_designation`] asked for, and does nothing
+/// unless this connection is actually owed one — a turn with no delivery
+/// behind it is logged rather than ignored, because it would mean something
+/// else in this core learned to ask for one.
+fn deliver_agent_copy<H: RuntimeHost>(
+    host: &mut H,
+    id: ConnectionId,
+    conn: &mut calloop::generic::NoIoDrop<Connection>,
+) {
+    // Which delivery this connection is owed. At most one per principal by
+    // the ledger's own rule; found by connection rather than tracked
+    // per-connection, because the wake carries nothing.
+    let runtime = host.runtime();
+    let Some(designation) = runtime.kernel.deliveries.owed_by_connection(id) else {
+        tracing::debug!(
+            connection = %id,
+            "a connection was woken with no designation owed"
+        );
+        return;
+    };
+    let Some(entry) = runtime.kernel.deliveries.get_mut(designation) else {
+        return;
+    };
+    let frame = vitrin_protocol::terminals::powerbox_designated_frame(
+        entry.facet_id,
+        entry.id.get(),
+        wire_kind(entry.ask),
+        wire_mode(entry.ask),
+        // Lossy AND clamped, in one helper beside the bound it clamps to:
+        // `name` is a wire `string`, which is UTF-8, while a filename is
+        // bytes. It is **display only** -- the descriptor is already open and
+        // nothing resolves this -- so a name that is not UTF-8 arrives with
+        // replacement characters rather than failing a designation the human
+        // already made. The clamp is not cosmetic: lossy conversion *grows*
+        // (one invalid byte becomes three), so an ordinary 255-byte filename
+        // that is not UTF-8 would otherwise overflow the message's
+        // `string@max` and trip that encoder's assertion **inside this
+        // dispatch callback** -- a panic in the trusted core reachable from a
+        // file the human picked.
+        &vitrin_protocol::terminals::display_name(&entry.name),
+    );
+    let sent = vitrin_ipc::reply(conn, &frame, Some(std::os::fd::AsFd::as_fd(&entry.fd)));
+    match sent {
+        Ok(()) => entry.agent = crate::picker::delivery::Half::Sent,
+        Err(err) => {
+            tracing::warn!(%err, "the agent's designated descriptor could not be written");
+            entry.agent = crate::picker::delivery::Half::Failed;
+        }
+    }
+    if entry.agent != crate::picker::delivery::Half::Sent {
+        // The agent's half failed, so the realm's is NOT attempted (module
+        // docs on `picker::delivery`). The descriptor is closed here.
+        release_delivery(
+            host.runtime(),
+            designation,
+            crate::picker::delivery::Abandoned::SendFailed,
+        );
+        return;
+    }
+    // Ask the realm's shim for its own turn.
+    let realm = entry.realm.clone();
+    let runtime = host.runtime();
+    let Some(shim) = runtime.realms.get(&realm) else {
+        release_delivery(
+            runtime,
+            designation,
+            crate::picker::delivery::Abandoned::RealmDied,
+        );
+        return;
+    };
+    shim.outbox.wake();
+}
+
+fn wire_kind(
+    ask: crate::designation::AskedFor,
+) -> vitrin_protocol::generated::vitrin_powerbox::Kind {
+    use vitrin_protocol::generated::vitrin_powerbox::Kind;
+    match ask {
+        crate::designation::AskedFor::File { .. } => Kind::File,
+        crate::designation::AskedFor::Dir => Kind::Directory,
+    }
+}
+
+/// The **effective** mode, which may be narrower than the ask.
+///
+/// A directory designation is a directory descriptor, opened read-only by
+/// `picker::resolve` whatever was asked, so it reports `read` -- the wire
+/// value must describe the descriptor that was actually opened, not the
+/// request that was made.
+fn wire_mode(
+    ask: crate::designation::AskedFor,
+) -> vitrin_protocol::generated::vitrin_powerbox::Mode {
+    use vitrin_protocol::generated::vitrin_powerbox::Mode;
+    match ask {
+        crate::designation::AskedFor::File { write: true } => Mode::ReadWrite,
+        crate::designation::AskedFor::File { write: false } | crate::designation::AskedFor::Dir => {
+            Mode::Read
         }
     }
 }
@@ -4785,15 +5894,14 @@ fn dispatch_shim<H: RuntimeHost>(
         // to write, which is the one thing an fd-bearing `reply` needs that a
         // silent peer cannot supply — see `Outbox::wake`.
         //
-        // Unreachable today: nothing in this crate calls `wake()` yet. The
-        // picker's descriptor delivery (#190) is its only intended caller, and
-        // it attaches here. Logged rather than ignored, because a turn arriving
-        // with no caller would mean something else learned to ask for one.
+        // **The realm's copy of a designated descriptor goes out here**
+        // (P2.6.6, issue #190), and it is the SAME descriptor the agent
+        // received one turn earlier — `SCM_RIGHTS` installs a descriptor
+        // referring to the same open file description in each receiver, which
+        // is what `dup` produces, so the two share a file offset. Two opens
+        // would be two race windows and could name two different inodes.
         ConnectionEvent::Woken => {
-            tracing::debug!(
-                "a connection was woken with no delivery owed; nothing asks \
-                 for turns yet"
-            );
+            deliver_realm_copy(host, realm_id, conn);
         }
         ConnectionEvent::Message(msg) => {
             let (runtime, view) = host.split();
@@ -4867,6 +5975,84 @@ fn dispatch_shim<H: RuntimeHost>(
     }
 }
 
+/// Write the realm's `vitrin_shim_session.designation`.
+///
+/// Runs inside the turn [`deliver_agent_copy`] asked for, and only ever after
+/// the agent's copy went out: the IDL's premise for this event is that the
+/// agent already has its own.
+fn deliver_realm_copy<H: RuntimeHost>(
+    host: &mut H,
+    realm_id: &RealmId,
+    conn: &mut calloop::generic::NoIoDrop<Connection>,
+) {
+    let runtime = host.runtime();
+    let Some(designation) = runtime.kernel.deliveries.owed_by_realm(realm_id) else {
+        tracing::debug!(realm = %realm_id, "a shim was woken with no designation owed");
+        return;
+    };
+    let Some(entry) = runtime.kernel.deliveries.get_mut(designation) else {
+        return;
+    };
+    let frame = vitrin_protocol::terminals::shim_designation_frame(
+        crate::shim::SHIM_SESSION_ID,
+        entry.id.get(),
+        wire_kind(entry.ask),
+        wire_mode(entry.ask),
+        // The same clamp as the agent's copy, and the same reason: see
+        // `deliver_agent_copy`.
+        &vitrin_protocol::terminals::display_name(&entry.name),
+    );
+    match vitrin_ipc::reply(conn, &frame, Some(std::os::fd::AsFd::as_fd(&entry.fd))) {
+        Ok(()) => entry.shim = crate::picker::delivery::Half::Sent,
+        Err(err) => {
+            tracing::warn!(realm = %realm_id, %err, "the realm's designation could not be written");
+            entry.shim = crate::picker::delivery::Half::Failed;
+        }
+    }
+    // Both halves have an answer now, whatever those answers are, so the
+    // entry leaves the table and the descriptor is closed. The journal line
+    // says which: the agent's copy went out (that is what `delivered` means),
+    // and a failed realm half is reported in the outcome word rather than by
+    // pretending nothing happened.
+    let runtime = host.runtime();
+    let failed = runtime
+        .kernel
+        .deliveries
+        .get_mut(designation)
+        .is_some_and(|e| e.shim != crate::picker::delivery::Half::Sent);
+    if failed {
+        release_delivery(
+            runtime,
+            designation,
+            crate::picker::delivery::Abandoned::SendFailed,
+        );
+        // ...and still re-arm below: this entry is off the table either way,
+        // and a *sibling* entry owed to the same realm must not be stranded
+        // because this one's write failed.
+    } else if let Some(entry) = runtime.kernel.deliveries.take_settled(designation) {
+        journal_delivered(runtime, &entry);
+    }
+    // **One turn serves one entry, so ask for another if one is owed.**
+    //
+    // `Outbox::wake` is a flag, not a counter, so two wakes on the same shim
+    // collapse into one `ConnectionEvent::Woken`. Two designations settled
+    // into the same realm inside one delivery deadline would therefore leave
+    // the second's realm copy waiting for a turn that never comes -- it would
+    // expire on the sweep, with the *agent's* copy already delivered, which is
+    // exactly the half-delivered state the IDL's premise forbids.
+    //
+    // Re-arming here is the mechanism the loop documents for this: "a core
+    // that asks for another turn from inside the handler sets it again and
+    // gets exactly one more". It cannot spin -- each turn removes an entry
+    // from the table, so `owed_by_realm` strictly shrinks, and the arm is
+    // taken only when something is genuinely still owed.
+    if runtime.kernel.deliveries.owed_by_realm(realm_id).is_some() {
+        if let Some(shim) = runtime.realms.get(realm_id) {
+            shim.outbox.wake();
+        }
+    }
+}
+
 /// The realm's shim connection ended — EOF, a transport fault, or a shim
 /// protocol violation — routed into the realm-lifecycle funnel.
 ///
@@ -4917,6 +6103,42 @@ fn close_realm<H: RuntimeHost>(host: &mut H, realm_id: &RealmId, cause: DeathCau
             realm = %realm_id,
             "clipboard slot cleared: the realm its contents came from has died"
         );
+    }
+    // ...and the two designation tables, on the slot's own terms and for a
+    // sharper reason (`crate::designation::DesignationTicket::realm`): a
+    // *declared* realm keeps its id across a process death, so a ticket left
+    // behind could be redeemed against whatever next holds that id -- the
+    // human's editor crashes mid-pick, they restart it, they confirm, and the
+    // descriptor lands in a process they never approved. Forgetting the
+    // ticket here is what makes that window not exist, and it is why
+    // `DeliveryWorld::realm_is_the_same` can be the second line rather than
+    // the first.
+    for ticket in runtime.kernel.designations.forget_realm(realm_id) {
+        tracing::info!(
+            realm = %realm_id,
+            designation = %ticket.id(),
+            "designation abandoned: the realm it was addressed to has died"
+        );
+        // The client is owed exactly one terminal and this is it. Journalled
+        // through the same funnel every other refusal takes.
+        let id = ticket.id();
+        journal_designation(runtime, id, Some(&ticket), None, SettleFailure::RealmDied);
+        voice_powerbox_refusal(runtime, &ticket, SettleFailure::RealmDied);
+    }
+    for (entry, why) in runtime.kernel.deliveries.forget_realm(realm_id) {
+        journal_abandoned(runtime, entry, why);
+    }
+    // A picker raised for a designation that just died has nothing left to
+    // browse for. Its card is taken down by the next
+    // [`service_picker_round`], which finds the obligation gone; the session
+    // is dropped here so its directory descriptors do not outlive the realm.
+    if runtime
+        .kernel
+        .picker
+        .as_ref()
+        .is_some_and(|p| !runtime.kernel.designations.is_open(p.id()))
+    {
+        runtime.kernel.picker = None;
     }
     runtime.dirty = true;
     view.request_present();
@@ -5013,6 +6235,13 @@ pub(crate) fn post_dispatch<H: RuntimeHost>(host: &mut H) {
     // reads `dirty`. Backends that cannot host a prompt inherit the trait's
     // no-op and pay nothing here.
     host.service_consent(Instant::now());
+    // ...and the picker, immediately after and on identical terms (P2.6.6):
+    // raising or lowering one is exactly what makes the frame dirty, and it
+    // runs after consent for the same reason the lock does -- the journal
+    // should read in the order the human experienced, and a round that both
+    // answered a petition and raised a picker did those two things in that
+    // order.
+    host.service_picker(Instant::now());
     // ...and the lock, on the same terms and immediately after: raising or
     // lowering it is exactly what makes the frame dirty. Sampling `Instant::now()`
     // a second time rather than threading one turn instant through both is the
@@ -5789,6 +7018,28 @@ mod tests {
             }
         }
 
+        /// The nested backend's picker override in miniature (P2.6.6, issue
+        /// #190): with a grab attached, run [`service_picker_round`] and mark
+        /// the frame dirty on a change.
+        ///
+        /// The same shape and the same grab as this rig's `service_consent`,
+        /// so a picker and a consent card cannot both be up here either.
+        fn service_picker(&mut self, now: Instant) {
+            let Some(grab) = self.grab.clone() else {
+                return;
+            };
+            let mut grab = grab.borrow_mut();
+            if service_picker_round(
+                &mut grab,
+                &mut self.runtime,
+                &mut self.view.consent,
+                now,
+                PromptVisibility::Reachable,
+            ) {
+                self.runtime.dirty = true;
+            }
+        }
+
         /// The bare-metal backend's [`RuntimeHost::service_screen`] in
         /// miniature: the resume detector, then the blank's round.
         fn service_screen(&mut self, wall: std::time::SystemTime, now: Instant) {
@@ -5816,11 +7067,22 @@ mod tests {
             // two implementations are kept the same shape deliberately -- a rig
             // that was safe by accident would stop being a model of the thing it
             // stands in for.
+            // A rig with no grab gets an empty one for the length of this
+            // call. That is not a fixture shortcut: an idle grab holds no
+            // picker, so `picker_holds_the_screen_awake` answers `false`,
+            // which is the same answer a backend with no grab must give. The
+            // alternative -- an `Option` parameter -- is the shape the round's
+            // own signature refuses.
+            let grab = self
+                .grab
+                .clone()
+                .unwrap_or_else(|| Rc::new(RefCell::new(ConsentGrab::new())));
             let changed = {
                 let mut activity = activity.borrow_mut();
                 service_blank_round(
                     &mut self.runtime,
                     &lock,
+                    &grab,
                     &mut activity,
                     &mut self.view.blank,
                     now,
@@ -5977,6 +7239,11 @@ mod tests {
                 // `backlight_signal` reads in a real backend, and a rig that
                 // set it here would be claiming a device it has not built.
                 backlight: None,
+                // Per test: a rig that wants a picker installs one
+                // (`Rig::with_picker_root`), and the default is no picker at
+                // all, so a session-level test cannot accidentally serve
+                // designations it never asked to serve.
+                picker_root: None,
             };
             let event_loop: EventLoop<'static, TestHost> =
                 EventLoop::try_new().expect("event loop");
@@ -6251,6 +7518,655 @@ mod tests {
             crate::recorder::tests::cleanup(&self.log);
             std::fs::remove_dir_all(&self.dir).ok();
         }
+    }
+
+    // -- the core-drawn file picker (P2.6.6, issue #190) --------------------
+
+    use crate::designation::{AskedFor, DesignationId};
+    use crate::grants::GrantId;
+    use crate::picker::resolve::EffectiveMode;
+    use crate::picker::session::{Chosen, PickerRoot};
+
+    /// A scratch tree with one real file in it, plus the root descriptor the
+    /// funnel resolves from.
+    fn picker_fixture(tag: &str) -> (PathBuf, PickerRoot) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "vitrin-picker-funnel-{tag}-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("chosen.txt"), b"the human's file").unwrap();
+        // A second row, so a motion has somewhere to move to: a one-row
+        // listing makes every navigation test vacuous.
+        std::fs::write(dir.join("second.txt"), b"another file").unwrap();
+        let root = PickerRoot::open(&dir).expect("the scratch root opens");
+        (dir, root)
+    }
+
+    /// A grant row carrying `designate_file` over the rig's realm.
+    fn designation_grant(rig: &mut Rig, principal: &PrincipalIdentity, now: Instant) -> GrantId {
+        rig.host
+            .runtime
+            .kernel
+            .grants
+            .insert(
+                crate::grants::GrantSpec {
+                    principal_id: principal.clone(),
+                    realm_id: RealmId::new(crate::realm::WELL_KNOWN_REALM_ID),
+                    resource_ref: crate::grants::ResourceRef::WholeRealm,
+                    verbs: Verb::DESIGNATE_FILE,
+                    expiry: None,
+                    max_event_rate: std::num::NonZeroU32::new(20).unwrap(),
+                    persistence: crate::grants::PersistenceRung::WhileRunning,
+                    issuer: crate::grants::Issuer::HumanConsent,
+                },
+                now,
+            )
+            .expect("a valid row")
+    }
+
+    /// Mint one outstanding obligation on the rig's ledger.
+    fn open_designation(
+        rig: &mut Rig,
+        principal: &PrincipalIdentity,
+        grant: GrantId,
+        deadline: Instant,
+    ) -> DesignationId {
+        let connection = rig.host.runtime.kernel.petitions.register_connection();
+        rig.host
+            .runtime
+            .kernel
+            .designations
+            .open(
+                connection,
+                20,
+                10,
+                grant,
+                principal,
+                &RealmId::new(crate::realm::WELL_KNOWN_REALM_ID),
+                AskedFor::File { write: false },
+                false,
+                deadline,
+            )
+            .expect("the ledger admits this ask")
+    }
+
+    /// What the picker would hand the funnel for a row directly under
+    /// `root`: the directory descriptor the human was standing in, plus the
+    /// one name inside it.
+    fn chose(root: &PickerRoot, name: &str) -> Chosen {
+        Chosen {
+            dir: root.as_fd().try_clone_to_owned().expect("dup the root"),
+            name: name.as_bytes().to_vec(),
+            mode: EffectiveMode::ReadOnly,
+            directory: false,
+            shown_path: Vec::new(),
+        }
+    }
+
+    /// The one `designation_settled` entry, or a panic naming what there was.
+    fn settled(rig: &mut Rig) -> crate::recorder::tests::Json {
+        let entries = rig.entries();
+        let mut found = crate::recorder::tests::of_kind(&entries, "designation_settled");
+        assert_eq!(
+            found.len(),
+            1,
+            "expected exactly one designation_settled entry, got {}",
+            found.len()
+        );
+        found.remove(0).clone()
+    }
+
+    /// A watch that fires on `IN_OPEN` and nothing else, plus a drain.
+    ///
+    /// Returns the inotify descriptor; [`opened_since`] answers whether
+    /// anything opened the watched file since the last call.
+    fn watch_opens(path: &std::path::Path) -> std::os::fd::OwnedFd {
+        let inot = rustix::fs::inotify::init(rustix::fs::inotify::CreateFlags::NONBLOCK)
+            .expect("inotify is available on every kernel this core supports");
+        rustix::fs::inotify::add_watch(&inot, path, rustix::fs::inotify::WatchFlags::OPEN)
+            .expect("the fixture file can be watched");
+        inot
+    }
+
+    /// Whether the watched file was opened since this was last asked.
+    ///
+    /// `EAGAIN` on a non-blocking inotify descriptor is the kernel saying
+    /// "no events", which is the negative answer this test needs — and it is
+    /// a *positive* statement about the kernel's record rather than an
+    /// absence of evidence.
+    fn opened_since(inot: &std::os::fd::OwnedFd) -> bool {
+        let mut buf = [std::mem::MaybeUninit::<u8>::uninit(); 4096];
+        let mut reader = rustix::fs::inotify::Reader::new(inot, &mut buf);
+        match reader.next() {
+            Ok(_) => true,
+            // `AGAIN` and `WOULDBLOCK` are the same errno on Linux, so one arm.
+            Err(rustix::io::Errno::AGAIN) => false,
+            Err(err) => {
+                panic!("the inotify read failed for a reason that is not 'no events': {err:?}")
+            }
+        }
+    }
+
+    /// **A revoked grant must never cause the core to open a file.**
+    ///
+    /// Not "must fail to send a descriptor" — must never *touch the human's
+    /// filesystem*. Opening is itself an act: it updates atime, it can fire an
+    /// inotify watch, and on a network filesystem it is a round trip. The
+    /// funnel's step 1 is the ledger's redemption precisely so that no
+    /// authority failure gets as far as an `openat2`.
+    ///
+    /// # How this test can tell, and why the refusal word is not enough
+    ///
+    /// It **watches the file**. An `IN_OPEN` watch is armed on the fixture
+    /// before the funnel runs, and the assertion is that the kernel recorded
+    /// no open at all.
+    ///
+    /// That is the whole point of the inotify half, and it was added because
+    /// the version of this test that stood here could not see the thing it was
+    /// named for. It asserted only the refusal *word*: the chosen row exists
+    /// and the connection does not, so `authority_died` (step 1) is
+    /// distinguishable from `connection_gone` (step 2) and `unresolvable`
+    /// (step 3), and the claim was that asserting the first proves the others
+    /// were not reached. It does not. A stray `openat2` hoisted **above** step
+    /// 1 — the exact regression this test names — still refuses
+    /// `authority_died` and still journals no inode, because the redeem-failure
+    /// arm passes `None`. That breakage was constructed and the old assertions
+    /// stayed green through it.
+    ///
+    /// The word assertions are kept beside the watch, because they say which
+    /// step refused and the watch does not.
+    #[test]
+    fn a_revoked_grant_never_causes_the_core_to_open_a_file() {
+        let _fd = crate::capture::tests::fd_lock();
+        let mut rig = Rig::new(
+            "designate-revoked",
+            ConsentPolicyArg {
+                policy: crate::petitions::ConsentPolicy::AutoApprove,
+                config: PetitionConfig::default(),
+            },
+        );
+        let (dir, root) = picker_fixture("revoked");
+        rig.host.runtime.kernel.picker_root = Some(root);
+        let now = Instant::now();
+        let who = PrincipalIdentity::parse(DEMO_IDENTITY).unwrap();
+        let grant = designation_grant(&mut rig, &who, now);
+        let id = open_designation(&mut rig, &who, grant, now + Duration::from_secs(90));
+
+        // The grant dies between the ask and the confirm -- the whole reason
+        // the ticket holds names rather than an answer.
+        assert!(rig.host.runtime.kernel.grants.revoke(grant));
+
+        // Arm the watch AFTER the fixture is built, so nothing the setup did
+        // can be mistaken for the funnel's own work.
+        let watch = watch_opens(&dir.join("chosen.txt"));
+        assert!(
+            !opened_since(&watch),
+            "control: the watch must start quiet, or a `false` below proves nothing"
+        );
+
+        let chosen = chose(
+            rig.host
+                .runtime
+                .kernel
+                .picker_root
+                .as_ref()
+                .expect("installed above"),
+            "chosen.txt",
+        );
+        settle_designation(&mut rig.host.runtime, id, Some(chosen), now);
+
+        assert!(
+            !opened_since(&watch),
+            "the core opened the human's file for a grant that was already revoked. A \
+             delivered descriptor is kernel authority this core cannot recall, and an open \
+             is itself an act on the filesystem -- it fires exactly the watch this test just \
+             saw fire"
+        );
+        // ...and the control that makes the assertion above non-vacuous: the
+        // same file, opened the way the funnel would have, DOES fire it. A
+        // watch that never fires would let the assertion pass against a core
+        // that opens everything.
+        {
+            let fd = crate::picker::resolve::resolve(
+                rig.host
+                    .runtime
+                    .kernel
+                    .picker_root
+                    .as_ref()
+                    .expect("installed above")
+                    .as_fd(),
+                &[std::ffi::OsStr::new("chosen.txt")],
+                EffectiveMode::ReadOnly,
+                false,
+            )
+            .expect("the fixture file opens");
+            drop(fd);
+        }
+        assert!(
+            opened_since(&watch),
+            "control: an open of this file must be observable, or the assertion above is \
+             vacuous and would hold against a funnel that opens every time"
+        );
+
+        let entry = settled(&mut rig);
+        assert_eq!(
+            entry.str("outcome"),
+            "authority_died",
+            "the funnel must refuse at the authority step, before it resolves anything"
+        );
+        assert!(!entry.bool("delivered"));
+        assert!(
+            entry.path("st_ino").is_none(),
+            "an inode was recorded, so a descriptor was opened for a grant that was already \
+             dead -- and a delivered descriptor is kernel authority the core cannot recall"
+        );
+        assert_eq!(
+            rig.host.runtime.kernel.deliveries.outstanding(),
+            0,
+            "nothing may be held for a designation that was refused"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **A dead realm is refused before the open too.**
+    ///
+    /// The control for the test above, and it identifies the step the same
+    /// way: here the grant is alive and the chosen row names an entry that
+    /// **does not exist**, so a funnel that reached step 3 would say
+    /// `unresolvable`. It must say `realm_died` — the redemption's own second
+    /// question, asked before anything touches a filesystem.
+    ///
+    /// The realm is dead because this rig has no shim session at all, which
+    /// is exactly the state `realm_is_the_same` exists to detect: a grant row
+    /// naming a realm whose process is gone.
+    #[test]
+    fn a_dead_realm_is_refused_before_the_open() {
+        let _fd = crate::capture::tests::fd_lock();
+        let mut rig = Rig::new(
+            "designate-gone",
+            ConsentPolicyArg {
+                policy: crate::petitions::ConsentPolicy::AutoApprove,
+                config: PetitionConfig::default(),
+            },
+        );
+        let (dir, root) = picker_fixture("gone");
+        rig.host.runtime.kernel.picker_root = Some(root);
+        let now = Instant::now();
+        let who = PrincipalIdentity::parse(DEMO_IDENTITY).unwrap();
+        let grant = designation_grant(&mut rig, &who, now);
+        let id = open_designation(&mut rig, &who, grant, now + Duration::from_secs(90));
+
+        let chosen = chose(
+            rig.host
+                .runtime
+                .kernel
+                .picker_root
+                .as_ref()
+                .expect("installed above"),
+            "not-here.txt",
+        );
+        settle_designation(&mut rig.host.runtime, id, Some(chosen), now);
+
+        let entry = settled(&mut rig);
+        assert_eq!(
+            entry.str("outcome"),
+            "realm_died",
+            "the funnel must judge the destination before it opens: a name that does not \
+             exist would have answered `unresolvable` if the resolve step had been reached"
+        );
+        assert!(entry.path("st_ino").is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **An unanswered designation is expired by the armed sweep**, and the
+    /// journal says so.
+    ///
+    /// Driven through [`sweep_at`] rather than by calling the ledger's expiry
+    /// entry point, on `the_expiry_sweep_has_no_second_caller`'s rule: a test
+    /// that reaches past the wiring proves the function works while the wiring
+    /// could be missing entirely.
+    #[test]
+    fn the_sweep_expires_a_designation_nobody_answered() {
+        let _fd = crate::capture::tests::fd_lock();
+        let mut rig = Rig::new(
+            "designate-sweep",
+            ConsentPolicyArg {
+                policy: crate::petitions::ConsentPolicy::AutoApprove,
+                config: PetitionConfig::default(),
+            },
+        );
+        let now = Instant::now();
+        let who = PrincipalIdentity::parse(DEMO_IDENTITY).unwrap();
+        let grant = designation_grant(&mut rig, &who, now);
+        let deadline = now + Duration::from_secs(90);
+        let id = open_designation(&mut rig, &who, grant, deadline);
+        assert!(rig.host.runtime.kernel.designations.is_open(id));
+
+        // Inside the deadline: still owed.
+        sweep_at(&mut rig.host, deadline - Duration::from_millis(1));
+        assert!(
+            rig.host.runtime.kernel.designations.is_open(id),
+            "a designation inside its deadline is still waiting for a human"
+        );
+
+        sweep_at(&mut rig.host, deadline);
+        assert!(
+            !rig.host.runtime.kernel.designations.is_open(id),
+            "the sweep must expire an obligation nobody answered"
+        );
+        let entry = settled(&mut rig);
+        assert_eq!(entry.str("outcome"), "timed_out");
+        assert!(!entry.bool("delivered"));
+    }
+
+    /// **Decision 9: a screen that stopped being the human's cancels a raised
+    /// picker**, on the walk-away rule rather than a second vocabulary.
+    #[test]
+    fn a_screen_that_is_not_ours_cancels_a_raised_picker() {
+        let _fd = crate::capture::tests::fd_lock();
+        let mut rig = Rig::new(
+            "designate-vt",
+            ConsentPolicyArg {
+                policy: crate::petitions::ConsentPolicy::AutoApprove,
+                config: PetitionConfig::default(),
+            },
+        );
+        let (dir, root) = picker_fixture("vt");
+        rig.host.runtime.kernel.picker_root = Some(root);
+        let grab = rig.attach_grab();
+        let now = Instant::now();
+        let who = PrincipalIdentity::parse(DEMO_IDENTITY).unwrap();
+        let grant = designation_grant(&mut rig, &who, now);
+        let id = open_designation(&mut rig, &who, grant, now + Duration::from_secs(90));
+
+        // Raise it on a reachable screen.
+        let mut surface =
+            crate::consent::ConsentSurface::new(crate::consent::TrustedIndicator::for_test());
+        assert!(service_picker_round(
+            &mut grab.borrow_mut(),
+            &mut rig.host.runtime,
+            &mut surface,
+            now,
+            PromptVisibility::Reachable,
+        ));
+        assert_eq!(grab.borrow().raised_designation(), Some(id));
+
+        // The seat takes the devices away.
+        service_picker_round(
+            &mut grab.borrow_mut(),
+            &mut rig.host.runtime,
+            &mut surface,
+            now,
+            PromptVisibility::ScreenNotOurs,
+        );
+        assert_eq!(
+            grab.borrow().raised_designation(),
+            None,
+            "a picker must not be left holding the human's input on somebody else's VT"
+        );
+        assert!(!rig.host.runtime.kernel.designations.is_open(id));
+        let entry = settled(&mut rig);
+        assert_eq!(
+            entry.str("outcome"),
+            "timed_out",
+            "a VT switch follows the timeout rule -- nobody answered, so policy decides -- \
+             rather than claiming the human cancelled"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **Decision 6, and its bound.** A raised picker holds the idle blank and
+    /// the idle lock off — and stops holding them at the ticket's own
+    /// deadline, with nothing having to release it.
+    #[test]
+    fn a_raised_picker_holds_the_screen_awake_only_until_its_deadline() {
+        let _fd = crate::capture::tests::fd_lock();
+        let mut rig = Rig::new(
+            "designate-awake",
+            ConsentPolicyArg {
+                policy: crate::petitions::ConsentPolicy::AutoApprove,
+                config: PetitionConfig::default(),
+            },
+        );
+        let (dir, root) = picker_fixture("awake");
+        rig.host.runtime.kernel.picker_root = Some(root);
+        let grab = rig.attach_grab();
+        let now = Instant::now();
+        let who = PrincipalIdentity::parse(DEMO_IDENTITY).unwrap();
+        let grant = designation_grant(&mut rig, &who, now);
+        let deadline = now + Duration::from_secs(90);
+        let id = open_designation(&mut rig, &who, grant, deadline);
+
+        assert!(
+            !picker_holds_the_screen_awake(&rig.host.runtime, &grab, now),
+            "control: with nothing raised, nothing is held awake"
+        );
+
+        let mut surface =
+            crate::consent::ConsentSurface::new(crate::consent::TrustedIndicator::for_test());
+        service_picker_round(
+            &mut grab.borrow_mut(),
+            &mut rig.host.runtime,
+            &mut surface,
+            now,
+            PromptVisibility::Reachable,
+        );
+        assert_eq!(grab.borrow().raised_designation(), Some(id));
+        assert!(
+            picker_holds_the_screen_awake(&rig.host.runtime, &grab, now),
+            "a raised picker must hold the blank and the lock off"
+        );
+
+        // **The bound, with nothing released.** The grab still holds the card
+        // and the ledger still holds the ticket -- this is the state a bug
+        // that forgot to clear a flag would leave -- and the answer flips
+        // anyway, because it is read off the ticket's own deadline.
+        assert!(
+            !picker_holds_the_screen_awake(&rig.host.runtime, &grab, deadline),
+            "the suppression must end at the deadline whatever else has or has not run: a \
+             flag set at raise and cleared at settle would still be set here"
+        );
+        assert_eq!(
+            grab.borrow().raised_designation(),
+            Some(id),
+            "and it ended without anything having been released, which is the point"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A step typed against one designation never lands on another.
+    ///
+    /// [`crate::consent::grab::Decision`]'s fail-closed shape, applied to a
+    /// keystroke: the embedder may drain after the picker advanced.
+    #[test]
+    fn a_picker_step_naming_another_designation_is_dropped() {
+        let _fd = crate::capture::tests::fd_lock();
+        let mut rig = Rig::new(
+            "designate-stale",
+            ConsentPolicyArg {
+                policy: crate::petitions::ConsentPolicy::AutoApprove,
+                config: PetitionConfig::default(),
+            },
+        );
+        let (dir, root) = picker_fixture("stale");
+        rig.host.runtime.kernel.picker_root = Some(root);
+        let grab = rig.attach_grab();
+        let now = Instant::now();
+        let who = PrincipalIdentity::parse(DEMO_IDENTITY).unwrap();
+        let grant = designation_grant(&mut rig, &who, now);
+        let id = open_designation(&mut rig, &who, grant, now + Duration::from_secs(90));
+
+        let mut surface =
+            crate::consent::ConsentSurface::new(crate::consent::TrustedIndicator::for_test());
+        service_picker_round(
+            &mut grab.borrow_mut(),
+            &mut rig.host.runtime,
+            &mut surface,
+            now,
+            PromptVisibility::Reachable,
+        );
+
+        // A *motion* typed against a designation that is not the raised one.
+        //
+        // A motion rather than a confirm, deliberately: a confirm typed
+        // against a stranger settles a ticket that does not exist and leaves
+        // the ledger untouched, so it is insensitive to the very check this
+        // test is about. A motion moves visible state or it does not, and
+        // `chosen.txt` / `second.txt` are two rows so there is somewhere for
+        // it to move to.
+        let before = rig
+            .host
+            .runtime
+            .kernel
+            .picker
+            .as_ref()
+            .expect("a picker is up")
+            .cursor();
+        assert_eq!(before, 0);
+        let stranger = DesignationId::from_u32_for_test(id.get() + 7);
+        grab.borrow_mut().queue_step(
+            stranger,
+            crate::picker::keys::PickerStep::Move(crate::picker::keys::Motion::Down),
+        );
+        service_picker_round(
+            &mut grab.borrow_mut(),
+            &mut rig.host.runtime,
+            &mut surface,
+            now,
+            PromptVisibility::Reachable,
+        );
+        assert_eq!(
+            rig.host
+                .runtime
+                .kernel
+                .picker
+                .as_ref()
+                .expect("still up")
+                .cursor(),
+            before,
+            "a step naming another designation moved the raised picker's selection"
+        );
+        assert!(rig.host.runtime.kernel.designations.is_open(id));
+        assert_eq!(grab.borrow().raised_designation(), Some(id));
+
+        // ...and the control: the same step, correctly addressed, does move
+        // it. Without this the assertion above would pass against a picker
+        // that ignores every step.
+        grab.borrow_mut().queue_step(
+            id,
+            crate::picker::keys::PickerStep::Move(crate::picker::keys::Motion::Down),
+        );
+        service_picker_round(
+            &mut grab.borrow_mut(),
+            &mut rig.host.runtime,
+            &mut surface,
+            now,
+            PromptVisibility::Reachable,
+        );
+        assert_eq!(
+            rig.host
+                .runtime
+                .kernel
+                .picker
+                .as_ref()
+                .expect("still up")
+                .cursor(),
+            1,
+            "control: a step addressed to the raised designation must move the selection, or \
+             the assertion above proves only that the picker is inert"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **The one open, and the descriptor really is the file the human
+    /// chose.**
+    ///
+    /// Driven through the picker's own state machine and then through the
+    /// resolve the funnel makes — **not** through [`settle_designation`]
+    /// itself, and not read back from the delivery table. It cannot be: this
+    /// rig has no principal `Connection` in `runtime.conns` and no live shim,
+    /// so the funnel refuses at step 2 before it opens anything. What is
+    /// proved here is that what a confirm hands the funnel names the inode the
+    /// picker displayed. The funnel's own steps 3 and 4 have no mock-free
+    /// coverage in this crate, and that is stated rather than implied.
+    #[test]
+    fn a_confirm_opens_exactly_the_row_the_human_was_standing_on() {
+        let _fd = crate::capture::tests::fd_lock();
+        let mut rig = Rig::new(
+            "designate-open",
+            ConsentPolicyArg {
+                policy: crate::petitions::ConsentPolicy::AutoApprove,
+                config: PetitionConfig::default(),
+            },
+        );
+        let (dir, root) = picker_fixture("open");
+        // **The SECOND row**, not the first: the human moves the selection, so
+        // a `chosen()` that ignored the cursor and answered "whatever is at
+        // the top" would resolve the wrong inode and this test would say so.
+        // Resolving the first row would make the assertion true by accident.
+        let intended = {
+            let fd = crate::picker::resolve::resolve(
+                root.as_fd(),
+                &[std::ffi::OsStr::new("second.txt")],
+                EffectiveMode::ReadOnly,
+                false,
+            )
+            .expect("the fixture file opens");
+            crate::picker::resolve::identity(std::os::fd::AsFd::as_fd(&fd)).expect("fstat")
+        };
+        rig.host.runtime.kernel.picker_root = Some(root);
+        let now = Instant::now();
+        let who = PrincipalIdentity::parse(DEMO_IDENTITY).unwrap();
+        let grant = designation_grant(&mut rig, &who, now);
+        let id = open_designation(&mut rig, &who, grant, now + Duration::from_secs(90));
+
+        // The funnel's own steps 1-3, with both receivers stubbed alive by
+        // reaching straight for the resolve: this rig has no principal
+        // connection, so the delivery half cannot be driven here. What IS
+        // driven is the property that matters -- the descriptor the funnel
+        // would park names the inode the picker displayed.
+        let mut session = crate::picker::session::PickerSession::open(
+            id,
+            AskedFor::File { write: false },
+            rig.host
+                .runtime
+                .kernel
+                .picker_root
+                .as_ref()
+                .expect("installed above")
+                .as_fd(),
+        )
+        .expect("the fixture root lists");
+        // The human presses Down once, exactly as a key would.
+        assert_eq!(
+            session.apply(crate::picker::keys::PickerStep::Move(
+                crate::picker::keys::Motion::Down
+            )),
+            crate::picker::session::Applied::Changed
+        );
+        let chosen = session.chosen().expect("a row is selected");
+        assert_eq!(chosen.name, b"second.txt".to_vec());
+        // Resolved the way the funnel resolves it: one component, from the
+        // directory descriptor the confirm carried out.
+        let name =
+            <std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(chosen.name.clone());
+        let fd = crate::picker::resolve::resolve(
+            std::os::fd::AsFd::as_fd(&chosen.dir),
+            &[name.as_os_str()],
+            chosen.mode,
+            chosen.directory,
+        )
+        .expect("the chosen row resolves");
+        assert_eq!(
+            crate::picker::resolve::identity(std::os::fd::AsFd::as_fd(&fd)).expect("fstat"),
+            intended,
+            "the descriptor the funnel would deliver must be the inode the picker displayed"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// **A physical brightness press moves the panel and is never delivered to
@@ -6882,10 +8798,36 @@ mod tests {
              is the exact state issue #77 found this core in"
         );
         // ...and in production it has exactly one call site each, in `sweep`.
+        //
+        // **Four sweepers, named** (P2.6.6 raised this from two): the petition
+        // registry, the grant table, the **designation ledger** and the
+        // **delivery table**. The count is deliberately a number rather than a
+        // set membership test, because what it is guarding is that nobody adds
+        // a *second* call site for any one of them — a grant table swept from
+        // two places is a row that dies twice in the journal, and a delivery
+        // table swept from two places is a descriptor released while another
+        // path still believes it holds it.
+        //
+        // Raising this number is a real decision each time, and the reviewer
+        // has to be able to say which four. Named by their table rather than
+        // spelled out as calls, because writing the identifier here would make
+        // this comment the first hit of the assertion above it:
+        //
+        // 1. the petition registry — a human never answered; the client gets
+        //    `timed_out`.
+        // 2. the grant table — a row's time bound passed with no use.
+        // 3. the designation ledger — a picker nobody answered; the client
+        //    gets `vitrin_powerbox.refusal timed_out`.
+        // 4. the delivery table — a descriptor opened, woken for, and never
+        //    collected because the peer died between the wake and the turn.
+        //    This is the one that must not be forgotten: without it a dead
+        //    agent pins the human's file open for the session's life.
         assert_eq!(
             production.matches(&format!("{needle}(now)")).count(),
-            2,
-            "petitions and grants are swept from `sweep` and nowhere else"
+            4,
+            "the four expiry sweeps -- petitions, grants, designations and held descriptors -- \
+             are driven from `sweep` and nowhere else. A second call site for any of them is a \
+             thing that dies twice; a missing one is a file pinned open for the session"
         );
     }
 
@@ -8231,9 +10173,9 @@ mod tests {
         grab: &Rc<RefCell<ConsentGrab>>,
     ) -> crate::petitions::PetitionId {
         rig.pump_until(Duration::from_secs(5), |_| {
-            grab.borrow().armed_petition().is_some()
+            grab.borrow().raised_petition().is_some()
         });
-        grab.borrow().armed_petition().expect("a prompt is up")
+        grab.borrow().raised_petition().expect("a prompt is up")
     }
 
     /// **Acceptance: an interactive petition puts a prompt on screen and tells
@@ -8258,7 +10200,7 @@ mod tests {
 
         // The grab holds this petition's prompt, and the surface really has a
         // card to draw (its origin resolves only when a prompt is up).
-        assert_eq!(grab.borrow().armed_petition(), Some(petition));
+        assert_eq!(grab.borrow().raised_petition(), Some(petition));
         assert!(
             rig.host.view.consent.card_origin(VIEW.0, VIEW.1).is_some(),
             "raising a prompt must put a card on the consent surface"
@@ -8355,7 +10297,7 @@ mod tests {
             .front_pending()
             .expect("the petition must be queued and awaiting a human");
         assert!(
-            grab.borrow().armed_petition().is_none(),
+            grab.borrow().raised_petition().is_none(),
             "a card was raised while the seat held this session's devices: nothing composited \
              this round reaches a panel, so no human could have seen it"
         );
@@ -8578,7 +10520,7 @@ mod tests {
              cannot undo"
         );
         assert!(
-            !lock.borrow_mut().tick(Instant::now()),
+            !lock.borrow_mut().tick(Instant::now(), false),
             "and the lock must not raise itself on a VT nobody is looking at"
         );
 
@@ -8601,7 +10543,7 @@ mod tests {
             "and no cover reached the composite either"
         );
         assert!(
-            !lock.borrow_mut().tick(Instant::now()),
+            !lock.borrow_mut().tick(Instant::now(), false),
             "#257, the stronger half: the idle lock armed on return, so the human is asked for \
              a passphrase for the offence of coming back to their own screen"
         );
@@ -8745,11 +10687,16 @@ mod tests {
         // The session's own gate, still unlocked: the round reads it and this
         // path must not be the one that decides what `locked` says.
         let lock = rig.lock();
+        // No picker in this test, so an idle grab is the honest stand-in:
+        // `picker_holds_the_screen_awake` answers `false` for it, which is the
+        // answer a session with no designation outstanding must give.
+        let blank_grab = Rc::new(RefCell::new(ConsentGrab::new()));
         let log = LogCapture::install();
 
         service_blank_round(
             &mut rig.host.runtime,
             &lock,
+            &blank_grab,
             &mut activity,
             &mut surface,
             t0 + Duration::from_secs(60),
@@ -8762,6 +10709,7 @@ mod tests {
         service_blank_round(
             &mut rig.host.runtime,
             &lock,
+            &blank_grab,
             &mut activity,
             &mut surface,
             t0 + Duration::from_secs(90) + WAKE_DEADLINE,
@@ -8833,6 +10781,9 @@ mod tests {
         // contradicts.
         let _shared = rig.attach_blank(idle);
         let lock = rig.lock();
+        // No designation is outstanding in this test, so an idle grab gives
+        // the honest answer: a picker holds nothing off.
+        let blank_grab = Rc::new(RefCell::new(ConsentGrab::new()));
         let t0 = Instant::now();
         let held = |surface| IdleInhibitAsk {
             surface: Some(surface),
@@ -8851,6 +10802,7 @@ mod tests {
         service_blank_round(
             &mut rig.host.runtime,
             &lock,
+            &blank_grab,
             &mut control,
             &mut control_surface,
             t0 + idle,
@@ -8871,6 +10823,7 @@ mod tests {
         service_blank_round(
             &mut rig.host.runtime,
             &lock,
+            &blank_grab,
             &mut activity,
             &mut surface,
             t0 + idle,
@@ -8905,6 +10858,7 @@ mod tests {
         service_blank_round(
             &mut rig.host.runtime,
             &lock,
+            &blank_grab,
             &mut activity,
             &mut surface,
             t0 + idle,
@@ -8934,6 +10888,7 @@ mod tests {
         service_blank_round(
             &mut rig.host.runtime,
             &lock,
+            &blank_grab,
             &mut activity,
             &mut surface,
             t0 + idle,
@@ -9107,7 +11062,7 @@ mod tests {
         activity.borrow_mut().note_frame_queued();
         activity.borrow_mut().went_dark();
         assert!(
-            lock.borrow_mut().tick(t0 + Duration::from_secs(600)),
+            lock.borrow_mut().tick(t0 + Duration::from_secs(600), false),
             "a dark screen must not freeze the idle lock -- the shorter timer silently \
              disabling the longer one is the coupling D-030(2) was written to catch"
         );
@@ -9198,7 +11153,7 @@ mod tests {
             .front_pending()
             .expect("the petition must be queued and awaiting a human");
         assert!(
-            grab.borrow().armed_petition().is_none(),
+            grab.borrow().raised_petition().is_none(),
             "a card was raised onto a panel this session had powered down: no human could \
              have seen it, and the record would say one was asked"
         );
@@ -9546,7 +11501,7 @@ mod tests {
             "an approved petition mints exactly one grant row"
         );
         assert!(
-            grab.borrow().armed_petition().is_none(),
+            grab.borrow().raised_petition().is_none(),
             "the decided petition's card must be lowered, freeing the queue"
         );
     }
@@ -9585,7 +11540,7 @@ mod tests {
             "a denied petition must mint no grant row"
         );
         assert!(
-            grab.borrow().armed_petition().is_none(),
+            grab.borrow().raised_petition().is_none(),
             "the refused petition's card must be lowered too"
         );
     }
@@ -9620,7 +11575,7 @@ mod tests {
             "an unchanged consent round must not dirty the frame (no busy-spin)"
         );
         assert_eq!(
-            grab.borrow().armed_petition(),
+            grab.borrow().raised_petition(),
             Some(petition),
             "the same prompt must still be up"
         );

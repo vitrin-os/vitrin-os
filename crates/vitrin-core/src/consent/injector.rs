@@ -61,6 +61,10 @@
 //!   harness -> core   describe
 //!                     band
 //!                     decide <token> <allow-once|allow-while-running|deny>
+//!                     list
+//!                     navigate <up|down|in|out|first|last|page-up|page-down>
+//!                     confirm
+//!                     cancel
 //!
 //!   core -> harness   vitrin-consent-injector 1            (banner, once)
 //!                     raised <petition_id> <token>          (unsolicited edge)
@@ -69,7 +73,32 @@
 //!                     band <composites> <band_changes> ...  (band reply)
 //!                     decided-ack <queued|no-prompt|unknown-token
 //!                                 |no-such-button|malformed>
+//!                     picker <none|shown> <designation|-> <cursor> <visible>
+//!                            <listing|confirm|cancel|-> <selected-hex|->
+//!                     picker-ack <queued|no-picker>
 //! ```
+//!
+//! # The picker's four verbs (P2.6.6, issue #190)
+//!
+//! Same posture as `decide`, and the same claim: they **enqueue a step and
+//! nothing else**. Each one lands in the same [`ConsentGrab`] queue a
+//! physical key press lands in, and is drained, validated and applied by the
+//! production path — `crate::session::service_picker_round` — rather than by
+//! a second navigation path of its own. Nothing here opens a descriptor,
+//! resolves a name, or consults a grant.
+//!
+//! **`selected-hex` is hex, and that is not decoration.** A filename is
+//! arbitrary bytes; this channel is printable ASCII by
+//! [`parse_request`]'s own rule, and the whole point of
+//! `crate::paint::transcript` is that a name must never be able to smuggle
+//! control characters into a surface that is supposed to be trustworthy. Hex
+//! keeps the reply total over every possible filename without inventing a
+//! second escaping scheme.
+//!
+//! **There is no verb that asks for the whole listing**, deliberately: a
+//! directory of ten thousand entries would be an unbounded reply on a channel
+//! whose every other message is bounded, and a harness that needs to find a
+//! row can type into the filter and read `visible` shrink.
 //!
 //! **The injector never reports an authority outcome.** It reports *edges*
 //! (a card went up, a card came down) and *message acceptance* (`queued`
@@ -80,6 +109,7 @@
 
 use crate::consent::Choice;
 use crate::grants::PersistenceRung;
+use crate::picker::keys::Motion;
 
 /// The longest line the core will accept from the peer, `\n` included.
 ///
@@ -209,6 +239,52 @@ pub(crate) enum Request {
     Band,
     /// Press a button on the prompt `token` names.
     Decide { token: PromptToken, choice: Choice },
+    /// Snapshot the raised picker: which designation, where the selection is,
+    /// how many rows the filter is showing, and what is focused.
+    ///
+    /// A **read**, exactly as [`Self::Describe`] is, and it carries no token
+    /// for the reason `describe` carries none either: it confers nothing, so
+    /// there is nothing for a replay to spend.
+    List,
+    /// Move the selection, or step into or out of a directory.
+    Navigate(Motion),
+    /// Commit whatever is focused — the selected row, or the Confirm button.
+    Confirm,
+    /// Dismiss the picker.
+    ///
+    /// Synthesized as the keys a human would type rather than as a private
+    /// path: cancelling is a **button on the surface** reached by Tab
+    /// ([`crate::picker::keys`]), because Escape belongs to the dead-man
+    /// chord. So this becomes however many `FocusNext` steps land on Cancel,
+    /// then a `Confirm` — which is exactly the sequence a keyboard produces,
+    /// through exactly the same state machine.
+    Cancel,
+}
+
+/// What the core did with a picker verb. Never an authority outcome, and
+/// never a designation outcome: `queued` means the step reached the grab, and
+/// whether a descriptor was minted is observed where it always is — the
+/// agent's own `designated` event and the flight recorder.
+#[cfg_attr(not(feature = "consent-injector"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PickerAck {
+    Queued,
+    /// No picker is up, so there is nothing to drive.
+    NoPicker,
+    // There is deliberately no `Malformed`. A line that does not parse cannot
+    // be attributed to *any* verb, so it is answered by the channel's own
+    // `decided-ack malformed` -- one answer for one condition, rather than a
+    // second spelling of it that a harness would have to know to expect.
+}
+
+#[cfg_attr(not(feature = "consent-injector"), allow(dead_code))]
+impl PickerAck {
+    pub(crate) fn word(self) -> &'static str {
+        match self {
+            PickerAck::Queued => "queued",
+            PickerAck::NoPicker => "no-picker",
+        }
+    }
 }
 
 /// What the core did with a `decide` line. Never an authority outcome (module
@@ -258,6 +334,47 @@ pub(crate) fn choice_word(choice: Choice) -> &'static str {
     }
 }
 
+/// The motion a navigate word names, or `None` for anything else.
+///
+/// **This direction is not compile-checked, and the claim that stood here
+/// said it was.** It matches a `&str` with a `_ => None` arm, so a variant
+/// added to [`Motion`] compiles straight past it. What *is* compile-checked is
+/// [`motion_word`]'s exhaustive match in the other direction — which forces a
+/// new motion to have a word and then leaves this side free to not parse it,
+/// which is a motion silently undrivable from this channel.
+///
+/// The gap is closed by the round-trip test below being driven off
+/// [`Motion::ALL`] rather than a list written out in the test, on
+/// [`crate::grants::PersistenceRung::ALL`]'s precedent: a motion missing an
+/// arm here is then a test failure the moment it joins the enumeration.
+fn parse_motion(word: &str) -> Option<Motion> {
+    match word {
+        "up" => Some(Motion::Up),
+        "down" => Some(Motion::Down),
+        "in" => Some(Motion::In),
+        "out" => Some(Motion::Out),
+        "first" => Some(Motion::First),
+        "last" => Some(Motion::Last),
+        "page-up" => Some(Motion::PageUp),
+        "page-down" => Some(Motion::PageDown),
+        _ => None,
+    }
+}
+
+/// The inverse of [`parse_motion`], so the two cannot drift.
+pub(crate) fn motion_word(motion: Motion) -> &'static str {
+    match motion {
+        Motion::Up => "up",
+        Motion::Down => "down",
+        Motion::In => "in",
+        Motion::Out => "out",
+        Motion::First => "first",
+        Motion::Last => "last",
+        Motion::PageUp => "page-up",
+        Motion::PageDown => "page-down",
+    }
+}
+
 /// The inverse of [`choice_word`], or `None` for anything else.
 fn parse_choice(word: &str) -> Option<Choice> {
     match word {
@@ -296,6 +413,10 @@ pub(crate) fn parse_request(line: &str) -> Option<Request> {
             let choice = parse_choice(fields.next()?)?;
             Request::Decide { token, choice }
         }
+        "list" => Request::List,
+        "navigate" => Request::Navigate(parse_motion(fields.next()?)?),
+        "confirm" => Request::Confirm,
+        "cancel" => Request::Cancel,
         _ => return None,
     };
     // A trailing field is a different message, not a decorated one.
@@ -1056,10 +1177,90 @@ mod tests {
         assert_eq!(before, words.len(), "two buttons share one word: {words:?}");
     }
 
+    /// Every motion has a word, and [`parse_motion`] is exactly
+    /// [`motion_word`]'s inverse.
+    ///
+    /// The picker's counterpart to `every_button_round_trips_through_its_word`
+    /// and driven the same way — off the type's own [`Motion::ALL`], never off
+    /// a list restated here. That is the half that makes this a check rather
+    /// than a snapshot: `motion_word`'s exhaustive match already forces a new
+    /// motion to *have* a word, but nothing forces [`parse_motion`] to accept
+    /// it, and a hand-written list here would not mention it either — so the
+    /// motion would become silently undrivable from this channel with every
+    /// assertion still green. That is the shape this list had when it was
+    /// reviewed.
+    #[test]
+    fn every_motion_round_trips_through_its_word() {
+        let all = crate::picker::keys::Motion::ALL;
+        for motion in all {
+            let word = motion_word(motion);
+            assert_eq!(
+                parse_motion(word),
+                Some(motion),
+                "{word:?} must parse back to the motion it names"
+            );
+        }
+        let mut words: Vec<&str> = all.iter().copied().map(motion_word).collect();
+        words.sort_unstable();
+        let before = words.len();
+        words.dedup();
+        assert_eq!(before, words.len(), "two motions share one word: {words:?}");
+    }
+
+    /// **The longest legal line still fits [`MAX_LINE`].**
+    ///
+    /// The constant's docs derive the bound from the longest request, and the
+    /// picker's verbs are new requests — so the derivation is re-checked here
+    /// rather than re-read. A line over the cap is refused by
+    /// [`parse_request`], so a verb that outgrew it would be a verb that
+    /// silently stopped working.
+    #[test]
+    fn every_request_fits_the_line_cap() {
+        let longest_decide = format!("decide {} allow-while-running", "0".repeat(16));
+        let longest_navigate = format!(
+            "navigate {}",
+            motion_word(crate::picker::keys::Motion::PageDown)
+        );
+        for line in [
+            longest_decide.as_str(),
+            longest_navigate.as_str(),
+            "describe",
+            "band",
+            "list",
+            "confirm",
+            "cancel",
+        ] {
+            assert!(
+                line.len() <= MAX_LINE,
+                "{line:?} is {} bytes, past the {MAX_LINE}-byte cap",
+                line.len()
+            );
+        }
+    }
+
     #[test]
     fn the_three_requests_parse() {
         assert_eq!(parse_request("describe"), Some(Request::Describe));
         assert_eq!(parse_request("band"), Some(Request::Band));
+        assert_eq!(parse_request("list"), Some(Request::List));
+        assert_eq!(parse_request("confirm"), Some(Request::Confirm));
+        assert_eq!(parse_request("cancel"), Some(Request::Cancel));
+        assert_eq!(
+            parse_request("navigate down"),
+            Some(Request::Navigate(Motion::Down))
+        );
+        assert_eq!(
+            parse_request("navigate page-up"),
+            Some(Request::Navigate(Motion::PageUp))
+        );
+        // Strict, exactly as `decide` is: no bare verb, no extra field, no
+        // spelling the core does not emit.
+        assert_eq!(parse_request("navigate"), None);
+        assert_eq!(parse_request("navigate sideways"), None);
+        assert_eq!(parse_request("navigate Down"), None);
+        assert_eq!(parse_request("navigate down extra"), None);
+        assert_eq!(parse_request("list extra"), None);
+        assert_eq!(parse_request("confirm extra"), None);
         let token = PromptToken::from_bytes([0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]);
         assert_eq!(token.to_hex(), "0123456789abcdef");
         assert_eq!(

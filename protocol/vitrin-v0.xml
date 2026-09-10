@@ -635,15 +635,17 @@
         a petition resolves "unsupported" WHOLE - the server never quietly
         drops an unserved bit and grants the remainder, because an agent
         must never believe it holds authority nothing enforces.
-        <!-- vitrin-verb-set: unserved-verbs = observe_cursor, designate_file, egress | count: three -->
-        THREE bits are in that posture at EVERY deployment today -
-        observe_cursor, designate_file and egress, for three unrelated
+        <!-- vitrin-verb-set: unserved-verbs = observe_cursor, egress | count: two -->
+        TWO bits are in that posture at EVERY deployment today -
+        observe_cursor and egress, for two unrelated
         missing mechanisms named in the verb enum - and whichever others a
         given deployment declines are its own business rather than the
         wire's. That list read "observe_cursor and egress" until the
         P2.6.5 and P2.7.2 branches were merged, each having seen only its
-        own new bit, which is why it now carries the marker that derives
-        the set instead of a list a reader has to trust. A petition
+        own new bit; it then read three, and it reads two again now that
+        the reference core serves designate_file. Which is why it carries
+        the marker that derives the set instead of a list a reader has to
+        trust. A petition
         naming layout_arrange has one further admission-time answer,
         "layout_held", when the verb is already SPOKEN FOR for the output -
         by a live grant carrying it, or by another petition that is still
@@ -997,18 +999,20 @@
         that two parallel workstreams each drew a bit from it and neither
         collided is the registry doing its whole job.
 
-        <!-- vitrin-verb-set: unserved-verbs = observe_cursor, designate_file, egress -->
+        <!-- vitrin-verb-set: unserved-verbs = observe_cursor, egress -->
         DEFINED BUT UNSERVED. A verb may be defined here and refused
         "unsupported" by a deployment that does not serve it, exactly as
         the durable persistence rungs are. observe_cursor is refused by
         every deployment at version 2, because per-principal cursor
-        delivery does not exist. designate_file is refused by every
-        deployment too, and for a reason that is scheduled rather than
-        open-ended: no core-drawn picker exists to mint an fd (P2.6.6) and
-        no human-readable consent copy names what approving it costs
-        (P2.6.8, Q13's rule that no verb is served before its copy exists).
-        Both halves must land before any deployment may answer a
-        designate_file petition anything but "unsupported".
+        delivery does not exist. designate_file WAS in this posture and no
+        longer is: the core-drawn picker that mints an fd (P2.6.6) exists,
+        so whether a designate_file petition is answered "unsupported" is
+        now a property of the deployment rather than of the wire - a
+        deployment with no picker root it can open still answers so. Note
+        what has NOT landed with it: the human-readable consent copy that
+        names what approving it costs (P2.6.8, Q13's rule) is a minimum
+        line rather than a considered one, so a human approving this verb
+        today reads a card that names it and does not yet describe it.
         egress is refused by every deployment
         too, and for a reason that is about mechanism rather than about
         policy: the mediating proxy a connection would be made through
@@ -1016,12 +1020,12 @@
         names. Its FACET now exists (vitrin_egress, minted by get_egress),
         so the reason has narrowed since the bit landed - there is a
         request to exercise the verb, and there is nothing behind it.
-        Both of the two newest bits are therefore in this posture at once,
-        and their reasons are NOT the same one: designate_file waits on a
-        picker and its consent copy, egress on a proxy, and closing either
-        does nothing for the other.
-        layout_arrange, layout_focus and
-        realm_launch were in that same position when they were allocated
+        The two newest bits were both in this posture at once, and their
+        reasons were NOT the same one: designate_file waited on a picker,
+        egress on a proxy, and closing either did nothing for the other.
+        Closing the first is what left egress alone here.
+        layout_arrange, layout_focus, realm_launch and now designate_file
+        were in that same position when they were allocated
         and are now SERVABLE - each has a facet interface, a chokepoint arm
         and prompt copy - so whether a petition for one is answered
         "unsupported" is a property of the deployment rather than of the
@@ -1192,7 +1196,7 @@
       <entry name="observe_cursor" value="8" summary="capture frames that include the human principal's cursor - reading the human's attention, hence a verb and not a display preference; meaningful only alongside observe, and a petition naming it without observe resolves unsupported; another agent principal's cursor is not purchasable by this or any verb; refused unsupported in version 1"/>
       <entry name="layout_arrange" value="16" summary="arrange the granted realm's view, subject to the ordering invariants no grant can purchase; exercised through vitrin_layout_arrange, which defines set_fullscreen and no other request - place, resize, raise and stacking are absent rather than refused, because a scene showing one unstacked realm cannot honour them; at most one holder per output, counting a live grant that carries this verb AND a petition still pending for it, so a second petition while either exists resolves layout_held"/>
       <entry name="layout_focus" value="32" summary="bind the output to a view of the granted realm and direct input there - one act, because routing keys to a realm the human cannot see is focus theft in its sharpest form; exercised through vitrin_layout_focus; separate from layout_arrange because focus theft is at once the sharpest attack and the most legitimate need, so it must be attenuable alone"/>
-      <entry name="designate_file" value="64" summary="designate one file or one directory subtree to the granted realm, through the vitrin_powerbox facet; the human picks in a core-drawn picker and what crosses the wire is a file descriptor, never a path, so this is authority to ASK for a designation rather than authority over any named file; a delivered fd is kernel authority the core cannot recall, so revocation stops future designations and kills the grant row while the payload keeps every fd already handed over until its realm dies - PRD P2's revocation is immediate and transitive is FALSE for designations already made; refused unsupported in version 1, which cannot mint the facet at all, and by every deployment until the picker (P2.6.6) and its consent copy (P2.6.8) exist"/>
+      <entry name="designate_file" value="64" summary="designate one file or one directory subtree to the granted realm, through the vitrin_powerbox facet; the human picks in a core-drawn picker and what crosses the wire is a file descriptor, never a path, so this is authority to ASK for a designation rather than authority over any named file; a delivered fd is kernel authority the core cannot recall, so revocation stops future designations and kills the grant row while the payload keeps every fd already handed over until its realm dies - PRD P2's revocation is immediate and transitive is FALSE for designations already made; refused unsupported in version 1, which cannot mint the facet at all; at version 2 whether it is served is a property of the deployment, and the reference core has served it since P2.6.6 landed the core-drawn picker - a deployment with no picker root it can open answers internal rather than serving a verb with nothing behind it, and the human-readable consent copy that names what approving it costs is still owed (P2.6.8, Q13)"/>
       <entry name="egress" value="128" summary="open one outbound connection to the single host:port named by this grant's net: resource selector, through an out-of-core mediating proxy that asks the enforcement chokepoint per connection and holds no grant of its own; exercised through the vitrin_egress facet, which is a separate interface of its own rather than a request on the filesystem powerbox, since interface/@verb is one value per interface; the selector's grammar is wildcard-free, so a blanket egress grant is inexpressible rather than refused, and one selector covers exactly itself - though not every spelling of one endpoint is one selector, since the host is compared byte-exactly and kept as presented; SPECIFIED BUT NOT IMPLEMENTED ANYWHERE YET: a DNS name is to resolve only in the proxy and the addresses it resolved to at grant time are to be pinned into the grant row, so that a connection to an unpinned address is refused not_granted even under a name-scoped grant - no proxy, no resolver and no pinned column with a value exist today; the dotted SDK name is egress unchanged, the wire name carrying no underscore to replace; refused unsupported in version 1 and by every deployment at version 2 - the facet exists now, so what is missing is the proxy behind it rather than a request to ask through"/>
       <entry name="realm_launch" value="512" summary="launch the realm template this grant addresses into a new realm instance, through the vitrin_launcher facet; the template names the program and no command ever crosses the wire, so this is authority over an operator-written template rather than over an arbitrary command; bit 256 is allocated to a verb not yet defined here and was skipped rather than reused, as 64 was until designate_file landed on it and 128 was until egress did; refused unsupported in version 1, which cannot mint the facet at all, and by any deployment that does not serve it"/>
     </enum>
@@ -2925,13 +2929,13 @@
       whether a petition for it is refused "unsupported" is a property of
       the deployment rather than of the wire: a deployment that will not
       host process creation answers "unsupported" rather than killing the
-      <!-- vitrin-verb-set: unserved-verbs = observe_cursor, designate_file, egress | count: three -->
-      connection. observe_cursor, designate_file and egress are the THREE
+      <!-- vitrin-verb-set: unserved-verbs = observe_cursor, egress | count: two -->
+      connection. observe_cursor and egress are the TWO
       bits left in
       that defined-but-unserved posture, refused by every deployment, and
-      their reasons are three different ones rather than one shared one -
-      no per-principal cursor delivery, no picker and consent copy, no
-      out-of-core proxy. The verb enum's own DEFINED BUT UNSERVED paragraph
+      their reasons are two different ones rather than one shared one -
+      no per-principal cursor delivery, no out-of-core proxy.
+      designate_file left this list when the core-drawn picker landed. The verb enum's own DEFINED BUT UNSERVED paragraph
       is the list; this sentence restates it and carries the same
       machine-checked marker, so the two cannot drift apart the way this
       one silently did while a second verb was landing beside it. Defining

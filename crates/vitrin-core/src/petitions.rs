@@ -696,15 +696,13 @@ impl PetitionRegistry {
             return declined(Outcome::Unsupported);
         }
         // A verb bit the IDL defines but this core does not enforce.
-        // vitrin-verb-set: unserved-verbs = observe_cursor, designate_file, egress
-        // Three today: `observe_cursor` (D-017), `designate_file` (P2.6.5,
-        // which put the bit on the wire and deliberately left the picker and
-        // the consent copy to P2.6.6/P2.6.8) and `egress` (P2.7.2).
-        // `layout_arrange` and `layout_focus` left that set at WS-E.1.4 and
-        // `realm_launch` at WS-E.1.1, each when the core gained the
-        // mechanism its refusal stood for; the other two joined it when the
-        // IDL gained their bits and this core gained nothing to enforce by
-        // them. The
+        // vitrin-verb-set: unserved-verbs = observe_cursor, egress
+        // Two today: `observe_cursor` (D-017) and `egress` (P2.7.2).
+        // `layout_arrange` and `layout_focus` left that set at WS-E.1.4,
+        // `realm_launch` at WS-E.1.1 and `designate_file` at P2.6.6, each
+        // when the core gained the mechanism its refusal stood for; the two
+        // that remain joined it when the IDL gained their bits and this core
+        // gained nothing to enforce by them. The
         // set itself is derived (`UNSERVED_VERB_BITS`), so this comment is
         // the only thing here that could go stale -- and `cargo xtask
         // verb-sets --check` reads the marker line above so that it cannot.

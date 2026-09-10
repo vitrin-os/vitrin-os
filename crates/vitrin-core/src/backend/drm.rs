@@ -1165,34 +1165,43 @@ impl session::RuntimeHost for DrmState {
     /// panel, so a card raised now would be journalled `shown` to a human who
     /// could not see it.
     fn service_consent(&mut self, now: Instant) {
-        let visibility = if !self.view.output.active {
-            session::PromptVisibility::ScreenNotOurs
-        } else if self.view.blank.is_covering() {
-            // WS-E.4.3, and D-030(4)'s own deferral discharged: it filed "a
-            // dark-output gate -- to whichever change implements DPMS, as that
-            // change's own acceptance criterion", and this is that change. A
-            // separate variant rather than reusing `ScreenNotOurs` because the
-            // facts differ and the journal must say which: a paused session's
-            // card can never reach a panel, while a dark session's reaches it
-            // the instant the human touches anything.
-            //
-            // **THE COVER, NOT THE POWER STATE, AND THE DIFFERENCE IS A REAL
-            // BUG THIS ONCE HAD.** `is_dark()` is `Phase::Dark` alone, but the
-            // opaque cover is already composited over everything during
-            // `Phase::Covering` -- so gating on power let a card be raised,
-            // journalled `shown`, and marked `prompt_shown` onto a panel the
-            // human was already seeing as black. The test rig gated on the
-            // cover and was therefore STRICTER than the code it stood in for,
-            // which is how the acceptance criterion passed while the shipped
-            // backend failed it. `the_seat_handler_...` now pins both to this
-            // same predicate by source inspection.
-            session::PromptVisibility::ScreenIsDark
-        } else {
-            session::PromptVisibility::Reachable
-        };
+        let visibility = self.prompt_visibility();
         let grab = Rc::clone(&self.grab);
         let mut grab = grab.borrow_mut();
         if session::service_consent_round(
+            &mut grab,
+            &mut self.runtime,
+            &mut self.view.consent,
+            now,
+            visibility,
+        ) {
+            self.runtime.dirty = true;
+            self.view.request_present();
+        }
+    }
+
+    /// Drive the core-drawn file picker for this dispatch round (P2.6.6,
+    /// issue #190).
+    ///
+    /// The visibility gate is [`Self::service_consent`]'s, derived the same
+    /// way from the same two fields, because it answers the same question: a
+    /// card raised onto a panel the human cannot see spends its guard
+    /// interval where nobody can read it.
+    ///
+    /// **Decision 6, and it is structural rather than remembered.** A raised
+    /// picker suppresses the idle blank and the idle lock, and the suppression
+    /// is *derived every round* from `grab.raised_designation()` rather than
+    /// held as a flag somebody has to clear -- see
+    /// [`Self::picker_holds_the_screen_awake`]. So a bug cannot hold the
+    /// screen awake past the ticket's deadline: past it the grab stops
+    /// consuming, the round finds the obligation gone, the card comes down,
+    /// and the derivation answers `false` on the very next round with nothing
+    /// to release.
+    fn service_picker(&mut self, now: Instant) {
+        let visibility = self.prompt_visibility();
+        let grab = Rc::clone(&self.grab);
+        let mut grab = grab.borrow_mut();
+        if session::service_picker_round(
             &mut grab,
             &mut self.runtime,
             &mut self.view.consent,
@@ -1267,9 +1276,14 @@ impl session::RuntimeHost for DrmState {
             // `--blank-idle 300 --lock-idle 600`, both reach a locked session
             // behind a dark panel. Borrowed for the length of one `is_locked`
             // inside, which cannot collide with the `activity` guard above.
+            // `&self.grab` on identical terms and for decision 6 (P2.6.6): a
+            // raised picker holds the blank off, bounded by the designation's
+            // own deadline. Read-only here too -- the round borrows it for one
+            // derivation and cannot raise or lower anything.
             let changed = session::service_blank_round(
                 &mut self.runtime,
                 &self.lock,
+                &self.grab,
                 &mut activity,
                 &mut self.view.blank,
                 now,
@@ -1341,6 +1355,43 @@ impl DeadManHost for DrmState {
 }
 
 impl DrmState {
+    /// **Whether a card raised this round would reach the human's eyes.**
+    ///
+    /// Extracted from `service_consent` when the picker gained a round of its
+    /// own (P2.6.6, issue #190), because the two must never be able to
+    /// disagree about it: a picker raised onto a paused or blanked panel
+    /// spends its guard interval where nobody can read it, exactly as a
+    /// consent card does. One derivation, two callers, and
+    /// `the_seat_handler_...` pins the predicates here and pins both callers
+    /// to it.
+    fn prompt_visibility(&self) -> session::PromptVisibility {
+        if !self.view.output.active {
+            session::PromptVisibility::ScreenNotOurs
+        } else if self.view.blank.is_covering() {
+            // WS-E.4.3, and D-030(4)'s own deferral discharged: it filed "a
+            // dark-output gate -- to whichever change implements DPMS, as that
+            // change's own acceptance criterion", and this is that change. A
+            // separate variant rather than reusing `ScreenNotOurs` because the
+            // facts differ and the journal must say which: a paused session's
+            // card can never reach a panel, while a dark session's reaches it
+            // the instant the human touches anything.
+            //
+            // **THE COVER, NOT THE POWER STATE, AND THE DIFFERENCE IS A REAL
+            // BUG THIS ONCE HAD.** `is_dark()` is `Phase::Dark` alone, but the
+            // opaque cover is already composited over everything during
+            // `Phase::Covering` -- so gating on power let a card be raised,
+            // journalled `shown`, and marked `prompt_shown` onto a panel the
+            // human was already seeing as black. The test rig gated on the
+            // cover and was therefore STRICTER than the code it stood in for,
+            // which is how the acceptance criterion passed while the shipped
+            // backend failed it. `the_seat_handler_...` now pins both to this
+            // same predicate by source inspection.
+            session::PromptVisibility::ScreenIsDark
+        } else {
+            session::PromptVisibility::Reachable
+        }
+    }
+
     /// Complete the dead-man chord if due and keep its timer armed —
     /// [`super::winit::deadman_tick`], the one shared implementation, driven
     /// from this backend too.
@@ -3318,14 +3369,39 @@ mod tests {
         // The gate that keeps `Shown` honest, read off the SAME field
         // `should_queue_flip` reads -- one notion of "is this screen ours",
         // never two that can disagree.
+        // **Read off the shared derivation, not off one caller** (P2.6.6).
+        // `service_consent` and `service_picker` both raise a card that seizes
+        // the human's input, and both must ask this same question -- so the
+        // predicates are pinned once, here, and each caller is pinned to
+        // calling it. Inspecting only `service_consent` would let a picker be
+        // raised onto a panel nobody is looking at with every assertion below
+        // still green.
         let consent = source()
-            .split("fn service_consent(&mut self, now: Instant)")
+            .split("fn prompt_visibility(&self) -> session::PromptVisibility")
             .nth(1)
-            .expect("this backend overrides the consent round");
+            .expect("this backend derives prompt visibility in one place");
         let consent_body = consent
             .split_once("\n    }\n")
             .expect("the method body ends at its closing brace")
             .0;
+        for caller in [
+            "fn service_consent(&mut self, now: Instant)",
+            "fn service_picker(&mut self, now: Instant)",
+        ] {
+            let body = source()
+                .split(caller)
+                .nth(1)
+                .unwrap_or_else(|| panic!("this backend overrides `{caller}`"))
+                .split_once("\n    }\n")
+                .expect("the method body ends at its closing brace")
+                .0;
+            assert!(
+                body.contains("self.prompt_visibility()"),
+                "`{caller}` stopped asking whether the screen is the human's: it would raise a \
+                 card onto a paused or blanked panel, journal it `shown`, and start its guard \
+                 interval where nobody can read it"
+            );
+        }
         assert!(
             consent_body.contains("self.view.output.active")
                 && consent_body.contains("PromptVisibility::ScreenNotOurs"),

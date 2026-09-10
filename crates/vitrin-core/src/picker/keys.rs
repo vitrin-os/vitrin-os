@@ -60,6 +60,28 @@ pub(crate) enum Motion {
     Last,
 }
 
+impl Motion {
+    /// Every motion the picker has.
+    ///
+    /// The one enumeration, on [`crate::grants::PersistenceRung::ALL`]'s
+    /// precedent and for its reason: anything that has to cover the whole set
+    /// -- today the out-of-process injector's word table and its round-trip
+    /// test -- reads it from here rather than restating it, so a motion that
+    /// becomes representable is covered without anyone remembering. Kept
+    /// beside the type so adding a variant without extending this is a
+    /// visible omission rather than an invisible one.
+    pub(crate) const ALL: [Motion; 8] = [
+        Motion::Up,
+        Motion::Down,
+        Motion::Out,
+        Motion::In,
+        Motion::PageUp,
+        Motion::PageDown,
+        Motion::First,
+        Motion::Last,
+    ];
+}
+
 // The layout-invariant function-key block.
 const XK_BACKSPACE: u32 = 0xff08;
 const XK_TAB: u32 = 0xff09;

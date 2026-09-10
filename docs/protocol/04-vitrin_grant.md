@@ -601,26 +601,27 @@ in plain language. `layout_arrange` and `layout_focus` joined at WS-E.1.4, and
 `realm_launch` at WS-E.1.1, when the core gained the spawn path, the realm cap
 and the prompt line its refusal had stood for.
 
-<!-- vitrin-verb-set: unserved-verbs = observe_cursor, designate_file, egress | count: three -->
-**Three remain**, and for three different missing mechanisms.
+<!-- vitrin-verb-set: unserved-verbs = observe_cursor, egress | count: two -->
+**Two remain**, and for two different missing mechanisms.
 
 `observe_cursor`'s reason has not moved: the
 per-principal cursor *delivery* it would widen a capture with does not exist
 (D-017, D-019), so serving the verb would promise something no capture
 carries.
 
-**`designate_file` is the second**, and unlike `observe_cursor` its refusal has
-a scheduled end. It landed at P2.6.5 with its facet interface and nothing
-else: no picker mints a descriptor (P2.6.6) and no consent copy names what
-approving it costs (P2.6.8 — Q13's rule that no verb is served before a human
-can be told what it means). Both must land before any deployment may answer a
-petition naming it anything but `unsupported`. In the reference core that is
-structural rather than a promise: `SERVED_VERB_BITS` does not list the bit,
-the unserved set is *derived* from the wire mask, and admission refuses the
-petition **whole** — so forgetting the rest of E2.6 produces a refusal, never
-a grant nothing enforces.
+**`designate_file` has left this list**, and it is worth reading how, because
+the staging is the point. It landed at P2.6.5 with its facet interface and
+nothing else, and was refused by every deployment on two grounds: no picker
+minted a descriptor (P2.6.6) and no consent copy named what approving it cost
+(P2.6.8 — Q13's rule that no verb is served before a human can be told what it
+means). P2.6.6 closed the first, and the reference core's `SERVED_VERB_BITS`
+now lists the bit. **The second ground is not closed**: the consent card names
+the verb, which is Q13's letter, and the considered copy that would describe
+what it costs is still P2.6.8's. And the bit alone still admits nothing — a
+deployment with no picker root it can open answers `internal`, loudly, rather
+than serving a verb with no mechanism behind it.
 
-**`egress` is the third**, refused by **every** deployment, and its reason has
+**`egress` is the second**, refused by **every** deployment, and its reason has
 *narrowed once* without going away — worth stating in that shape, because "the
 facet does not exist" was the reason given when the bit landed and it is no
 longer true. [`vitrin_egress`](19-vitrin_egress.md) is in the IDL, an interface
@@ -630,9 +631,9 @@ that would ask the chokepoint per connection, which is P2.7.3's — and a verb
 whose mechanism does not exist cannot be served, because a deployment MUST NOT
 grant a verb it does not enforce. Landing the bit before the facet, and the
 facet before the mechanism, is the same staging `realm_launch` used and for the
-same reason: a petition naming it is answered rather than killed. As with
-`designate_file`, the reference core makes that structural rather than a
-promise: `SERVED_VERB_BITS` does not list the bit.
+same reason: a petition naming it is answered rather than killed. The
+reference core makes that structural rather than a promise:
+`SERVED_VERB_BITS` does not list the bit.
 
 Serving a verb is a **deployment** property, not a version property. A
 deployment that will not host process creation must refuse `realm_launch`

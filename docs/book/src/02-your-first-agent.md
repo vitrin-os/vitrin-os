@@ -98,17 +98,16 @@ verbs = Verb.OBSERVE | Verb.ACTUATE_POINTER
 
 The enum has **nine** members, and the petition above asked for three of
 them: `OBSERVE`, `ACTUATE_POINTER` and `ACTUATE_TEXT`. Three more are
-**served** by this core on the same terms — `LAYOUT_ARRANGE`, `LAYOUT_FOCUS`
-and `REALM_LAUNCH`, exercised by `grant.set_fullscreen()`, `grant.focus()` and
-`grant.launch()`.
+**served** by this core on the same terms — `LAYOUT_ARRANGE`, `LAYOUT_FOCUS`,
+`REALM_LAUNCH` and `DESIGNATE_FILE`, exercised by `grant.set_fullscreen()`,
+`grant.focus()`, `grant.launch()` and the `vitrin_powerbox` facet.
 
-<!-- vitrin-verb-set: unserved-verbs = observe_cursor, designate_file, egress -->
+<!-- vitrin-verb-set: unserved-verbs = observe_cursor, egress -->
 
-The remaining three — `OBSERVE_CURSOR`, `DESIGNATE_FILE` and `EGRESS` — are
+The remaining two — `OBSERVE_CURSOR` and `EGRESS` — are
 defined and resolve
 `unsupported`: the first because per-principal cursor delivery does not exist
-yet, the second because no core-drawn file picker and no consent copy for it
-exist yet, the third because the out-of-core proxy an outbound connection
+yet, the second because the out-of-core proxy an outbound connection
 would be
 made through does not exist. `DESIGNATE_FILE` and `EGRESS` both have a facet
 on the wire

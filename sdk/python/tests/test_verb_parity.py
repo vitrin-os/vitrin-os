@@ -87,7 +87,7 @@ def test_verb_mask_covers_exactly_the_defined_bits() -> None:
     assert protocol.VERB_MASK == defined
 
 
-# vitrin-verb-set: unserved-verbs = observe_cursor, designate_file, egress
+# vitrin-verb-set: unserved-verbs = observe_cursor, egress
 def test_the_unserved_marker_is_actually_a_phrase_the_idl_uses() -> None:
     """The served/unserved split below is derived from a STRING MATCH.
 
@@ -98,15 +98,19 @@ def test_the_unserved_marker_is_actually_a_phrase_the_idl_uses() -> None:
     D-017 recorded. So pin that the phrase is still load-bearing: at least one
     entry carries it, and at least one does not.
 
-    At wire version 2 the marked side is `observe_cursor`, `designate_file`
-    (added by P2.6.5, and unserved by every deployment until its picker and
-    its consent copy exist), `egress` (added by P2.7.2, and unserved by every
-    deployment until the out-of-core mediating proxy exists) and
-    `realm_launch` — the last of which stays out
+    At wire version 2 the marked side is `observe_cursor`, `designate_file`,
+    `egress` (added by P2.7.2, and unserved by every deployment until the
+    out-of-core mediating proxy exists) and
+    `realm_launch` — two of which stay out
     of the SERVED set for a reason about the version rather than the
-    deployment (a version-1 connection cannot mint `vitrin_launcher` at all),
-    and the IDL's own summary says so, which is why deriving from the IDL
-    rather than from a second list is the point. No count is stated here: the
+    deployment: a version-1 connection cannot mint `vitrin_launcher` or
+    `vitrin_powerbox` at all, so `realm_launch` and `designate_file` are
+    unserved *in version 1* however well the reference core serves them at
+    version 2. The IDL's own summary says so, which is why deriving from the
+    IDL rather than from a second list is the point — and it is also why the
+    `unserved-verbs` marker on this file names a **different** set from this
+    docstring: that marker is about what THIS CORE serves, and this docstring
+    is about what VERSION 1 defines. No count is stated here: the
     assertions below are over the derived sets, and the one sentence that did
     state a count ("`observe_cursor` alone") went false the moment a second
     verb landed, and would have gone false again on the third.

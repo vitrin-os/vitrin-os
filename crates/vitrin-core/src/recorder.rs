@@ -846,6 +846,76 @@ pub(crate) enum Event<'a> {
         /// here (B2).
         origin: &'static str,
     },
+    /// **One designation, settled** (P2.6.6, issue #190): what a human
+    /// chose, what the core opened, and whether the agent ever received it.
+    ///
+    /// # Why the descriptor's identity is on this line and not derivable
+    ///
+    /// `(st_dev, st_ino)` is `fstat`'d off the descriptor the core actually
+    /// opened, once, at the moment it opened it. Nothing else in the journal
+    /// can reconstruct it: a path would be a *name*, and re-resolving a name
+    /// after the fact is exactly the race the picker exists to close, so an
+    /// entry that recorded one would be recording a claim about whatever that
+    /// name points at when someone reads the log rather than about the inode
+    /// the human approved.
+    ///
+    /// # An abandoned descriptor is journalled too, and that is the point
+    ///
+    /// [`Self::delivered`] is false for a descriptor the core opened and then
+    /// closed -- the wake produced no turn, the agent disconnected, the realm
+    /// died, a write failed. That is a designation **the human made and the
+    /// agent never received**, and it must not be silent: a session where the
+    /// human handed over a file and the handover failed is not the same
+    /// session as one where they never handed it over, and only this field
+    /// separates them.
+    ///
+    /// The corollary is the rule this entry is written to keep: a line saying
+    /// `allowed` must never name a descriptor no client received. It does not
+    /// -- `allowed` lives on [`Self::UseDecision`], which names no descriptor
+    /// at all, and this entry names one and says plainly whether it arrived.
+    DesignationSettled {
+        connection: ConnectionId,
+        /// The core's opaque id, matching the terminal's `designation_id`.
+        designation: crate::designation::DesignationId,
+        /// The principal that asked -- named rather than joined through the
+        /// connection, because "who now holds this file" is what this entry
+        /// exists to answer.
+        principal: &'a PrincipalIdentity,
+        /// The realm the descriptor was delivered into.
+        realm: &'a RealmId,
+        /// The grant row the ask was admitted under, and re-judged against at
+        /// the instant of delivery.
+        grant_id: GrantId,
+        /// `file` or `directory`.
+        ///
+        /// **Named `target`, not `kind`.** Every entry already carries a
+        /// top-level `kind` naming the *event type*, and a second `kind`
+        /// inside one produced a duplicate JSON key -- a line no strict reader
+        /// will parse at all. Found by this module's own round-trip test
+        /// rather than in a log somebody was trying to read during an
+        /// incident.
+        target: &'static str,
+        /// `read` or `read_write` -- the **effective** access, which may be
+        /// narrower than the ask.
+        mode: &'static str,
+        /// The device and inode the descriptor actually opened. `None` when
+        /// no descriptor was ever opened, which is every refusal.
+        dev_ino: Option<(u64, u64)>,
+        /// Whether the agent received it. See the second section above.
+        delivered: bool,
+        /// The one-word outcome: `delivered`, or the refusal that stood in
+        /// for it (`cancelled`, `timed_out`, `unresolvable`,
+        /// `authority_died`, `realm_died`, `connection_gone`, `no_turn`,
+        /// `send_failed`).
+        ///
+        /// **`busy` is deliberately not in that list.** The ledger's busy
+        /// refusal happens before a ticket is minted, so there is no
+        /// obligation for this entry to describe; the client is answered
+        /// `vitrin_powerbox.refusal busy` on its facet and the chokepoint's
+        /// own `use_decision` line is the record. Naming it here would be a
+        /// word a reader could grep for and never find.
+        outcome: &'static str,
+    },
     /// A `once` grant's single use was consumed by an admitted use: the
     /// active-to-spent lifecycle transition.
     GrantSpent {
@@ -1434,6 +1504,7 @@ impl Event<'_> {
             Event::UseDecision { .. } => "use_decision",
             Event::UseRefusalSummary { .. } => "use_refusal_summary",
             Event::SeatDelivered { .. } => "seat_delivered",
+            Event::DesignationSettled { .. } => "designation_settled",
             Event::GrantSpent { .. } => "grant_spent",
             Event::GrantExpired { .. } => "grant_expired",
             Event::GrantRevoked { .. } => "grant_revoked",
@@ -1724,6 +1795,35 @@ impl Event<'_> {
                 field_display(out, "realm", realm);
                 field_str(out, "event", event);
                 field_str(out, "origin", origin);
+            }
+            Event::DesignationSettled {
+                connection,
+                designation,
+                principal,
+                realm,
+                grant_id,
+                target,
+                mode,
+                dev_ino,
+                delivered,
+                outcome,
+            } => {
+                field_display(out, "connection", connection);
+                field_display(out, "designation", designation);
+                field_display(out, "principal", principal);
+                field_display(out, "realm", realm);
+                field_display(out, "grant_id", grant_id);
+                field_str(out, "target", target);
+                field_str(out, "mode", mode);
+                // Written as two fields rather than one pair so a reader can
+                // grep either half; absent entirely when nothing was opened,
+                // because a zero would read as an inode.
+                if let Some((dev, ino)) = dev_ino {
+                    field_u64(out, "st_dev", dev);
+                    field_u64(out, "st_ino", ino);
+                }
+                field_bool(out, "delivered", delivered);
+                field_str(out, "outcome", outcome);
             }
             Event::GrantSpent {
                 connection,

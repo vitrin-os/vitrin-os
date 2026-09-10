@@ -3011,6 +3011,30 @@ impl session::RuntimeHost for NestedState {
         }
     }
 
+    /// Drive the core-drawn file picker for this dispatch round (P2.6.6,
+    /// issue #190).
+    ///
+    /// The same shape as [`Self::service_consent`] and for the identical
+    /// borrow reason, sharing the same grab: one grab, two subjects, so a
+    /// picker and a consent card can never both be up.
+    fn service_picker(&mut self, now: Instant) {
+        let grab = Rc::clone(&self.grab);
+        let mut grab = grab.borrow_mut();
+        if session::service_picker_round(
+            &mut grab,
+            &mut self.runtime,
+            &mut self.view.consent,
+            now,
+            // `Reachable` for the reason spelled out above `service_consent`'s
+            // own argument: nested has no honest analogue of "the seat took
+            // our devices away".
+            session::PromptVisibility::Reachable,
+        ) {
+            self.runtime.dirty = true;
+            self.view.backend.window().request_redraw();
+        }
+    }
+
     /// Drive the lock screen for this dispatch round (WS-E.2.2, issue #214).
     ///
     /// Same shape as [`Self::service_consent`] above and for the same borrow

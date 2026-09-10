@@ -16,12 +16,14 @@
 //! could be re-pointed, and what reaches the agent is kernel authority over
 //! one inode. "Designation is authorization" is that sentence made literal.
 //!
-//! # The four modules
+//! # The five modules
 //!
 //! * [`keys`] — which keys drive it, and the one that deliberately does not.
 //! * [`listing`] — one directory, in which no two rows may look alike.
 //! * [`resolve`] — the race-free walk from a held directory descriptor.
 //! * [`delivery`] — descriptors opened and not yet handed over.
+//! * [`session`] — one raised picker's state: where the human is standing,
+//!   and the two descriptors every move is made through.
 //!
 //! # What this module does not decide
 //!
@@ -37,3 +39,4 @@ pub(crate) mod delivery;
 pub(crate) mod keys;
 pub(crate) mod listing;
 pub(crate) mod resolve;
+pub(crate) mod session;

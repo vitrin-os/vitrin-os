@@ -93,7 +93,17 @@ pub(crate) struct InFlight {
     pub(crate) ask: AskedFor,
     pub(crate) grant: GrantId,
     pub(crate) principal: PrincipalIdentity,
+    /// The connection the ask arrived on — the one the agent's copy is
+    /// written to, and the one a journal line names. Carried rather than
+    /// looked up from the principal, because a principal may hold more than
+    /// one connection and only the one that asked is owed a terminal.
+    pub(crate) connection: crate::petitions::ConnectionId,
     pub(crate) realm: RealmId,
+    /// The basename the human chose, **display only**, for both terminals'
+    /// `name` argument. Never a path, and never used to resolve anything: the
+    /// descriptor is already open, and the only thing this string can do is
+    /// appear in an app's title bar.
+    pub(crate) name: Vec<u8>,
     pub(crate) facet_id: u32,
     pub(crate) grant_wire_id: u32,
     pub(crate) agent: Half,
@@ -149,6 +159,18 @@ impl DeliveryTable {
         self.held.get_mut(&id)
     }
 
+    /// Remove an entry whatever it still owes.
+    ///
+    /// The abandon path's counterpart to [`Self::take_settled`], and named to
+    /// be read beside it: this one is for a delivery the caller has decided is
+    /// over — a write failed, a wake produced no turn inside its own round —
+    /// and the caller owes the journal a line for it, because a descriptor
+    /// removed and dropped without one is exactly the silence this module's
+    /// docs forbid.
+    pub(crate) fn take_any(&mut self, id: DesignationId) -> Option<InFlight> {
+        self.held.remove(&id)
+    }
+
     /// Remove an entry that has nothing left to owe.
     pub(crate) fn take_settled(&mut self, id: DesignationId) -> Option<InFlight> {
         if self.held.get(&id).is_some_and(InFlight::settled) {
@@ -160,6 +182,37 @@ impl DeliveryTable {
 
     pub(crate) fn outstanding(&self) -> usize {
         self.held.len()
+    }
+
+    /// The designation this connection is owed a copy of, if any.
+    ///
+    /// Asked on a `Woken` turn, which carries nothing at all: the wake is an
+    /// *occasion to write*, not a message, so the core has to look up what it
+    /// woke itself for. At most one per connection, by the ledger's
+    /// one-outstanding-ask-per-principal rule; the first by id if that rule
+    /// were ever relaxed, so this is deterministic either way.
+    pub(crate) fn owed_by_connection(
+        &self,
+        connection: crate::petitions::ConnectionId,
+    ) -> Option<DesignationId> {
+        self.held
+            .values()
+            .find(|e| e.connection == connection && e.agent == Half::Owed)
+            .map(|e| e.id)
+    }
+
+    /// The designation this realm is owed a copy of, if any.
+    ///
+    /// Only ever answers for an entry whose **agent half already went out**,
+    /// which is this table's ordering rule expressed as a query rather than
+    /// as a rule somebody has to remember: a shim woken for an entry the
+    /// agent has not received gets nothing, so the IDL's premise that the
+    /// agent was served first cannot be broken by a stray wake.
+    pub(crate) fn owed_by_realm(&self, realm: &RealmId) -> Option<DesignationId> {
+        self.held
+            .values()
+            .find(|e| &e.realm == realm && e.agent == Half::Sent && e.shim == Half::Owed)
+            .map(|e| e.id)
     }
 
     /// Entries whose turn never came. Ascending by id, so a caller journals
@@ -190,6 +243,33 @@ impl DeliveryTable {
             .held
             .iter()
             .filter(|(_, e)| &e.principal == principal)
+            .map(|(id, _)| *id)
+            .collect();
+        gone.into_iter()
+            .filter_map(|id| {
+                self.held
+                    .remove(&id)
+                    .map(|e| (e, Abandoned::ConnectionGone))
+            })
+            .collect()
+    }
+
+    /// Release everything owed to a connection that has gone away, by its
+    /// connection id.
+    ///
+    /// [`Self::withdraw_connection`]'s sibling, and the one the runtime
+    /// actually calls: teardown knows the `ConnectionId` it is closing, and a
+    /// principal may hold more than one connection — so withdrawing by
+    /// *identity* would release a descriptor owed to a sibling connection
+    /// that is still perfectly alive.
+    pub(crate) fn withdraw_connection_by_id(
+        &mut self,
+        connection: crate::petitions::ConnectionId,
+    ) -> Vec<(InFlight, Abandoned)> {
+        let gone: Vec<DesignationId> = self
+            .held
+            .iter()
+            .filter(|(_, e)| e.connection == connection)
             .map(|(id, _)| *id)
             .collect();
         gone.into_iter()
@@ -246,7 +326,13 @@ mod tests {
             ask: AskedFor::File { write: false },
             grant: GrantId::from_u64_for_test(u64::from(id)),
             principal: ident(who),
+            connection: crate::petitions::PetitionRegistry::new(
+                crate::petitions::ConsentPolicy::Interactive,
+                crate::petitions::PetitionConfig::default(),
+            )
+            .register_connection(),
             realm: RealmId::new(realm),
+            name: b"fixture.txt".to_vec(),
             facet_id: 7,
             grant_wire_id: 9,
             agent: Half::Owed,

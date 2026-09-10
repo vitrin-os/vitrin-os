@@ -251,7 +251,7 @@ const EXPIRY_UNBOUNDED: &str = "no time limit - bounded only by the choice below
 /// It deliberately does not say "and observe it": launching confers nothing
 /// over what was launched, and a line that implied otherwise would ask for
 /// consent to authority this grant does not carry.
-const VERB_CATALOGUE: [(Verb, &str, &str); 6] = [
+const VERB_CATALOGUE: [(Verb, &str, &str); 7] = [
     (Verb::OBSERVE, "observe", "capture frames of this realm"),
     (
         Verb::ACTUATE_POINTER,
@@ -278,6 +278,25 @@ const VERB_CATALOGUE: [(Verb, &str, &str); 6] = [
         Verb::REALM_LAUNCH,
         "realm_launch",
         "start the program named above, as a new app, as often as its rate limit allows",
+    ),
+    // **The one line here that a fuller review still owes** (P2.6.8, Q13).
+    // It exists because P2.6.6 moved `designate_file` into
+    // `SERVED_VERB_BITS`, and the test below refuses to let a servable verb
+    // go unnamed on a card -- so this is the minimum honest copy rather than
+    // the considered copy.
+    //
+    // What it must get right, and does: the verb is authority to *ask*, the
+    // human chooses each time, and the descriptor **survives revocation**.
+    // That last clause is the one a human cannot infer and the IDL states
+    // outright -- "revocation stops future designations and kills the grant
+    // row while the payload keeps every fd already handed over until its
+    // realm dies" -- so a card that omitted it would describe an authority
+    // the deployment cannot actually take back as one it can.
+    (
+        Verb::DESIGNATE_FILE,
+        "designate_file",
+        "ask you to pick one file or folder to hand over - you choose each time, and what you \
+         hand over stays readable by this app until it exits, even if you revoke this grant",
     ),
 ];
 
@@ -948,24 +967,34 @@ mod tests {
         // WS-E.1.4 (issue #210) moved `layout_arrange` and `layout_focus`
         // out on the same terms.
         //
-        // vitrin-verb-set: unserved-verbs = observe_cursor, designate_file, egress
+        // vitrin-verb-set: unserved-verbs = observe_cursor, egress
         //
-        // Three verbs are pinned here. `observe_cursor` stays, and for a
+        // **Two verbs are pinned here: `observe_cursor` and `egress`.** The
+        // marker is not the enumeration -- this sentence is, and it is what a
+        // reader believes -- so both are named on it rather than left to the
+        // paragraphs below.
+        //
+        // `observe_cursor` stays, and for a
         // reason that has not moved: per-principal cursor *delivery* is
         // still M2's (D-017/D-019 both say so in as many words), so serving
         // the verb would widen a capture with a cursor the core does not
         // have.
         //
-        // **Re-pinned by P2.6.5 (issue #189) in the other direction** — the
-        // first time this pin has *grown*. `designate_file` (64) is appended
-        // to the IDL and is classified **unserved**, deliberately and not for
-        // lack of time: Q13's rule is that no verb is served before its
-        // human-readable consent copy exists (P2.6.8), and there is no picker
-        // to mint a descriptor either (P2.6.6). So it gets **no catalogue
-        // line above** — a line here would be prompt copy for a verb no
-        // petition can ever carry to a prompt, which is the exact failure the
-        // second assertion in this test forbids. When P2.6.8 writes the copy,
-        // this pin shrinks again and a line goes in above, in one change.
+        // **`designate_file` (64) LEFT this pin at P2.6.6 (issue #190)**,
+        // the third shrink. It was appended to the IDL at P2.6.5 and pinned
+        // unserved on two grounds — no picker to mint a descriptor, and no
+        // consent copy under Q13's rule. The first ground is gone: the
+        // core-drawn picker ([`crate::picker`]) exists and the chokepoint has
+        // a sink to reach it.
+        //
+        // **The second ground is not gone, and this is the honest place to
+        // say so.** P2.6.8 owns the considered copy; the catalogue line above
+        // is the minimum that keeps the card from omitting a verb it is
+        // asking a human to approve. So Q13's rule is met in the letter — the
+        // verb is named on the card — and the review that would make it met
+        // in spirit is still owed. That is a weaker state than
+        // `realm_launch`'s, whose copy was written by the task that served
+        // it, and the difference is recorded rather than smoothed over.
         //
         // **`egress` (128) JOINED the pin at P2.7.2 (issue #196)**, the
         // second growth, and again
@@ -985,12 +1014,12 @@ mod tests {
         // changes what the wire can express; only a mechanism changes what
         // this core can enforce, and only the second moves a bit out of
         // `UNSERVED_VERB_BITS`. The same is true of `designate_file` and
-        // `vitrin_powerbox`. `egress` leaves this pin when P2.7.3 lands
-        // the proxy and P2.6.8's Q13 copy review clears its line, not
-        // before.
+        // `vitrin_powerbox`, whose facet landed a release before its
+        // mechanism did. `egress` leaves this pin when P2.7.3 lands the
+        // proxy, not before.
         assert_eq!(
             crate::grants::UNSERVED_VERB_BITS,
-            (Verb::OBSERVE_CURSOR | Verb::DESIGNATE_FILE | Verb::EGRESS).bits(),
+            (Verb::OBSERVE_CURSOR | Verb::EGRESS).bits(),
             "the IDL defines a verb this module has not classified as served \
              or unserved (D-017/D-018)"
         );
@@ -1039,7 +1068,8 @@ mod tests {
                 "actuate_text",
                 "layout_arrange",
                 "layout_focus",
-                "realm_launch"
+                "realm_launch",
+                "designate_file"
             ]
         );
     }

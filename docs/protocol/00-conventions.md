@@ -339,16 +339,16 @@ endpoint and a blanket egress grant is inexpressible rather than refused.
 Having a facet is not being served, and both of those two are the proof: a
 facet is a request to ask through, a mechanism is what answers.
 
-<!-- vitrin-verb-set: unserved-verbs = observe_cursor, designate_file, egress | count: three -->
-So the count this enumeration exists to answer is **three**: `observe_cursor`,
-`designate_file`
+<!-- vitrin-verb-set: unserved-verbs = observe_cursor, egress | count: two -->
+So the count this enumeration exists to answer is **two**: `observe_cursor`
 and `egress` are the verbs no deployment serves today, and `layout_arrange`,
-`layout_focus` and `realm_launch` have each left that posture. That count is
+`layout_focus`, `realm_launch` and `designate_file` have each left that
+posture. That count is
 not a sentence anyone has to remember: `cargo xtask verb-sets --check`
 derives the set from the IDL and from the reference core's `SERVED_VERB_BITS`
 and fails on every surface still enumerating the old one — as it did on this
 very paragraph, which said "two" while a parallel branch was landing the
-third.
+third, and again when the core-drawn picker took `designate_file` back out.
 
 ---
 

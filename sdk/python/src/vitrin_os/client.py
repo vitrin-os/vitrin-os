@@ -90,13 +90,13 @@ def _parse_verbs(verbs: int | Verb | Iterable[str | Verb]) -> int:
     # recoverable and is the answer the caller is entitled to see. Pre-empting
     # it locally would hide a deployment difference behind a client-side error.
     #
-    # vitrin-verb-set: unserved-verbs = observe_cursor, designate_file, egress
+    # vitrin-verb-set: unserved-verbs = observe_cursor, egress
     #
-    # Three of them -- observe.cursor, designate.file and egress -- are
-    # refused by EVERY
-    # deployment today (no cursor delivery; no picker and no consent copy for
-    # it; no mediating proxy), and
-    # realm.launch and the layout.* pair by any deployment that declines them.
+    # Two of them -- observe.cursor and egress -- are refused by EVERY
+    # deployment today (no cursor delivery; no mediating proxy), and
+    # designate.file, realm.launch and the layout.* pair by any deployment
+    # that declines them. designate.file was in the first list until the
+    # reference core's core-drawn picker landed.
     # The first list is derived from the reference core by `cargo xtask
     # verb-sets --check`, so it cannot fall behind the way it did when
     # `egress` landed; the second is a deployment property and cannot be
@@ -108,7 +108,9 @@ def _parse_verbs(verbs: int | Verb | Iterable[str | Verb]) -> int:
     # request
     # to ask through; the picker or the proxy behind it is what a deployment
     # would need to
-    # answer with, and only that moves a verb off this list.
+    # answer with, and only that moves a verb off this list -- which is
+    # exactly what happened to `designate.file` when its picker landed, and
+    # has not happened to `egress`.
     return bits
 
 

@@ -1573,11 +1573,13 @@ and this is **what a shell realm may reach that an app realm may not**:
   mints it and passes it down the spawn path as an inherited file descriptor —
   so nothing is mounted, no path is opened, no Landlock rule is added, and the
   realm's mount table stays closed. A measured walk of a realm's whole
-  filesystem finds exactly one socket, the shim's own, and that stays true after
-  this. Everything else about a shell realm — its mount table, its Landlock
-  domain, its namespaces, its retained supplementary groups — is the confinement
-  every realm gets. **An app realm is handed one socket, its own shim's, and
-  nothing else.**
+  filesystem finds exactly the shim's two sockets (`wayland-0` and
+  `designation.sock`, both its own — the second since P2.6.7,
+  [#191](https://github.com/vitrin-os/vitrin-os/issues/191)), and that stays
+  true after this. Everything else about a shell realm — its mount table, its
+  Landlock domain, its namespaces, its retained supplementary groups — is the
+  confinement every realm gets. **An app realm is handed its own shim's two
+  sockets, and nothing else.**
 - **What the connection buys is fenced.** It may petition, and it may hold
   `layout_focus`, `layout_arrange` and `realm_launch` over *other* realms — the
   last of which is authority to create realms, the widest authority here, and it
@@ -2607,7 +2609,15 @@ runtime directory into a realm puts the bus socket back inside it at
 portals *properly* — a core-mediated file chooser under a grant — is the Phase-2 powerbox's job and is a
 different thing again from restoring the toolkit's. **Serving portals has no
 issue and appears in no plan document**, so read this as an absence nobody has
-scheduled rather than as work in a queue.
+scheduled rather than as work in a queue. Since P2.6.6 that core-mediated
+chooser exists — the core-drawn picker below, reached through
+`vitrin_powerbox` and delivering a descriptor to the realm over
+`designation.sock` — and it does not change this entry: **what does not exist
+is anything that hands its result to a toolkit dialog.** A GTK or Qt file
+chooser inside a realm is still the toolkit's own, still cannot reach a file
+the application could not already open, and is not wired to the picker by any
+portal; the picker's result reaches only a powerbox-aware app that connects to
+the socket itself (next entries).
 
 **The core-drawn file picker will not draw Arabic, Hebrew, Devanagari or
 Thai.** That chooser — the one a realm asks for over `vitrin_powerbox`, drawn
@@ -2686,6 +2696,78 @@ produce distinct transcript *text*, witnessed by a decoder that inverts the
 encoder for every input. **No issue tracks this**, because it is a boundary
 rather than a gap — there is no version of this picker in which the global
 property holds.
+
+**A designation reaches only a powerbox-aware app, and a legacy application
+that expects a path gets nothing.** What the picker delivers to a realm is a
+file descriptor over `SCM_RIGHTS`, and the realm's shim hands it on over one
+socket, `$XDG_RUNTIME_DIR/designation.sock`, as a `vitrin_shim_session.designation`
+frame plus the descriptor (P2.6.7,
+[#191](https://github.com/vitrin-os/vitrin-os/issues/191); the app-facing
+contract is on the
+[shim-session page](https://github.com/vitrin-os/vitrin-os/blob/main/docs/protocol/09-vitrin_shim_session.md#what-the-app-connects-to)).
+An application that wants a *filename* — which is every unmodified GTK, Qt or
+Electron program — gets no designation in v0: the FUSE synthetic-path layer
+that would show it one as a path (PRD Doc 2 §12, with its named warts) is
+E3.6/Q10, scheduled in no Phase-2 document. The v0 audience is an app that
+connects to that socket at startup and **holds the connection for its
+lifetime, because there is no signal a designation is coming** — no
+environment variable, no Wayland event, no wakeup; the socket is announced by
+nothing and found by the same convention that finds `wayland-0`.
+
+**A designation with no connected app is closed, not queued; a connected app
+that does not read is dropped after the kernel's own queue fills.** The shim
+holds nothing: a `designation` that arrives while no app is connected is
+closed the moment it is received and recorded `no_client`, because any
+shim-side hold would pin a file open for a time the app controls, which is
+exactly the residue the core cannot take back. The only queue is the
+kernel's, on the socket the app is holding, and it is bounded by the shim
+socket's **send buffer** (`net.core.wmem_default`, 212992 bytes on a
+default-tuned kernel — a few hundred designations at these frame sizes, 278
+measured): a connected app that stops reading pins that many designations —
+each with its descriptor — in the kernel, and the next one fails `EAGAIN`, at
+which point the shim drops that connection and the slot is free for a working
+process. It is not `net.unix.max_dgram_qlen`: the kernel skips that
+per-message check for a peer connected back to the sender, which a
+`SEQPACKET` connection is. The human who made those designations is not
+told; the shim's ledger is.
+
+**One connection at a time, and the first holds until it closes.** A second
+process connecting to `designation.sock` while one connection is held is
+accepted and closed at once — it sees EOF, never a hang, and the ledger says
+`refused_occupied` — and it does not displace the holder. Every process in a
+realm is one trust domain, so no rule about *which* connection receives
+changes any authority; first-holds is the rule under which the loser finds
+out. The descriptor the app receives **shares its file offset with the asking
+agent's copy** — one open file description, delivered twice — so a `read` by
+either advances the other's cursor; the remedies (positional I/O, or a fresh
+`openat` from a directory descriptor) are on the
+[protocol page](https://github.com/vitrin-os/vitrin-os/blob/main/docs/protocol/13-vitrin_powerbox.md#the-two-halves-share-one-file-offset).
+
+**At `--isolation=off`, any process of your uid can connect first and receive
+the realm's designations.** In that mode there is no namespace: the socket is
+at `$XDG_RUNTIME_DIR/vitrin-0/<realm_id>/designation.sock` on the host, under
+a `0700` directory of the operator's uid, with the same standing the Wayland
+socket beside it has — reachable by anything running as you. The socket's own
+node is `0700` and the shim verifies it, but that keeps out *other users*,
+which is not the threat. The shim's ledger records which case a run was in:
+`designation-sock: … tier=in-realm` at `--isolation=default`, where the
+realm's mount namespace presents the directory as `/run/vitrin`, and
+`tier=host-path` otherwise. At the default the host spelling of the realm's
+runtime directory still names the same inode, so read "announced by nothing"
+as the whole claim, not "unreachable from outside the realm".
+
+**The in-flight descriptor budget is one uid's, and it is a denial-of-service
+surface of the whole `SCM_RIGHTS` plane.** Linux charges every descriptor in
+flight over an `AF_UNIX` socket against the *sending user's* `RLIMIT_NOFILE`,
+and a send over the limit fails `ETOOMANYREFS`. Core, shim, agent and app all
+run as one uid in this build's single-id map, so any of them — or any
+unrelated process of that uid — can exhaust the budget, and a designation
+that then fails to relay fails closed: the shim records `send_failed
+errno=ETOOMANYREFS`, drops the connection and closes the descriptor. Nothing
+here is lost silently and nothing is retried, and nothing here is specific to
+the relay either: the same limit sits under the core's own `SCM_RIGHTS`
+delivery to the agent. It is named here because the relay is a new victim of
+it, not because the relay introduced it.
 
 <!-- limit: no-x11 -->
 **No X11 shim.** Wayland only. Per-app X11 with an embedded WM is Phase 3.

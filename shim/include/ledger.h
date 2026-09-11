@@ -105,6 +105,64 @@
  *                    overflow=N suppressed_offers=N suppressed_binds=N
  *                    suppressed_demands=N
  *
+ * THE DESIGNATION RELAY'S RECORDS (P2.6.7, issue #191). Appended to the same
+ * grammar, and `version=1` STAYS: every record above is byte-for-byte what it
+ * was, and the additions are new record NAMES a parser that does not know
+ * them skips by prefix -- the Wayland-style growth rule the wire itself
+ * follows (conventions §6). A version bump would tell every existing parser
+ * the records it knew had changed, which is false.
+ *
+ *   designation-sock:    path=PATH mode=0700 tier=in-realm|host-path
+ *   designation-client:  seq=N event=connected|gone|refused_occupied|wrote_and_closed
+ *                        [peer_pid=N app=0|1] [bytes=N] [errno=NAME]
+ *   designation-relay:   seq=N designation_id=ID kind=file|directory
+ *                        mode=read|read_write name_len=N
+ *                        outcome=relayed|no_client|send_failed [errno=NAME]
+ *   designation-summary: relayed=N no_client=N send_failed=N clients=N
+ *                        refused=N writes=N suppressed_clients=N
+ *                        suppressed_refused=N suppressed_writes=N
+ *
+ * `tier=in-realm` iff the socket's directory is exactly `/run/vitrin`, the
+ * constant the realm's mount namespace presents at `--isolation=default`;
+ * `host-path` is every other spelling, and is the tier at which any process
+ * of the operator's uid can connect first (limits.md).
+ *
+ * `peer_pid` and `app` appear on `connected` only: `app=1` iff the peer's
+ * SO_PEERCRED pid is the app the shim forked, `app=0` for any other process
+ * in the realm (a helper, a test client spawned by hand). `bytes` appears on
+ * `wrote_and_closed` only, and is the length of the whole message the app
+ * sent (received with MSG_TRUNC, so a message longer than the drain buffer
+ * still reports its real size); it may be 0, since SEQPACKET permits an
+ * empty message and one is still a write. `errno` on `gone` when the
+ * connection ended in an error rather than an EOF, and on `send_failed`.
+ *
+ * `outcome=relayed` is DEFINED as: the kernel accepted the message, with its
+ * one descriptor, for the held connection. Receipt by the app is
+ * unobservable from the shim by design -- the socket has no reply path -- so
+ * `relayed` is the strongest claim this ledger can make and a reader must not
+ * promote it to "the app has it". `no_client` is a designation that arrived
+ * with no connection held (closed, never queued); `send_failed` is one the
+ * kernel refused for the held connection, whose errno names why (EAGAIN: the
+ * app stopped reading and its kernel queue is full; EPIPE/ECONNRESET: the app
+ * is gone; ETOOMANYREFS: this uid's in-flight-descriptor budget is exhausted,
+ * possibly by another process), and after which the held connection is
+ * dropped and the slot freed.
+ *
+ * THE ASYMMETRY IN WHAT IS CAPPED. `designation-client` records are APP-PACED:
+ * the app chooses how often to connect, disconnect and write, so, under the
+ * "no record is unbounded" rule below, at most VITRIN_LEDGER_DEMAND_RECORDS of
+ * each event kind are printed per run and the rest are counted into the
+ * summary's `suppressed_*` (connected and gone share `suppressed_clients`;
+ * refused_occupied is `suppressed_refused`; wrote_and_closed is
+ * `suppressed_writes`). `designation-relay` records are CORE-PACED -- one per
+ * completed human decision in the picker -- and are UNCAPPED: the rate is
+ * bounded by a human's hand, and every one of them is the evidence a reader
+ * of a designation's journey needs.
+ *
+ * The basename the human chose is NEVER recorded (P2.6.5's rule: name LENGTH
+ * only). It is display copy for a picker, and a per-realm log is not a place
+ * the designation authorized it to go.
+ *
  * `globals-error` carries no `object=` field: libwayland's own message text
  * already names the offending object ("invalid method 3, object wp_viewport@27")
  * and the closure's object argument is opaque outside libwayland.
@@ -142,8 +200,10 @@
 #define VITRIN_LEDGER_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <sys/types.h> /* pid_t (the designation socket's SO_PEERCRED peer) */
 
 #include <wayland-server-core.h>
 
@@ -218,13 +278,90 @@ struct vitrin_ledger {
 	struct wl_global *probes[VITRIN_LEDGER_MAX_ROWS];
 	int probe_count;
 
+	/* The designation relay's counters (P2.6.7, issue #191; grammar in the
+	 * header comment). Totals for `designation-summary`, plus the per-kind
+	 * printed counts that implement the cap on the app-paced
+	 * `designation-client` records. */
+	uint64_t designations_relayed;
+	uint64_t designations_no_client;
+	uint64_t designations_send_failed;
+	uint64_t designation_clients;  /* `connected` events */
+	uint64_t designation_gone;     /* `gone` events */
+	uint64_t designation_refused;  /* `refused_occupied` events */
+	uint64_t designation_writes;   /* `wrote_and_closed` events */
+	/* Records of each client event kind actually printed, indexed by
+	 * `enum vitrin_ledger_designation_client_event`; the cap compares
+	 * against these, and what exceeds it lands in the three below. */
+	uint64_t designation_client_printed[4];
+	uint64_t designation_suppressed_clients; /* connected + gone */
+	uint64_t designation_suppressed_refused;
+	uint64_t designation_suppressed_writes;
+
 	/* `--globals-log PATH`, or NULL. Flushed after every record the run may
 	 * not survive to repeat -- `globals-demand` and `globals-error`, both at
 	 * WLR_ERROR -- and at teardown. Routine records ride the stdio buffer:
 	 * flushing those too meant a write(2) per `wl_registry.bind`, which a
-	 * client controls the rate of. */
+	 * client controls the rate of.
+	 *
+	 * ALSO flushed after every `designation-*` record, whatever its level.
+	 * The bind-rate argument does not apply there: `designation-relay` is
+	 * paced by a human's hand in the picker, and `designation-client` is
+	 * capped at VITRIN_LEDGER_DEMAND_RECORDS per kind, so the most an app can
+	 * extract is a few dozen write(2)s per run. What the flush buys is a
+	 * ledger the acceptance script can read LIVE, sequencing "the shim relayed
+	 * it" against the client's own account without waiting for teardown. */
 	FILE *sink;
 };
+
+/* ---- the designation relay's emitters (P2.6.7, issue #191) ------------
+ *
+ * Exported so designation.c can emit records while `record()` stays static
+ * and the grammar stays in one file. Each is one record, flushed; at INFO,
+ * except `designation-relay ... outcome=send_failed`, which is at ERROR --
+ * a designation the human made that the app will not get is the run a reader
+ * diagnoses (ledger.c). */
+
+/* The `designation-client` event kinds, in the grammar's spelling order.
+ * Values are the index into `designation_client_printed[]`. */
+enum vitrin_ledger_designation_client_event {
+	VITRIN_LEDGER_DESIGNATION_CONNECTED = 0,
+	VITRIN_LEDGER_DESIGNATION_GONE = 1,
+	VITRIN_LEDGER_DESIGNATION_REFUSED_OCCUPIED = 2,
+	VITRIN_LEDGER_DESIGNATION_WROTE_AND_CLOSED = 3,
+};
+
+/* The `designation-relay` outcomes. Returned by `vitrin_designation_relay`
+ * as well, so the log line in upstream.c and the ledger record cannot
+ * disagree about what happened. */
+enum vitrin_ledger_designation_outcome {
+	VITRIN_LEDGER_DESIGNATION_RELAYED,
+	VITRIN_LEDGER_DESIGNATION_NO_CLIENT,
+	VITRIN_LEDGER_DESIGNATION_SEND_FAILED,
+};
+
+/* `designation-sock: path=... mode=0700 tier=...`, once, from
+ * `vitrin_designation_init` after the post-bind mode check passed (the record
+ * states 0700 as a fact, so it is emitted only once that is one). */
+void vitrin_ledger_designation_sock(struct vitrin_shim *s, const char *path, bool in_realm);
+
+/* One `designation-client` record, capped per kind. `peer_pid`/`app` are
+ * printed for `connected`, `bytes` for `wrote_and_closed`, `err` (an errno,
+ * 0 for none) for `gone`; the others are ignored for the other kinds. */
+void vitrin_ledger_designation_client(struct vitrin_shim *s,
+	enum vitrin_ledger_designation_client_event event,
+	pid_t peer_pid, bool app, size_t bytes, int err);
+
+/* One `designation-relay` record, uncapped. `err` is the errno for
+ * `send_failed` and ignored otherwise. Never takes the name: only its length. */
+void vitrin_ledger_designation_relay(struct vitrin_shim *s, uint32_t designation_id,
+	bool directory, bool read_write, uint32_t name_len,
+	enum vitrin_ledger_designation_outcome outcome, int err);
+
+/* The symbolic name of an errno (`EAGAIN`, `EPIPE`, ...), for `errno=NAME`
+ * fields and for the shim log's send-failure suffix. Never NULL: an errno
+ * without a known name renders as `E<number>`, which is still greppable and
+ * still one token. */
+const char *vitrin_ledger_errno_name(int err);
 
 /* Attach the protocol logger and the client listener. Must run before the
  * Wayland socket is bound, or the first client's registry traffic -- which is

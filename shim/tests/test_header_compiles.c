@@ -493,13 +493,15 @@ static void call_fd_and_string_message(void) {
 /* Encodes then decodes vitrin_shim_session.designation: the FIRST fd-bearing
  * core -> shim event this protocol has ever defined (P2.6.5, issue #189), and
  * the reason it is called here rather than only type-checked. Every other fd
- * this transport has had to marshal travels shim -> core, so shim/include/wire.h
- * implements SCM_RIGHTS on the send side only and closes an arriving
- * descriptor as a violation -- see its own header comment, which says so and
- * names P2.6.7 as owing the receive path. This call proves the *marshalling*
- * half a C shim will need is already there and correct, including the
- * fd-present precondition (HAS_FD is 1, so decoding with fd < 0 must be
- * refused) and the 255-byte bound on `name`.
+ * the shim's transport marshals travels shim -> core; for this one
+ * shim/include/wire.h receives the descriptor (its pending-fd queue and
+ * positional matching, landed by P2.6.6, issue #190, for the event P2.6.5
+ * defined) and shim/src/designation.c relays it to the
+ * app over the realm's own socket (P2.6.7, issue #191) -- and the app decodes
+ * it with THIS header, since the shim sends the frame verbatim. This call
+ * proves the *marshalling* half both ends rely on is there and correct,
+ * including the fd-present precondition (HAS_FD is 1, so decoding with fd < 0
+ * must be refused) and the 255-byte bound on `name`.
  *
  * vitrin_powerbox.designated, the agent-facing half of the same designation,
  * is type-checked through VITRIN_EVERY_MESSAGE like every message and is not

@@ -24,9 +24,16 @@
 #       assertion rather than a tautology.
 #
 #   (B) IT SAYS SO. The shim logs the arrival, naming the designation id the
-#       mock core sent, and says plainly that the descriptor was closed rather
-#       than relayed -- because no designation socket exists yet (P2.6.7, issue
-#       #191). A silent success and a silent drop look identical in a log.
+#       mock core sent, and says plainly what became of the descriptor. The
+#       relay exists as of P2.6.7 (issue #191): the shim serves
+#       `designation.sock` and hands designations to an app holding it. THIS
+#       RUN SPAWNS NO APP, so nothing is connected and the disposition the
+#       shim must name is "CLOSED, not relayed: no app is connected" -- the
+#       no-client path, closed by the transport and never queued. The relay
+#       itself, with a connected client, is designation_relay.sh's; this
+#       script keeps its original purpose: a shim that survives, says so, and
+#       holds nothing. A silent success and a silent drop look identical in a
+#       log.
 #
 #   (D) IT STILL REFUSES A DESCRIPTOR ON A FRAME WHOSE SIGNATURE HAS NONE.
 #       Receiving `designation` narrowed which frames may carry an fd; it must
@@ -178,12 +185,16 @@ ok "the shim holds no descriptor on the designated file ($SCANNED fds scanned)"
 # --- (B) it said what it did with the descriptor -------------------------
 grep -q "designation $DESIGNATION_ID arrived" "$SHIM_LOG" \
 	|| fail "the shim did not log designation $DESIGNATION_ID"
-grep -q "CLOSED, not relayed" "$SHIM_LOG" \
-	|| fail "the shim logged a designation without saying what became of the \
-descriptor. Until P2.6.7 (#191) serves the realm's designation socket the app \
-never receives it, and a log that does not say so reads as a delivery; shim log:
+# The exact suffix, not a substring of it: this run has no app on
+# designation.sock, so the only honest disposition is the no-client one. A
+# `send failed` or a `relayed` here would mean something connected that this
+# script never started.
+grep -q "CLOSED, not relayed: no app is connected" "$SHIM_LOG" \
+	|| fail "the shim logged a designation without naming the no-client \
+disposition. No app was spawned in this run, so the descriptor cannot have \
+been relayed, and a log that does not say so reads as a delivery; shim log:
 $(grep -i designation "$SHIM_LOG" || echo '(no designation lines)')"
-ok "the shim logged the arrival and named the disposition"
+ok "the shim logged the arrival and named the disposition (no app connected)"
 
 wait "$CORE_PID" || true
 CORE_PID=""

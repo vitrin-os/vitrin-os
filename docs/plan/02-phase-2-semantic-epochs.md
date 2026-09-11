@@ -176,6 +176,55 @@ tree, it exports a name space.
   an fd, and E3.7 must not read it as evidence that the residue has been
   observed.
 
+> **CORRECTED 2026-09-11 BY P2.6.7
+> ([#191](https://github.com/vitrin-os/vitrin-os/issues/191)) — one item of
+> the "does not exist" list exists, and the block above stands as the dated
+> record it is.** The **shim's per-realm relay** is in the tree this block
+> ships in — #191 closes when the branch carrying it merges, which a block
+> here cannot record in advance: `shim/src/designation.c` serves
+> `$XDG_RUNTIME_DIR/designation.sock` (`/run/vitrin/designation.sock` at
+> `--isolation=default`, reserved as `IN_REALM_DESIGNATION_SOCKET` in
+> `crates/vitrin-realm-init`), one `SOCK_SEQPACKET` connection at a time, and
+> relays each `vitrin_shim_session.designation` verbatim with its descriptor
+> over `SCM_RIGHTS`; the app-facing contract is on
+> [`09-vitrin_shim_session.md`](../protocol/09-vitrin_shim_session.md#what-the-app-connects-to).
+> Its evidence is a **component test** against `shim/tests/mock_core.c`
+> (`shim/tests/acceptance/designation_relay.sh`), labelled as such wherever it
+> is listed, and never gate evidence: the mock-free rung that reaches an app
+> through a real core is ★P2.6.9's. The **core-drawn picker** on the same
+> list is P2.6.6's ([#190](https://github.com/vitrin-os/vitrin-os/issues/190));
+> its code is in the tree this block ships in, and its status is P2.6.6's
+> own row's to record, not this block's. **The last sentence of the third bullet
+> is the one this block reaches:** "the fd/socket delivery path" is no longer a
+> dependency on open issues on the designation side — the picker mints, the
+> chokepoint arm carries, the shim relays — and E3.5/E3.6 may name it as
+> landed for *designation*, while the egress half (#197, #198) is as open as
+> the bullet says. C5's exported limitation is now a statement about a
+> mechanism that **has** delivered an fd; E3.7 still must not read that as the
+> residue having been *observed* outliving a grant, which no test has done.
+
+> **CORRECTED 2026-09-11 BY P2.6.7
+> ([#191](https://github.com/vitrin-os/vitrin-os/issues/191)) — the "Landed"
+> bullet's `SERVED_VERB_BITS` sentence is out of date, and this block is the
+> dated record rather than a rewrite.** The bullet says both bits are
+> "deliberately **outside** `SERVED_VERB_BITS`, which is `1 | 2 | 4 | 16 | 32
+> | 512` = **567**", and that "every petition naming either resolves
+> `unsupported` **whole**". Since P2.6.6
+> ([#190](https://github.com/vitrin-os/vitrin-os/issues/190)) landed the
+> core-drawn picker, `designate_file` (64) is **inside** the constant, which
+> reads `1 | 2 | 4 | 16 | 32 | 64 | 512` = **631** in
+> `crates/vitrin-core/src/grants.rs`; only `egress` (128) is still
+> deliberately absent, and the constant's doc comment says so of that one bit
+> alone. The `unsupported` sentence therefore holds for `egress` only. For
+> `designate_file` the IDL's sentence — which wins over this document — is
+> the record: the reference core has served it since P2.6.6, a deployment
+> with no picker root it can open answers `internal` rather than serving a
+> verb with nothing behind it, and the human-readable consent copy that names
+> what approving it costs is still owed (P2.6.8, Q13). The verb-bit registry's
+> 64 row in [§5](#5-phase-2-allocation-registry-and-decision-gates) carries
+> the same stale clause ("unserved — no picker, no consent copy") and is
+> corrected by the block beneath that table.
+
 ---
 
 ## 2. Epics and tasks
@@ -1194,6 +1243,19 @@ Three clusters decomposing in parallel independently claimed the same verb bit, 
 | 128 | `egress` (**bit and facet landed**; unserved — no proxy) | E2.7 | P2.7.2 (#196) |
 | 256 | `publish_tree` | E2.4 | P2.4.1 |
 | 512 | `realm_launch` | **WS-E** ([14-workstream-session-mode.md](14-workstream-session-mode.md)) | WS-E.1.1 (#207) |
+
+> **CORRECTED 2026-09-11 BY P2.6.7
+> ([#191](https://github.com/vitrin-os/vitrin-os/issues/191)) — the 64 row's
+> status clause is stale and stands as the dated record it is.** "unserved —
+> no picker, no consent copy" was true when P2.6.5 allocated the bit. P2.6.6
+> ([#190](https://github.com/vitrin-os/vitrin-os/issues/190)) landed the
+> core-drawn picker and moved `designate_file` into `SERVED_VERB_BITS`, so the
+> reference core serves it; a deployment with no picker root it can open
+> answers `internal`, and the considered consent copy is still P2.6.8's (the
+> card today carries a minimum line naming the verb). The 128 row is still
+> exactly right. The allocation columns — bit, epic, task — are what this
+> table exists for and none of them moved; see the §1 block for the
+> `SERVED_VERB_BITS` value.
 
 **The registry is repo-wide, not Phase-2-only.** The 512 row is the proof: WS-E is
 a workstream, not a Phase-2 epic, and its first task drafted `realm_launch` at

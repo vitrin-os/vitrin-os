@@ -36,7 +36,11 @@ enumerates, with an errno for each:
 * a **walk** of the realm's whole filesystem for AF_UNIX socket inodes, with a
   `connect` to each. This is the route a candidate list cannot cover — "any path
   the mount table happens to expose" — and it is the reason the negative here is
-  a measurement rather than a list of paths somebody thought of.
+  a measurement rather than a list of paths somebody thought of. What the walk
+  is expected to find is exactly the shim's **two** sockets, `wayland-0` and
+  (since P2.6.7, #191) its sibling `designation.sock`, and the second is
+  asserted *present* as well as allowed, so the allowlist cannot be satisfied
+  by a shim that never bound it.
 
 Anything that connects is then driven all the way through the shipped SDK's
 `hello`, twice: with the deployment's real credential and with a wrong one.
@@ -133,7 +137,7 @@ from harness import (
 # The probe's own outcome vocabulary, imported rather than restated: the two
 # halves of this measurement disagreeing about what `connect=-1` means is
 # exactly how an unmeasured route would come to be read as a denial.
-from p311_realm_probe import CONNECT_INCONCLUSIVE, CONNECT_OK
+from p311_realm_probe import CONNECT_DENIED, CONNECT_INCONCLUSIVE, CONNECT_OK
 
 require_binaries()
 
@@ -606,16 +610,71 @@ class RealmReachesPrincipalSocket(IntegrationTest):
             "[default-landlock-off] the realm root was not enumerable even with the ruleset "
             f"off; enumerated roots were {sorted(roots)}",
         )
+        # The realm's filesystem holds exactly the shim's two sockets, and
+        # nothing else that connects. An ALLOWLIST rather than a single
+        # exclusion since P2.6.7 (#191): the shim binds `designation.sock` as a
+        # sibling of the Wayland socket it was given (`WAYLAND_DISPLAY` from the
+        # core, `--socket` from a script) -- `dirname(<that>)/designation.sock`,
+        # announced by nothing, found by the app under `$XDG_RUNTIME_DIR` the
+        # same way it finds `wayland-0` -- so the second socket is expected, and
+        # a filter that only knew about the first would report the relay as a
+        # stray. The spelling is DERIVED from `$WAYLAND_DISPLAY` rather than
+        # typed, so the allowlist follows the shim's own rule for where the
+        # node lives instead of restating it.
         shim_socket = mount_only.report.env().get("WAYLAND_DISPLAY")
+        self.assertTrue(
+            shim_socket and shim_socket.startswith("/"),
+            "[default-landlock-off] the realm's WAYLAND_DISPLAY is not an absolute path, so "
+            f"the shim's socket directory cannot be derived from it: {shim_socket!r}",
+        )
+        designation_socket = os.path.dirname(shim_socket) + "/designation.sock"
+        shim_sockets = {shim_socket, designation_socket}
         strays = [
             _un(row["path"])
             for row in mount_only.report.of("P311-WALK-SOCKET")
-            if row["connect"] == str(CONNECT_OK) and _un(row["path"]) != shim_socket
+            if row["connect"] == str(CONNECT_OK) and _un(row["path"]) not in shim_sockets
         ]
         self.assertEqual(
             strays, [],
             "[default-landlock-off] walking the realm's whole filesystem found a connectable "
-            "socket that is not the shim's own",
+            f"socket that is not one of the shim's two ({sorted(shim_sockets)})",
+        )
+        # VACUITY GUARD for the allowlist's second entry. An allowlist naming a
+        # socket the walk never met proves nothing about it -- a shim that
+        # forgot to bind the relay, or bound it somewhere else, would pass the
+        # stray check above just as cleanly. So the walk must have FOUND
+        # `designation.sock`, and the kernel must have answered for it in the
+        # way a live socket of the shim's type does. The probe connects with
+        # `SOCK_STREAM` (`p311_realm_probe.try_connect`) and the relay is
+        # `SOCK_SEQPACKET` (D2 of P2.6.7), so the answer is not `CONNECT_OK`
+        # but `EPROTOTYPE` -- which `unix_find_bsd` returns only after it has
+        # located a live socket by inode and compared types; a stale node
+        # answers `ECONNREFUSED` and a missing one `ENOENT` (measured on this
+        # kernel, 2026-09-11). `EPROTOTYPE` is therefore the STREAM probe's
+        # proof that a live SEQPACKET socket holds the node, and a
+        # `CONNECT_OK` here would mean the shim is serving a STREAM socket
+        # under the relay's name, which is the wrong socket, not a better
+        # answer. A SEQPACKET-aware probe would turn this into a `CONNECT_OK`
+        # assertion; until one exists, this is what the data can carry.
+        designation_rows = [
+            row
+            for row in mount_only.report.of("P311-WALK-SOCKET")
+            if _un(row["path"]) == designation_socket
+        ]
+        self.assertEqual(
+            len(designation_rows), 1,
+            "[default-landlock-off] the walk did not find the shim's designation socket at "
+            f"{designation_socket}, so the allowlist entry for it is vacuous: "
+            f"{len(designation_rows)} rows",
+        )
+        designation_row = designation_rows[0]
+        self.assertEqual(
+            (int(designation_row["connect"]), int(designation_row["errno"])),
+            (CONNECT_DENIED, errno.EPROTOTYPE),
+            "[default-landlock-off] the shim's designation socket was found but the kernel "
+            "did not answer the STREAM probe with EPROTOTYPE, so either no live SEQPACKET "
+            f"socket holds the node or the relay is not what P2.6.7 says it is: connect="
+            f"{designation_row['connect']} errno={designation_row['errno']}",
         )
         # And the ruleset's own contribution, stated rather than assumed: at the
         # shipped default the same walk is refused at the root.

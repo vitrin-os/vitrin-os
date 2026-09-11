@@ -619,6 +619,12 @@ const PROFILE: &str = "packaging/apparmor/vitrind";
 /// The decision log. A `**Status:**` line is a status word, not a register --
 /// see the warning above.
 const DECISIONS: &str = "docs/plan/20-decision-log.md";
+/// The integration harness's README. It is where the p311 instrument's
+/// measurement table and its reading are published, and the one sentence
+/// held here -- how many sockets a realm's app is handed -- is a COUNT, which
+/// is the kind of fact the warning above allows across registers: it has one
+/// value, and the limits page and this README must agree on it.
+const INTEGRATION_README: &str = "tests/integration/README.md";
 /// The wire protocol IDL -- CLAUDE.md's "source of truth for every interface",
 /// and therefore the canonical set behind every published interface count and
 /// every published interface table.
@@ -1142,17 +1148,31 @@ pub const CLAIMS: &[Claim] = &[
             },
         ],
     },
+    // Since P2.6.6/P2.6.7 the "no file chooser beyond the toolkit's own"
+    // clause needs one more sentence beside it, or a reader who has just met
+    // the core-drawn picker reads this row as stale: the core-mediated chooser
+    // EXISTS, and what does not is anything that hands its result to a
+    // toolkit dialog -- a GTK or Qt chooser inside a realm is still the
+    // toolkit's own and is wired to the picker by no portal. The limits page
+    // carries that cross-reference and the anchor below holds it there; the
+    // README and the site keep the shorter absence, which is still true.
     Claim {
         id: "no-portals",
         says: "No portals: a realm is advertised no session bus, so no file chooser beyond \
                the toolkit's own, no screen share, no notifications -- and that is an absence \
-               of a service, NOT a confinement.",
+               of a service, NOT a confinement. The core-drawn chooser exists (P2.6.6) and \
+               delivers over designation.sock (P2.6.7); what does not exist is anything \
+               handing its result to a toolkit dialog.",
         issue: "#160 (E2.6/E2.7, open) is what makes the unadvertised bus actually \
                 unreachable. Serving portals has no issue and is not scheduled anywhere.",
         surfaces: &[
             Anchor {
                 path: LIMITS,
                 needle: "xdg-desktop-portal",
+            },
+            Anchor {
+                path: LIMITS,
+                needle: "what does not exist is anything that hands its result to a toolkit dialog",
             },
             Anchor {
                 path: README,
@@ -2758,6 +2778,349 @@ pub const CLAIMS: &[Claim] = &[
             },
         ],
     },
+    // ---------------------------------------------------------------------
+    // #191's six: the shim-side designation relay (P2.6.7). Five publish what
+    // the relay IS -- a socket a powerbox-aware app has to know about, with a
+    // shape every one of its failure modes follows from -- and the sixth
+    // corrects a count three surfaces had stated as "one": how many sockets a
+    // realm's app is handed.
+    //
+    // **LIMITS-only for the first five, on #190's precedent** (the block
+    // comment above the picker rows): the site's warning box names no file
+    // picker, and the root README's WS-E summary carries the picker's three
+    // limits but not the relay's -- a row there would have to introduce the
+    // socket before it could bound it. The sixth is LIMITS + the integration
+    // README, because the README is where the p311 instrument's measurement
+    // is published and it stated the old count in two sentences.
+    //
+    // **What no table here can hold**, again: none of the six has an
+    // enumerating home in `docs/plan/` (P2.6.7's row in
+    // `02-phase-2-semantic-epochs.md` names the relay and not its limits), so
+    // `cross_check_limit_sets` does not see them and they carry no
+    // `<!-- limit: -->` marker. Same hole as the picker rows, same remedy owed
+    // by whoever gives E2.6 a limits enumeration.
+    //
+    // The evidence needles are the CODE'S spelling of each bound -- the
+    // socket type, the backlog, the errno table entry -- rather than a
+    // comment's, because a comment that describes a bound and a constant
+    // that sets it can disagree with the build green, and only the second one
+    // is what the app meets.
+    Claim {
+        id: "designation-reaches-only-a-powerbox-aware-app",
+        says: "A designation reaches only a powerbox-aware app that connects to \
+               $XDG_RUNTIME_DIR/designation.sock at startup and holds the connection for \
+               its lifetime; there is no signal a designation is coming, and a legacy \
+               path-expecting application gets nothing in v0 -- the FUSE synthetic-path \
+               layer is E3.6/Q10.",
+        issue: "#191 built the relay this bounds, and the commit that adds this row closes \
+                it -- do not read the id as naming open work. The path-expecting half has \
+                no Phase-2 issue: it is E3.6's (PRD Doc 2 §12, Q10), decomposed nowhere.",
+        surfaces: &[
+            Anchor {
+                path: LIMITS,
+                needle: "there is no signal a designation is coming",
+            },
+            Anchor {
+                path: LIMITS,
+                needle: "gets no designation in v0",
+            },
+        ],
+        evidence: &[
+            // The name the app is told to look for, at the one place a change
+            // to it would be a change to the app-facing contract.
+            Evidence::Contains {
+                path: "shim/include/designation.h",
+                needle: "#define VITRIN_DESIGNATION_SOCKET_NAME \"designation.sock\"",
+                means: "the socket is still named `designation.sock`, which is the spelling the \
+                        limits page and the protocol prose tell an app to connect to. Rename it \
+                        and every published sentence naming it is describing a socket that is \
+                        not there.",
+            },
+            // The in-realm spelling, pinned on the core's side of the seam:
+            // the shim binds a sibling of its Wayland socket, and the core
+            // sets `WAYLAND_DISPLAY=/run/vitrin/wayland-0`, so this constant is what makes
+            // "$XDG_RUNTIME_DIR/designation.sock" resolve to the node the
+            // shim bound rather than to a convention two crates merely share.
+            Evidence::Contains {
+                path: "crates/vitrin-realm-init/src/lib.rs",
+                needle: "pub const IN_REALM_DESIGNATION_SOCKET: &str = \"/run/vitrin/designation.sock\";",
+                means: "the realm-init crate still reserves the in-realm path the shim's sibling \
+                        rule produces at `--isolation=default`. If this moves off \
+                        `/run/vitrin`, the runtime dir the core hands the app no longer holds \
+                        the socket and the 'same convention that finds wayland-0' sentence is \
+                        false.",
+            },
+            // The negative half: no synthetic-path layer anywhere in the
+            // shim. `<fuse` is how every libfuse header is included
+            // (`<fuse.h>`, `<fuse_lowlevel.h>`, `<fuse3/fuse.h>`); a shim
+            // that started materialising paths would include one before any
+            // page said so. Not the bare word: `refuse` contains it, and the
+            // shim refuses things in comments on most pages.
+            Evidence::AbsentFrom {
+                roots: &["shim/src", "shim/include"],
+                needle: "<fuse",
+                means: "the shim still materialises no synthetic path for a designation. If \
+                        this fires the 'gets nothing in v0' sentence has to be re-read, in the \
+                        direction that matters -- a path layer would be a second delivery path \
+                        the limits page does not describe.",
+            },
+        ],
+    },
+    Claim {
+        id: "designation-with-no-connected-app-is-closed-not-queued",
+        says: "A designation arriving while no app is connected is closed, not queued; a \
+               connected app that does not read pins designations in the kernel only until \
+               the shim socket's send buffer (net.core.wmem_default) is full -- a few \
+               hundred, not net.unix.max_dgram_qlen, which the kernel skips for a connected \
+               peer -- then the next send fails EAGAIN and the connection is dropped.",
+        issue: "#191 built the relay this bounds and the commit adding this row closes it. \
+                The bound is the kernel's; no issue tracks raising it, and none should -- a \
+                shim-side queue is the residue the IDL forbids.",
+        surfaces: &[
+            Anchor {
+                path: LIMITS,
+                needle: "closed, not queued",
+            },
+            Anchor {
+                path: LIMITS,
+                needle: "net.core.wmem_default",
+            },
+        ],
+        evidence: &[
+            // The bound is a property of the socket TYPE: on SEQPACKET each
+            // queued designation is one message charged whole to the sender's
+            // send buffer, and `max_dgram_qlen` is skipped for a connected
+            // peer, so the page publishes a byte bound and a measured message
+            // count. A relay quietly switched to SOCK_STREAM would coalesce
+            // frames and change the count while every sentence around it
+            // stayed true.
+            Evidence::Contains {
+                path: "shim/src/designation.c",
+                needle: "int fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);",
+                means: "the listener is still SOCK_SEQPACKET, so the kernel queue the page \
+                        bounds is one message per designation against the sender's send \
+                        buffer. Change the type and the count the page publishes is measured \
+                        in the wrong unit.",
+            },
+            // The no-queue half. The ledger outcome is what the relay records
+            // on the path that does not relay, and the record's existence is
+            // what an acceptance script greps -- a relay that started holding
+            // would have to stop emitting it.
+            Evidence::Contains {
+                path: "shim/include/ledger.h",
+                needle: "VITRIN_LEDGER_DESIGNATION_NO_CLIENT,",
+                means: "the relay still has a recorded outcome for 'no app connected', which \
+                        is the outcome the page says a designation meets rather than a queue. \
+                        If this leaves the grammar, either a queue arrived or the case became \
+                        invisible; both falsify the sentence.",
+            },
+        ],
+    },
+    Claim {
+        id: "designation-socket-holds-one-connection-first-holds",
+        says: "designation.sock holds one connection at a time and the first holds until it \
+               closes: a second connector is accepted and closed with EOF and recorded \
+               refused_occupied. The descriptor an app receives shares its file offset with \
+               the asking agent's.",
+        issue: "#191 built the relay and the commit adding this row closes it. The shared \
+                offset is P2.6.5's (#189, closed) and is published on the protocol pages; \
+                this row cross-references it and holds nothing about it.",
+        surfaces: &[
+            Anchor {
+                path: LIMITS,
+                needle: "the first holds until it closes",
+            },
+            Anchor {
+                path: LIMITS,
+                needle: "refused_occupied",
+            },
+        ],
+        evidence: &[
+            // The loser's experience is an accepted-then-closed connection,
+            // never ECONNREFUSED, and that is a property of the backlog: a
+            // listen(fd, 0) would let the kernel refuse the second connector
+            // before the shim saw it, and the recorded EOF the page promises
+            // would never be recorded.
+            Evidence::Contains {
+                path: "shim/include/designation.h",
+                needle: "#define VITRIN_DESIGNATION_BACKLOG 8",
+                means: "the accept queue still exists, so a second connector is accepted by \
+                        the kernel and closed by the shim -- the recorded EOF the page \
+                        describes -- rather than refused at the kernel with nothing recorded.",
+            },
+            Evidence::Contains {
+                path: "shim/include/ledger.h",
+                needle: "VITRIN_LEDGER_DESIGNATION_REFUSED_OCCUPIED",
+                means: "the refusal is still a recorded event, which is the half of \
+                        'first-holds' that the page argues for: the loser finds out. A relay \
+                        that displaced the holder, or closed the loser silently, would have no \
+                        use for this record.",
+            },
+        ],
+    },
+    Claim {
+        id: "designation-socket-is-uid-reachable-at-isolation-off",
+        says: "At --isolation=off any process of the operator's uid can connect to \
+               designation.sock first and receive the realm's designations; the ledger \
+               records tier=host-path there and tier=in-realm when the socket's directory is \
+               the realm's /run/vitrin.",
+        issue: "#191 built the relay and the commit adding this row closes it. The \
+                reachability is the debugging tier's, not a gap: `--isolation=off` is \
+                published as having no sandbox at all, and this row names one more thing \
+                that follows from it.",
+        surfaces: &[
+            Anchor {
+                path: LIMITS,
+                needle: "any process of your uid can connect first",
+            },
+            Anchor {
+                path: LIMITS,
+                needle: "tier=host-path",
+            },
+        ],
+        evidence: &[
+            // The tier is decided by string equality against the one
+            // directory the realm's mount namespace presents; anything else
+            // -- including the host spelling of that same directory -- is
+            // host-path. That is what makes the ledger word mean what the
+            // page says it means.
+            Evidence::Contains {
+                path: "shim/src/designation.c",
+                needle: "#define VITRIN_DESIGNATION_IN_REALM_DIR \"/run/vitrin\"",
+                means: "`tier=in-realm` is still decided against the constant the realm's \
+                        mount namespace presents, so `host-path` still means exactly 'the \
+                        socket is somewhere any process of this uid can name'. If this \
+                        constant moves, the ledger word and the page's reading of it part \
+                        ways.",
+            },
+            Evidence::Contains {
+                path: "shim/src/ledger.c",
+                needle: "designation-sock: path=%s mode=0700 tier=%s",
+                means: "the ledger still records the tier at all, in the record the page \
+                        tells an operator to read. Drop the record and the sentence 'the \
+                        shim's ledger records which case a run was in' is false.",
+            },
+        ],
+    },
+    Claim {
+        id: "scm-rights-inflight-budget-is-a-shared-dos-surface",
+        says: "The per-uid in-flight descriptor budget (ETOOMANYREFS) is a denial-of-service \
+               surface of the whole SCM_RIGHTS plane -- core, shim, agent and app are one \
+               uid -- and a designation that meets it fails closed: recorded, dropped, \
+               closed, never retried.",
+        issue: "#191 named it, because the relay is a new victim of it; no issue tracks \
+                the budget itself, which is the kernel's, and none should -- the single-id \
+                map that makes every party one uid is D-020's and Q11's, closed.",
+        surfaces: &[
+            Anchor {
+                path: LIMITS,
+                needle: "ETOOMANYREFS",
+            },
+            Anchor {
+                path: LIMITS,
+                needle: "the relay is a new victim of it",
+            },
+        ],
+        evidence: &[
+            // "Fails closed" is a property of the send-failure path treating
+            // every errno alike: one branch, drop the connection, record the
+            // outcome. A relay that special-cased ETOOMANYREFS into a retry
+            // would hold the descriptor across the retry, which is the hold
+            // the previous rows forbid.
+            Evidence::Contains {
+                path: "shim/src/designation.c",
+                needle: "drop_client(d);",
+                means: "a failed send still drops the held connection, on every errno, which \
+                        is what makes 'fails closed, never retried' true of ETOOMANYREFS \
+                        without a branch that names it. If a retry path appears, the page's \
+                        'nothing is retried' is false and the descriptor is being held across \
+                        it.",
+            },
+            // The errno is NAMED in the ledger rather than printed as a
+            // number: that is what lets an operator who meets the DoS tell it
+            // apart from an app that died (EPIPE) or stalled (EAGAIN), which
+            // is the whole reason the page separates the three.
+            Evidence::Contains {
+                path: "shim/src/ledger.c",
+                needle: "{ ETOOMANYREFS, \"ETOOMANYREFS\" },",
+                means: "the ledger still spells this errno by name, so a `send_failed \
+                        errno=ETOOMANYREFS` record is what the page says an operator will \
+                        read. Without the table entry the record says `E109` and the page is \
+                        describing a spelling nobody sees.",
+            },
+        ],
+    },
+    // The correction row. Three surfaces said "exactly one socket, the shim's
+    // own" from D-046's measurement onward, and P2.6.7 made the count two.
+    // The decision log keeps its sentence as a dated record with an appended
+    // correction (plan-doc convention: never rewritten in place), which is
+    // why it is NOT a surface here -- an anchor on it would demand the
+    // rewrite the convention forbids. The limits page and the integration
+    // README state the count as current fact, so both are held to it.
+    Claim {
+        id: "app-realm-is-handed-the-shims-two-sockets",
+        says: "A walk of a realm's filesystem finds exactly the shim's two sockets, wayland-0 \
+               and designation.sock, and an app realm is handed those two and nothing else. \
+               D-046's 'exactly one AF_UNIX inode' was true when measured (2026-08-23) and \
+               is corrected by an appended block, not rewritten.",
+        issue: "#191 changed the count and the commit adding this row closes it. #311 is \
+                the decision whose measurement stated the old count; it is closed and its \
+                entry is corrected by appendix, which is the only edit the plan-doc \
+                convention allows.",
+        surfaces: &[
+            Anchor {
+                path: LIMITS,
+                needle: "exactly the shim's two sockets",
+            },
+            Anchor {
+                path: INTEGRATION_README,
+                needle: "exactly the shim's two sockets",
+            },
+        ],
+        evidence: &[
+            // The instrument that measures the count now allow-lists both
+            // sockets by derivation from the one path the app is handed, and
+            // asserts that the second WAS found and answered as a live
+            // SEQPACKET socket (EPROTOTYPE to its STREAM probe) -- the
+            // vacuity guard, without which an allowlist entry for a socket
+            // that is not there passes as easily as one for a socket that is.
+            Evidence::Contains {
+                path: "tests/integration/p311_principal_socket_reach.py",
+                needle: "designation_socket = os.path.dirname(shim_socket) + \"/designation.sock\"",
+                means: "the p311 instrument still derives the second allowed socket from the \
+                        Wayland one the way the shim binds it, so 'exactly two' is what the \
+                        instrument asserts and not a number the page carries alone. If this \
+                        line goes, the walk's allowlist and the published count part ways.",
+            },
+            Evidence::Contains {
+                path: "tests/integration/p311_principal_socket_reach.py",
+                needle: "the walk did not find the shim's designation socket",
+                means: "the instrument still refuses a run in which the second socket was \
+                        NOT found -- the vacuity guard. Without it a shim that stopped binding \
+                        designation.sock would leave the allowlist satisfied and the count \
+                        published as two while the walk found one.",
+            },
+            // The decision log's own sentence, held as a DATED record rather
+            // than rewritten: the correction block must exist, and the
+            // original must still be there for it to correct.
+            Evidence::Contains {
+                path: DECISIONS,
+                needle: "found exactly **one** AF_UNIX inode, the shim's own `/run/vitrin/wayland-0`",
+                means: "D-046's finding 1 still reads as it was measured on 2026-08-23. The \
+                        plan-doc convention is append-only; if this sentence has been edited \
+                        in place, the record of what was measured that day is gone and the \
+                        correction block below it corrects nothing.",
+            },
+            Evidence::Contains {
+                path: DECISIONS,
+                needle: "CORRECTED 2026-09-11 BY P2.6.7",
+                means: "the appended correction to finding 1 is still there. The limits page \
+                        and the README state the new count as current fact; the decision log \
+                        is the one surface that keeps both numbers, and it keeps them only \
+                        while this block exists.",
+            },
+        ],
+    },
 ];
 
 // ---------------------------------------------------------------------------
@@ -3612,6 +3975,16 @@ pub const COVERED_CLAIMS: &[&str] = &[
     "picker-transcribes-shaped-and-bidi-scripts",
     "picker-transcribes-kanji-outside-the-subset",
     "picker-row-distinctness-is-per-listing",
+    // #191's six. Five bound the shim's designation relay (LIMITS-only, on
+    // #190's precedent); the sixth corrects a count three surfaces stated as
+    // one and holds the decision log to keeping BOTH numbers -- the measured
+    // one as a dated record, the current one as an appended correction.
+    "designation-reaches-only-a-powerbox-aware-app",
+    "designation-with-no-connected-app-is-closed-not-queued",
+    "designation-socket-holds-one-connection-first-holds",
+    "designation-socket-is-uid-reachable-at-isolation-off",
+    "scm-rights-inflight-budget-is-a-shared-dos-surface",
+    "app-realm-is-handed-the-shims-two-sockets",
 ];
 
 /// Every derived value this gate covers. Same contract as [`COVERED_CLAIMS`],

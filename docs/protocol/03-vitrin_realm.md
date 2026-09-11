@@ -179,9 +179,10 @@ death.
   either direction (see [`vitrin_powerbox`](./13-vitrin_powerbox.md)). A
   petition may leave `resource` null and let the human choose without a stated
   kind. Adding a prefix breaks no client at any version, because an unserved
-  prefix already resolves `unsupported` recoverably — which is also what these
-  two resolve to in **every deployment today**, since none serves
-  `designate_file` yet. Whether a prefix is *served* is a property of a
+  prefix already resolves `unsupported` recoverably — which is what these two
+  resolved to in every deployment until P2.6.6 landed the core-drawn picker;
+  the reference core serves them since, exactly as it serves
+  `designate_file`. Whether a prefix is *served* is a property of a
   deployment, exactly as it is for a verb.
 - **`net:HOST:PORT` is the one prefix whose grammar is normative rather than
   illustrative** *(version 2)*. It names the single host and single port an
@@ -191,9 +192,9 @@ death.
   widened to something that does parse. It is also the prefix that *does* name
   its resource on the wire, which is the opposite of what `file:` and `dir:`
   do and is not in tension with them: a `host:port` is a public name the human
-  is shown and approves, a path is a secret the picker chooses. Like the
-  powerbox's two, it resolves `unsupported` in every deployment today, since
-  none serves `egress` yet.
+  is shown and approves, a path is a secret the picker chooses. Unlike the
+  powerbox's two since P2.6.6, it resolves `unsupported` in every deployment
+  today, since none serves `egress` yet.
 - `verbs` is the requested verb bitfield. It MUST be non-zero — a petition for
   nothing is a client bug, not a world change (see failure modes below).
 - `expiry_ms` of `0` defers the lifetime to the persistence rung.

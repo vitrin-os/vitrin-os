@@ -32,6 +32,8 @@
 #include "seat.h"
 #include "clipboard.h"
 #include "constraint.h"
+#include "designation.h"
+#include "ledger.h"
 #include "server.h"
 #include "upstream.h"
 #include "vitrin-protocol.h"
@@ -628,33 +630,30 @@ static void handle_offer_selection(struct vitrin_shim *s, const uint8_t *frame, 
 /* `vitrin_shim_session.designation` (P2.6.5, issue #189): the core's half of a
  * completed designation. An agent holding `designate_file` asked, the human
  * chose in the core-drawn picker, and this event delivers the resulting
- * descriptor into this realm. It is the FIRST and so far only core -> shim
+ * descriptor into this realm. It is the first and so far only core -> shim
  * event that carries one; wire.c's receive path exists for it.
  *
- * WHAT THIS DOES WITH THE DESCRIPTOR TODAY: nothing but close it, by leaving
- * `*fd` for the transport (see the ownership rule on
- * `vitrin_wire_handler_t`). The descriptor is for the APP, not for the shim,
- * and the per-realm designation socket that relays it there is P2.6.7's
- * (issue #191). Until that lands the app never sees a designated file, and
- * the log line below says so rather than implying a delivery.
+ * WHAT THIS DOES WITH THE DESCRIPTOR: hands it to the relay (P2.6.7, issue
+ * #191, designation.c), which sends the frame -- verbatim -- and the
+ * descriptor down the realm's own `designation.sock` to the app holding that
+ * socket, if one is. The descriptor is for the APP, not for the shim, and
+ * this function never looks at the file behind it.
  *
- * That is a lossy disposition, not a placeholder that pretends otherwise --
- * but it is the one the IDL asks for on any path that does not relay: "a shim
- * that cannot relay a descriptor closes it", because the alternative pins a
- * file open for the life of the realm, and because there is no message by
- * which a shim declines one. The asking agent already has its own copy,
- * delivered on its own connection before this event was sent, so closing here
- * costs the app its half and costs the agent nothing.
+ * OWNERSHIP, ON EVERY OUTCOME: `*fd` is left set. The relay never claims the
+ * descriptor either (`vitrin_designation_relay` is not given the means to),
+ * so the transport closes the shim's copy the instant this returns -- which
+ * is correct whether the send succeeded (the kernel holds its own reference
+ * for the app now) or failed (nothing was queued, nothing is held). This
+ * function therefore has no close() and cannot forget one, and neither can
+ * the relay. When no app is connected the disposition is the one the IDL asks
+ * for on any path that does not relay -- "a shim that cannot relay a
+ * descriptor closes it" -- and the log line below says which of the three
+ * dispositions applied rather than implying a delivery.
  *
  * A malformed frame is logged and dropped rather than fatal, the posture every
  * other event here takes: the core is the TCB, so this is version skew. */
 static void handle_designation(struct vitrin_shim *s, const uint8_t *frame, size_t len,
 		int *fd) {
-	/* Unused today because nothing here touches realm state -- the shim is
-	 * decoding, logging and dropping. Kept in the signature so P2.6.7 (#191),
-	 * which relays over a socket this struct will own, does not have to change
-	 * the call site to reach it. */
-	(void)s;
 	uint32_t object_id = 0;
 	vitrin_shim_session_evt_designation_t ev;
 	vitrin_decode_status_t st =
@@ -664,20 +663,55 @@ static void handle_designation(struct vitrin_shim *s, const uint8_t *frame, size
 		return;
 	}
 
+	/* Decoded once, here, and the decoded struct is what the relay gets: it
+	 * needs the id, kind, mode and name length for its ledger record, and a
+	 * second decode would be a second place for the two to disagree. The
+	 * frame goes along too, because the frame -- not a re-encoding -- is
+	 * what crosses the socket. */
+	int err = 0;
+	enum vitrin_ledger_designation_outcome outcome =
+		vitrin_designation_relay(s, frame, len, *fd, &ev, &err);
+
 	/* The basename is deliberately NOT logged. It is display copy for a human
 	 * looking at a picker, the shim's log is not that surface, and the core's
 	 * journal already records what the human chose; writing a filename the
 	 * human picked into a per-realm log would put it somewhere the designation
 	 * itself never authorized. Its LENGTH is logged, because "a designation
-	 * arrived and its name decoded" is what a reader of this line needs. */
-	wlr_log(WLR_INFO,
-		"designation %u arrived (%s, %s, name %u bytes) and was CLOSED, not "
-		"relayed: this realm has no designation socket yet (P2.6.7, issue "
-		"#191), so the app never receives it",
-		ev.designation_id,
-		ev.kind == VITRIN_POWERBOX_KIND_DIRECTORY ? "directory subtree" : "file",
-		ev.mode == VITRIN_POWERBOX_MODE_READ_WRITE ? "read-write" : "read-only",
-		ev.name.len);
+	 * arrived and its name decoded" is what a reader of this line needs.
+	 *
+	 * THE WHOLE LINE IS A PARSER CONTRACT. The prefix
+	 * `designation %u arrived (%s, %s, name %u bytes)` is grepped by
+	 * tests/integration/test_real_powerbox.py, tests/acceptance/
+	 * designation_receive.sh and tests/acceptance/designation_relay.sh; the
+	 * three suffix spellings below (`and was relayed to the connected app`,
+	 * `CLOSED, not relayed: no app is connected`, `CLOSED, not relayed: the
+	 * send failed (ERRNO)`) are grepped verbatim by the two acceptance
+	 * scripts. ledger.h's grammar block names the same three dispositions
+	 * under their ledger spellings (`outcome=relayed|no_client|send_failed`),
+	 * and its enum is what this switch keys on. */
+	const char *id_desc = ev.kind == VITRIN_POWERBOX_KIND_DIRECTORY ? "directory subtree" : "file";
+	const char *mode_desc = ev.mode == VITRIN_POWERBOX_MODE_READ_WRITE ? "read-write" : "read-only";
+	switch (outcome) {
+	case VITRIN_LEDGER_DESIGNATION_RELAYED:
+		wlr_log(WLR_INFO,
+			"designation %u arrived (%s, %s, name %u bytes) and was relayed to the "
+			"connected app",
+			ev.designation_id, id_desc, mode_desc, ev.name.len);
+		break;
+	case VITRIN_LEDGER_DESIGNATION_NO_CLIENT:
+		wlr_log(WLR_INFO,
+			"designation %u arrived (%s, %s, name %u bytes) and was CLOSED, not "
+			"relayed: no app is connected",
+			ev.designation_id, id_desc, mode_desc, ev.name.len);
+		break;
+	case VITRIN_LEDGER_DESIGNATION_SEND_FAILED:
+		wlr_log(WLR_INFO,
+			"designation %u arrived (%s, %s, name %u bytes) and was CLOSED, not "
+			"relayed: the send failed (%s)",
+			ev.designation_id, id_desc, mode_desc, ev.name.len,
+			vitrin_ledger_errno_name(err));
+		break;
+	}
 
 	/* `*fd` is left set on purpose: the transport closes what a handler does
 	 * not claim, so this function has no close() and cannot forget one. */

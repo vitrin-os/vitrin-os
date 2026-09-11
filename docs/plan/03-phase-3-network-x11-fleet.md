@@ -34,6 +34,30 @@ against **C1**–**C8** in
 | **E3.7** | **A3**, **B2**, and **C5** — durable designation grants multiply exactly the unrecallable-fd residue C5 exports — plus **C8**, since `node:` granularity is what a durable grant gets scoped to | #180, #181; C8 ← E2.2 #176 | Partly — **C8's producer has zero task issues.** |
 | **E3.8** | **C2** and **C6** — the "E2.5 native semantic path" this epic's design decision names *is* C6 — plus **C3** | #175, #176, E2.5 [#179](https://github.com/vitrin-os/vitrin-os/issues/179) | **No.** |
 
+> **CORRECTED 2026-09-11 BY P2.6.7
+> ([#191](https://github.com/vitrin-os/vitrin-os/issues/191)).** The table
+> above stands as the dated record it is; two cells of it are stale in the
+> same clause and are corrected here rather than rewritten. The E3.5 row says
+> the C5 tasks *"P2.6.5–P2.6.7 (#189–#191) … all exist and are all open"*, and
+> the E3.6 row says *"C5's #189–#191 and #196–#198 open"*. As of this block
+> **#189 is closed and the code of #190 and #191 is in the tree this block
+> ships in** — their issues close when the branch carrying them merges, and a
+> block here cannot record that in advance (the lesson D-046's first
+> correction wrote down). P2.6.5 landed the `vitrin_powerbox` facet and the
+> `designation` event, P2.6.6 the core-drawn picker and the chokepoint arm
+> that carries a designation, and P2.6.7 the shim's per-realm
+> `designation.sock` relay that hands the descriptor to the app. So the
+> designation half of C5's *"fd/socket delivery path"* — the thing E3.5's
+> drag-and-drop shares and the thing E3.6's *"the fds exist; this adds the
+> path view"* names by name — exists, and both rows may treat it as landed.
+> The egress half (P2.7.2–P2.7.4, #196–#198) is as the rows say. Neither
+> row's "Decomposed?" answer moves: the producers were decomposed before, and
+> P2.6.11 still has no issue. The paragraph below carries the same staleness
+> in one clause — *"unbuilt mediation, which is the picker, the fd minting,
+> the shim relay and the egress proxy"* — and this block corrects it too: of
+> those four, the egress proxy is the one still unbuilt, and the trap the
+> paragraph names is now the egress half of C5 alone.
+
 **Phase 3 is further away than the ladder's single arrow suggests, and the
 count is why.** Four of the eight epics above — **E3.1, E3.2, E3.4 and E3.8** —
 depend entirely on contracts (C1, C2, C3, C6, C7) produced by epics that have

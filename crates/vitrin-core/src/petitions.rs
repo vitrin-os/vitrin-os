@@ -1393,10 +1393,11 @@ mod tests {
 
         let mut wire_id = 10;
         // **Derived from `UNSERVED_VERB_BITS`, not hand-listed.** This set has
-        // shrunk three times (D-018's two verbs, then `realm_launch` at
-        // WS-E.1.1), grown twice (`designate_file` at P2.6.5, `egress` at
-        // P2.7.2) and will move again when
-        // cursor delivery, the picker and the egress proxy land. A
+        // shrunk four times (D-018's two verbs, then `realm_launch` at
+        // WS-E.1.1, then `designate_file` at P2.6.6 when the core-drawn
+        // picker landed), grown twice (`designate_file` at P2.6.5, `egress`
+        // at P2.7.2) and will move again when
+        // cursor delivery and the egress proxy land. A
         // hand-written list would
         // keep passing while a newly appended, unclassified bit went
         // unexercised — the shape of failure this repo keeps finding, and the

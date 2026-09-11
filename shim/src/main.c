@@ -4,8 +4,8 @@
  *
  * Owns the process lifecycle and the single load-bearing bring-up order:
  *
- *   upstream -> backend -> ledger -> globals -> output -> window
- *   -> bind socket -> start backend -> arm the core link -> run loop
+ *   upstream -> backend -> ledger -> designation socket -> globals -> output
+ *   -> window -> bind socket -> start backend -> arm the core link -> run loop
  *   -> teardown
  *
  * The first step is first for a protocol reason, not a stylistic one. The
@@ -95,9 +95,19 @@ static int handle_sigchld(int sig, void *data) {
  * to the TCB in a confined app is the whole confinement gone. All the shim's
  * fds are close-on-exec: fd 3 (wire.c re-arms FD_CLOEXEC), the Wayland listen
  * socket and the event-loop epoll fd (libwayland opens both with SOCK/EPOLL
- * _CLOEXEC), and the renderer/DRM fds (wlroots opens them O_CLOEXEC), so
- * execve drops every one. We assert fd 3's flag before forking rather than
- * trust it -- the one descriptor whose leak matters most. Returns false only
+ * _CLOEXEC), the renderer/DRM fds (wlroots opens them O_CLOEXEC), and the
+ * designation relay's two (P2.6.7): the `designation.sock` listener
+ * (SOCK_CLOEXEC at creation) and the event loop's own dup of it
+ * (`wl_os_dupfd_cloexec`). Two, not four, at this point: no connection can
+ * have been accepted yet, because the event loop has not run before the fork
+ * -- and when one is, `accept4` gives it SOCK_CLOEXEC and the loop dups it
+ * close-on-exec the same way. An app that inherited the LISTENER could accept
+ * its own realm's connectors, which is a confusion rather than an escalation
+ * (one realm, one trust domain), but still not its to have. So execve drops
+ * every one.
+ * We assert two flags before forking rather than trust them: fd 3's, the one
+ * descriptor whose leak matters most, and the designation listener's, the
+ * one this file's own bring-up order most recently added. Returns false only
  * on a fork failure the caller must treat as a bring-up failure; on execv
  * failure the CHILD _exit(127)s and the parent learns via SIGCHLD. */
 static bool vitrin_spawn_app(struct vitrin_shim *s) {
@@ -112,6 +122,25 @@ static bool vitrin_spawn_app(struct vitrin_shim *s) {
 				"fd %d is not FD_CLOEXEC before app spawn; refusing to leak the "
 				"core connection to the confined app",
 				VITRIN_CORE_FD);
+			return false;
+		}
+	}
+	/* UNCONDITIONALLY -- outside the standalone guard above, because the
+	 * relay serves in --no-upstream mode too (there is no core to receive
+	 * designations from, but the socket, its mode and its refusal to share a
+	 * name are what the acceptance arms for it measure, and a standalone
+	 * shim that spawned an app with the listener open would be a different
+	 * binary from the one the core runs). A listener at -1 here means the
+	 * bring-up order in main() was changed under this assertion. */
+	{
+		int lfd = s->designation.listen_fd;
+		int fl = lfd >= 0 ? fcntl(lfd, F_GETFD) : -1;
+		if (fl < 0 || (fl & FD_CLOEXEC) == 0) {
+			wlr_log(WLR_ERROR,
+				"the designation listener (fd %d) is not FD_CLOEXEC before app "
+				"spawn; refusing to leak the realm's designation socket to the "
+				"confined app",
+				lfd);
 			return false;
 		}
 	}
@@ -329,6 +358,17 @@ int main(int argc, char **argv) {
 	 * the instant the socket below is bound. Instrumenting late would leave
 	 * exactly the discovery phase unobserved. */
 	vitrin_ledger_init(&s);
+	/* Right after the ledger (its first record needs one) and BEFORE the
+	 * Wayland socket is bound and the core link armed: frames the core
+	 * batched behind `configure` are dispatched inside `vitrin_upstream_start`
+	 * -> `vitrin_wire_arm`, before the loop runs, and a `designation` among
+	 * them must meet an initialised relay (as `no_client`, since no app can
+	 * have connected yet), never an uninitialised one. Fatal on failure, the
+	 * same posture as the Wayland bind below. */
+	if (!vitrin_designation_init(&s)) {
+		wlr_log(WLR_ERROR, "designation socket bring-up failed");
+		goto err;
+	}
 	if (!vitrin_create_globals(&s)) {
 		wlr_log(WLR_ERROR, "global creation failed");
 		goto err;

@@ -386,6 +386,50 @@ pub enum Evidence {
         needle: &'static str,
         means: &'static str,
     },
+    /// `feature` is declared in `manifest`'s `[features]` table, is **not**
+    /// in its `default` list, and is the target of **no** other feature's
+    /// edge -- so nothing in the manifest itself can switch it on. Read
+    /// through `test_census::feature_graph`, the hand parser this tool
+    /// already trusts for its per-feature-set coverage matrix, rather than
+    /// through a grep: the manifest's own comment block legitimately contains
+    /// `feature = "provenance"`, so a substring needle over the file cannot
+    /// tell a declaration from a sentence about one. The command-line half of
+    /// "nothing enables it" is `AbsentFrom` rows; this is the manifest half,
+    /// and it was missing until an adversarial review of P2.6.8 showed that
+    /// `default = ["provenance"]` left the gate green while compiling the
+    /// proof out of every build.
+    FeatureUnreachable {
+        manifest: &'static str,
+        feature: &'static str,
+        means: &'static str,
+    },
+}
+
+/// The manifest half of "nothing enables this feature", as a plain function so
+/// it can be tested against a hand-built graph rather than a temp file.
+fn feature_unreachable(
+    graph: &crate::test_census::FeatureGraph,
+    feature: &str,
+) -> Result<(), String> {
+    if !graph.edges.contains_key(feature) {
+        return Err(format!("the `[features]` table declares no `{feature}`"));
+    }
+    if graph.default.iter().any(|f| f == feature) {
+        return Err(format!("`default` enables `{feature}`"));
+    }
+    let implied_by: Vec<&str> = graph
+        .edges
+        .iter()
+        .filter(|(name, enables)| name.as_str() != feature && enables.iter().any(|f| f == feature))
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if !implied_by.is_empty() {
+        return Err(format!(
+            "`{feature}` is enabled by another feature: {}",
+            implied_by.join(", ")
+        ));
+    }
+    Ok(())
 }
 
 /// One published claim: where it is said, and what makes it true.
@@ -641,6 +685,7 @@ const PROVENANCE_ROOTS: &[&str] = &[
     "tests/integration/run.sh",
     ".cargo/config.toml",
     "crates/xtask/src/main.rs",
+    "crates/xtask/src/kana_atlas.rs",
     "shim/ci",
 ];
 
@@ -2493,23 +2538,46 @@ pub const CLAIMS: &[Claim] = &[
     // (`honesty-tracker.yml`'s "provenance of a published claim" and
     // `main.rs`'s "its provenance record"), so it cannot be the needle
     // without going red on sentences about something else. What the rows
-    // hold instead is every way a command line or a manifest can name the
-    // feature: the flag with the bare name, the `=` form, the
-    // `vitrin-core/provenance` form in any list position (`/provenance`), a
-    // later list position (`,provenance`), the two quoted forms, and a
-    // manifest's `features = ["provenance`. Plus `--all-features`, which
-    // would enable it without ever spelling it. A spelling not in this list
-    // is a spelling this gate does not see -- stated so a reader does not
-    // mistake eight greps for a grammar.
+    // hold instead is a LIST of spellings a command line can use to name the
+    // feature: `--features` with the bare name, its `=` form, cargo's short
+    // alias `-F` in its three accepted shapes, the `vitrin-core/provenance`
+    // form in any list position (`/provenance`), a later list position
+    // (`,provenance`), the quoted forms at either end of a quoted list, and a
+    // manifest-shaped `features = ["provenance`. Plus `--all-features` and
+    // cargo-hack's `--each-feature` / `--feature-powerset`, which would
+    // enable it without ever spelling it. A spelling not in this list is a
+    // spelling this gate does not see -- stated so a reader does not mistake
+    // a dozen greps for a grammar. One known gap is named rather than
+    // implied: a bare `provenance` anywhere but FIRST in a space-separated
+    // quoted list (`--features "a provenance"`) matches none of these. A
+    // trailing-quote needle (`provenance"`) was tried for it and collides
+    // with `kana_atlas.rs`'s `kana-atlas.provenance"` filename -- the same
+    // prose-collision that rules out the bare word -- so the gap stands,
+    // stated.
     //
-    // **Why these roots.** They are every place in this tree that composes a
-    // `cargo` command: the workflows, the integration runner, the cargo
-    // config, this tool's own entry point, and the shim's CI helpers. No
-    // manifest here depends on `vitrin-core`, so a feature of it can only be
-    // switched on from a command line, and these are where the command lines
-    // are. A `Makefile` or `justfile` would join the list the day one exists;
-    // `collect_hits` refuses a root that does not, so they are not listed
-    // speculatively.
+    // **The manifest half is not a grep at all.** `default = ["provenance"]`
+    // or `some-feature = ["provenance"]` in `crates/vitrin-core/Cargo.toml`
+    // would enable the feature in every build and compile the proof out --
+    // and no substring needle over that file can hold it, because the
+    // manifest's own comment block contains `feature = "provenance"` in
+    // prose. So the `FeatureUnreachable` row below reads the `[features]`
+    // table through `test_census::feature_graph` and refuses a default or an
+    // implication edge outright. An adversarial review of P2.6.8 found this
+    // gate green with `default = ["provenance"]` in place; that is why the
+    // row exists.
+    //
+    // **Why these roots.** They are the places in this tree that compose a
+    // `cargo` command line, NAMED rather than "every": the workflows, the
+    // integration runner, the cargo config, this tool's two modules that
+    // shell out to cargo (`main.rs` and `kana_atlas.rs` -- the second was
+    // missed on the first pass and found by review), and the shim's CI
+    // helpers. A new xtask module that spawns `cargo` has to be added here
+    // by hand; `limits.rs` itself is not rooted because it carries the
+    // needles. No manifest here depends on `vitrin-core`, so a feature of it
+    // is switched on from a command line or from its own manifest, and
+    // those are the two halves held. A `Makefile` or `justfile` would join
+    // the list the day one exists; `collect_hits` refuses a root that does
+    // not, so they are not listed speculatively.
     //
     // The per-feature-set test matrix that would have to gain a row for a
     // build with the feature on is `CI_TEST_RUNS` in `test_census.rs`, which
@@ -2559,12 +2627,27 @@ pub const CLAIMS: &[Claim] = &[
             Evidence::Contains {
                 path: "crates/vitrin-core/src/grants.rs",
                 needle: "#[cfg(not(feature = \"provenance\"))]",
-                means: "the proof exists: an `impl` gated on the feature's ABSENCE whose body \
-                        is an empty match on the enum, which compiles only while the enum has \
-                        no variant reachable in a default build. Remove the gate and the \
-                        `provenance` build breaks the day E3.7 adds its variant; remove the \
-                        impl and a variant added without a cfg compiles quietly. Both are the \
-                        line this needle holds.",
+                means: "the proof's gate on the feature's ABSENCE is in place -- which is what \
+                        keeps a `provenance` build compiling the day E3.7 adds its gated \
+                        variant. This needle holds the gate; the row below holds the body.",
+            },
+            Evidence::Contains {
+                path: "crates/vitrin-core/src/grants.rs",
+                needle: "pub(crate) fn uninhabited(self) -> !",
+                means: "the proof's BODY exists: the function whose empty match on the enum is \
+                        what actually goes red when a variant lands un-gated. Deleting it as \
+                        dead code with the gated `impl` left standing would leave the previous \
+                        needle satisfied and the proof gone; this needle is what catches that. \
+                        (`match self {}` itself cannot be the needle: the doc comment above the \
+                        function repeats it in prose.)",
+            },
+            Evidence::FeatureUnreachable {
+                manifest: "crates/vitrin-core/Cargo.toml",
+                feature: "provenance",
+                means: "the manifest itself cannot switch the feature on: it is declared, it \
+                        is in no `default` list, and no other feature implies it. Read through \
+                        the `[features]` parser, not a grep -- see the comment above this \
+                        claim for why a needle over the manifest cannot hold this.",
             },
             Evidence::Contains {
                 path: "crates/vitrin-core/Cargo.toml",
@@ -2578,12 +2661,31 @@ pub const CLAIMS: &[Claim] = &[
             Evidence::AbsentFrom {
                 roots: PROVENANCE_ROOTS,
                 needle: "--features provenance",
-                means: "no command line in the tree enables the feature by its bare name.",
+                means: "no command line in the tree enables the feature as `--features \
+                        provenance` (each row here names its own spelling; none claims the \
+                        set is closed).",
             },
             Evidence::AbsentFrom {
                 roots: PROVENANCE_ROOTS,
                 needle: "--features=provenance",
                 means: "no command line enables it in the `=` spelling either.",
+            },
+            Evidence::AbsentFrom {
+                roots: PROVENANCE_ROOTS,
+                needle: "-F provenance",
+                means: "no command line enables it through cargo's short alias `-F` with the \
+                        bare name.",
+            },
+            Evidence::AbsentFrom {
+                roots: PROVENANCE_ROOTS,
+                needle: "-F=provenance",
+                means: "no command line enables it through the short alias in its `=` spelling.",
+            },
+            Evidence::AbsentFrom {
+                roots: PROVENANCE_ROOTS,
+                needle: "-Fprovenance",
+                means: "no command line enables it through the short alias with no separator, \
+                        which cargo also accepts.",
             },
             Evidence::AbsentFrom {
                 roots: PROVENANCE_ROOTS,
@@ -2622,6 +2724,17 @@ pub const CLAIMS: &[Claim] = &[
                         graph-resolution setting for cargo-deny, which compiles nothing; the \
                         needle carries the leading dashes so that setting's mention in \
                         `ci.yml`'s comments does not trip it.)",
+            },
+            Evidence::AbsentFrom {
+                roots: PROVENANCE_ROOTS,
+                needle: "--each-feature",
+                means: "nothing runs cargo-hack's per-feature sweep, which would build with \
+                        this feature on without naming it.",
+            },
+            Evidence::AbsentFrom {
+                roots: PROVENANCE_ROOTS,
+                needle: "--feature-powerset",
+                means: "the same for cargo-hack's powerset sweep.",
             },
         ],
     },
@@ -4847,6 +4960,32 @@ pub fn run_claims(root: &Path, claims: &[Claim]) -> Result<Vec<String>> {
                         ));
                     }
                 }
+                Evidence::FeatureUnreachable {
+                    manifest,
+                    feature,
+                    means,
+                } => {
+                    let graph = match crate::test_census::feature_graph(&root.join(manifest)) {
+                        Ok(g) => g,
+                        Err(err) => {
+                            failures.push(format!(
+                                "[{}] EVIDENCE -- cannot read {manifest}'s [features]: {err:#}",
+                                claim.id
+                            ));
+                            continue;
+                        }
+                    };
+                    if let Err(why) = feature_unreachable(&graph, feature) {
+                        failures.push(format!(
+                            "[{}] EVIDENCE -- {manifest}: {why}.\n    The feature's \
+                             unreachability from the manifest was the evidence for: {means}\n    \
+                             The published claim: {}\n    Published on: {}",
+                            claim.id,
+                            claim.says,
+                            surface_list(claim),
+                        ));
+                    }
+                }
             }
         }
     }
@@ -6410,6 +6549,72 @@ mod tests {
         assert!(failures.iter().all(|f| f.contains("EVIDENCE")));
         assert!(failures[0].contains("no longer contains"));
         assert!(failures[1].contains("now appears in the tree"));
+    }
+
+    /// **The non-vacuity test for the manifest half.** A `FeatureUnreachable`
+    /// row must go red on each of the three ways a manifest can reach the
+    /// feature -- not declared at all, in `default`, implied by another
+    /// feature -- and green on the shape `crates/vitrin-core/Cargo.toml`
+    /// actually has. Hand-built graphs, so this tests the predicate and not
+    /// the parser (`test_census` tests the parser).
+    #[test]
+    fn a_feature_reachable_from_its_own_manifest_fails() {
+        use crate::test_census::FeatureGraph;
+        let mut ok = FeatureGraph::default();
+        ok.edges.insert("provenance".into(), vec![]);
+        ok.edges.insert("session-keymap".into(), vec![]);
+        assert!(feature_unreachable(&ok, "provenance").is_ok());
+
+        let undeclared = FeatureGraph::default();
+        let err = feature_unreachable(&undeclared, "provenance").unwrap_err();
+        assert!(err.contains("declares no"), "{err}");
+
+        let mut defaulted = ok.clone();
+        defaulted.default = vec!["provenance".into()];
+        let err = feature_unreachable(&defaulted, "provenance").unwrap_err();
+        assert!(err.contains("`default` enables"), "{err}");
+
+        let mut implied = ok.clone();
+        implied
+            .edges
+            .insert("consent-injector".into(), vec!["provenance".into()]);
+        let err = feature_unreachable(&implied, "provenance").unwrap_err();
+        assert!(err.contains("consent-injector"), "{err}");
+    }
+
+    /// And the same through `run_claims`, so the failure is reported as
+    /// EVIDENCE with the claim's id like every other row -- against the real
+    /// manifest, for a feature it does declare in `default`-free form (the
+    /// shipped row) and for one it does not declare at all (synthetic).
+    #[test]
+    fn a_feature_unreachable_row_reports_through_run_claims() {
+        static SURFACES: &[Anchor] = &[Anchor {
+            path: LIMITS,
+            needle: "Where this is honest about its limits",
+        }];
+        static EVIDENCE: &[Evidence] = &[
+            Evidence::FeatureUnreachable {
+                manifest: "crates/vitrin-core/Cargo.toml",
+                feature: "provenance",
+                means: "true on the shipped tree",
+            },
+            Evidence::FeatureUnreachable {
+                manifest: "crates/vitrin-core/Cargo.toml",
+                feature: "a-feature-nobody-declared",
+                means: "false: not in the table",
+            },
+        ];
+        let claims = &[Claim {
+            id: "synthetic-feature",
+            says: "a claim about a feature",
+            issue: "none: synthetic",
+            surfaces: SURFACES,
+            evidence: EVIDENCE,
+        }];
+        let failures = run_claims(&root(), claims).expect("roots exist");
+        assert_eq!(failures.len(), 1, "{failures:#?}");
+        assert!(failures[0].contains("EVIDENCE"), "{}", failures[0]);
+        assert!(failures[0].contains("declares no"), "{}", failures[0]);
     }
 
     /// A claim with no evidence is refused by the table check itself, so the

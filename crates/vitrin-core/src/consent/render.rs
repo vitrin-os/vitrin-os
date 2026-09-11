@@ -1813,7 +1813,7 @@ mod tests {
     /// **Every catalogue line reaches the human whole** (P2.6.8, issue #192,
     /// D-048).
     ///
-    /// The card wraps each verb's `- {name}: {what}` value independently into
+    /// The card wraps each line `verb_lines` produces independently into
     /// at most [`MAX_VALUE_LINES`] lines of [`CONTENT_W`] at [`VALUE_PX`], and
     /// [`Text::wrap`] cuts overflow with a visible
     /// [`crate::paint::text::ELLIPSIS`] -- the right
@@ -1832,10 +1832,20 @@ mod tests {
     #[test]
     fn every_catalogue_line_fits_untruncated() {
         let mut text = Text::new();
-        for (_, name, what) in VERB_CATALOGUE {
-            let value = format!("- {name}: {what}");
-            let on_card = text.wrap(&value, VALUE_PX, CONTENT_W, MAX_VALUE_LINES);
-            let unbounded = text.wrap(&value, VALUE_PX, CONTENT_W, usize::MAX);
+        for (verb, name, _) in VERB_CATALOGUE {
+            // The renderer's own line, not a rebuilt `- {name}: {what}`: a
+            // wider prefix or a changed separator in `verb_lines` must be
+            // measured here too, or this test measures a string the card
+            // never draws.
+            let lines = verb_lines(verb);
+            assert_eq!(
+                lines.len(),
+                1,
+                "one catalogue verb renders exactly one line"
+            );
+            let value = &lines[0];
+            let on_card = text.wrap(value, VALUE_PX, CONTENT_W, MAX_VALUE_LINES);
+            let unbounded = text.wrap(value, VALUE_PX, CONTENT_W, usize::MAX);
             assert!(
                 on_card.len() <= MAX_VALUE_LINES,
                 "`{name}` wraps to {} lines; the card draws at most {MAX_VALUE_LINES}",

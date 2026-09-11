@@ -450,14 +450,15 @@ D-047 reads as the enumeration it was, not as a claim of completeness.
 > owner decision. **One thing the review found is out of scope and filed:**
 > [#350](https://github.com/vitrin-os/vitrin-os/issues/350) — `designate_file`
 > is admitted at every isolation tier, against the IDL's "a deployment MUST NOT
-> grant a verb it does not enforce", which this row's own key-decisions
-> paragraph on #192 tied to P2.6.1 and which nothing has built. The copy was
+> grant a verb it does not enforce", which #192's own "Key decisions" section
+> tied to P2.6.1 and which nothing has built. The copy was
 > written to state the grant's reach rather than the sandbox's so it stays
 > true on every tier. **#348** closes with the same branch's protocol commit,
 > which rewrites the IDL's "still owed" and served-status clauses and sweeps
-> the protocol prose restating them. The §1 and §5 blocks above that say the
-> considered copy is "still owed (P2.6.8, Q13)" are **not** swept: they are
-> dated records and stand, and this block is what supersedes them.
+> the protocol prose restating them. The §1 block above ("still owed
+> (P2.6.8, Q13)") and the §5 block ("the considered consent copy is still
+> P2.6.8's") are **not** swept: they are dated records and stand, and this
+> block is what supersedes them.
 
 #### P2.6.3, corrected
 

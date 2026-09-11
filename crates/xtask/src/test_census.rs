@@ -517,13 +517,13 @@ fn split_top_level(text: &str) -> Vec<String> {
 
 /// One package's `[features]` table, as far as this scan needs it.
 #[derive(Debug, Clone, Default)]
-struct FeatureGraph {
+pub(crate) struct FeatureGraph {
     /// The `default = [..]` list, empty when there is none.
-    default: Vec<String>,
+    pub(crate) default: Vec<String>,
     /// Every other feature and what it enables. `dep:x` and `pkg/feat`
     /// entries are dropped: they turn on a dependency, never a `cfg(feature)`
     /// of this package.
-    edges: BTreeMap<String, Vec<String>>,
+    pub(crate) edges: BTreeMap<String, Vec<String>>,
 }
 
 /// Read a package's `[features]` table out of its `Cargo.toml`.
@@ -532,7 +532,7 @@ struct FeatureGraph {
 /// a narrow one, because it only has to read `name = [ "a", "b" ]` with
 /// comments and line breaks inside the array, which is exactly how
 /// `crates/vitrin-core/Cargo.toml` writes them.
-fn feature_graph(manifest: &Path) -> Result<FeatureGraph> {
+pub(crate) fn feature_graph(manifest: &Path) -> Result<FeatureGraph> {
     let text = std::fs::read_to_string(manifest)
         .with_context(|| format!("reading {}", manifest.display()))?;
     let mut graph = FeatureGraph::default();

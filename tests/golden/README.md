@@ -58,6 +58,8 @@ commit the regenerated files together with the change that motivated them.
 | `sdk/python/tests/golden/test_pattern_64x40.xrgb` | `capture::tests::sdk_capture_golden_file_pins_the_wire_bytes` | Exact, raw xrgb8888 — cross-language pin (Rust writes, Python consumes) |
 | `crates/vitrin-core/tests/golden/lock_screen.txt` | `lock::tests::lock_screen_golden` | Deterministic ink map (one character per 8×8 block) + blake3, same bundled font and disabled SIMD |
 | `crates/vitrin-core/tests/golden/status_strip.txt` | `status::tests::status_strip_golden` | Deterministic ink map (one character per 4×4 block) + blake3 |
+| `crates/vitrin-core/tests/golden/picker_card.txt` | `consent::tests::picker_card_golden` | Deterministic ink map (one character per 8×8 block) + blake3 — the ink map is a luminance reduction and cannot witness a tint; the blake3 line is what pins the picker's run colours (P2.6.6, #190) |
+| `crates/vitrin-core/tests/golden/consent_prompt_designate.txt` | `consent::tests::consent_prompt_designate_golden` | Deterministic ink map (one character per 8×8 block) + blake3 — a `designate_file`-only card at the `once` rung, pinning the considered consent copy as drawn (P2.6.8, #192); regenerate with `cargo xtask bless --filter designate` |
 
 The consent-UI golden is deterministic across CI runs because the font is
 vendored and embedded and fontdue's architecture-dependent SIMD is disabled

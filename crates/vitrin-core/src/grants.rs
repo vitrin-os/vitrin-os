@@ -639,6 +639,36 @@ pub(crate) const UNSERVED_VERB_BITS: u32 = Verb::VALID_MASK & !SERVED_VERB_BITS;
 /// maps to the `unsupported` outcome. The wire enum
 /// ([`WirePersistence`]) keeps all four rungs so the wire never changes
 /// shape; this type is the table's honest subset.
+///
+/// # The rule for the variants E3.7 adds (P2.6.8, issue #192, D-048)
+///
+/// The durable rungs MUST arrive carrying the provenance as **payload** --
+/// `UntilRevoked(ProvenanceRef)` and `Always(ProvenanceRef)`, never a bare
+/// `UntilRevoked` beside an optional `provenance_ref` column that a caller
+/// is trusted to fill. With the payload, a durable row cannot exist without
+/// a provenance value *by construction*: there is no code path that forgets
+/// to check, because there is no value to build without one. Without it,
+/// "durable rows have provenance" is an invariant held by every insert site
+/// agreeing, which is exactly the kind of agreement this repository keeps
+/// finding broken.
+///
+/// **The cost, named so E3.7 does not discover it at the end:** [`Self::ALL`]
+/// is a `const` array, and it is consumed as one at three sites --
+/// `crate::consent::PromptContent::choices` (the allow-buttons a card
+/// draws), `crate::consent::injector` (the harness's button vocabulary) and
+/// `crate::picker::keys` (the picker's key table). A variant with a payload
+/// has no const enumeration -- there is no single `Always(_)` to list -- so
+/// E3.7 must redesign that array and its three consumers (a discriminant
+/// type without the payload, or an enumeration that takes the provenance as
+/// input) *before* it can add the variants. Nothing mechanical holds that
+/// cost today, and this paragraph says so rather than implying a tripwire:
+/// a payload variant added while [`ProvenanceRef`] is still empty compiles,
+/// `ALL` keeps its two entries, and only the `match`es in
+/// [`Self::rank`] and `From<PersistenceRung> for WirePersistence` go red --
+/// which is a prompt to read this paragraph, not a proof of it. What the
+/// proof beside [`ProvenanceRef`] holds is the *other* half: the payload
+/// type gains no constructor outside the `provenance` feature, so the
+/// variants stay unconstructible in every build that exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PersistenceRung {
     /// Single-use authority: consumed by its first allowed use, then
@@ -746,8 +776,47 @@ pub(crate) enum FocusCondition {}
 /// fills it with the Sigstore-style identity reference (decision D-009)
 /// and thereby unblocks `until_revoked`/`always`. An empty enum: an MVP
 /// row cannot fabricate provenance.
+///
+/// # The rule for the constructor E3.7 adds (P2.6.8, issue #192, D-048)
+///
+/// Two clauses, and the proof below holds the first mechanically:
+///
+/// 1. **Every variant this enum ever gains is `#[cfg(feature = "provenance")]`.**
+///    The feature is declared, empty, in this crate's `Cargo.toml` (read its
+///    comment for why it exists before E3.7 has anything to put behind it),
+///    and nothing enables it -- no `default`, no CI job, no script, held by
+///    `cargo xtask limits-check`. So in every build that exists the enum is
+///    uninhabited and a durable grant row cannot be built, and that stays
+///    true not because a reviewer keeps checking but because the `impl` below
+///    stops compiling the moment a variant is reachable in a default build.
+/// 2. **The durable rungs carry this type as payload**, so the value is
+///    demanded at the one place a durable row is constructed rather than
+///    checked at every place one is used. The rule, and the cost it puts on
+///    [`PersistenceRung::ALL`], is written on [`PersistenceRung`].
+///
+/// Together they are what lets the published sentence "durable rungs are
+/// structurally impossible in this build" (`docs/book/src/limits.md`) be a
+/// fact about the type system rather than a fact about the current diff.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProvenanceRef {}
+
+#[cfg(not(feature = "provenance"))]
+impl ProvenanceRef {
+    /// The proof, not a function: an empty match compiles only while this enum
+    /// has no variant, so a constructor added without
+    /// `#[cfg(feature = "provenance")]` turns every build red here. Never
+    /// called; it exists to be uncallable.
+    ///
+    /// The `cfg` is on the `impl` and not merely a courtesy: the day E3.7 adds
+    /// its gated variant, a `provenance` build has an inhabited enum and an
+    /// un-gated `match self {}` would be the thing that broke *that* build.
+    /// Gating the proof on the feature's absence keeps it exactly as wide as
+    /// the claim it proves.
+    #[allow(dead_code)]
+    pub(crate) fn uninhabited(self) -> ! {
+        match self {}
+    }
+}
 
 /// `pinned_addrs`: the IP addresses the grant's `net:` host resolved to
 /// **at grant time** -- the addresses the human actually approved when
@@ -3058,6 +3127,48 @@ mod tests {
         assert_eq!(
             PersistenceRung::try_from(WirePersistence::Always),
             Err(DurableRungUnsupported(WirePersistence::Always))
+        );
+
+        // **The partition, derived from the wire's own enumeration** (P2.6.8,
+        // issue #192, D-048). The four assertions above are hand-listed, and a
+        // hand-listed test is exactly what stays green when the thing it
+        // describes moves: a fifth wire rung, or a `try_from` arm that started
+        // admitting `UntilRevoked`, would leave every line above true. So walk
+        // the generated `Persistence::ALL` instead and hold the two halves to
+        // exact sets -- what the table admits is `{Once, WhileRunning}` and
+        // nothing more, what it refuses is `{UntilRevoked, Always}` and nothing
+        // less, the two exhaust the wire, and `PersistenceRung::ALL` (the one
+        // enumeration the consent card draws its buttons from) is the same
+        // size as the admissible half, so a rung the table admits is a rung a
+        // human can be offered.
+        //
+        // Deliberately not `#[cfg]`-gated on anything: this is what the DEFAULT
+        // build promises, and E3.7's `provenance` build must change this test
+        // on purpose, not skip it.
+        let (admissible, refused): (Vec<WirePersistence>, Vec<WirePersistence>) =
+            WirePersistence::ALL
+                .iter()
+                .copied()
+                .partition(|wire| PersistenceRung::try_from(*wire).is_ok());
+        assert_eq!(
+            admissible,
+            [WirePersistence::Once, WirePersistence::WhileRunning],
+            "the table admits exactly the two MVP rungs"
+        );
+        assert_eq!(
+            refused,
+            [WirePersistence::UntilRevoked, WirePersistence::Always],
+            "the table refuses exactly the two durable rungs"
+        );
+        assert_eq!(
+            admissible.len() + refused.len(),
+            WirePersistence::ALL.len(),
+            "the two halves exhaust the wire's rungs"
+        );
+        assert_eq!(
+            PersistenceRung::ALL.len(),
+            admissible.len(),
+            "every rung the table admits is one the consent card can offer"
         );
     }
 

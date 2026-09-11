@@ -1592,7 +1592,11 @@ and this is **what a shell realm may reach that an app realm may not**:
 - **The authority to hand one over is an operator's `realm.toml` declaration
   *and* a human's consent** — both, not either — at the `while_running` rung,
   because the durable rungs are structurally impossible in this build (they need
-  a verified binary identity, which is Phase 3). So the consent is **once per
+  a verified binary identity, which is Phase 3; since P2.6.8,
+  [#192](https://github.com/vitrin-os/vitrin-os/issues/192), the type that
+  would carry it can gain a constructor only behind the `provenance` cargo
+  feature, and nothing in this repository enables that feature — no default, no
+  CI job, no script). So the consent is **once per
   core start**, and there is no connected-apps surface to forget it from later.
   D-046 further asks that the card **render** a disabled "remember me" with its
   reason rather than omit it. That is a **reversal of what this core does

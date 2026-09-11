@@ -629,6 +629,20 @@ const INTEGRATION_README: &str = "tests/integration/README.md";
 /// and therefore the canonical set behind every published interface count and
 /// every published interface table.
 const IDL_PATH: &str = "protocol/vitrin-v0.xml";
+/// Every place in this tree that composes a `cargo` command line, and so every
+/// place a `vitrin-core` feature could be switched on (no manifest here
+/// depends on that crate, so a command line is the only way). The roots the
+/// `durable-rungs-need-a-provenance-value` claim greps for any spelling of a
+/// `provenance` feature flag. Files as well as directories -- `AbsentFrom`
+/// allows both -- and only paths that exist, because [`collect_hits`] refuses
+/// a missing root rather than passing on it.
+const PROVENANCE_ROOTS: &[&str] = &[
+    ".github/workflows",
+    "tests/integration/run.sh",
+    ".cargo/config.toml",
+    "crates/xtask/src/main.rs",
+    "shim/ci",
+];
 
 /// Directories whose contents are third-party and must never satisfy or break
 /// an [`Evidence::AbsentFrom`] check. `shim/subprojects/` is vendored wlroots,
@@ -2437,10 +2451,13 @@ pub const CLAIMS: &[Claim] = &[
                 means: "the durable rungs are still STRUCTURALLY unreachable in this build: a \
                         durable row needs a ProvenanceRef value and the type is uninhabited, \
                         which is why the page says the shell is consented once per core start \
-                        and the card's remember-me is rendered disabled. If this type gains a \
-                        constructor (P2.6.8/#192 plans to put one behind a `provenance` \
-                        feature that does not exist yet), the rung sentence stops being forced \
-                        by the type system and has to be re-argued rather than reworded.",
+                        and the card's remember-me is rendered disabled. The `provenance` \
+                        cargo feature exists since P2.6.8 (#192, D-048), is empty, and gates \
+                        only the compile-time proof that this enum has no variant; nothing \
+                        enables it (`durable-rungs-need-a-provenance-value` below holds that). \
+                        If this type gains a constructor OUTSIDE that feature, the rung \
+                        sentence stops being forced by the type system and has to be re-argued \
+                        rather than reworded.",
             },
             Evidence::Contains {
                 path: "crates/vitrin-core/src/grants.rs",
@@ -2457,6 +2474,154 @@ pub const CLAIMS: &[Claim] = &[
                         reworded: a verb JOINING the set cannot falsify the claim, which is \
                         about those six being served, and the shell fence does not carry \
                         designate_file either way. The needle moved; the sentence did not.",
+            },
+        ],
+    },
+    // #192's (P2.6.8, D-048): the structural half of Q9, held as a claim
+    // rather than as a subcommand or a CI step, because every piece of
+    // machinery it needs already exists here. The published sentence is the
+    // shell-realm row's "durable rungs are structurally impossible in this
+    // build", and this row is what makes that a sentence about the TYPE
+    // SYSTEM rather than about the current diff: the enum is uninhabited
+    // (needle 1), a proof beside it stops compiling the moment a variant is
+    // reachable in a default build (needle 2), the feature that proof is
+    // gated on is declared (needle 3), and nothing enables that feature
+    // (every `AbsentFrom` row).
+    //
+    // **Why the absence rows are spellings and not the bare word.** The bare
+    // word `provenance` appears in two of these roots already, in prose
+    // (`honesty-tracker.yml`'s "provenance of a published claim" and
+    // `main.rs`'s "its provenance record"), so it cannot be the needle
+    // without going red on sentences about something else. What the rows
+    // hold instead is every way a command line or a manifest can name the
+    // feature: the flag with the bare name, the `=` form, the
+    // `vitrin-core/provenance` form in any list position (`/provenance`), a
+    // later list position (`,provenance`), the two quoted forms, and a
+    // manifest's `features = ["provenance`. Plus `--all-features`, which
+    // would enable it without ever spelling it. A spelling not in this list
+    // is a spelling this gate does not see -- stated so a reader does not
+    // mistake eight greps for a grammar.
+    //
+    // **Why these roots.** They are every place in this tree that composes a
+    // `cargo` command: the workflows, the integration runner, the cargo
+    // config, this tool's own entry point, and the shim's CI helpers. No
+    // manifest here depends on `vitrin-core`, so a feature of it can only be
+    // switched on from a command line, and these are where the command lines
+    // are. A `Makefile` or `justfile` would join the list the day one exists;
+    // `collect_hits` refuses a root that does not, so they are not listed
+    // speculatively.
+    //
+    // The per-feature-set test matrix that would have to gain a row for a
+    // build with the feature on is `CI_TEST_RUNS` in `test_census.rs`, which
+    // already derives its rows from `[features]`; D-048 cites it rather than
+    // building a second one, and so does this row.
+    Claim {
+        id: "durable-rungs-need-a-provenance-value",
+        says: "A durable persistence rung (until_revoked, always) cannot be represented in a \
+               grant row in this build, and that is a property of the type system rather than \
+               of the current code: the durable rungs require a ProvenanceRef value, the type \
+               is an uninhabited enum, a compile-time proof beside it goes red if it gains a \
+               variant outside the `provenance` cargo feature, and nothing in this repository \
+               enables that feature -- no default, no CI job, no script.",
+        issue: "#192 (P2.6.8) is the task that added the feature and the proof and closes \
+                with this row; the full answer -- a constructor behind the feature, and the \
+                durable variants carrying it as payload -- is E3.7's (Phase 3, D-009), and \
+                this row is what has to be rewritten deliberately when it lands. #311 (D-046) \
+                is the decision whose published paragraph carries the sentence.",
+        surfaces: &[
+            Anchor {
+                path: LIMITS,
+                needle: "durable rungs are structurally impossible in this build",
+            },
+            Anchor {
+                path: LIMITS,
+                needle: "nothing in this repository enables that feature",
+            },
+            // D-048's own sentence, offered by that entry as the stable
+            // anchor for this row: the decision log is where the claim is
+            // dated, and a record that stops matching the tree it records
+            // is the defect class this table exists for.
+            Anchor {
+                path: DECISIONS,
+                needle: "The durable rungs need a provenance value, and the `provenance` \
+                         feature that could ever supply one is enabled by no build in this \
+                         tree.",
+            },
+        ],
+        evidence: &[
+            Evidence::Contains {
+                path: "crates/vitrin-core/src/grants.rs",
+                needle: "pub(crate) enum ProvenanceRef {}",
+                means: "the type a durable row needs a value of has no variant, so no durable \
+                        row can be built. This needle is byte-identical to the one the \
+                        shell-realm row holds; both rows lean on the same line and say so.",
+            },
+            Evidence::Contains {
+                path: "crates/vitrin-core/src/grants.rs",
+                needle: "#[cfg(not(feature = \"provenance\"))]",
+                means: "the proof exists: an `impl` gated on the feature's ABSENCE whose body \
+                        is an empty match on the enum, which compiles only while the enum has \
+                        no variant reachable in a default build. Remove the gate and the \
+                        `provenance` build breaks the day E3.7 adds its variant; remove the \
+                        impl and a variant added without a cfg compiles quietly. Both are the \
+                        line this needle holds.",
+            },
+            Evidence::Contains {
+                path: "crates/vitrin-core/Cargo.toml",
+                needle: "provenance = []",
+                means: "the feature the proof is gated on is declared, and declared EMPTY. \
+                        Without the declaration the cfg above is an `unexpected_cfgs` error \
+                        under -D warnings and the proof could not be written; with anything \
+                        in the array it would be enabling something before E3.7 has defined \
+                        what a provenance build carries.",
+            },
+            Evidence::AbsentFrom {
+                roots: PROVENANCE_ROOTS,
+                needle: "--features provenance",
+                means: "no command line in the tree enables the feature by its bare name.",
+            },
+            Evidence::AbsentFrom {
+                roots: PROVENANCE_ROOTS,
+                needle: "--features=provenance",
+                means: "no command line enables it in the `=` spelling either.",
+            },
+            Evidence::AbsentFrom {
+                roots: PROVENANCE_ROOTS,
+                needle: "/provenance",
+                means: "no command line enables it as `vitrin-core/provenance`, in any list \
+                        position -- the spelling this repo's own workflows and \
+                        `tests/integration/run.sh` use for every other feature they turn on.",
+            },
+            Evidence::AbsentFrom {
+                roots: PROVENANCE_ROOTS,
+                needle: ",provenance",
+                means: "no command line enables it as a later member of a feature list.",
+            },
+            Evidence::AbsentFrom {
+                roots: PROVENANCE_ROOTS,
+                needle: "\"provenance",
+                means: "no command line enables it double-quoted (`--features \"provenance\"`).",
+            },
+            Evidence::AbsentFrom {
+                roots: PROVENANCE_ROOTS,
+                needle: "'provenance",
+                means: "no command line enables it single-quoted.",
+            },
+            Evidence::AbsentFrom {
+                roots: PROVENANCE_ROOTS,
+                needle: "features = [\"provenance",
+                means: "no manifest-shaped text in these roots enables it as a dependency \
+                        feature. Held here for completeness of the spellings; the real reason \
+                        no manifest can is that nothing in this tree depends on `vitrin-core`.",
+            },
+            Evidence::AbsentFrom {
+                roots: PROVENANCE_ROOTS,
+                needle: "--all-features",
+                means: "nothing enables every feature at once, which would enable this one \
+                        without ever spelling it. (`deny.toml`'s `all-features = true` is a \
+                        graph-resolution setting for cargo-deny, which compiles nothing; the \
+                        needle carries the leading dashes so that setting's mention in \
+                        `ci.yml`'s comments does not trip it.)",
             },
         ],
     },
@@ -3967,6 +4132,13 @@ pub const COVERED_CLAIMS: &[&str] = &[
     // nowhere, so the two evidence rows hold the facts about this build that
     // the published paragraph leans on and nothing holds the un-builtness.
     "shell-realm-reaches-one-more-thing-than-an-app-realm",
+    // #192's (P2.6.8, D-048): the structural half of Q9. The shell-realm row
+    // above leans on the sentence "durable rungs are structurally impossible
+    // in this build"; this row is what makes it a fact about the type system
+    // -- the uninhabited enum, the proof beside it, the empty feature the
+    // proof is gated on, and eight absence rows holding that nothing enables
+    // that feature.
+    "durable-rungs-need-a-provenance-value",
     // #190's three. The first rows here whose subject is what a human SEES,
     // and the first three that are LIMITS+README with the site carrying
     // nothing -- see the block comment above them in CLAIMS for why that is a

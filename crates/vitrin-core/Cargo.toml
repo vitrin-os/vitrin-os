@@ -830,6 +830,37 @@ drm-backend = [
     "smithay/backend_session_libseat",
     "smithay/backend_gbm",
 ]
+# The home of the ONLY constructor `crate::grants::ProvenanceRef` may ever
+# gain (P2.6.8, issue #192, decision D-048; the constructor itself is E3.7's,
+# decision D-009). It exists now, empty, for one structural reason: the type
+# is an uninhabited enum, and the durable persistence rungs (`until_revoked`,
+# `always`) are admissible only with a value of it -- so "a durable grant
+# cannot exist in this build" is a fact the compiler holds rather than a
+# sentence a reviewer checks. The proof of that fact is an empty `match` on
+# the enum, gated `#[cfg(not(feature = "provenance"))]` beside it in
+# `grants.rs`, and this declaration is what makes that `cfg` legal at all:
+# rustc's `unexpected_cfgs` lint is an ERROR under `-D warnings` for a feature
+# no manifest declares, so without this line the proof could not be written.
+#
+# Until E3.7 it gates nothing but the proof's absence. A build WITH it is a
+# build that has agreed to let `ProvenanceRef` be constructed -- that is, a
+# build claiming the core can verify a presenting binary's identity -- and
+# what such a build must additionally carry is E3.7's to define, not this
+# line's. A build WITHOUT it (every build there is) keeps the proof compiled,
+# so a variant added to the enum without `#[cfg(feature = "provenance")]` on
+# it turns every default build red at the proof instead of quietly making
+# the durable rungs representable.
+#
+# Enabled by no `default` (there is none), no CI job, no script, and no
+# manifest in this tree (nothing depends on `vitrin-core`, so a feature can
+# only be switched on from a command line). `cargo xtask limits-check` holds
+# that: claim `durable-rungs-need-a-provenance-value` greps every workflow,
+# the integration runner and this repo's own build tooling for any spelling
+# of `--features ...provenance` and for `--all-features`, and goes red the
+# day one appears. The per-feature-set test matrix that would have to gain
+# a row for it is `CI_TEST_RUNS` in `crates/xtask/src/test_census.rs`, which
+# already derives its rows from this table; nothing here builds a second one.
+provenance = []
 
 [dev-dependencies]
 # The permanent mock-shim fixture (issue #21): a compliant peer speaking the

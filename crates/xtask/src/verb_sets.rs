@@ -39,23 +39,28 @@
 //! `UnservedVerbs` is the one set that is a property of the **reference core**
 //! rather than of the wire, and the tool says so rather than blurring it: a
 //! deployment may decline any verb it likes. It is checkable here only because
-//! the two sets coincide today -- `observe_cursor`, `designate_file` and
-//! `egress` are refused by
-//! *every* deployment (no per-principal cursor delivery; for `designate_file`,
-//! no core-drawn picker and no consent copy; and for `egress`, no
+//! the two sets coincide today -- `observe_cursor` and `egress` are refused by
+//! *every* deployment (no per-principal cursor delivery; and for `egress`, no
 //! out-of-core mediating proxy -- the facet landed at P2.7.2 and did not make
 //! the verb servable, so this parenthetical reads "no proxy" where it once
 //! read "no facet at all"), which is what the spec surfaces claim, and those
-//! three are also exactly what this core leaves out of `SERVED_VERB_BITS`.
+//! two are also exactly what this core leaves out of `SERVED_VERB_BITS`.
 //! Should a
 //! verb ever be unserved *here* but servable elsewhere, the spec carriers must
 //! drop the marker rather than be forced to restate a local fact.
 //!
-//! That sentence named **two** of the three, and said "exactly", until the
-//! P2.6.5 and P2.7.2 branches were merged: it was written on the second while
-//! the first was landing `designate_file`, and `SERVED_VERB_BITS` has left
-//! that bit out since. The module built to stop this defect class was carrying
-//! an instance of it in its own header, and no check here reads its own docs.
+//! That sentence has been wrong twice, in opposite directions, and both are
+//! kept here because no check reads this header. It named **two** of what
+//! were then three, and said "exactly", until the P2.6.5 and P2.7.2 branches
+//! were merged: it was written on the second while the first was landing
+//! `designate_file`, and `SERVED_VERB_BITS` left that bit out from then on.
+//! Then it named **three** after P2.6.6 (#190) had served `designate_file` --
+//! the core-drawn picker gave the chokepoint a sink -- and went on saying "no
+//! consent copy" after P2.6.8 (#192, D-048) had landed the considered line;
+//! two, not three, since P2.6.6. The module built to stop this defect class
+//! was carrying an instance of it in its own header both times, and this file
+//! excludes itself from the scan below, so the only thing that corrects this
+//! paragraph is a reader.
 //!
 //! # The marker, and why it is not a phrase
 //!
@@ -71,15 +76,17 @@
 //! and a carrier that also states the set's **size in words** appends the word:
 //!
 //! ```text
-//! <!-- vitrin-verb-set: unserved-verbs = observe_cursor, designate_file, egress | count: three -->
+//! <!-- vitrin-verb-set: unserved-verbs = observe_cursor, egress | count: two -->
 //! ```
 //!
-//! Both examples spell the sets this tree actually derives. They read
-//! `observe_cursor, egress` and `count: two` until the P2.6.5 and P2.7.2
-//! branches were merged, and this file excludes itself from the scan
-//! ([`files_with_markers`]), so nothing here goes red when an example goes
-//! stale -- which is why they are written from the derived sets rather than
-//! invented.
+//! Both examples spell the sets this tree actually derives. The second read
+//! `observe_cursor, egress` and `count: two` before the P2.6.5 and P2.7.2
+//! merges, then `observe_cursor, designate_file, egress` and `count: three`
+//! until P2.6.6 served `designate_file`, and it is `two` again now; this file
+//! excludes itself from the scan ([`files_with_markers`]), so nothing here
+//! goes red when an example goes stale -- which is why they are written from
+//! the derived sets rather than invented, and why a reader who finds them
+//! disagreeing with `cargo xtask verb-sets` should believe the tool.
 //!
 //! Three things are then checked per marker, and each closes a different half
 //! of the observed defect:

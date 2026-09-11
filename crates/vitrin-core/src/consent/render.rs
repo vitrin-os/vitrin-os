@@ -327,8 +327,21 @@ const EXPIRY_UNBOUNDED: &str = "no time limit - bounded only by the choice below
 /// must not get prompt copy that implies it can. `observe_cursor` is the
 /// standing example, and `designate_file` (P2.6.5) was one beside it until
 /// P2.6.6 moved the bit into the served set and put a minimum honest line in
-/// this table; the considered copy that says what approving it costs is still
-/// P2.6.8's deliverable (Q13).
+/// this table; P2.6.8 (issue #192, D-048) replaced that line with the
+/// considered copy under Q13's first prompt-design review, and the entry's
+/// own comment traces every clause of it to the IDL. `egress` is the next
+/// verb whose copy is written, and it is deliberately NOT in this table:
+/// D-048 stages its line as prose until P2.7.3's proxy makes the verb
+/// enforceable, because a line here for authority no code enforces is the
+/// exact lie this table exists to prevent.
+///
+/// **What a line here may claim, stated as the rule the review applied:** a
+/// line states the GRANT's reach -- what approving it lets this principal
+/// do -- and never the SANDBOX's denial. "This app gets only what you pick"
+/// is a sentence about what confinement withholds, it is false at
+/// `--isolation=off`, and a consent card that is true on one isolation tier
+/// and false on another is not a consent card. Every line below is written
+/// to stay true on every tier the core admits the verb on.
 ///
 /// A served-set pin alone would let a newly appended IDL verb slip past this
 /// module in silence — [`crate::grants::UNSERVED_VERB_BITS`] is *derived* from
@@ -398,24 +411,73 @@ const VERB_CATALOGUE: [(Verb, &str, &str); 7] = [
         "realm_launch",
         "start the program named above, as a new app, as often as its rate limit allows",
     ),
-    // **The one line here that a fuller review still owes** (P2.6.8, Q13).
-    // It exists because P2.6.6 moved `designate_file` into
-    // `SERVED_VERB_BITS`, and the test below refuses to let a servable verb
-    // go unnamed on a card -- so this is the minimum honest copy rather than
-    // the considered copy.
+    // **`designate_file`'s considered copy** (P2.6.8, issue #192, D-048 --
+    // Q13's first prompt-design review). P2.6.6 served the verb with a
+    // minimum honest line so the test below would not let a servable verb go
+    // unnamed on a card; this is the line that review replaced it with. Six
+    // drafts from three angles, four judge passes, two syntheses; the record
+    // is D-048's. The string is FINAL, and no protocol prose page restates
+    // it (a second unchecked copy is this repository's dominant defect
+    // class): `docs/protocol/13-vitrin_powerbox.md` points here instead.
+    // The decision log records it as the decided text, dated, which is a
+    // record and not a second surface.
     //
-    // What it must get right, and does: the verb is authority to *ask*, the
-    // human chooses each time, and the descriptor **survives revocation**.
-    // That last clause is the one a human cannot infer and the IDL states
-    // outright -- "revocation stops future designations and kills the grant
-    // row while the payload keeps every fd already handed over until its
-    // realm dies" -- so a card that omitted it would describe an authority
-    // the deployment cannot actually take back as one it can.
+    // **The four facts the line encodes**, each traceable to the IDL so the
+    // card and the protocol cannot disagree about what is being approved:
+    //
+    //   (1) "ask you ... you pick each time" -- the verb is authority to ASK,
+    //       exercised per ask, and the human picks in the core-drawn chooser
+    //       (`vitrin_grant.verb` `designate_file`; `vitrin_powerbox`'s
+    //       description; `request_file`). Not authority to read anything.
+    //   (2) "one file ... or one folder and everything in it" -- one ask
+    //       yields ONE handle: a file, or a directory subtree as a single
+    //       descriptor (the `designation` event; `request_dir`). "everything
+    //       in it" is what a directory handle is, said in words.
+    //   (3) "to read or to read and change" -- the mode CEILING a file ask
+    //       may carry, stated as the pair. The per-ask mode is shown on the
+    //       PICKER card at pick time (`CONSEQUENCE_READ` / `CONSEQUENCE_WRITE`
+    //       below); the folder card there deliberately names no mode, and
+    //       this line claims none for a folder either -- the pair is
+    //       attached to the file clause, not to the sentence.
+    //   (4) "keeps what you hand over until it exits, even if you revoke this
+    //       grant" -- the residue survives revocation until the realm dies
+    //       (the `designation` event's description; `designate_file`:
+    //       "revocation ... keeps every fd already handed over until its
+    //       realm dies"). The one clause a human cannot infer, and the one
+    //       whose omission would describe an authority the deployment cannot
+    //       take back as one it can.
+    //
+    // **Three things it deliberately does NOT say**, each refused for a
+    // reason rather than cut for length:
+    //
+    //   - "nothing else about your files is reachable" / "this app gets only
+    //     what you pick". That is a claim about the SANDBOX's denial, not
+    //     about the grant, and it is false at `--isolation=off`. This
+    //     catalogue's own rule (module docs) is that a line states the
+    //     GRANT's reach, and only the grant's, so it stays true on every
+    //     tier.
+    //   - "the chooser says which" (read or read-and-change). True for a file
+    //     ask, false for a folder ask, whose card names no mode -- a sentence
+    //     that is half-true on a consent surface is a lie on it.
+    //   - that the agent holds its own copy of the descriptor. A cross-
+    //     principal fact about the relay, which the card must not surface:
+    //     the human is deciding what THIS app may ask for, and naming a third
+    //     party's holdings would invite consent to something this grant does
+    //     not confer.
+    //
+    // Fit: `- designate_file: ` plus this string measures 1318 px of
+    // Liberation Sans advance at `VALUE_PX` (measured through `Text::width`,
+    // not estimated; the review's pre-landing estimate was about 1408) against
+    // a three-line budget of 3 x `CONTENT_W` = 1524 px, and wraps to exactly
+    // three lines, untruncated. `every_catalogue_line_fits_untruncated` below
+    // holds that for every line here, present and future, so the number is a
+    // note and the test is the fact.
     (
         Verb::DESIGNATE_FILE,
         "designate_file",
-        "ask you to pick one file or folder to hand over - you choose each time, and what you \
-         hand over stays readable by this app until it exits, even if you revoke this grant",
+        "ask you to hand over one file, to read or to read and change, or one folder and everything \
+         in it - you pick each time, and this app keeps what you hand over until it exits, even if \
+         you revoke this grant",
     ),
 ];
 
@@ -1658,14 +1720,17 @@ mod tests {
         // core-drawn picker ([`crate::picker`]) exists and the chokepoint has
         // a sink to reach it.
         //
-        // **The second ground is not gone, and this is the honest place to
-        // say so.** P2.6.8 owns the considered copy; the catalogue line above
-        // is the minimum that keeps the card from omitting a verb it is
-        // asking a human to approve. So Q13's rule is met in the letter — the
-        // verb is named on the card — and the review that would make it met
-        // in spirit is still owed. That is a weaker state than
-        // `realm_launch`'s, whose copy was written by the task that served
-        // it, and the difference is recorded rather than smoothed over.
+        // **The second ground went at P2.6.8 (issue #192, D-048)**, two
+        // tasks after the first, and the gap between them is recorded rather
+        // than smoothed over: from P2.6.6 to P2.6.8 the verb was served with
+        // a minimum honest line, so Q13's rule was met in the letter (the
+        // verb was named on the card) and not yet in spirit (nobody had
+        // reviewed what the line asked a human to approve). That was a
+        // weaker state than `realm_launch`'s, whose copy was written by the
+        // task that served it. The considered copy is the catalogue entry
+        // above, with every clause traced to the IDL in its comment, and
+        // `every_catalogue_line_fits_untruncated` holds that a human can
+        // read all of it.
         //
         // **`egress` (128) JOINED the pin at P2.7.2 (issue #196)**, the
         // second growth, and again
@@ -1743,6 +1808,51 @@ mod tests {
                 "designate_file"
             ]
         );
+    }
+
+    /// **Every catalogue line reaches the human whole** (P2.6.8, issue #192,
+    /// D-048).
+    ///
+    /// The card wraps each verb's `- {name}: {what}` value independently into
+    /// at most [`MAX_VALUE_LINES`] lines of [`CONTENT_W`] at [`VALUE_PX`], and
+    /// [`Text::wrap`] cuts overflow with a visible
+    /// [`crate::paint::text::ELLIPSIS`] -- the right
+    /// behaviour for an operator-registered identity that is too long, and
+    /// the wrong outcome for consent copy, where the clause that gets cut is
+    /// by construction the last one, and the last clause of every line here
+    /// is the one a human cannot infer ("even if you revoke this grant").
+    /// Before this test the only answer to "does the copy fit" was a pixel
+    /// measurement in a comment; this is the mechanical answer, for every
+    /// line present and future, in the exact code path the card uses.
+    ///
+    /// Two checks that must both hold. The wrap at the card's real limit must
+    /// equal the wrap with no limit at all -- if they differ, the limit is
+    /// what made them differ -- and no produced line may end in the marker,
+    /// which is the same fact asserted from the human's side of the glass.
+    #[test]
+    fn every_catalogue_line_fits_untruncated() {
+        let mut text = Text::new();
+        for (_, name, what) in VERB_CATALOGUE {
+            let value = format!("- {name}: {what}");
+            let on_card = text.wrap(&value, VALUE_PX, CONTENT_W, MAX_VALUE_LINES);
+            let unbounded = text.wrap(&value, VALUE_PX, CONTENT_W, usize::MAX);
+            assert!(
+                on_card.len() <= MAX_VALUE_LINES,
+                "`{name}` wraps to {} lines; the card draws at most {MAX_VALUE_LINES}",
+                on_card.len()
+            );
+            assert_eq!(
+                on_card, unbounded,
+                "`{name}`'s copy is cut by the card's {MAX_VALUE_LINES}-line budget: the human \
+                 would read a truncated consequence"
+            );
+            for line in &on_card {
+                assert!(
+                    !line.ends_with(crate::paint::text::ELLIPSIS),
+                    "`{name}` renders a truncation marker on a consent card: {line:?}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -1034,6 +1034,24 @@ pub(crate) struct RealmRegistry {
     /// happen. Nothing else in this type is interior-mutable, and the cell
     /// is written by one method.
     next_instance: Cell<u64>,
+    /// **The directory the core-drawn file picker browses from** (P2.6.6,
+    /// issue #190), from this file's optional `[[picker]]` table, or `None`
+    /// when the file declared none.
+    ///
+    /// It lives on the *realm* registry because `realm.toml` is the session's
+    /// one configuration file and this core parses its own configuration
+    /// rather than linking a TOML crate (plan risk R7, [`crate::toml_subset`])
+    /// -- so a second file would be a second thing an operator has to know
+    /// about and a second place hostile config bytes are scanned. It is not a
+    /// property of any realm, and the `[[picker]]` table says so by being a
+    /// table of its own rather than a key inside `[[realm]]`.
+    ///
+    /// A **path**, not a descriptor: opening it is
+    /// `crate::picker::session::PickerRoot`'s job, at startup, and the
+    /// distinction matters -- what a path means is a fact about a filesystem
+    /// at a moment, which is exactly the class of question
+    /// [`RealmRegistry::load`] already keeps out of [`parse_config`].
+    picker_root: Option<PathBuf>,
 }
 
 impl RealmRegistry {
@@ -1049,7 +1067,7 @@ impl RealmRegistry {
         let mut text = String::new();
         file.read_to_string(&mut text)
             .map_err(|e| at(ErrorKind::Io(e)))?;
-        let specs = parse_config(&text).map_err(at)?;
+        let ParsedConfig { specs, picker_root } = parse_config(&text).map_err(at)?;
         // The transitive half of the not-writable policy (module docs), and
         // the reason it lives *here* rather than in `parse_config`: what a
         // path means is a fact about this filesystem at this moment, not
@@ -1059,7 +1077,17 @@ impl RealmRegistry {
         for spec in &specs {
             audit_spawn_target(spec.spawn.command()).map_err(at)?;
         }
-        Self::from_specs(specs).map_err(at)
+        let mut registry = Self::from_specs(specs).map_err(at)?;
+        registry.picker_root = picker_root;
+        Ok(registry)
+    }
+
+    /// The configured picker root, if this file declared one.
+    ///
+    /// Read once by startup, before the registry is moved into the runtime
+    /// seed.
+    pub fn picker_root(&self) -> Option<&Path> {
+        self.picker_root.as_deref()
     }
 
     /// Build a registry from parsed tables, enforcing the cross-table
@@ -1141,6 +1169,11 @@ impl RealmRegistry {
         Ok(Self {
             realms,
             next_instance: Cell::new(1),
+            // Declared only by `[[picker]]` in `realm.toml`, so every other
+            // constructor -- tests, `from_specs` -- comes up with no picker
+            // root and therefore serves no designation. Fail-closed by
+            // default rather than by remembering to set it.
+            picker_root: None,
         })
     }
 
@@ -1569,11 +1602,37 @@ struct RawRealm {
     autostart: Option<bool>,
 }
 
+/// Everything one `realm.toml` declares: the realms, and the session-wide
+/// `[[picker]]` table if it has one.
+#[derive(Debug)]
+struct ParsedConfig {
+    specs: Vec<RealmSpec>,
+    picker_root: Option<PathBuf>,
+}
+
+/// One `[[picker]]` table under construction.
+#[derive(Default)]
+struct RawPicker {
+    root: Option<(String, usize)>,
+    /// Where the table was opened, so a table missing its `root` can be
+    /// reported at the line the operator wrote rather than at the end of file.
+    line_no: usize,
+}
+
 /// Parse the strict TOML subset into validated specs. Anything outside the
 /// documented schema is an error, never a guess (module docs).
-fn parse_config(text: &str) -> Result<Vec<RealmSpec>, ErrorKind> {
+fn parse_config(text: &str) -> Result<ParsedConfig, ErrorKind> {
     let parse_err = |line: usize, detail: String| ErrorKind::Parse { line, detail };
     let mut raw: Vec<RawRealm> = Vec::new();
+    // **At most one**, refused rather than last-wins: two `[[picker]]` tables
+    // is an operator who believes something about which root is in force, and
+    // exactly one of the two beliefs would be right.
+    let mut picker: Option<RawPicker> = None;
+    // Which table the keys below belong to. `realm.toml` was a file of one
+    // table kind until P2.6.6, so key routing was "the last `[[realm]]`"; it
+    // is now "the last table of any kind", and the enum is what stops a
+    // `root =` line landing in a realm or an `id =` line in the picker.
+    let mut current = Table::None;
     for (idx, raw_line) in text.lines().enumerate() {
         let line_no = idx + 1;
         let line = raw_line.trim();
@@ -1589,26 +1648,68 @@ fn parse_config(text: &str) -> Result<Vec<RealmSpec>, ErrorKind> {
                     "trailing content after table header".into(),
                 ));
             }
-            if header != "[[realm]]" {
-                return Err(parse_err(
-                    line_no,
-                    "only [[realm]] tables are allowed in this file".into(),
-                ));
+            match header {
+                "[[realm]]" => {
+                    raw.push(RawRealm::default());
+                    current = Table::Realm;
+                }
+                "[[picker]]" => {
+                    if picker.is_some() {
+                        return Err(parse_err(
+                            line_no,
+                            "a second [[picker]] table: this file declares one picker root for \
+                             the session, and two would leave which one is in force to the \
+                             order they happen to appear in"
+                                .into(),
+                        ));
+                    }
+                    picker = Some(RawPicker {
+                        line_no,
+                        ..RawPicker::default()
+                    });
+                    current = Table::Picker;
+                }
+                other => {
+                    return Err(parse_err(
+                        line_no,
+                        format!(
+                            "unknown table {other} (this file declares [[realm]] tables and at \
+                             most one [[picker]] table)"
+                        ),
+                    ));
+                }
             }
-            raw.push(RawRealm::default());
             continue;
         }
-        let Some(realm) = raw.last_mut() else {
-            return Err(parse_err(
-                line_no,
-                "key outside any [[realm]] table (top-level keys are not allowed)".into(),
-            ));
-        };
         let (key, value) = line
             .split_once('=')
             .ok_or_else(|| parse_err(line_no, "expected `key = value`".into()))?;
         let key = key.trim();
         let value = value.trim_start();
+        if current == Table::Picker {
+            let picker = picker.as_mut().expect("the picker table was just opened");
+            match key {
+                "root" => {
+                    if picker.root.is_some() {
+                        return Err(parse_err(line_no, "duplicate `root` key".into()));
+                    }
+                    picker.root = Some((toml_subset::basic_string(value, line_no)?, line_no));
+                }
+                other => {
+                    return Err(parse_err(
+                        line_no,
+                        format!("unknown key {other:?} (the [[picker]] schema defines root)"),
+                    ));
+                }
+            }
+            continue;
+        }
+        let Some(realm) = raw.last_mut() else {
+            return Err(parse_err(
+                line_no,
+                "key outside any table (top-level keys are not allowed)".into(),
+            ));
+        };
         match key {
             "id" => {
                 if realm.id.is_some() {
@@ -1669,7 +1770,59 @@ fn parse_config(text: &str) -> Result<Vec<RealmSpec>, ErrorKind> {
         return Err(too_many_realms(raw.len()));
     }
 
-    raw.into_iter().map(validate_realm).collect()
+    // **An absolute path, or nothing.** A relative root would be resolved
+    // against a working directory nobody declared, and the picker walks from
+    // it with `RESOLVE_BENEATH` -- so "which directory did the human just
+    // browse" would depend on how `vitrind` happened to be started.
+    // A `[[picker]]` table with no `root` is refused rather than defaulted.
+    // Every other schema condition in this file is refused rather than
+    // guessed, and an operator who wrote `[[picker]]` intending to configure
+    // something would otherwise get a default and no diagnostic.
+    if let Some(p) = picker.as_ref() {
+        if p.root.is_none() {
+            return Err(parse_err(
+                p.line_no,
+                "a [[picker]] table with no `root` key: declaring the table is how a \
+                 deployment says it serves designations, so leaving the directory out \
+                 is refused rather than filled in with a guess"
+                    .into(),
+            ));
+        }
+    }
+    let picker_root = match picker.and_then(|p| p.root) {
+        Some((root, line_no)) => {
+            let path = PathBuf::from(root);
+            if !path.is_absolute() {
+                return Err(parse_err(
+                    line_no,
+                    format!(
+                        "picker root {} is relative; it must be an absolute path, because it \
+                         is resolved against no working directory and is the boundary every \
+                         designation is contained beneath",
+                        path.display()
+                    ),
+                ));
+            }
+            Some(path)
+        }
+        None => None,
+    };
+
+    let specs = raw
+        .into_iter()
+        .map(validate_realm)
+        .collect::<Result<Vec<RealmSpec>, ErrorKind>>()?;
+    Ok(ParsedConfig { specs, picker_root })
+}
+
+/// Which table the keys being parsed belong to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Table {
+    /// Before any table header: a key here is a top-level key, which the
+    /// subset does not allow.
+    None,
+    Realm,
+    Picker,
 }
 
 /// The one wording for "this session may not hold that many realms",
@@ -1983,6 +2136,129 @@ pub(crate) mod tests {
     /// The minimal valid file: one realm, one absolute command.
     const MINIMAL: &str = "[[realm]]\ncommand = \"/usr/bin/true\"\n";
 
+    // -- the [[picker]] table (P2.6.6, issue #190) -------------------------
+
+    /// The `[[picker]]` table's `root` reaches the parse result.
+    #[test]
+    fn a_picker_table_declares_the_session_root() {
+        let parsed = parse_config(
+            "[[realm]]\nid = \"realm-0\"\ncommand = \"/x\"\n\n[[picker]]\nroot = \"/srv/docs\"\n",
+        )
+        .expect("both tables parse");
+        assert_eq!(parsed.picker_root.as_deref(), Some(Path::new("/srv/docs")));
+        assert_eq!(parsed.specs.len(), 1);
+    }
+
+    /// **No `[[picker]]` table means no root**, which is the fail-closed
+    /// default: with none, `main` falls back to `$HOME`, and with neither the
+    /// chokepoint's sink refuses every designation `internal`.
+    #[test]
+    fn no_picker_table_means_no_root() {
+        let parsed =
+            parse_config("[[realm]]\nid = \"realm-0\"\ncommand = \"/x\"\n").expect("parses");
+        assert!(parsed.picker_root.is_none());
+    }
+
+    /// **A `[[picker]]` table with no `root` is refused, not defaulted.**
+    ///
+    /// Declaring the table is how a deployment says it serves designations.
+    /// Filling the directory in with a guess would give an operator who wrote
+    /// `[[picker]]` intending to configure something a default and no
+    /// diagnostic — and every other schema condition in this file is refused
+    /// rather than guessed.
+    #[test]
+    fn a_picker_table_without_a_root_is_refused() {
+        let err = parse_config("[[realm]]\nid = \"realm-0\"\ncommand = \"/x\"\n[[picker]]\n")
+            .expect_err("must refuse");
+        let ErrorKind::Parse { detail, .. } = err else {
+            panic!("expected a parse error, got {err:?}");
+        };
+        assert!(
+            detail.contains("no `root` key"),
+            "the diagnostic must name what is missing; got {detail}"
+        );
+    }
+
+    /// A relative root is refused, not resolved against a working directory
+    /// nobody declared.
+    #[test]
+    fn a_relative_picker_root_is_refused() {
+        let err = parse_config(
+            "[[realm]]\nid = \"realm-0\"\ncommand = \"/x\"\n[[picker]]\nroot = \"docs\"\n",
+        )
+        .expect_err("must refuse");
+        let ErrorKind::Parse { detail, .. } = err else {
+            panic!("expected a parse error, got {err:?}");
+        };
+        assert!(
+            detail.contains("relative"),
+            "the refusal must name the problem: {detail}"
+        );
+    }
+
+    /// Two `[[picker]]` tables are refused rather than last-wins: which root
+    /// is in force must not depend on the order they appear in.
+    #[test]
+    fn a_second_picker_table_is_refused() {
+        assert!(parse_config(
+            "[[realm]]\nid = \"realm-0\"\ncommand = \"/x\"\n[[picker]]\nroot = \"/a\"\n[[picker]]\nroot = \"/b\"\n",
+        )
+        .is_err());
+    }
+
+    /// Keys do not leak between the two tables: what each schema declares is
+    /// what each accepts, and anything else is an error rather than a guess.
+    #[test]
+    fn a_key_from_one_table_is_refused_in_the_other() {
+        assert!(
+            parse_config(
+                "[[realm]]\nid = \"realm-0\"\ncommand = \"/x\"\n[[picker]]\nid = \"nope\"\n"
+            )
+            .is_err(),
+            "a realm key inside [[picker]] must be refused, never silently ignored"
+        );
+        assert!(
+            parse_config("[[realm]]\nid = \"realm-0\"\ncommand = \"/x\"\nroot = \"/a\"\n").is_err(),
+            "a picker key inside [[realm]] must be refused: a root that silently does nothing \
+             reads to an operator exactly like one that works"
+        );
+    }
+
+    /// A key before any table header is still a top-level key, and still
+    /// refused.
+    #[test]
+    fn a_key_before_any_table_is_still_refused() {
+        // The key is `id`, which is **valid inside `[[realm]]`** --
+        // deliberately, because a key no schema accepts would be refused by
+        // the schema rather than by the no-table rule, and this test would
+        // then pass without the rule existing at all.
+        let err = parse_config("id = \"r\"\n[[realm]]\ncommand = \"/x\"\n")
+            .expect_err("a top-level key must be refused");
+        let ErrorKind::Parse { detail, .. } = err else {
+            panic!("expected a parse error, got {err:?}");
+        };
+        assert!(
+            detail.contains("outside any table"),
+            "the refusal must be the no-table rule, not a schema miss: {detail}"
+        );
+    }
+
+    /// An unknown table is named in the refusal, so an operator who typed
+    /// `[[pickers]]` learns which word was wrong.
+    #[test]
+    fn an_unknown_table_is_refused_by_name() {
+        let err = parse_config("[[picker s]]\n").expect_err("must refuse");
+        assert!(matches!(err, ErrorKind::Parse { .. }));
+        let err = parse_config("[[pickers]]\nroot = \"/a\"\n").expect_err("must refuse");
+        let ErrorKind::Parse { detail, .. } = err else {
+            panic!("expected a parse error, got {err:?}");
+        };
+        assert!(
+            detail.contains("pickers"),
+            "the refusal must name it: {detail}"
+        );
+    }
+
     /// A registry holding exactly these realms, all `Configured` -- what a
     /// `realm.toml` naming them would produce. The fixture other modules'
     /// tests build their realm environment from, so no test invents a realm
@@ -1998,6 +2274,11 @@ pub(crate) mod tests {
         RealmRegistry {
             realms: realms.into_iter().map(|r| (r.id.clone(), r)).collect(),
             next_instance: Cell::new(1),
+            // Declared only by `[[picker]]` in `realm.toml`, so every other
+            // constructor -- tests, `from_specs` -- comes up with no picker
+            // root and therefore serves no designation. Fail-closed by
+            // default rather than by remembering to set it.
+            picker_root: None,
         }
     }
 
@@ -2055,7 +2336,7 @@ pub(crate) mod tests {
     }
 
     fn registry_from(text: &str) -> Result<RealmRegistry, ErrorKind> {
-        RealmRegistry::from_specs(parse_config(text)?)
+        RealmRegistry::from_specs(parse_config(text)?.specs)
     }
 
     /// A private (0700) scratch directory owned by this process. Its own
@@ -2719,15 +3000,22 @@ pub(crate) mod tests {
         // parser cannot build a registry over the cap.
         let specs: Vec<RealmSpec> = parse_config(&at_cap)
             .unwrap()
+            .specs
             .into_iter()
-            .chain(parse_config("[[realm]]\nid = \"extra\"\ncommand = \"/x\"\n").unwrap())
+            .chain(
+                parse_config("[[realm]]\nid = \"extra\"\ncommand = \"/x\"\n")
+                    .unwrap()
+                    .specs,
+            )
             .collect();
         assert!(RealmRegistry::from_specs(specs).is_err());
 
         // The membership rule is likewise re-checked by the constructor, so
         // no path builds a registry a conformant client cannot address.
         assert!(RealmRegistry::from_specs(
-            parse_config("[[realm]]\nid = \"kiosk\"\ncommand = \"/x\"\n").unwrap()
+            parse_config("[[realm]]\nid = \"kiosk\"\ncommand = \"/x\"\n")
+                .unwrap()
+                .specs
         )
         .is_err());
     }

@@ -518,6 +518,27 @@ header_test = executable(
 )
 test('header-compiles', header_test)
 
+# --- P2.6.5 (#189): the transport's receive side for a descriptor --------
+# `vitrin_shim_session.designation` is the first core -> shim event that
+# carries an fd, so src/wire.c grew a pending-fd queue and positional matching
+# for it. Most of what can go wrong there is reachable only from a core that is
+# buggy or hostile -- an fd on a frame declaring none, a frame declaring one
+# with nothing attached, two fds on a one-fd frame -- and each of those is one
+# mock-core process and one grepped log away in an acceptance script, against
+# one function call here.
+#
+# It links src/wire.c itself rather than the shim binary, and drives it over a
+# socketpair: no compositor, no app, no GPU, and no fd 3. The scenarios that
+# need the SHIPPED binary are in tests/acceptance/designation_receive.sh.
+wire_designation_test = executable(
+  'test-wire-designation',
+  files('tests/test_wire_designation.c', 'src/wire.c'),
+  protocol_headers,
+  include_directories: inc,
+  dependencies: shim_deps,
+)
+test('wire-designation', wire_designation_test, timeout: 30)
+
 # --- The lists this tree writes down twice ------------------------------
 # Issue #283 added a fourth acceptance script to `meson test` and updated one
 # of the TWO places README.md states how many there are, so the file shipped
@@ -716,6 +737,37 @@ if have_idle_client
     timeout: 60,
   )
 endif
+
+# --- P2.6.5 (#189): the shipped shim survives a real designation --------
+# A COMPONENT test, not milestone acceptance: it drives the real `vitrin-shim`
+# binary against `tests/mock_core.c`, a hand-written stand-in for the trusted
+# core (CLAUDE.md's definition-of-done rule; see that file's own header).
+#
+# What only this can settle, and the unit test beside it cannot: that the
+# BINARY -- spawned under the real fd-3 contract, running its real event loop
+# and its real event routing -- survives an event carrying a descriptor. Before
+# this landed it did not: the transport treated any arriving fd as a violation
+# and killed the connection, so a successful designation would have killed the
+# realm. That failure mode is a dead app, which no in-process test observes.
+#
+# It also counts the shim's own descriptors through /proc while the shim is
+# still running, which is the only place a leaked designation is visible: the
+# shim closing on exit hides one, and the shim is the process that would hold
+# it.
+test(
+  'designation-receive',
+  find_program('bash'),
+  args: [
+    files('tests/acceptance/designation_receive.sh'),
+  ],
+  env: {
+    'BUILD_DIR': meson.current_build_dir(),
+  },
+  depends: [shim_exe, mock_core],
+  # The body is one timed send; the budget is the shim's bring-up, which the
+  # script polls for rather than racing, plus the mock core's own --run-ms.
+  timeout: 60,
+)
 
 # --- xdg-shell conformance, from the app's side ------------------------
 # Three facts about src/xdg.c that only a client can observe: the initial

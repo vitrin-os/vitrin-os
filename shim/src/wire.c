@@ -1,5 +1,6 @@
-/* wire.c -- framed send/receive over the core socketpair. See wire.h for
- * the design and for why the receive path needs no fd machinery.
+/* wire.c -- framed send/receive over the core socketpair. See wire.h for the
+ * design, and for the ownership rule the receive path's fd machinery exists to
+ * make structural.
  *
  * SPDX-License-Identifier: MPL-2.0
  *
@@ -8,8 +9,10 @@
  *   adopt   -- claim fd 3, re-arm FD_CLOEXEC, go non-blocking
  *   send    -- flush anything parked, sendmsg (fd as SCM_RIGHTS on the first
  *              write), park the tail the kernel refused
- *   recv    -- recvmsg into a reassembly buffer, split on the header's own
- *              size field, hand whole frames to the protocol layer
+ *   recv    -- recvmsg into a reassembly buffer, harvesting any SCM_RIGHTS
+ *              descriptor into the pending queue, split on the header's own
+ *              size field, hand whole frames -- and the descriptor the frame
+ *              declares -- to the protocol layer
  *   arm     -- put the descriptor on the Wayland event loop, watching for
  *              write readiness only while something is parked
  */
@@ -31,15 +34,37 @@
 #include "vitrin-protocol.h"
 #include "wire.h"
 
+/* Close every received-but-unclaimed descriptor. Both callers are ends of the
+ * connection -- the fatal path and teardown -- so nothing can claim these
+ * afterwards, and a descriptor left open here pins a file for the life of the
+ * realm. */
+static void wire_drop_pending_fds(struct vitrin_wire *w) {
+	while (w->pending_len > 0) {
+		struct vitrin_wire_pending_fd *front = &w->pending[w->pending_head];
+		if (front->fd >= 0) {
+			close(front->fd);
+			front->fd = -1;
+		}
+		w->pending_head = (w->pending_head + 1) % VITRIN_WIRE_MAX_UNCLAIMED_FDS;
+		w->pending_len--;
+	}
+}
+
 /* Declare the fatal condition once. Sticky: after this the stream may be
  * torn (a partial write leaves a frame prefix in the kernel buffer that no
- * later send may append past), so every operation refuses from here on. */
+ * later send may append past), so every operation refuses from here on.
+ *
+ * It also closes the pending descriptors, which is why every fd-related fatal
+ * below can simply `return wire_fail(...)` and be leak-free: once the stream
+ * is poisoned no frame will ever be dispatched again, so nothing is left that
+ * could claim them. */
 static bool wire_fail(struct vitrin_wire *w, const char *reason) {
 	if (!w->failed) {
 		w->failed = true;
 		w->fail_reason = reason;
 		wlr_log(WLR_ERROR, "core connection: %s", reason);
 	}
+	wire_drop_pending_fds(w);
 	return false;
 }
 
@@ -329,7 +354,7 @@ static bool wire_fill(struct vitrin_wire *w) {
 	}
 	union {
 		struct cmsghdr align;
-		char buf[CMSG_SPACE(sizeof(int) * 4)];
+		char buf[CMSG_SPACE(sizeof(int) * VITRIN_WIRE_MAX_UNCLAIMED_FDS)];
 	} control;
 	memset(&control, 0, sizeof(control));
 	struct iovec iov = {
@@ -343,10 +368,16 @@ static bool wire_fill(struct vitrin_wire *w) {
 		.msg_controllen = sizeof(control.buf),
 	};
 
+	/* Byte-stream offset of the first byte this recvmsg will return, captured
+	 * BEFORE the call: it is the start of the span every descriptor this
+	 * round delivers gets tagged with (see `struct vitrin_wire_pending_fd`). */
+	uint64_t span_start = w->consumed + (uint64_t)w->rx_len;
+
 	ssize_t n;
 	do {
-		/* MSG_CMSG_CLOEXEC so an fd we are about to reject is never
-		 * inheritable, not even for the instant before we close it. */
+		/* MSG_CMSG_CLOEXEC so every received fd is close-on-exec from the
+		 * instant it exists in this process -- including one we are about to
+		 * reject, which must not be inheritable even for that instant. */
 		n = recvmsg(w->fd, &msg, MSG_CMSG_CLOEXEC);
 	} while (n < 0 && errno == EINTR);
 
@@ -361,10 +392,12 @@ static bool wire_fill(struct vitrin_wire *w) {
 		return wire_fail(w, "recvmsg failed");
 	}
 
-	/* No version-1 core -> shim event carries a descriptor (wire.h). One
-	 * arriving means the core is not the core we compiled against; close it
-	 * before dying so the rejection leaks nothing. */
-	bool unsolicited = false;
+	/* Harvest whatever rode along into the pending queue, tagged with this
+	 * recvmsg's span. Which FRAME each belongs to is not decidable here --
+	 * the frame may not have arrived whole yet -- so that judgement is
+	 * `wire_dispatch`'s, against the span. */
+	uint64_t span_end = span_start + (uint64_t)n;
+	bool overflow = false;
 	for (struct cmsghdr *cm = CMSG_FIRSTHDR(&msg); cm != NULL; cm = CMSG_NXTHDR(&msg, cm)) {
 		if (cm->cmsg_level != SOL_SOCKET || cm->cmsg_type != SCM_RIGHTS) {
 			continue;
@@ -373,16 +406,30 @@ static bool wire_fill(struct vitrin_wire *w) {
 		for (size_t off = 0; off + sizeof(int) <= payload; off += sizeof(int)) {
 			int got = -1;
 			memcpy(&got, CMSG_DATA(cm) + off, sizeof(int));
-			if (got >= 0) {
-				close(got);
+			if (got < 0) {
+				continue;
 			}
-			unsolicited = true;
+			if (w->pending_len >= VITRIN_WIRE_MAX_UNCLAIMED_FDS) {
+				/* Closed here rather than queued: the queue is full, and the
+				 * fatal below drops what is already in it. */
+				close(got);
+				overflow = true;
+				continue;
+			}
+			size_t idx = (w->pending_head + w->pending_len) % VITRIN_WIRE_MAX_UNCLAIMED_FDS;
+			w->pending[idx].span_start = span_start;
+			w->pending[idx].span_end = span_end;
+			w->pending[idx].fd = got;
+			w->pending_len++;
 		}
 	}
-	if (unsolicited) {
-		return wire_fail(w, "core -> shim event carried a file descriptor");
+	if (overflow) {
+		return wire_fail(w, "more unclaimed descriptors than this transport holds: "
+		                    "the core attached fds to frames that declare none");
 	}
 	if ((msg.msg_flags & MSG_CTRUNC) != 0) {
+		/* More fds in one sendmsg than the ancillary buffer admits. The kernel
+		 * closed the overflow; `wire_fail` closes the ones it did install. */
 		return wire_fail(w, "ancillary data truncated");
 	}
 
@@ -394,8 +441,47 @@ static bool wire_fill(struct vitrin_wire *w) {
 	return true;
 }
 
+/* Take the descriptor a frame beginning at `frame_start` declares, or -1 if
+ * the pending queue holds none that could have been attached to it -- which is
+ * the caller's violation to report, not a state to continue from.
+ *
+ * A compliant peer attaches the fd to the frame's FIRST byte, and the recvmsg
+ * that consumed that byte -- necessarily the one that delivered the fd -- began
+ * at or before it, so `span_start <= frame_start` holds for the frame's own
+ * descriptor. A front entry whose whole delivering recvmsg lies AFTER this
+ * frame began therefore belongs to a later frame. (A front entry from strictly
+ * earlier bytes cannot exist: the frame covering those bytes either claimed it
+ * or died on it.) */
+static int wire_take_fd(struct vitrin_wire *w, uint64_t frame_start) {
+	if (w->pending_len == 0) {
+		return -1;
+	}
+	struct vitrin_wire_pending_fd *front = &w->pending[w->pending_head];
+	if (front->span_start > frame_start) {
+		return -1;
+	}
+	int fd = front->fd;
+	front->fd = -1;
+	w->pending_head = (w->pending_head + 1) % VITRIN_WIRE_MAX_UNCLAIMED_FDS;
+	w->pending_len--;
+	return fd;
+}
+
+/* True when a still-pending descriptor was attached at an offset below
+ * `frame_end` -- i.e. to this frame or an earlier one -- and no frame declared
+ * it. That is either fds on a frame declaring none or a second fd on a one-fd
+ * frame, both fatal `fd_violation` (conventions 2.4). This is the only layer
+ * that can see either: left unreported, a smuggled descriptor shifts positional
+ * matching for every frame after it. A span reaching PAST `frame_end` may
+ * belong to the next frame's first byte, so it stays pending and is judged when
+ * that frame completes. */
+static bool wire_has_unclaimed_fd(const struct vitrin_wire *w, uint64_t frame_end) {
+	return w->pending_len > 0 && w->pending[w->pending_head].span_end <= frame_end;
+}
+
 /* Split the reassembly buffer on the header's own size field and hand every
- * complete frame to the protocol layer. */
+ * complete frame -- with the descriptor its header declares, if any -- to the
+ * protocol layer. */
 static bool wire_dispatch(struct vitrin_wire *w) {
 	size_t pos = 0;
 	while (w->rx_len - pos >= VITRIN_HEADER_LEN) {
@@ -408,20 +494,55 @@ static bool wire_dispatch(struct vitrin_wire *w) {
 			 * cannot be advanced past, so the stream is unrecoverable. */
 			return wire_fail(w, "frame size below the 8-byte header minimum");
 		}
-		if (hdr.fd_count != 0) {
-			return wire_fail(w, "core -> shim event declared a file descriptor");
+		if (hdr.fd_count > 1) {
+			/* conventions 2.4: at most one descriptor per message is a
+			 * FRAMING invariant, not a property of the current signatures, so
+			 * it is enforced here rather than left to each decoder. */
+			return wire_fail(w, "core -> shim event declared more than one descriptor");
 		}
 		if (w->rx_len - pos < hdr.size) {
 			break; /* frame still arriving */
 		}
-		bool ok = w->handler(w->handler_data, w->rx + pos, hdr.size);
+		uint64_t frame_start = w->consumed + (uint64_t)pos;
+		uint64_t frame_end = frame_start + (uint64_t)hdr.size;
+		int fd = -1;
+		if (hdr.fd_count == 1) {
+			fd = wire_take_fd(w, frame_start);
+			if (fd < 0) {
+				return wire_fail(w, "frame declares a descriptor that no "
+				                    "ancillary data delivered");
+			}
+		}
+		/* Judged BEFORE the handler runs, so a smuggled descriptor is never
+		 * acted on. This frame's own is already off the queue by here, so what
+		 * `wire_has_unclaimed_fd` sees is a second one. */
+		if (wire_has_unclaimed_fd(w, frame_end)) {
+			if (fd >= 0) {
+				close(fd);
+			}
+			return wire_fail(w, "a descriptor arrived that no frame declared");
+		}
+		bool ok = w->handler(w->handler_data, w->rx + pos, hdr.size, &fd);
+		if (fd >= 0) {
+			/* The handler did not claim it. `designation`'s rule -- a shim
+			 * that cannot relay a descriptor closes it -- applied to every
+			 * handler and every path, including the `false` below, so no
+			 * handler can leak one by omission. */
+			close(fd);
+		}
 		pos += hdr.size;
 		if (!ok) {
-			return false;
+			/* The protocol layer declared the connection dead. wire.h promises
+			 * that every later operation then refuses, and only `wire_fail`
+			 * delivers that: returning false alone left `vitrin_wire_alive`
+			 * true, so `wire_ready` would neither tear down nor stop, and the
+			 * same bytes would be re-dispatched on the next wakeup. */
+			return wire_fail(w, "the protocol layer rejected an event");
 		}
 	}
 	memmove(w->rx, w->rx + pos, w->rx_len - pos);
 	w->rx_len -= pos;
+	w->consumed += (uint64_t)pos;
 	return true;
 }
 
@@ -444,7 +565,12 @@ bool vitrin_wire_recv_sync(struct vitrin_wire *w, int timeout_ms,
 				return wire_fail(w, "frame size below the 8-byte header minimum");
 			}
 			if (hdr.fd_count != 0) {
-				return wire_fail(w, "core -> shim event declared a file descriptor");
+				/* The only frame this function ever reads is `configure`, the
+				 * core's guaranteed-first message, and it is fd-less. A
+				 * descriptor on it means the core is not the core we compiled
+				 * against, and the shim has nowhere to route one before it is
+				 * armed. `wire_fail` closes what already arrived. */
+				return wire_fail(w, "the core's first event declared a file descriptor");
 			}
 			if (w->rx_len >= hdr.size) {
 				if (hdr.size > out_cap) {
@@ -454,6 +580,12 @@ bool vitrin_wire_recv_sync(struct vitrin_wire *w, int timeout_ms,
 				*out_len = hdr.size;
 				memmove(w->rx, w->rx + hdr.size, w->rx_len - hdr.size);
 				w->rx_len -= hdr.size;
+				/* Same bookkeeping `wire_dispatch` does: `consumed` is the
+				 * stream offset of rx[0], and the coordinate every pending
+				 * descriptor's span is measured in. A later frame in this same
+				 * batch may carry one, so getting this wrong here mis-matches
+				 * it there rather than failing visibly now. */
+				w->consumed += (uint64_t)hdr.size;
 				return true;
 			}
 		}
@@ -554,6 +686,32 @@ bool vitrin_wire_arm(struct vitrin_wire *w, struct wl_event_loop *loop,
 		return wire_fail(w, "cannot add the core connection to the event loop");
 	}
 	wire_update_mask(w);
+
+	/* Drain whatever the SYNCHRONOUS read left behind, before returning.
+	 *
+	 * `vitrin_wire_recv_sync` reads whole recvmsg rounds and hands back ONE
+	 * frame, so anything the core batched behind `configure` is already in this
+	 * reassembly buffer -- and the event loop is level-triggered on the SOCKET,
+	 * which by then holds none of it. Without this line those frames wait for
+	 * the core's NEXT message to wake the loop, which for a batch that carried
+	 * a `designation` may be a very long time and may be never.
+	 *
+	 * Found by tests/test_wire_designation.c's "fd smuggled behind the
+	 * synchronous configure read", where the consequence is sharpest: a
+	 * descriptor stranded in the pending queue is one no violation check ever
+	 * reaches, so a fatal that should have fired does not. */
+	if (w->rx_len > 0) {
+		if (!wire_dispatch(w)) {
+			return false;
+		}
+		/* A batch boundary like any other: everything this call delivered has
+		 * been handed on (see vitrin_wire_drained_t). */
+		if (w->on_drained != NULL) {
+			w->on_drained(w->handler_data);
+		}
+		/* A handler may have queued sends. */
+		wire_update_mask(w);
+	}
 	return true;
 }
 
@@ -571,6 +729,10 @@ void vitrin_wire_finish(struct vitrin_wire *w) {
 		w->queue_head = (w->queue_head + 1) % VITRIN_WIRE_QUEUE_SLOTS;
 		w->queue_len--;
 	}
+	/* Descriptors that arrived for frames which never did. Nothing can claim
+	 * them after this, and each one holds a file open for as long as this
+	 * process lives. */
+	wire_drop_pending_fds(w);
 	if (w->fd >= 0) {
 		close(w->fd);
 		w->fd = -1;

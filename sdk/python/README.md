@@ -139,9 +139,11 @@ the near-miss is the evidence, not an outage.
 
 ## Layout and launching (wire version 2)
 
-Three facets are minted structurally on a resolved grant — lazily, because
-`request_grant`'s five `new_id` arguments are frozen forever and every facet
-added after version 1 arrives as a mint on the grant:
+Three of the four facets this SDK mints structurally on a resolved grant —
+lazily, because `request_grant`'s five `new_id` arguments are frozen forever
+and every facet added after version 1 arrives as a mint on the grant. The
+fourth is the powerbox, in the next section; `vitrin_egress` would be a fifth
+and has no encoder here:
 
 ```python
 grant.focus()                    # vitrin_layout_focus.focus — fire-and-forget
@@ -170,6 +172,77 @@ Three things about these that a caller has to know rather than discover:
 [`examples/shell/`](../../examples/shell/README.md) is the worked example, and
 also the argument for why a client holding these verbs is still not a desktop
 shell.
+
+## Designation: asking a human for a file (wire version 2)
+
+`designate.file` is authority to **ask**, never authority over any file the
+agent can name. There is no request that says which file is wanted: the ask
+raises the core-drawn picker, the human chooses in front of the trusted
+indicator, and what crosses the wire is a **file descriptor**. The path never
+crosses the wire in either direction.
+
+```python
+grant = conn.request_grant(realm="realm-0", verbs=("designate.file",))
+grant.await_consent()
+
+answer = conn.request_file(grant, write=True)   # blocks: a human is deciding
+if isinstance(answer, DesignatedEvent):
+    data = os.pread(answer.fd, 4096, 0)         # positional I/O: see below
+    os.close(answer.fd)                         # yours to close
+else:                                           # PowerboxRefusedEvent
+    print("not this time:", PowerboxRefusal(answer.code).name)
+
+subtree = conn.request_dir(grant)               # one directory fd, not a batch
+```
+
+Four things a caller has to know rather than discover:
+
+- **The descriptor is yours to close.** Ownership transfers on receipt and
+  nothing in this SDK closes it for you. It is the only resource this SDK ever
+  hands over — `Frame` is deliberately the opposite (close-after-copy, nothing
+  owed), and a designation cannot be, because the descriptor *is* the payload.
+- **`name` is display-only and there is no path to be had.** It is a basename,
+  carried so a client can say what it was given. Re-opening "the file called
+  that" is a different act from using this descriptor, and it reintroduces
+  exactly the race the descriptor closed — between the human's confirmation and
+  your open, the name can come to mean a different file. (The path is not
+  secret: whoever holds the descriptor can read it out of `/proc/self/fd`. It
+  is withheld so no path is ever part of the interface's contract.)
+- **Both copies share one file offset.** The same descriptor goes to the agent
+  and to the realm's shim; the core resolves the human's choice once and sends
+  it twice, and `SCM_RIGHTS` installs descriptors onto the **same open file
+  description**. A `read` by one moves the other's cursor; for a directory the
+  shared position is the `getdents` cursor, so two walkers each see part of the
+  subtree and neither sees all of it. Use `os.pread`/`os.pwrite`, or for a
+  directory open a fresh description (`os.open(".", O_RDONLY | O_DIRECTORY,
+  dir_fd=fd)`). `os.dup` does not help — it is another descriptor onto the very
+  description being shared.
+- **A narrowed `mode` is an approval.** `write=True` is what the ask is *for*
+  and which picker chrome the human sees; the answer's `mode` is the
+  **effective** access they approved. A `request_file(write=True)` answered
+  `READ` is a file the human deliberately handed over read-only, not a failure.
+
+**A refusal is a value, not an exception.** `PowerboxRefusedEvent` is
+*returned* — a human declining to hand over a file is the system working, and an
+agent that raised on it would be treating the human as a fault. The refusal that
+*is* raised is the other one: `refused(designate_file, …)` on the grant, from
+the enforcement chokepoint, which answers whether this grant may ask at all and
+surfaces as the usual typed `GrantRefused` subclass. Keeping them apart is what
+lets a client tell "the human said no" (worth asking again) from "your grant
+expired" (not).
+
+**There is no client-side timeout, and none may be added.** The core bounds the
+wait on the deployment's own deadline and answers `timed_out`; a second timeout
+here would race it and could abandon a descriptor the core was about to deliver,
+leaking it for the connection's life. Nor should designation asks be pipelined:
+the protocol permits it, the reference core does not yet keep request-order
+pairing for them, and the refusal terminal carries no designation id to re-pair
+with — so this SDK's blocking one-ask-at-a-time shape is the shape to keep.
+
+Whether a deployment serves `designate.file` at all is a property of that
+deployment (it needs a picker). The reference core has served it since P2.6.6;
+a core without one answers the petition `unsupported`, which is a recoverable
+answer, not a dead socket.
 
 ## Test-vector sharing (decision)
 

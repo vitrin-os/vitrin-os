@@ -30,12 +30,13 @@ A row in the core's grant table:
 - **principal** — who. Authenticated at handshake, never asserted by the
   requester afterwards.
 - **resource** — what. A realm, or a specific surface within it.
-<!-- vitrin-verb-set: unserved-verbs = observe_cursor, designate_file, egress | count: three -->
+<!-- vitrin-verb-set: unserved-verbs = observe_cursor, egress | count: two -->
 - **verbs** — which actions. `observe`, `actuate.pointer`, `actuate.text`, the
-  two `layout.*` verbs and `realm.launch` (added at wire version 2) today; three
-  more are defined and refuse `unsupported` — `observe.cursor`,
-  `designate.file` (added at wire version 2, and unserved by every deployment
-  until the core-drawn file picker and its consent copy exist), and `egress`
+  two `layout.*` verbs, `realm.launch` (added at wire version 2) and
+  `designate.file` (added at wire version 2, served since the core-drawn file
+  picker landed — though no consent card yet says what approving it costs)
+  today; two
+  more are defined and refuse `unsupported` — `observe.cursor` and `egress`
   (added at P2.7.2, whose facet has landed and whose mediating proxy has
   not). Defining a
   verb before serving it is deliberate: it makes asking for one a recoverable

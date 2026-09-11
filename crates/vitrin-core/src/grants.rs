@@ -531,14 +531,13 @@ impl NetSelector {
 /// consequence in plain language, which is the whole of what "this core
 /// serves the verb" means.
 ///
-/// <!-- vitrin-verb-set: unserved-verbs = observe_cursor, designate_file, egress -->
-/// **Three stay out**, for three different missing mechanisms.
+/// <!-- vitrin-verb-set: unserved-verbs = observe_cursor, egress -->
+/// **Two stay out**, for two different missing mechanisms.
 /// `observe_cursor` (8) because per-principal cursor *delivery* is M2's, so
 /// serving the verb would promise a capture widened with a cursor this core
-/// does not have; `designate_file` (64) because no picker mints a descriptor
-/// (P2.6.6) and no consent copy names what approving it costs (P2.6.8);
-/// `egress` (128) because the out-of-core mediating proxy a
-/// connection would be made through does not exist. Both of the newer two
+/// does not have; `egress` (128) because the out-of-core mediating proxy a
+/// connection would be made through does not exist. `designate_file` (64) was
+/// the third until P2.6.6 landed the core-drawn picker. Both of the newer two
 /// have facets -- `vitrin_powerbox` and `vitrin_egress` -- and this doc named
 /// egress's missing facet as half its reason until it landed: a facet is a
 /// request to ask
@@ -547,27 +546,39 @@ impl NetSelector {
 /// is [`UNSERVED_VERB_BITS`], derived below, and `cargo xtask verb-sets
 /// --check` holds every surface that spells it out to this constant.
 ///
-/// **`designate_file` (64) joined the wire at P2.6.5 (issue #189) and is
-/// deliberately absent from this constant**, which is the whole of that
-/// issue's core-side deliverable, and `egress` (128) joined at P2.7.2 (issue
-/// #196) on identical terms. Each verb has a facet interface
-/// (`vitrin_powerbox`, `vitrin_egress`) whose messages issue #322 taught this
-/// core to dispatch, and no mechanism behind it: for the first, no picker
-/// mints a descriptor (P2.6.6) and no consent copy
-/// names what approving it costs (P2.6.8, Q13's rule); for the second, no
+/// **`designate_file` (64) joined this constant at P2.6.6 (issue #190),
+/// which is the change that gave it a mechanism.** It reached the wire at
+/// P2.6.5 (issue #189) and sat outside this set until a picker existed to
+/// mint a descriptor; the core-drawn picker
+/// ([`crate::picker`]) is that picker, and
+/// [`crate::enforcement::UseEnv::designate`] is the sink a deployment must
+/// install for the bit to do anything. **The bit alone still admits
+/// nothing**: a deployment whose sink refuses `Unavailable` -- one with no
+/// picker root it could open -- answers `internal` loudly rather than
+/// silently serving a verb with nothing behind it, and
+/// `a_designation_is_served_and_a_pickerless_deployment_still_refuses_loudly`
+/// pins both halves.
+///
+/// What it does **not** yet carry is P2.6.8's consent copy: no prompt names
+/// what approving `designate_file` costs, so a human approving one is
+/// approving a verb the card does not describe. That is a gap in the consent
+/// surface, not in this constant, and it is named here because this is where
+/// a reader asks "is this bit safe to grant".
+///
+/// **`egress` (128) is still deliberately absent**, on the terms
+/// `designate_file` used to share: it joined the wire at P2.7.2 (issue #196),
+/// its facet interface (`vitrin_egress`) dispatches since issue #322, and no
 /// proxy asks the chokepoint per connection (P2.7.3). **Dispatch is not
-/// authority, and #322 moved only the first**: a designation now reaches the
-/// chokepoint as [`crate::enforcement::UseKind::Designate`] and a connection
-/// as [`crate::enforcement::UseKind::Egress`], and both are refused there --
+/// authority**: a connection reaches the chokepoint as
+/// [`crate::enforcement::UseKind::Egress`] and is refused there --
 /// `not_granted` at the grant check, precisely because this constant omits
-/// both bits, and `internal` from the arm those two variants share, which is
-/// the unreachable guard against an unserved verb being admitted at all.
-/// Leaving both out means
-/// [`UNSERVED_VERB_BITS`] picks them up by derivation and
+/// the bit, and `internal` from its arm, which is the unreachable guard
+/// against an unserved verb being admitted at all. Leaving it out means
+/// [`UNSERVED_VERB_BITS`] picks it up by derivation and
 /// [`crate::petitions::PetitionRegistry::admit`] resolves every petition
-/// naming either `unsupported` **whole** -- so the failure mode if someone
-/// forgets the rest of E2.6 or E2.7 is a refusal, never a grant this core
-/// cannot enforce.
+/// naming it `unsupported` **whole** -- so the failure mode if someone
+/// forgets the rest of E2.7 is a refusal, never a grant this core cannot
+/// enforce.
 ///
 /// **Moving `realm_launch` in is the single largest widening this
 /// constant has taken**, and it is worth naming here rather than only at
@@ -607,7 +618,7 @@ impl NetSelector {
 /// then, from a client that is killed where the spec promises `unsupported`,
 /// is the expensive way. Flagged here rather than only in a plan document
 /// because this constant is where the fix has to land.
-pub(crate) const SERVED_VERB_BITS: u32 = 1 | 2 | 4 | 16 | 32 | 512;
+pub(crate) const SERVED_VERB_BITS: u32 = 1 | 2 | 4 | 16 | 32 | 64 | 512;
 
 /// The verb bits the IDL defines that this core does **not** serve. A
 /// petition naming any of these resolves `unsupported` -- whole, never
@@ -1607,24 +1618,33 @@ mod tests {
     // -- served vs. defined verbs ------------------------------------------
 
     #[test]
-    fn served_verb_bits_are_exactly_the_six_facet_verbs() {
+    fn served_verb_bits_are_exactly_the_seven_facet_verbs() {
         // Pinned to the generated constants, not to a literal, so a verb
         // that ever changed value would fail here rather than silently
         // widening what this core claims to enforce.
         //
-        // Six since WS-E.1.1 (issue #207): `realm_launch` joined the two
-        // layout verbs WS-E.1.4 added and the three original facet verbs.
-        // Each has an interface declaring it, a chokepoint arm exercising
-        // it and a consent-prompt line naming it. The defined verbs that
-        // stay out are whatever `UNSERVED_VERB_BITS` derives, and the
-        // sibling test is where that set is enumerated and held. This
-        // comment names no count of them on purpose: it said
+        // Seven since P2.6.6 (issue #190): `designate_file` joined the six
+        // WS-E.1.1 left, which were `realm_launch`, the two layout verbs
+        // WS-E.1.4 added and the three original facet verbs. Each has an
+        // interface declaring it and a chokepoint arm exercising it. The
+        // defined verbs that stay out are whatever `UNSERVED_VERB_BITS`
+        // derives, and the sibling test is where that set is enumerated and
+        // held.
+        //
+        // **`designate_file` is the one served verb with no consent-prompt
+        // line naming it**, and that is stated rather than left to be
+        // discovered: P2.6.8 owns the copy that says what approving it
+        // costs, and until it lands a human approving this verb reads a card
+        // that does not describe it. Every other entry here has one.
+        //
+        // This comment names no count of the unserved on purpose: it said
         // "`observe_cursor` is the one defined verb that stays out" and was
         // false from the moment P2.6.5 (issue #189) added a second, and
         // false again by one more the moment P2.7.2 (issue #196) added a
-        // third. **Both of those tasks left this constant untouched on
-        // purpose**: adding a bit to the IDL must not widen what this core
-        // claims to enforce.
+        // third. Both of those tasks left this constant untouched on
+        // purpose -- adding a bit to the IDL must not widen what this core
+        // claims to enforce -- and P2.6.6 moved one in only because it also
+        // shipped the mechanism behind it.
         assert_eq!(
             SERVED_VERB_BITS,
             (Verb::OBSERVE
@@ -1632,6 +1652,7 @@ mod tests {
                 | Verb::ACTUATE_TEXT
                 | Verb::LAYOUT_ARRANGE
                 | Verb::LAYOUT_FOCUS
+                | Verb::DESIGNATE_FILE
                 | Verb::REALM_LAUNCH)
                 .bits()
         );
@@ -1679,13 +1700,23 @@ mod tests {
         // bit on the wire with no enforcement behind it is exactly what
         // `unsupported` is for.
         //
+        // **`designate_file` left this list at P2.6.6 (issue #190)**, the
+        // second shrink for the reason `realm_launch` left at WS-E.1.1: the
+        // mechanism its refusal stood for now exists. The core-drawn picker
+        // ([`crate::picker`]) mints the descriptor and
+        // [`crate::enforcement::UseEnv::designate`] is the sink a deployment
+        // installs; the bit alone still admits nothing, which is what
+        // `enforcement`'s
+        // `a_designation_is_served_and_a_pickerless_deployment_still_refuses_loudly`
+        // holds.
+        //
         // A list, deliberately: this is a SET that has shrunk three times
-        // (D-018's two verbs, then `realm_launch` at WS-E.1.1) and grown
-        // twice, and will move again when cursor delivery, the picker and
-        // the egress proxy land. Collapsing it to a straight-line assertion
-        // would hide that shape and make the next movement a rewrite rather
-        // than an edit.
-        for verb in [Verb::OBSERVE_CURSOR, Verb::DESIGNATE_FILE, Verb::EGRESS] {
+        // (D-018's two verbs, then `realm_launch` at WS-E.1.1, then
+        // `designate_file` at P2.6.6) and grown twice, and will move again
+        // when cursor delivery and the egress proxy land. Collapsing it to a
+        // straight-line assertion would hide that shape and make the next
+        // movement a rewrite rather than an edit.
+        for verb in [Verb::OBSERVE_CURSOR, Verb::EGRESS] {
             assert!(
                 Verb::from_bits(verb.bits()).is_ok(),
                 "{verb:?} must decode: an out-of-range bit would be fatal, not `unsupported`"
@@ -1701,11 +1732,14 @@ mod tests {
         // from the list above. Asserted here rather than only in the
         // sibling test so the two halves of "moved from unserved to served"
         // are one failure when someone reverts half of it.
-        assert_eq!(
-            Verb::REALM_LAUNCH.bits() & SERVED_VERB_BITS,
-            Verb::REALM_LAUNCH.bits(),
-            "realm_launch must be served: WS-E.1.1 gave it a chokepoint arm and prompt copy"
-        );
+        for left in [Verb::REALM_LAUNCH, Verb::DESIGNATE_FILE] {
+            assert_eq!(
+                left.bits() & SERVED_VERB_BITS,
+                left.bits(),
+                "{left:?} must be served: the task that moved it out of this list gave it a \
+                 chokepoint arm and a mechanism behind that arm"
+            );
+        }
         // The two classifications partition the wire bitfield: a verb
         // appended to the IDL lands in one of them, never in neither.
         assert_eq!(SERVED_VERB_BITS | UNSERVED_VERB_BITS, Verb::VALID_MASK);

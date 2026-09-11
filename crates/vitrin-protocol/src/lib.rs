@@ -17,10 +17,16 @@
 //! - [`generated`] holds one module per protocol interface, produced by
 //!   `vitrin-scanner` from `protocol/vitrin-v0.xml`. Regenerate with
 //!   `cargo xtask codegen`; never hand-edit anything under `src/generated/`.
+//! - [`terminals`] holds hand-written frame builders for the three
+//!   designation messages, for two reasons its own docs give: the fd-bearing
+//!   pair cannot be built by a sender that must keep its one descriptor, and
+//!   `vitrin-core` is forbidden by its own single-enforcement-path census
+//!   from uttering the powerbox refusal event's type name.
 
 pub mod error;
 pub mod fixed;
 pub mod generated;
+pub mod terminals;
 pub mod wire;
 
 pub use error::DecodeError;

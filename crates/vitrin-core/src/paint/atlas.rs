@@ -1,0 +1,822 @@
+// SPDX-License-Identifier: MPL-2.0
+//! The picker's Japanese glyph source: a **pre-rasterized atlas**, not a font.
+//!
+//! [`super::text`] draws Latin, Greek and Cyrillic from the vendored vector
+//! face. That face carries **no kana and no Han at all** (measured by
+//! `the_vector_face_owns_none_of_the_atlas_alphabet` below), so a picker that
+//! draws Japanese filenames needs a second glyph source. This module is it.
+//!
+//! # Why an atlas rather than a subsetted CJK font
+//!
+//! A subsetted font was the obvious answer and is the wrong one here, on four
+//! counts — the first two are properties of *this* renderer, the last two are
+//! properties of the *pipeline* that has to keep the asset honest:
+//!
+//! 1. **Nothing here is ever drawn at another size.** The picker draws names
+//!    at exactly [`super::text::NAME_PX`], which is also the size
+//!    [`super::script::DENIED_APPEARANCE`] is measured at. A vector outline
+//!    buys scalability, and there is no second size to scale to.
+//! 2. **"No shaping" becomes a property of the file.** A font — subsetted or
+//!    not — can carry `GSUB`/`GPOS`; keeping them unused is then a promise
+//!    about the renderer, which is exactly the kind of promise this repository
+//!    keeps finding it has stopped keeping. This format has no table
+//!    directory at all, and [`validate`] proves the stronger statement:
+//!    **every byte of the file is header, index record, or coverage belonging
+//!    to exactly one glyph**, so there is no room in it for a shaping table.
+//!    That is checkable in CI, by two independent parsers (this one and
+//!    `crates/xtask/src/kana_atlas.rs`).
+//! 3. **No fontTools in the pipeline.** Subsetting means `pyftsubset`, which
+//!    is not installed on the machine this was authored on and would not be
+//!    on a CI runner either — a provenance step CI cannot re-run is a
+//!    provenance step nobody checks. Generating this atlas needs fontdue,
+//!    which is already in the graph.
+//! 4. **The parser it needs is 60 lines of bounds-checked slicing**, versus a
+//!    TrueType parser walking a second attacker-shaped format. (fontdue would
+//!    have parsed it, so this is a small win, but it is a win in the right
+//!    direction for a TCB.)
+//!
+//! What it costs, stated rather than implied: **658 011 bytes** — 3152 glyphs,
+//! 594 943 of them coverage, measured, not estimated — against the vector
+//! face's 410 820, and it is **single-size**, so a future surface wanting
+//! Japanese at another size must generate a second atlas rather than scale
+//! this one. Whether a subsetted font of the same 3152 glyphs would have been
+//! smaller was **not measured**: there is no subsetting tool on this machine
+//! to build one with, which is reason 3 above. No size claim is made in either
+//! direction.
+//!
+//! # Provenance
+//!
+//! The alphabet is declared in `assets/fonts/kana-atlas.codepoints` (that
+//! file's header states the rule and the re-runnable derivation), the atlas is
+//! generated from it by `cargo xtask kana-atlas`, and three checks hold it:
+//!
+//! | check | where | what it holds |
+//! |---|---|---|
+//! | structure + declared set | `cargo xtask kana-atlas --check` | the two files on disk agree, and the atlas tiles exactly |
+//! | structure + declared set + **digest** | this module's tests | the same, over the *embedded* constant, plus blake3 against `kana-atlas.provenance` |
+//! | byte length | [`ATLAS_LEN`] | a swapped file fails the **build** |
+//!
+//! The digest half lives here rather than in xtask because the hash function
+//! lives in this crate's dependency graph (blake3, already the recorder's) and
+//! not in xtask's, and no new dependency was going to be spent on restating it.
+//! The README beside the asset carries a **SHA-256** of the same bytes, which
+//! nothing in this repository computes — it is there so a reader can check the
+//! vendored file with `sha256sum` and no Rust at all.
+//!
+//! # Routing
+//!
+//! [`covers`] is a total function of the character and is **disjoint** from
+//! the vector face's coverage, which is what keeps [`super::text::Text`]'s
+//! `(char, size)` cache key single-sourced: no key can be claimed by both.
+//! Both directions are tested here.
+//!
+//! Nothing routes to this module yet: [`super::script::route`] still escapes
+//! kana and Han, because whether a codepoint is drawable is that module's call
+//! and not this one's. Wiring it is a one-line change there
+//! (`Route::Vector` when [`covers`] says so) and is deliberately left to the
+//! owner of that file.
+
+// Nothing on the drawing path reaches `covers`, `codepoints` or `validate`
+// until `script::route` starts sending kana here (see the Routing section
+// above) and the picker starts drawing names. The same allowance
+// `paint::script` takes for the same reason, and it comes off when the
+// picker lands.
+#![allow(dead_code)]
+
+use std::sync::OnceLock;
+
+/// The vendored atlas: 3152 glyphs at [`PX`], generated by
+/// `cargo xtask kana-atlas`. Digest and provenance in
+/// `assets/fonts/kana-atlas.provenance`.
+const ATLAS_BYTES: &[u8] = include_bytes!("../../assets/fonts/kana-atlas-14px.bin");
+
+/// Byte length of the vendored atlas, asserted at compile time below — the
+/// same tripwire [`super::text`] puts on the font file, for the same reason: a
+/// swapped or re-generated asset must fail the *build* rather than quietly
+/// move what the picker draws.
+const ATLAS_LEN: usize = 658_011;
+
+const _: () = assert!(
+    ATLAS_BYTES.len() == ATLAS_LEN,
+    "the vendored kana atlas changed; regenerate with `cargo xtask kana-atlas`, then update \
+     ATLAS_LEN and the digest in assets/fonts/kana-atlas.provenance"
+);
+
+/// The one size this atlas holds. Equal to [`super::text::NAME_PX`] — asserted
+/// at compile time, because an atlas at a size the picker does not draw at
+/// would silently serve nothing.
+pub(crate) const PX: f32 = 14.0;
+
+const _: () = assert!(
+    PX.to_bits() == super::text::NAME_PX.to_bits(),
+    "the atlas is rasterized at one size and it must be the size names are drawn at"
+);
+
+/// File magic. Includes the format version, so a format change is a parse
+/// failure rather than a misread field.
+const MAGIC: &[u8; 16] = b"VITRIN-ATLAS-01\n";
+
+/// Header: [`MAGIC`], then the size's `f32` bit pattern, the glyph count, and
+/// the coverage-blob length. All `u32` little-endian.
+const HEADER_LEN: usize = MAGIC.len() + 4 + 4 + 4;
+
+/// One index record: codepoint, blob offset, `w`, `h`, `xmin`, `ymin`, and the
+/// advance's `f32` bit pattern.
+///
+/// The advance is stored as raw `f32` bits rather than a fixed-point
+/// approximation so a drawn run is **bit-identical** to what the same face and
+/// rasterizer would have produced live: the pen is an `f32` accumulator, and a
+/// rounded advance would make measured and drawn text disagree by a fraction
+/// that accumulates across a name.
+const RECORD_LEN: usize = 4 + 4 + 2 + 2 + 2 + 2 + 4;
+
+/// One glyph out of the atlas: fontdue's metrics for it, and a borrow of its
+/// coverage rows inside the embedded constant.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Rendered<'a> {
+    pub xmin: i32,
+    pub ymin: i32,
+    pub width: usize,
+    pub height: usize,
+    pub advance: f32,
+    pub coverage: &'a [u8],
+}
+
+/// The parsed index: the record table and the coverage blob, both borrowed out
+/// of [`ATLAS_BYTES`].
+struct Atlas<'a> {
+    records: &'a [u8],
+    blob: &'a [u8],
+    count: usize,
+}
+
+/// The atlas, parsed once per process.
+///
+/// [`parse`] runs here and nothing else does: it holds the header's declared
+/// lengths against the file's actual length, which is what makes the index and
+/// blob slices safe to take. The stronger structural properties — ascending
+/// codepoints, exact tiling, in-block codepoints — are [`validate`]'s, and
+/// [`validate`] is run by `the_embedded_atlas_validates` over this same
+/// compile-time constant rather than at load. That split is deliberate and is
+/// the reason [`Atlas::find`]'s binary search is allowed to assume an ordering
+/// it does not itself re-check; it is stated here because "validated" would
+/// otherwise read as something this function does.
+///
+/// `expect` here is the same call the vector face's loader makes and rests on the
+/// same fact: the input is a compile-time constant of this binary, so a parse
+/// failure means the shipped artifact is malformed. There is no runtime
+/// condition, no configuration and no peer that can cause it, and no honest
+/// fallback (a picker that silently drew nothing where a filename's kanji
+/// were would be a designation surface showing something other than the name
+/// the human is choosing). `the_embedded_atlas_validates` makes it a test
+/// failure rather than a first-picker failure.
+fn atlas() -> &'static Atlas<'static> {
+    static ATLAS: OnceLock<Atlas<'static>> = OnceLock::new();
+    ATLAS.get_or_init(|| {
+        parse(ATLAS_BYTES)
+            .expect("the vendored kana atlas is a compile-time constant and must parse")
+    })
+}
+
+/// Parse the header and split the file into index and blob. Bounds-checked
+/// throughout; every failure is `None` rather than a panic, so the one place
+/// that turns a malformed atlas into a panic is [`atlas`] and it says why.
+fn parse(bytes: &[u8]) -> Option<Atlas<'_>> {
+    if bytes.len() < HEADER_LEN || &bytes[..MAGIC.len()] != MAGIC {
+        return None;
+    }
+    let px_bits = read_u32(bytes, MAGIC.len())?;
+    if px_bits != PX.to_bits() {
+        return None;
+    }
+    let count = read_u32(bytes, MAGIC.len() + 4)? as usize;
+    let blob_len = read_u32(bytes, MAGIC.len() + 8)? as usize;
+    let index_len = count.checked_mul(RECORD_LEN)?;
+    // Exact, not "at least": a file longer than its own declared contents has
+    // room in it for something nobody declared.
+    if HEADER_LEN.checked_add(index_len)?.checked_add(blob_len)? != bytes.len() {
+        return None;
+    }
+    Some(Atlas {
+        records: &bytes[HEADER_LEN..HEADER_LEN + index_len],
+        blob: &bytes[HEADER_LEN + index_len..],
+        count,
+    })
+}
+
+fn read_u32(bytes: &[u8], at: usize) -> Option<u32> {
+    let slice = bytes.get(at..at + 4)?;
+    Some(u32::from_le_bytes(slice.try_into().ok()?))
+}
+
+fn read_u16(bytes: &[u8], at: usize) -> Option<u16> {
+    let slice = bytes.get(at..at + 2)?;
+    Some(u16::from_le_bytes(slice.try_into().ok()?))
+}
+
+impl<'a> Atlas<'a> {
+    /// The `i`th record's codepoint, without decoding the rest of it.
+    fn codepoint_at(&self, i: usize) -> Option<u32> {
+        read_u32(self.records, i * RECORD_LEN)
+    }
+
+    /// Decode the `i`th record and borrow its coverage rows.
+    fn rendered_at(&self, i: usize) -> Option<Rendered<'a>> {
+        let at = i * RECORD_LEN;
+        let offset = read_u32(self.records, at + 4)? as usize;
+        let width = read_u16(self.records, at + 8)? as usize;
+        let height = read_u16(self.records, at + 10)? as usize;
+        let xmin = read_u16(self.records, at + 12)? as i16 as i32;
+        let ymin = read_u16(self.records, at + 14)? as i16 as i32;
+        let advance = f32::from_bits(read_u32(self.records, at + 16)?);
+        let len = width.checked_mul(height)?;
+        Some(Rendered {
+            xmin,
+            ymin,
+            width,
+            height,
+            advance,
+            coverage: self.blob.get(offset..offset.checked_add(len)?)?,
+        })
+    }
+
+    /// Index of `cp`, by binary search over the codepoint-ascending table.
+    fn find(&self, cp: u32) -> Option<usize> {
+        let (mut lo, mut hi) = (0usize, self.count);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            match self.codepoint_at(mid)?.cmp(&cp) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => return Some(mid),
+            }
+        }
+        None
+    }
+}
+
+/// The Unicode blocks the alphabet is drawn from. Checked before the binary
+/// search purely so the overwhelmingly common case — an ASCII character, on
+/// every existing trusted surface — costs one comparison rather than twelve.
+/// The declared set is a strict subset of these ranges;
+/// [`covers`] is what says whether a codepoint is actually in the atlas.
+const BLOCKS: [(u32, u32); 3] = [(0x3041, 0x309F), (0x30A0, 0x30FF), (0x4E00, 0x9F8D)];
+
+/// Whether the atlas holds a glyph for `ch`.
+///
+/// Total, and a function of the character alone — the atlas is a compile-time
+/// constant, so this answer cannot vary with configuration, machine or
+/// process state. That is what lets [`super::script::route`] consult it
+/// without becoming machine-dependent.
+pub(crate) fn covers(ch: char) -> bool {
+    let cp = ch as u32;
+    if !BLOCKS.iter().any(|&(lo, hi)| (lo..=hi).contains(&cp)) {
+        return false;
+    }
+    atlas().find(cp).is_some()
+}
+
+/// The atlas's glyph for `ch` at `px`, or `None`.
+///
+/// `px` must be [`PX`] **bit-for-bit**: there is exactly one size in the file,
+/// and silently serving a 14 px bitmap to a caller that asked for 19 px would
+/// be measured-and-drawn disagreement of the worst kind — the text would be
+/// the wrong size and the layout would not know.
+pub(crate) fn glyph(ch: char, px: f32) -> Option<Rendered<'static>> {
+    if px.to_bits() != PX.to_bits() {
+        return None;
+    }
+    let cp = ch as u32;
+    if !BLOCKS.iter().any(|&(lo, hi)| (lo..=hi).contains(&cp)) {
+        return None;
+    }
+    let atlas = atlas();
+    atlas.rendered_at(atlas.find(cp)?)
+}
+
+/// Every codepoint in the atlas, ascending. Used by the checks, and by nothing
+/// on the drawing path.
+pub(crate) fn codepoints() -> Vec<char> {
+    let atlas = atlas();
+    (0..atlas.count)
+        .filter_map(|i| atlas.codepoint_at(i).and_then(char::from_u32))
+        .collect()
+}
+
+/// The full structural check, over any candidate atlas bytes.
+///
+/// Returns the list of failures; empty means the file holds every property the
+/// format claims. Three of them are the load-bearing ones:
+///
+/// * **strictly ascending codepoints** — so [`Atlas::find`]'s binary search is
+///   correct, and so no codepoint appears twice with two different bitmaps;
+/// * **exact tiling** — record `i`'s coverage begins where record `i-1`'s
+///   ended, and the last one ends at the end of the blob. Combined with the
+///   exact-length check in [`parse`], every byte of the file is accounted for
+///   by a glyph or by the header, which is the form the "no shaping tables"
+///   claim takes here: there is nowhere to put one.
+/// * **in-block codepoints** — nothing outside [`BLOCKS`], so the disjointness
+///   with the vector face is a property of the file and not only of the
+///   generator that wrote it.
+pub(crate) fn validate(bytes: &[u8]) -> Vec<String> {
+    let mut failures = Vec::new();
+    let Some(atlas) = parse(bytes) else {
+        return vec![
+            "the atlas does not parse: bad magic, wrong size, or a declared length that does \
+             not account for every byte of the file"
+                .to_string(),
+        ];
+    };
+    if atlas.count == 0 {
+        failures.push("the atlas holds no glyphs at all".to_string());
+        return failures;
+    }
+    let mut expected_offset = 0usize;
+    let mut previous: Option<u32> = None;
+    for i in 0..atlas.count {
+        let Some(cp) = atlas.codepoint_at(i) else {
+            failures.push(format!("record {i}: truncated"));
+            break;
+        };
+        if let Some(prev) = previous {
+            if cp <= prev {
+                failures.push(format!(
+                    "record {i}: U+{cp:04X} does not follow U+{prev:04X} — the index must be \
+                     strictly ascending"
+                ));
+            }
+        }
+        previous = Some(cp);
+        if char::from_u32(cp).is_none() {
+            failures.push(format!("record {i}: U+{cp:04X} is not a scalar value"));
+        }
+        if !BLOCKS.iter().any(|&(lo, hi)| (lo..=hi).contains(&cp)) {
+            failures.push(format!(
+                "record {i}: U+{cp:04X} is outside the declared blocks"
+            ));
+        }
+        let at = i * RECORD_LEN;
+        let (Some(offset), Some(w), Some(h)) = (
+            read_u32(atlas.records, at + 4),
+            read_u16(atlas.records, at + 8),
+            read_u16(atlas.records, at + 10),
+        ) else {
+            failures.push(format!("record {i}: truncated"));
+            break;
+        };
+        if offset as usize != expected_offset {
+            failures.push(format!(
+                "record {i} (U+{cp:04X}): coverage starts at {offset}, but the previous glyph \
+                 ended at {expected_offset} — the blob must tile exactly, with no gap"
+            ));
+        }
+        expected_offset = offset as usize + w as usize * h as usize;
+        match read_u32(atlas.records, at + 16).map(f32::from_bits) {
+            Some(advance) if advance.is_finite() && advance >= 0.0 => {}
+            other => failures.push(format!(
+                "record {i} (U+{cp:04X}): advance {other:?} is not a usable width"
+            )),
+        }
+    }
+    if expected_offset != atlas.blob.len() {
+        failures.push(format!(
+            "the coverage blob is {} bytes but the index accounts for {expected_offset} — a \
+             byte no glyph owns is a byte something else could live in",
+            atlas.blob.len()
+        ));
+    }
+    failures
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::paint::text::Text;
+
+    /// Where the declared alphabet lives, and where the atlas and its
+    /// provenance record do. Read as files (not `include_str!`) by the
+    /// regeneration path, which has to write them.
+    const CODEPOINTS_PATH: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/assets/fonts/kana-atlas.codepoints"
+    );
+    const ATLAS_PATH: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/assets/fonts/kana-atlas-14px.bin"
+    );
+    const PROVENANCE_PATH: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/assets/fonts/kana-atlas.provenance"
+    );
+
+    /// The source face `cargo xtask kana-atlas` rasterizes from, unless
+    /// `VITRIN_KANA_ATLAS_SOURCE` names another. A collection; index 0 is the
+    /// JP face, and the generator asserts that by name.
+    const DEFAULT_SOURCE: &str = "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc";
+    const SOURCE_FACE_NAME: &str = "Noto Sans CJK JP";
+
+    /// Parse the declared alphabet. Shared by the generator and the checks, so
+    /// the two can never disagree about what was declared.
+    fn declared() -> Vec<char> {
+        let text = std::fs::read_to_string(CODEPOINTS_PATH).expect("the declared alphabet exists");
+        let mut out = Vec::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let hex = line
+                .strip_prefix("U+")
+                .unwrap_or_else(|| panic!("{line:?}: every entry is `U+XXXX`"));
+            let cp = u32::from_str_radix(hex, 16).expect("hexadecimal codepoint");
+            out.push(char::from_u32(cp).expect("a scalar value"));
+        }
+        out
+    }
+
+    /// The atlas is regenerated by `cargo xtask kana-atlas`, which drives this
+    /// test with `VITRIN_REGEN_KANA_ATLAS=1` — the same shape `cargo xtask
+    /// bless` uses for the pixel goldens, and for the same reason: the one
+    /// documented entry point produces a reviewable `git diff`.
+    ///
+    /// Regeneration needs the multi-megabyte source face, which CI does not
+    /// have; the checks below need only the two vendored files, which is why
+    /// the *properties* are what CI holds and the *bytes* are produced by
+    /// hand. Regenerating deliberately leaves the tree red until [`ATLAS_LEN`]
+    /// is updated to match, because a compile-time length assert that a
+    /// generator quietly rewrote would not be a tripwire.
+    #[test]
+    fn the_atlas_is_regenerated_only_when_asked() {
+        if std::env::var_os("VITRIN_REGEN_KANA_ATLAS").is_none() {
+            // Not a skip: the checks this file exists for are the tests below,
+            // and they run unconditionally. This test's whole subject is the
+            // generator, which is a human's deliberate act.
+            //
+            // What it asserts instead is the generator's *inputs*, which are
+            // read from disk rather than embedded and can therefore go missing
+            // without the build noticing: `include_bytes!` already proves the
+            // .bin is there, so asserting that alone would be a test that
+            // cannot fail.
+            assert!(
+                std::path::Path::new(ATLAS_PATH).exists(),
+                "the vendored atlas must exist even when nothing is regenerating it"
+            );
+            assert!(
+                !declared().is_empty(),
+                "the declared alphabet must be readable: it is what regeneration reads, and \
+                 what every check below compares the atlas against"
+            );
+            assert!(
+                std::path::Path::new(PROVENANCE_PATH).exists(),
+                "the provenance record must exist: an asset CI cannot regenerate is held by \
+                 that file and nothing else"
+            );
+        } else {
+            regenerate();
+        }
+    }
+
+    /// Rasterize the declared alphabet out of the source face and write both
+    /// the atlas and its provenance record.
+    fn regenerate() {
+        use fontdue::{Font, FontSettings};
+
+        let source = std::env::var("VITRIN_KANA_ATLAS_SOURCE")
+            .unwrap_or_else(|_| DEFAULT_SOURCE.to_string());
+        let bytes = std::fs::read(&source)
+            .unwrap_or_else(|e| panic!("reading the source face {source}: {e}"));
+        let font = Font::from_bytes(
+            bytes.as_slice(),
+            FontSettings {
+                // Index 0 of the Noto CJK collection is the JP face; the name
+                // assert below is what actually holds it, because a collection
+                // could be reordered upstream without changing its file name.
+                collection_index: 0,
+                // The same geometry scale the vector face is built with, so
+                // the two sources are preprocessed identically.
+                scale: 19.0,
+                load_substitutions: false,
+            },
+        )
+        .expect("the source face parses");
+        assert_eq!(
+            font.name(),
+            Some(SOURCE_FACE_NAME),
+            "the atlas is generated from {SOURCE_FACE_NAME}; another face would move every \
+             Japanese pixel with no diff to review"
+        );
+
+        let declared = declared();
+        let mut index = Vec::with_capacity(declared.len() * RECORD_LEN);
+        let mut blob: Vec<u8> = Vec::new();
+        for &ch in &declared {
+            assert!(
+                font.lookup_glyph_index(ch) != 0,
+                "the source face has no glyph for U+{:04X}; the declared alphabet and the face \
+                 disagree, and a missing glyph must not become a blank one",
+                ch as u32
+            );
+            let (metrics, coverage) = font.rasterize(ch, PX);
+            assert_eq!(
+                coverage.len(),
+                metrics.width * metrics.height,
+                "fontdue's coverage is width*height bytes"
+            );
+            let w = u16::try_from(metrics.width).expect("a 14 px glyph is not 65536 wide");
+            let h = u16::try_from(metrics.height).expect("a 14 px glyph is not 65536 tall");
+            let xmin = i16::try_from(metrics.xmin).expect("bearing fits i16");
+            let ymin = i16::try_from(metrics.ymin).expect("bearing fits i16");
+            index.extend_from_slice(&(ch as u32).to_le_bytes());
+            index.extend_from_slice(&(blob.len() as u32).to_le_bytes());
+            index.extend_from_slice(&w.to_le_bytes());
+            index.extend_from_slice(&h.to_le_bytes());
+            index.extend_from_slice(&xmin.to_le_bytes());
+            index.extend_from_slice(&ymin.to_le_bytes());
+            index.extend_from_slice(&metrics.advance_width.to_bits().to_le_bytes());
+            blob.extend_from_slice(&coverage);
+        }
+
+        let mut out = Vec::with_capacity(HEADER_LEN + index.len() + blob.len());
+        out.extend_from_slice(MAGIC);
+        out.extend_from_slice(&PX.to_bits().to_le_bytes());
+        out.extend_from_slice(&(declared.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(blob.len() as u32).to_le_bytes());
+        out.extend_from_slice(&index);
+        out.extend_from_slice(&blob);
+
+        std::fs::write(ATLAS_PATH, &out).expect("the atlas is writable");
+        let provenance = format!(
+            "# GENERATED by `cargo xtask kana-atlas`. Regenerating needs the source face named\n\
+             # below; CI has neither it nor fontTools, and holds the atlas by the properties in\n\
+             # crates/vitrin-core/src/paint/atlas.rs instead. See the README beside this file.\n\
+             format VITRIN-ATLAS-01\n\
+             px {PX}\n\
+             glyphs {}\n\
+             bytes {}\n\
+             coverage-bytes {}\n\
+             blake3 {}\n\
+             source-face {SOURCE_FACE_NAME}\n\
+             source-blake3 {}\n",
+            declared.len(),
+            out.len(),
+            blob.len(),
+            blake3::hash(&out).to_hex(),
+            blake3::hash(&bytes).to_hex(),
+        );
+        std::fs::write(PROVENANCE_PATH, provenance).expect("the provenance record is writable");
+        eprintln!(
+            "regenerated {ATLAS_PATH}: {} glyphs, {} bytes. Update ATLAS_LEN in atlas.rs and \
+             the sha256 line in the README, then review the diff.",
+            declared.len(),
+            out.len()
+        );
+    }
+
+    /// One field of the provenance record.
+    fn provenance(key: &str) -> String {
+        let text = std::fs::read_to_string(PROVENANCE_PATH).expect("the provenance record exists");
+        text.lines()
+            .filter(|l| !l.starts_with('#'))
+            .find_map(|l| l.strip_prefix(key)?.strip_prefix(' ').map(str::to_string))
+            .unwrap_or_else(|| panic!("the provenance record states `{key}`"))
+    }
+
+    #[test]
+    fn the_embedded_atlas_validates() {
+        let failures = validate(ATLAS_BYTES);
+        assert!(
+            failures.is_empty(),
+            "the vendored atlas is malformed:\n  {}",
+            failures.join("\n  ")
+        );
+    }
+
+    /// The digest half of the provenance check — the tripwire against the
+    /// `.bin` being swapped on its own. Swapping both files is still possible
+    /// and is a visible diff on a seven-line text file, which is the bound.
+    #[test]
+    fn the_embedded_atlas_is_the_file_its_provenance_names() {
+        assert_eq!(
+            blake3::hash(ATLAS_BYTES).to_hex().to_string(),
+            provenance("blake3"),
+            "the vendored atlas is not the file kana-atlas.provenance describes"
+        );
+        assert_eq!(ATLAS_BYTES.len().to_string(), provenance("bytes"));
+        assert_eq!(codepoints().len().to_string(), provenance("glyphs"));
+    }
+
+    /// The declared set, in both directions — a codepoint in the atlas that
+    /// nobody declared is as much a defect as a declared one that is missing.
+    #[test]
+    fn the_atlas_covers_exactly_the_declared_codepoints() {
+        let declared = declared();
+        assert_eq!(
+            codepoints(),
+            declared,
+            "the atlas and assets/fonts/kana-atlas.codepoints disagree"
+        );
+        // And the declared file is itself well-formed: ascending, unique, and
+        // the size its own header claims.
+        assert!(
+            declared.windows(2).all(|w| w[0] < w[1]),
+            "the declared alphabet must be strictly ascending"
+        );
+        assert_eq!(
+            declared.len(),
+            3152,
+            "187 kana + 2965 JIS X 0208 level-1 kanji"
+        );
+    }
+
+    /// **The appearance closure over the widened alphabet.**
+    ///
+    /// [`super::script::DENIED_APPEARANCE`] is the measured list of codepoints
+    /// denied because another codepoint *of the same group* rasterizes
+    /// identically at [`PX`], and its own test computes that closure over
+    /// `U+0020..=U+04FF` — the vector face's range. Adding 3152 glyphs to what
+    /// this renderer can draw extends the domain that closure has to hold
+    /// over, and nothing else in the tree would have noticed.
+    ///
+    /// What is measured here is the **atlas's** contribution to that closure,
+    /// and only that: partition the union of both alphabets by the same
+    /// signature the table uses (coverage bytes, dimensions, advance in
+    /// 1/64ths) and demand that no class holding an atlas glyph hold anything
+    /// else. Measured today: **zero** such classes — no two kanji, no kanji
+    /// and a Latin letter — so the atlas adds no rows to `DENIED_APPEARANCE`,
+    /// and this test is what will say otherwise after a regeneration.
+    ///
+    /// Face-only classes are deliberately *not* asserted on. They exist and
+    /// are fine: `X`/`Χ`/`Х` collide across Latin, Greek and Cyrillic, and the
+    /// mixed-script rule already transcribes a name that carries two groups.
+    /// Judging those needs the group rule, which is `script`'s own test's job
+    /// — restating it here would be a second copy to keep in step, and the
+    /// first version of this test did exactly that and failed on `X`.
+    #[test]
+    fn the_atlas_adds_no_appearance_collisions_at_name_px() {
+        let mut text = Text::new();
+        let mut classes: std::collections::HashMap<(Vec<u8>, usize, usize, u32), Vec<String>> =
+            std::collections::HashMap::new();
+        for cp in 0x20u32..=0x4FF {
+            let Some(ch) = char::from_u32(cp) else {
+                continue;
+            };
+            if crate::paint::script::route(ch) != crate::paint::script::Route::Vector {
+                continue;
+            }
+            let Some(signature) = text.raster_signature_for_test(ch, PX) else {
+                continue;
+            };
+            classes
+                .entry(signature)
+                .or_default()
+                .push(format!("face U+{cp:04X}"));
+        }
+        for ch in codepoints() {
+            let g = glyph(ch, PX).expect("every declared codepoint resolves");
+            classes
+                .entry((
+                    g.coverage.to_vec(),
+                    g.width,
+                    g.height,
+                    (g.advance * 64.0).round() as u32,
+                ))
+                .or_default()
+                .push(format!("atlas U+{:04X}", ch as u32));
+        }
+        let collisions: Vec<&Vec<String>> = classes
+            .values()
+            .filter(|members| members.len() > 1 && members.iter().any(|m| m.starts_with("atlas")))
+            .collect();
+        assert!(
+            collisions.is_empty(),
+            "atlas glyphs that rasterize identically to something else at {PX}px: \
+             {collisions:?}. Each class is a pair of filenames that would render to the same \
+             pixels, which is what paint::script::DENIED_APPEARANCE exists to deny — extend \
+             that table rather than relaxing this test."
+        );
+    }
+
+    /// **The disjointness that keeps the glyph cache single-sourced.**
+    ///
+    /// The cache key is `(char, size)`; two sources claiming one key would
+    /// make what is drawn depend on which arm ran first. Both directions:
+    /// nothing the atlas holds is in the vector face, and nothing
+    /// [`super::super::script::route`] sends to the face is in the atlas.
+    #[test]
+    fn the_vector_face_owns_none_of_the_atlas_alphabet() {
+        for ch in codepoints() {
+            assert!(
+                !Text::vector_face_has_glyph_for_test(ch),
+                "the vector face has a glyph for U+{:04X}, which the atlas also claims",
+                ch as u32
+            );
+        }
+        for cp in 0x20u32..=0x4FF {
+            let Some(ch) = char::from_u32(cp) else {
+                continue;
+            };
+            if crate::paint::script::route(ch) == crate::paint::script::Route::Vector {
+                assert!(
+                    !covers(ch),
+                    "U+{cp:04X} routes to the vector face and is also in the atlas"
+                );
+            }
+        }
+    }
+
+    /// Every record in the atlas is shaped like a glyph: its coverage is
+    /// exactly `width * height` bytes, it has a positive advance, and the
+    /// alphabet as a whole carries ink.
+    ///
+    /// **This does not compare against the source face**, and cannot: the
+    /// 19.5 MB `.ttc` is not in this repository and is not on a CI runner, so
+    /// there is nothing here to rasterize a second time and diff against. What
+    /// holds the bytes to that face is the digest pair in
+    /// `kana-atlas.provenance` (`source-blake3` names the face,
+    /// `blake3` names what came out of it) plus
+    /// `the_embedded_atlas_is_the_file_its_provenance_names`. Said explicitly
+    /// because an earlier version of this comment claimed a source comparison
+    /// that no line of the body performs, which is the exact shape of defect
+    /// this module's other checks are written to avoid.
+    #[test]
+    fn atlas_glyphs_are_shaped_like_glyphs() {
+        let mut inked = 0usize;
+        for ch in codepoints() {
+            let g = glyph(ch, PX).expect("every declared codepoint resolves");
+            assert_eq!(g.coverage.len(), g.width * g.height);
+            assert!(g.advance > 0.0, "U+{:04X} has no advance", ch as u32);
+            if g.coverage.iter().any(|&a| a != 0) {
+                inked += 1;
+            }
+        }
+        // Not "every glyph inks": U+3000-class blanks are not in this
+        // alphabet, but asserting the whole set inks would be a claim about
+        // the face rather than about the file. A large majority is the honest
+        // form.
+        assert!(
+            inked * 100 / codepoints().len() >= 99,
+            "only {inked} of {} atlas glyphs carry any ink",
+            codepoints().len()
+        );
+    }
+
+    /// The size gate: there is one size in the file and asking for another
+    /// must fail rather than silently hand back the wrong one.
+    #[test]
+    fn the_atlas_serves_exactly_one_size() {
+        let ch = 'あ';
+        assert!(glyph(ch, PX).is_some());
+        assert!(glyph(ch, 19.0).is_none());
+        assert!(glyph(ch, 13.999_999).is_none());
+        // `covers` is about the character, not the size — it is what a router
+        // consults, and a router has no size in hand.
+        assert!(covers(ch));
+        assert!(!covers('a'));
+        assert!(
+            !covers('\u{3099}'),
+            "combining marks are deliberately absent"
+        );
+    }
+
+    /// A malformed atlas is caught rather than half-read. The mutations are
+    /// the three the format is shaped to make impossible.
+    #[test]
+    fn validate_rejects_the_shapes_the_format_forbids() {
+        // A file with room in it for something undeclared.
+        let mut padded = ATLAS_BYTES.to_vec();
+        padded.push(0);
+        assert!(
+            !validate(&padded).is_empty(),
+            "trailing bytes must be caught"
+        );
+
+        // A wrong magic.
+        let mut wrong = ATLAS_BYTES.to_vec();
+        wrong[0] = b'X';
+        assert!(!validate(&wrong).is_empty(), "bad magic must be caught");
+
+        // A gap between two glyphs' coverage: bump the second record's offset.
+        let mut gapped = ATLAS_BYTES.to_vec();
+        let at = HEADER_LEN + RECORD_LEN + 4;
+        gapped[at..at + 4].copy_from_slice(&1u32.to_le_bytes());
+        let failures = validate(&gapped);
+        assert!(
+            failures.iter().any(|f| f.contains("tile exactly")),
+            "a gap in the coverage blob must be caught, got {failures:?}"
+        );
+
+        // A codepoint out of order: swap the first two records' codepoints.
+        let mut unsorted = ATLAS_BYTES.to_vec();
+        let (a, b) = (HEADER_LEN, HEADER_LEN + RECORD_LEN);
+        let first: [u8; 4] = unsorted[a..a + 4].try_into().expect("4 bytes");
+        let second: [u8; 4] = unsorted[b..b + 4].try_into().expect("4 bytes");
+        unsorted[a..a + 4].copy_from_slice(&second);
+        unsorted[b..b + 4].copy_from_slice(&first);
+        assert!(
+            validate(&unsorted)
+                .iter()
+                .any(|f| f.contains("strictly ascending")),
+            "an unsorted index must be caught: the binary search depends on it"
+        );
+    }
+}

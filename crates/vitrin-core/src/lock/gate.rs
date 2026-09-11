@@ -477,8 +477,36 @@ impl LockScreen {
     /// second thing to keep in step. The cost is that a completely idle session
     /// raises on the next event the loop wakes for; the session's own sweep
     /// timer bounds that.
-    pub fn tick(&mut self, now: Instant) -> bool {
+    ///
+    /// # `held_by_picker` (P2.6.6, issue #190, decision 6)
+    ///
+    /// A raised file picker holds the idle lock off, because locking a human
+    /// out mid-choice would abandon a designation they were in the middle of
+    /// making. It is a **parameter**, on
+    /// [`crate::backend::blank::SessionActivity::tick`]'s precedent and for
+    /// its reason: the caller
+    /// ([`crate::session::service_lock_round`]) recomputes it from live
+    /// records every round, so it can never answer stale, and a field would
+    /// be derived state stored in the state machine.
+    ///
+    /// **This is emphatically not the idle-inhibit hole.** An app's
+    /// `idle_inhibit` holds the blank and never this, because an app that
+    /// could suppress a security control could disable it (D-033(1),
+    /// `an_idle_inhibit_holds_the_blank_and_not_the_lock`). This term comes
+    /// from the *core's own* card, is bounded by the designation ledger's
+    /// deadline, and no confined app can raise one — only an admitted
+    /// `vitrin_powerbox` ask can, which means a human already approved a
+    /// `designate_file` grant.
+    pub fn tick(&mut self, now: Instant, held_by_picker: bool) -> bool {
         if self.locked.is_some() {
+            return false;
+        }
+        if held_by_picker {
+            // Note that this does NOT touch the activity clock: the countdown
+            // resumes from where it was the moment the picker comes down,
+            // rather than restarting. A designation the human ignored for
+            // eighty-nine seconds must not buy the session a fresh idle
+            // timeout.
             return false;
         }
         // The seat is somebody else's right now (D-030(7)). Time the human
@@ -862,9 +890,9 @@ mod tests {
     fn an_idle_session_locks_itself_and_a_busy_one_does_not() {
         let t0 = Instant::now();
         let mut s = screen(Some(Duration::from_secs(60)), t0);
-        assert!(!s.tick(t0 + Duration::from_secs(59)));
+        assert!(!s.tick(t0 + Duration::from_secs(59), false));
         assert!(!s.is_locked());
-        assert!(s.tick(t0 + Duration::from_secs(60)));
+        assert!(s.tick(t0 + Duration::from_secs(60), false));
         assert!(s.is_locked());
         assert_eq!(s.cause(), Some(LockCause::Idle));
         assert_eq!(
@@ -877,8 +905,8 @@ mod tests {
         // Physical input pushes the deadline out.
         let mut s = screen(Some(Duration::from_secs(60)), t0);
         s.judge(&press(KEYSYM_RETURN), t0 + Duration::from_secs(59));
-        assert!(!s.tick(t0 + Duration::from_secs(118)));
-        assert!(s.tick(t0 + Duration::from_secs(119)));
+        assert!(!s.tick(t0 + Duration::from_secs(118), false));
+        assert!(s.tick(t0 + Duration::from_secs(119), false));
     }
 
     #[test]
@@ -899,7 +927,7 @@ mod tests {
                 "an agent's admitted actuation is the chokepoint's business"
             );
         }
-        assert!(s.tick(t0 + Duration::from_secs(60)));
+        assert!(s.tick(t0 + Duration::from_secs(60), false));
     }
 
     /// **Switching to another VT does not lock the session** (D-030(7)).
@@ -927,7 +955,7 @@ mod tests {
         s.set_seat_absent(true, t0 + Duration::from_secs(1));
         // Well past the deadline, and past any plausible absence.
         assert!(
-            !s.tick(t0 + Duration::from_secs(8 * 60 * 60)),
+            !s.tick(t0 + Duration::from_secs(8 * 60 * 60), false),
             "a session must not lock itself while the human is on another VT: nobody could see \
              it happen, and they would come back to a prompt they did not ask for"
         );
@@ -938,10 +966,10 @@ mod tests {
         let back = t0 + Duration::from_secs(8 * 60 * 60);
         s.set_seat_absent(false, back);
         assert!(
-            !s.tick(back + Duration::from_secs(59)),
+            !s.tick(back + Duration::from_secs(59), false),
             "the countdown must restart from the return, not resume mid-way"
         );
-        assert!(s.tick(back + Duration::from_secs(60)));
+        assert!(s.tick(back + Duration::from_secs(60), false));
         assert_eq!(s.cause(), Some(LockCause::Idle));
     }
 
@@ -963,7 +991,7 @@ mod tests {
         ] {
             let t0 = Instant::now();
             let mut s = screen_with_policy(Some(Duration::from_secs(60)), t0, policy);
-            assert!(s.tick(t0 + Duration::from_secs(60)));
+            assert!(s.tick(t0 + Duration::from_secs(60), false));
             assert!(s.is_locked());
             // The cause the human's absence raised, before any seat event.
             assert_eq!(s.cause(), Some(LockCause::Idle));
@@ -1057,14 +1085,14 @@ mod tests {
         let mut long = screen_with_policy(Some(idle), t0, SeatChangePolicy::Idle);
         long.set_seat_absent(true, t0 + Duration::from_secs(1));
         assert!(
-            !long.tick(t0 + Duration::from_secs(8 * 60 * 60)),
+            !long.tick(t0 + Duration::from_secs(8 * 60 * 60), false),
             "still not DURING the absence: the raise the human cannot watch is the one D-030(2) \
              refused, and this policy does not bring it back"
         );
         let back = t0 + Duration::from_secs(8 * 60 * 60);
         long.set_seat_absent(false, back);
         assert!(
-            long.tick(back),
+            long.tick(back, false),
             "the first round after the return must find the countdown already spent"
         );
         assert_eq!(long.cause(), Some(LockCause::Idle));
@@ -1075,15 +1103,15 @@ mod tests {
         let mut short = screen_with_policy(Some(idle), t0, SeatChangePolicy::Idle);
         short.set_seat_absent(true, t0);
         short.set_seat_absent(false, t0 + Duration::from_secs(30));
-        assert!(!short.tick(t0 + Duration::from_secs(30)));
+        assert!(!short.tick(t0 + Duration::from_secs(30), false));
         short.set_seat_absent(true, t0 + Duration::from_secs(30));
         short.set_seat_absent(false, t0 + Duration::from_secs(50));
         assert!(
-            !short.tick(t0 + Duration::from_secs(59)),
+            !short.tick(t0 + Duration::from_secs(59), false),
             "50s of absence and 9s at the keyboard is 59s, and the timeout is 60"
         );
         assert!(
-            short.tick(t0 + Duration::from_secs(60)),
+            short.tick(t0 + Duration::from_secs(60), false),
             "two absences must ADD, not overwrite: a session that forgave the first one every \
              time it was switched away from again would never lock"
         );
@@ -1127,7 +1155,7 @@ mod tests {
             crate::session::note_seat_presence(&screen, true);
             crate::session::note_seat_presence(&screen, false);
             assert_eq!(
-                screen.borrow_mut().tick(Instant::now()),
+                screen.borrow_mut().tick(Instant::now(), false),
                 expected,
                 "{}: the ten minutes this session spent on another VT must be charged to the \
                  countdown under `idle` and forgiven under `never`, and the instant that decides \
@@ -1160,11 +1188,11 @@ mod tests {
         // One keystroke, before the round that would have locked the screen.
         s.judge(&press(KEYSYM_RETURN), back);
         assert!(
-            !s.tick(back + Duration::from_secs(59)),
+            !s.tick(back + Duration::from_secs(59), false),
             "the human is here; the absence is spent and the countdown starts over"
         );
         assert!(
-            s.tick(back + Duration::from_secs(60)),
+            s.tick(back + Duration::from_secs(60), false),
             "and it is the ordinary countdown afterwards, not a disabled one"
         );
     }
@@ -1186,14 +1214,14 @@ mod tests {
             screen_with_policy(Some(idle), t0, SeatChangePolicy::Never),
         ] {
             s.set_seat_absent(true, t0 + Duration::from_secs(1));
-            assert!(!s.tick(t0 + Duration::from_secs(8 * 60 * 60)));
+            assert!(!s.tick(t0 + Duration::from_secs(8 * 60 * 60), false));
             let back = t0 + Duration::from_secs(8 * 60 * 60);
             s.set_seat_absent(false, back);
             assert!(
-                !s.tick(back + Duration::from_secs(59)),
+                !s.tick(back + Duration::from_secs(59), false),
                 "the countdown restarts from the return under the default, named or not"
             );
-            assert!(s.tick(back + Duration::from_secs(60)));
+            assert!(s.tick(back + Duration::from_secs(60), false));
             assert_eq!(s.cause(), Some(LockCause::Idle));
         }
     }
@@ -1242,7 +1270,7 @@ mod tests {
     fn no_idle_timeout_means_no_idle_raise_however_long_the_session_sits() {
         let t0 = Instant::now();
         let mut s = screen(None, t0);
-        assert!(!s.tick(t0 + Duration::from_secs(86_400)));
+        assert!(!s.tick(t0 + Duration::from_secs(86_400), false));
         assert!(!s.is_locked());
     }
 
@@ -2299,11 +2327,11 @@ mod tests {
             "idle BLANKS, it does not lock: an unlocked session behind a dark screen is the \
              owner's decision and is published, not softened"
         );
-        assert!(!s.tick(t0 + Duration::from_secs(599)));
+        assert!(!s.tick(t0 + Duration::from_secs(599), false));
 
         // ...and the lock still fires at 600, behind the dark screen.
         assert!(
-            s.tick(t0 + Duration::from_secs(600)),
+            s.tick(t0 + Duration::from_secs(600), false),
             "a dark screen must not freeze the idle lock, or `--blank-idle 300 --lock-idle \
              600` silently never locks"
         );
@@ -2360,7 +2388,7 @@ mod tests {
         // ...and the lock fires at 600 regardless. This is the assertion the
         // whole feature is bounded by.
         assert!(
-            s.tick(t0 + Duration::from_secs(600)),
+            s.tick(t0 + Duration::from_secs(600), false),
             "an idle inhibit must not hold the idle LOCK: a confined app that could suppress \
              `--lock-idle` would be a comfort feature disabling a security control, which \
              D-033(1) forbids"

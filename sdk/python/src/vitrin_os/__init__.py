@@ -41,6 +41,13 @@ from .errors import (
     VersionUnsupported,
     VitrinError,
 )
+# The two powerbox terminals are the only *event* types re-exported here, and
+# they are here because they are the RETURN TYPES of `Connection.request_file`
+# and `request_dir`: a caller has to tell the two apart to use either, and
+# reaching into `vitrin_os.messages` to name the answer it was just handed
+# would be an odd thing to require. Every other event stays where it is —
+# nothing else in this API returns one.
+from .messages import DesignatedEvent, PowerboxRefusedEvent
 from .protocol import (
     BTN_LEFT,
     BTN_MIDDLE,
@@ -49,12 +56,15 @@ from .protocol import (
     Axis,
     ButtonState,
     ConsentState,
+    DesignationKind,
+    DesignationMode,
     ErrorCode,
     Format,
     FrameFlags,
     LayoutMode,
     Outcome,
     Persistence,
+    PowerboxRefusal,
     Refusal,
     Verb,
 )
@@ -100,9 +110,15 @@ __all__ = [
     "NoSurface",
     "OperationFailed",
     "AtCapacity",
+    # designation terminals (the answers request_file / request_dir return)
+    "DesignatedEvent",
+    "PowerboxRefusedEvent",
     # protocol constants
     "PROTOCOL_VERSION",
     "Verb",
+    "DesignationKind",
+    "DesignationMode",
+    "PowerboxRefusal",
     "Persistence",
     "Outcome",
     "Refusal",

@@ -39,11 +39,13 @@ from .messages import (
     AttentionEvent,
     BoundEvent,
     ConsentStateEvent,
+    DesignatedEvent,
     DoneEvent,
     ErrorEvent,
     Event,
     FrameReadyEvent,
     LaunchedEvent,
+    PowerboxRefusedEvent,
     RefusedEvent,
     ResolvedEvent,
 )
@@ -52,9 +54,12 @@ from .protocol import (
     Axis,
     ButtonState,
     ConsentState,
+    DesignationKind,
+    DesignationMode,
     Format,
     Outcome,
     Persistence,
+    PowerboxRefusal,
     Refusal,
     Verb,
 )
@@ -90,13 +95,13 @@ def _parse_verbs(verbs: int | Verb | Iterable[str | Verb]) -> int:
     # recoverable and is the answer the caller is entitled to see. Pre-empting
     # it locally would hide a deployment difference behind a client-side error.
     #
-    # vitrin-verb-set: unserved-verbs = observe_cursor, designate_file, egress
+    # vitrin-verb-set: unserved-verbs = observe_cursor, egress
     #
-    # Three of them -- observe.cursor, designate.file and egress -- are
-    # refused by EVERY
-    # deployment today (no cursor delivery; no picker and no consent copy for
-    # it; no mediating proxy), and
-    # realm.launch and the layout.* pair by any deployment that declines them.
+    # Two of them -- observe.cursor and egress -- are refused by EVERY
+    # deployment today (no cursor delivery; no mediating proxy), and
+    # designate.file, realm.launch and the layout.* pair by any deployment
+    # that declines them. designate.file was in the first list until the
+    # reference core's core-drawn picker landed.
     # The first list is derived from the reference core by `cargo xtask
     # verb-sets --check`, so it cannot fall behind the way it did when
     # `egress` landed; the second is a deployment property and cannot be
@@ -108,7 +113,9 @@ def _parse_verbs(verbs: int | Verb | Iterable[str | Verb]) -> int:
     # request
     # to ask through; the picker or the proxy behind it is what a deployment
     # would need to
-    # answer with, and only that moves a verb off this list.
+    # answer with, and only that moves a verb off this list -- which is
+    # exactly what happened to `designate.file` when its picker landed, and
+    # has not happened to `egress`.
     return bits
 
 
@@ -374,6 +381,101 @@ class _LauncherFacet(_Proxy):
             self._launched.append(event)
 
 
+class _PowerboxFacet(_Proxy):
+    """`vitrin_powerbox` — ask the human to designate one file or one subtree.
+
+    Reply-bearing, like :class:`_LauncherFacet`, and the shape of the reply is
+    what makes it different from every other facet here: an ask has **three**
+    possible terminals with **two** different answerers. ``designated`` and
+    ``refused`` both arrive on this facet and carry what the human decided (or
+    what the core made of the human's choice); ``refused(designate_file, …)``
+    arrives on the *grant* and is the enforcement chokepoint deciding whether
+    this grant may ask at all. Exactly one of the three arrives per ask, and
+    the split is what lets a caller tell "the human said no" (worth asking
+    again) from "your grant expired" (not).
+
+    **Both of this facet's terminals share ONE queue, in arrival order.** Two
+    queues would let a refusal overtake a designation with nothing noticing:
+    the IDL's rule is exactly one terminal per request, in request order, and a
+    client that sorted the two kinds apart on receipt could no longer check the
+    order it was given. With one queue the head is the answer to the oldest
+    unanswered ask, whichever kind it turned out to be.
+    """
+
+    _interface = "vitrin_powerbox"
+
+    def __init__(self, conn: "Connection", oid: int, grant: "Grant") -> None:
+        super().__init__(conn, oid)
+        self._grant = grant
+        self._terminals: deque[DesignatedEvent | PowerboxRefusedEvent] = deque()
+        # Asks sent on this facet whose terminal has not been claimed yet.
+        #
+        # It exists to BOUND the queue. "Exactly one terminal per request"
+        # means terminals in flight can never outnumber asks outstanding, so a
+        # terminal arriving when the queue is already as long as the number of
+        # asks owed is one nothing asked for — a server contract violation.
+        # That check earns its place here and would not elsewhere in this SDK:
+        # an unclaimed `designated` holds a **file descriptor**, and with no
+        # check it would sit in this queue unreachable and unclosed for the
+        # life of the connection.
+        #
+        # A counter rather than a flag because the protocol permits pipelining
+        # (terminals pair in request order); this SDK's blocking API sends one
+        # ask at a time, so it never exceeds 1 today, and a flag would have to
+        # be replaced rather than raised the day that changes.
+        self._owed = 0
+
+    def _handle_event(self, event: Event) -> None:
+        if isinstance(event, DesignatedEvent):
+            self._accept(event, fd=event.fd)
+        elif isinstance(event, PowerboxRefusedEvent):
+            self._accept(event, fd=None)
+
+    def _accept(
+        self,
+        event: DesignatedEvent | PowerboxRefusedEvent,
+        *,
+        fd: int | None,
+    ) -> None:
+        """Queue one terminal, or die contract.
+
+        On every dying path the descriptor this event arrived with is closed
+        first; on the queueing path it is not, because it is the caller's.
+        """
+        if len(self._terminals) >= self._owed:
+            if fd is not None:
+                # Ownership transferred to us with the event, and nobody will
+                # ever claim it: close it before the connection dies, or it
+                # leaks for the life of the process.
+                os.close(fd)
+            self._conn._die_contract(
+                f"server sent a powerbox terminal on object {self.id} for an ask "
+                f"that was never made ({len(self._terminals)} already queued, "
+                f"{self._owed} owed)"
+            )
+        if isinstance(event, DesignatedEvent):
+            try:
+                # Undefined enum entries are a server contract violation,
+                # validated here at dispatch — as the consent state and the
+                # resolved outcome are — so a caller converting `kind`/`mode`
+                # to their enums cannot be surprised by a value.
+                DesignationKind(event.kind)
+                DesignationMode(event.mode)
+            except ValueError as exc:
+                os.close(event.fd)
+                self._conn._die_contract(
+                    f"server sent designated with an undefined enum value: {exc}"
+                )
+        else:
+            try:
+                PowerboxRefusal(event.code)
+            except ValueError:
+                self._conn._die_contract(
+                    f"server sent undefined powerbox refusal code {event.code}"
+                )
+        self._terminals.append(event)
+
+
 class _LayoutFocusFacet(_Proxy):
     """`vitrin_layout_focus` — bind the output to the granted realm.
 
@@ -422,6 +524,7 @@ class Grant(_Proxy):
         self._layout_focus: _LayoutFocusFacet | None = None
         self._layout_arrange: _LayoutArrangeFacet | None = None
         self._launcher: _LauncherFacet | None = None
+        self._powerbox: _PowerboxFacet | None = None
 
     def _handle_event(self, event: Event) -> None:
         if isinstance(event, ResolvedEvent):
@@ -568,6 +671,21 @@ class Grant(_Proxy):
             self._conn._register(self._launcher)
             self._conn._send(messages.encode_get_launcher(self.id, facet_id=oid))
         return self._launcher
+
+    def _powerbox_facet(self) -> _PowerboxFacet:
+        """Mint (once) the powerbox facet this grant asks for designations on.
+
+        Minting is structural, always legal and silent — a grant that does not
+        hold `designate_file` mints fine and is refused on first *use*, because
+        refusing the mint would make it an oracle for what the grant holds. So
+        there is nothing to wait for here and no failure to report.
+        """
+        if self._powerbox is None:
+            oid = self._conn._allocate_ids(1)[0]
+            self._powerbox = _PowerboxFacet(self._conn, oid, self)
+            self._conn._register(self._powerbox)
+            self._conn._send(messages.encode_get_powerbox(self.id, facet_id=oid))
+        return self._powerbox
 
     def _focus_facet(self) -> _LayoutFocusFacet:
         if self._layout_focus is None:
@@ -936,6 +1054,146 @@ class Connection:
         """
         self._require_bound()
         self._barrier(grant)
+
+    # -- designation (the powerbox) -----------------------------------------
+
+    def request_file(
+        self, grant: Grant, *, write: bool = False
+    ) -> DesignatedEvent | PowerboxRefusedEvent:
+        """Ask the human to designate one file; block until they answer.
+
+        Reply-bearing, and the wait is **human-long**: this raises the
+        core-drawn picker and returns when the human has chosen, dismissed it,
+        or let it expire. It names no file and cannot — the path never crosses
+        the wire in either direction, which is the whole security property of a
+        powerbox rather than an economy. There is no filter, no starting
+        directory and no hint argument either: each would be an agent-supplied
+        string steering what the human sees in a window the human is meant to
+        trust. An agent holding `designate.file` holds authority to **ask**,
+        never authority over any file it can name.
+
+        Returns one of two values, never coalesced and never both:
+
+        * :class:`~vitrin_os.messages.DesignatedEvent` — the human chose. Read
+          its docstring before using ``fd``: **the descriptor is yours to
+          close** (``os.close(event.fd)``, the only resource this SDK ever
+          hands you), **``name`` is display-only and there is no path to be
+          had**, and **your copy and the realm's share one file offset**, so a
+          read by one moves the other's cursor.
+        * :class:`~vitrin_os.messages.PowerboxRefusedEvent` — the ask was
+          admitted and produced no descriptor (the human cancelled, the card
+          expired, the core would not designate what they chose, or no card
+          could be raised). **This is not an exception and is not raised**: a
+          human declining to hand over a file is the system working, and an
+          agent that treated it as an error would be treating the human as a
+          fault. Asking again later is legal.
+
+        ``write`` selects which picker the human sees: ``False`` an open
+        dialog, ``True`` one that also offers to create. It is what the ask is
+        **for**, never what you get — the human may narrow it, and the
+        answer's ``mode`` carries the effective access that was approved. A
+        ``request_file(write=True)`` answered
+        :attr:`~vitrin_os.protocol.DesignationMode.READ` is an **approval**,
+        not a refusal, and a caller that treats a narrowed mode as failure will
+        discard a file the human deliberately handed over read-only.
+
+        The third terminal, ``refused(designate_file, …)``, is the enforcement
+        chokepoint declining the ask before anything reached the human, and it
+        *is* raised — as the typed
+        :class:`~vitrin_os.errors.GrantRefused` subclass, exactly like every
+        other refused use of a grant. That is the split worth keeping: the
+        chokepoint decides whether this grant may ask, the human decides what
+        to designate, and collapsing the two would make "the human said no"
+        indistinguishable from "your grant expired".
+
+        **There is deliberately no client-side timeout, and none may be
+        added.** The core already bounds the wait on the deployment's own
+        deadline and answers ``timed_out``; a second timeout here would race
+        that one and could abandon a descriptor the core was about to deliver,
+        leaking it for the life of the connection. Nothing else in this
+        connection is served while this blocks — the SDK is single-threaded by
+        design — so a client that must stay responsive should ask on a
+        connection of its own.
+
+        Do **not** pipeline designation asks. The protocol permits it and
+        records that the reference core does not yet keep the request-order
+        pairing rule for them (an admitted ask's terminal is owed across human
+        time while a later ask's "busy" is answered inside its own dispatch
+        turn), so terminals can arrive out of order and the refusal terminal
+        carries no designation id to re-pair them with. This method is
+        blocking, which is one ask at a time by construction.
+        """
+        self._require_bound()
+        facet = grant._powerbox_facet()
+        mode = DesignationMode.READ_WRITE if write else DesignationMode.READ
+        return self._designate(
+            grant, facet, messages.encode_request_file(facet.id, mode=int(mode))
+        )
+
+    def request_dir(self, grant: Grant) -> DesignatedEvent | PowerboxRefusedEvent:
+        """Ask the human to designate one directory subtree; block until they
+        answer.
+
+        Identical to :meth:`request_file` in every respect its docstring
+        describes — terminals, ordering, the typed chokepoint refusal, the
+        absence of a client-side timeout, and the three things the answer's
+        descriptor obliges you to know — with two differences.
+
+        **A subtree is ONE descriptor, not a batch.** What arrives is a single
+        directory fd covering the whole subtree, and the receiver walks it with
+        the kernel's own ``openat`` (``os.open(name, …, dir_fd=fd)``), so
+        containment is the kernel's rather than a prefix match on strings this
+        protocol never carries. The shared-offset warning bites hardest here:
+        for a directory the shared file position is the ``getdents`` cursor, so
+        if the realm's app and this agent both walk the subtree, each sees part
+        of it and neither sees all of it — the failure most likely to be
+        misread as a corrupt filesystem. Open a fresh description first
+        (``os.open(".", os.O_RDONLY | os.O_DIRECTORY, dir_fd=event.fd)``) if
+        you intend to walk it; ``os.dup`` does not help.
+
+        **There is no ``write`` argument, deliberately.** A subtree picker has
+        one chrome, so a mode here would steer nothing while putting the widest
+        ask this verb can make — read-write over a whole subtree — in the least
+        visible place. The human's tick in the picker decides it, and the
+        answer's ``mode`` carries what they approved.
+        """
+        self._require_bound()
+        facet = grant._powerbox_facet()
+        return self._designate(grant, facet, messages.encode_request_dir(facet.id))
+
+    def _designate(
+        self, grant: Grant, facet: _PowerboxFacet, request: bytes
+    ) -> DesignatedEvent | PowerboxRefusedEvent:
+        """Send one ask and read the ordered stream until its one terminal.
+
+        The same shape as :meth:`Grant.launch` and :meth:`Grant.observe` — wait
+        for either the facet's own terminal or a chokepoint refusal of this
+        grant's `designate_file` — with the one difference that the facet's
+        refusal is a *value* here rather than an exception, because it is the
+        human's answer and not an authority verdict.
+
+        The caller has already checked `bound` and minted the facet: the mint
+        puts a frame on the wire, so it must not happen on an unbound
+        connection either.
+        """
+        self._send(request)
+        # Counted after the send, not before: a send that raises has killed the
+        # transport (a partial write leaves the framed stream indeterminate, so
+        # it is never reused), and nothing is owed on a connection that is gone.
+        facet._owed += 1
+        self._run_until(
+            lambda: facet._terminals
+            or grant._first_refusal(Verb.DESIGNATE_FILE) is not None
+        )
+        refusal = grant._first_refusal(Verb.DESIGNATE_FILE)
+        if not facet._terminals and refusal is not None:
+            grant._refusals.remove(refusal)
+            facet._owed -= 1
+            raise refusal_error_by_code(
+                refusal.verb, refusal.code, refusal.retry_after_ms, grant_id=grant.id
+            )
+        facet._owed -= 1
+        return facet._terminals.popleft()
 
     # -- frame contract (vitrin_view.frame_ready memfd contract) ------------
 

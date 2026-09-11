@@ -170,6 +170,31 @@
 //!                                with four, and a section opening "Every
 //!                                `string` argument" that listed 15 of 17.
 //!                                Reads only; also runs as a test.
+//!
+//! cargo xtask kana-atlas         Regenerate crates/vitrin-core/assets/fonts/
+//!                                kana-atlas-14px.bin -- the picker's
+//!                                pre-rasterized Japanese glyph source (#190)
+//!                                -- from the codepoints declared beside it.
+//!                                Needs the 19.5 MB source face, which CI does
+//!                                not have; drives vitrin-core's own generator
+//!                                test with VITRIN_REGEN_KANA_ATLAS=1, the same
+//!                                way `bless` drives the pixel goldens.
+//!
+//! cargo xtask kana-atlas --check Verify the checked-in atlas: that it parses,
+//!                                that every byte of it is header, index or
+//!                                coverage belonging to exactly one glyph (so
+//!                                there is no room in the file for a GSUB or
+//!                                GPOS table -- the picker's no-shaping claim,
+//!                                as a property of the FILE rather than of the
+//!                                renderer), that it covers exactly the
+//!                                declared codepoint set in both directions,
+//!                                and that its provenance record, the core's
+//!                                compile-time ATLAS_LEN and NOTICE all name
+//!                                the same file. Reads only; also runs as a
+//!                                test. The blake3 digest is NOT checked here
+//!                                -- that hash is in vitrin-core's dependency
+//!                                graph and not in this crate's, so
+//!                                vitrin-core's own test pins the bytes.
 //! ```
 //!
 //! Calls straight into the `vitrin_scanner` library (`parse`, `rust_gen`,
@@ -187,6 +212,7 @@ use anyhow::{bail, Context, Result};
 
 mod build_output;
 mod isolation_matrix;
+mod kana_atlas;
 mod kernel_matrix;
 mod limits;
 mod protocol_tables;
@@ -213,7 +239,7 @@ fn main() -> ExitCode {
 }
 
 fn usage() -> &'static str {
-    "usage: cargo xtask codegen [--check]\n       cargo xtask demo [--headless] [--task K=V]...\n       cargo xtask bless [--filter SUBSTR]\n       cargo xtask session-matrix [--check]\n       cargo xtask isolation-matrix [--check]\n       cargo xtask kernel-matrix [--check]\n       cargo xtask limits-check [--tracker]\n       cargo xtask verb-sets [--check]\n       cargo xtask protocol-tables [--check]\n       cargo xtask skip-scan\n       cargo xtask skip-census --min-tests N [--expect-self-marker] -- CMD [ARG...]"
+    "usage: cargo xtask codegen [--check]\n       cargo xtask demo [--headless] [--task K=V]...\n       cargo xtask bless [--filter SUBSTR]\n       cargo xtask session-matrix [--check]\n       cargo xtask isolation-matrix [--check]\n       cargo xtask kernel-matrix [--check]\n       cargo xtask limits-check [--tracker]\n       cargo xtask verb-sets [--check]\n       cargo xtask protocol-tables [--check]\n       cargo xtask kana-atlas [--check]\n       cargo xtask skip-scan\n       cargo xtask skip-census --min-tests N [--expect-self-marker] -- CMD [ARG...]"
 }
 
 fn run() -> Result<()> {
@@ -398,6 +424,31 @@ fn run() -> Result<()> {
             let report = protocol_tables::check(&workspace_root()?)?;
             println!("{report}");
             Ok(())
+        }
+        "kana-atlas" => {
+            // Two modes, unlike its read-only siblings: the generator half
+            // needs a multi-megabyte source face and is a human's deliberate
+            // act, so `--check` is what CI runs and the bare form is what a
+            // maintainer runs after changing the declared alphabet.
+            let mut check = false;
+            for arg in &args[1..] {
+                match arg.as_str() {
+                    "--check" => check = true,
+                    "-h" | "--help" => {
+                        println!("{}", usage());
+                        return Ok(());
+                    }
+                    other => bail!("unknown flag '{other}' for 'kana-atlas'\n\n{}", usage()),
+                }
+            }
+            let root = workspace_root()?;
+            if check {
+                let report = kana_atlas::check(&root)?;
+                println!("{report}");
+                Ok(())
+            } else {
+                kana_atlas::regenerate(&root)
+            }
         }
         "skip-scan" => {
             // Reads sources, writes nothing -- one mode, like limits-check.

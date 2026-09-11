@@ -55,8 +55,8 @@ writing a Go, TypeScript or C++ SDK forks it.
   Omitting one turns a recoverable `unsupported` refusal into a dead socket
   for any user who petitions it. Which of them a deployment *serves* is that
   deployment's business and can change under you — this core refuses
-  `observe.cursor`, `designate.file` and `egress`, and serves the other six
-  <!-- vitrin-verb-set: unserved-verbs = observe_cursor, designate_file, egress -->
+  `observe.cursor` and `egress`, and serves the other seven
+  <!-- vitrin-verb-set: unserved-verbs = observe_cursor, egress -->
   (`egress` because no mediating proxy exists, *not* because its facet is
   missing — `vitrin_egress` is on the wire, exactly as `vitrin_powerbox` is
   for `designate.file`) — so never

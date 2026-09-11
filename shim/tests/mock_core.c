@@ -231,6 +231,34 @@ struct core {
 	const char *dump_path;
 	uint64_t dump_at;
 
+	/* --designate (P2.6.5, issue #189): the one core -> shim event that
+	 * carries a descriptor. `designate_fd` is opened before the fork and sent
+	 * once, `designate_at_ms` after the run starts.
+	 *
+	 * THE DELAY SELECTS WHICH RECEIVE PATH IS EXERCISED, and no longer avoids
+	 * a broken one. The shim reads `configure` SYNCHRONOUSLY and only then
+	 * puts the core link on its event loop, so an event landing in the same
+	 * recvmsg as `configure` is already in the shim's reassembly buffer with
+	 * nothing left in the socket to wake a level-triggered loop. That used to
+	 * strand it; `vitrin_wire_arm` now drains the buffer before it returns
+	 * (see the comment there), so `--designate-after-ms 0` is a legitimate run
+	 * that exercises the DRAIN path. The 500 ms default exercises the ordinary
+	 * ARMED path instead, which is the steady state a real designation lands
+	 * in -- a human has to look at a picker first. */
+	const char *designate_path;
+	int designate_fd;
+	int64_t designate_at_ms;
+	bool designated;
+
+	/* --smuggle-fd: send the descriptor on a frame whose SIGNATURE has none,
+	 * with the header's own `fd_count` set to 1 so the transport hands it up
+	 * rather than rejecting it as unsolicited. That is `fd_violation`'s first
+	 * disjunct (conventions 2.4), which only the layer holding the signature
+	 * table can see -- a hostile core, modelled here so the shim's answer to
+	 * one is a measured fact and not a code-reading. */
+	bool smuggle_fd;
+	bool smuggled;
+
 	/* accounting the acceptance script asserts on */
 	uint64_t commits;
 	uint64_t frame_dones;
@@ -277,7 +305,45 @@ static int64_t now_ms(void) {
 	return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-/* ---- sending (core -> shim; never carries an fd in version 1) -------- */
+/* ---- sending (core -> shim) ------------------------------------------ */
+
+/* One sendmsg carrying a frame and the single descriptor its header declares,
+ * which is how the real core delivers `designation` -- the fd rides the frame's
+ * FIRST bytes so the receiver's positional matching holds by construction
+ * (conventions 2.2). Only one message in v0 needs this; everything else goes
+ * through `core_send` below. */
+static bool core_send_with_fd(struct core *c, const uint8_t *frame, size_t len, int fd) {
+	union {
+		struct cmsghdr align;
+		char buf[CMSG_SPACE(sizeof(int))];
+	} control;
+	memset(&control, 0, sizeof(control));
+	struct iovec iov = {.iov_base = (void *)(uintptr_t)frame, .iov_len = len};
+	struct msghdr msg = {
+		.msg_iov = &iov,
+		.msg_iovlen = 1,
+		.msg_control = control.buf,
+		.msg_controllen = sizeof(control.buf),
+	};
+	struct cmsghdr *cm = CMSG_FIRSTHDR(&msg);
+	cm->cmsg_level = SOL_SOCKET;
+	cm->cmsg_type = SCM_RIGHTS;
+	cm->cmsg_len = CMSG_LEN(sizeof(int));
+	memcpy(CMSG_DATA(cm), &fd, sizeof(int));
+
+	ssize_t n;
+	do {
+		n = sendmsg(c->fd, &msg, MSG_NOSIGNAL);
+	} while (n < 0 && errno == EINTR);
+	if (n < 0) {
+		return false;
+	}
+	/* A short first write would have taken the ancillary data with it and left
+	 * the tail to a plain send(). Not handled, and not silently: every frame
+	 * this program sends is tens of bytes into an empty socketpair buffer, so a
+	 * partial write here means something this code does not model. */
+	return (size_t)n == len;
+}
 
 static bool core_send(struct core *c, const uint8_t *frame, size_t len) {
 	size_t sent = 0;
@@ -305,6 +371,78 @@ static void send_configure(struct core *c, const char *realm, uint32_t w, uint32
 	if (n < 0 || !core_send(c, buf, (size_t)n)) {
 		fail(c, "cannot send configure");
 	}
+}
+
+/* `vitrin_shim_session.designation`: hand the realm one designated descriptor.
+ *
+ * The values are fixed rather than configurable because the acceptance script
+ * greps the shim's log for them; `designation_id` in particular is what ties
+ * "the shim logged an arrival" to "this is the one we sent". The name is a
+ * BASENAME, never a path -- the IDL is explicit that no path crosses this wire
+ * -- so it is deliberately not derived from `--designate`'s argument. */
+#define MOCK_DESIGNATION_ID 4242u
+#define MOCK_DESIGNATION_NAME "designated.txt"
+
+static void send_designation(struct core *c) {
+	uint8_t buf[512];
+	vitrin_shim_session_evt_designation_t ev = {
+		.fd = -1, /* rides SCM_RIGHTS; never written to the byte buffer */
+		.designation_id = MOCK_DESIGNATION_ID,
+		.kind = VITRIN_POWERBOX_KIND_FILE,
+		.mode = VITRIN_POWERBOX_MODE_READ,
+		.name = {
+			.len = (uint32_t)strlen(MOCK_DESIGNATION_NAME),
+			.data = (const uint8_t *)MOCK_DESIGNATION_NAME,
+		},
+	};
+	int32_t n = vitrin_shim_session_evt_designation_encode(&ev, 1u, buf, sizeof(buf));
+	if (n < 0 || !core_send_with_fd(c, buf, (size_t)n, c->designate_fd)) {
+		fail(c, "cannot send designation");
+		return;
+	}
+	/* Closed the instant the kernel has it: the receiver holds its own now, and
+	 * a copy kept here would make the acceptance script's descriptor census
+	 * count this process's leak as the shim's. */
+	close(c->designate_fd);
+	c->designate_fd = -1;
+	c->designated = true;
+	trace("EV designation designation_id=%u kind=file mode=read name=%s",
+		MOCK_DESIGNATION_ID, MOCK_DESIGNATION_NAME);
+}
+
+/* --smuggle-fd: a `frame_done` -- an event whose signature declares NO
+ * descriptor -- with `fd_count` hand-set to 1 and a real fd attached.
+ *
+ * The header is patched rather than a bespoke frame hand-rolled, so what
+ * reaches the shim is a legitimate, decodable event that lies in exactly one
+ * byte. The transport cannot catch this: `fd_count == 1` and one descriptor
+ * arrived, so positional matching is satisfied. Only the layer that knows
+ * `frame_done` has no fd argument can, and conventions 2.4 says what it must
+ * do about it. Returns with the descriptor given away either way. */
+static void send_smuggled_fd(struct core *c) {
+	uint8_t buf[64];
+	vitrin_shim_surface_evt_frame_done_t ev = {.time_ms = (uint32_t)now_ms()};
+	int32_t n = vitrin_shim_surface_evt_frame_done_encode(&ev, c->surface_id,
+		buf, sizeof(buf));
+	if (n < 0) {
+		fail(c, "cannot encode the frame carrying a smuggled descriptor");
+		return;
+	}
+	vitrin_frame_header_t hdr;
+	if (vitrin_frame_header_decode(buf, (size_t)n, &hdr) != VITRIN_DECODE_OK) {
+		fail(c, "cannot re-read the header of the frame just encoded");
+		return;
+	}
+	hdr.fd_count = 1u;
+	vitrin_frame_header_encode(&hdr, buf);
+	if (!core_send_with_fd(c, buf, (size_t)n, c->designate_fd)) {
+		fail(c, "cannot send the frame carrying a smuggled descriptor");
+		return;
+	}
+	close(c->designate_fd);
+	c->designate_fd = -1;
+	c->smuggled = true;
+	trace("EV smuggled_fd object_id=%u opcode=%u", hdr.object_id, hdr.opcode);
 }
 
 static void send_buffer_done(struct core *c, uint32_t buffer_id, uint32_t status) {
@@ -1230,12 +1368,18 @@ static void usage(void) {
 		"usage: mock-core [--realm NAME] [--size WxH] [--frames N] [--run-ms MS]\n"
 		"                 [--frame-delay MS] [--defer-release]\n"
 		"                 [--input SCRIPT] [--input-after-commits N]\n"
-		"                 [--dump-frame N:PATH] -- SHIM_ARGV...\n");
+		"                 [--dump-frame N:PATH]\n"
+		"                 [--designate PATH] [--designate-after-ms MS]\n"
+		"                 [--smuggle-fd]\n"
+		"                 -- SHIM_ARGV...\n");
 	exit(2);
 }
 
 int main(int argc, char **argv) {
 	const char *realm = "realm-0";
+	const char *designate_path = NULL;
+	int designate_after_ms = 500;
+	bool smuggle_fd = false;
 	uint32_t width = 800, height = 600;
 	uint64_t want_frames = 0;
 	int run_ms = 10000;
@@ -1266,6 +1410,12 @@ int main(int argc, char **argv) {
 			input_script = argv[++i];
 		} else if (strcmp(argv[i], "--input-after-commits") == 0 && i + 1 < argc) {
 			input_after_commits = strtoull(argv[++i], NULL, 10);
+		} else if (strcmp(argv[i], "--designate") == 0 && i + 1 < argc) {
+			designate_path = argv[++i];
+		} else if (strcmp(argv[i], "--designate-after-ms") == 0 && i + 1 < argc) {
+			designate_after_ms = atoi(argv[++i]);
+		} else if (strcmp(argv[i], "--smuggle-fd") == 0) {
+			smuggle_fd = true;
 		} else if (strcmp(argv[i], "--dump-frame") == 0 && i + 1 < argc) {
 			/* N:PATH -- the commit index to capture, then where to put it.
 			 * Which frame matters: frame 0 of a browser is usually blank,
@@ -1300,6 +1450,27 @@ int main(int argc, char **argv) {
 		return 2;
 	}
 
+	/* Opened before the socketpair and the fork, for `load_input_script`'s
+	 * reason: an unopenable file must fail the run without ever having spawned
+	 * a shim, or the test would read its own bad argument as a shim fault.
+	 * O_CLOEXEC so the descriptor the shim receives is the one SCM_RIGHTS
+	 * installs, never one it inherited across execve -- which would make the
+	 * acceptance script's leak census meaningless. */
+	if (smuggle_fd && designate_path == NULL) {
+		fprintf(stderr, "mock-core: --smuggle-fd needs --designate PATH for the "
+			"descriptor it smuggles\n");
+		return 2;
+	}
+	int designate_fd = -1;
+	if (designate_path != NULL) {
+		designate_fd = open(designate_path, O_RDONLY | O_CLOEXEC);
+		if (designate_fd < 0) {
+			fprintf(stderr, "mock-core: cannot open %s to designate: %s\n",
+				designate_path, strerror(errno));
+			return 2;
+		}
+	}
+
 	int sv[2];
 	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) != 0) {
 		perror("socketpair");
@@ -1323,6 +1494,10 @@ int main(int argc, char **argv) {
 	c->input_after_commits = input_after_commits;
 	c->dump_path = dump_path;
 	c->dump_at = dump_at;
+	c->designate_path = designate_path;
+	c->designate_fd = designate_fd;
+	c->smuggle_fd = smuggle_fd;
+	c->designate_at_ms = -1; /* armed below, once the run's clock exists */
 	c->input_due_ms = -1; /* armed by the Nth commit, not by the clock */
 
 	trace("EV spawned shim_pid=%d", (int)shim);
@@ -1332,6 +1507,9 @@ int main(int argc, char **argv) {
 	trace("EV configure realm=%s width=%u height=%u", realm, width, height);
 
 	int64_t deadline = now_ms() + run_ms;
+	if (designate_path != NULL) {
+		c->designate_at_ms = now_ms() + designate_after_ms;
+	}
 	int exit_code = 0;
 	while (!g_stop) {
 		int64_t remaining = deadline - now_ms();
@@ -1366,6 +1544,19 @@ int main(int argc, char **argv) {
 				break;
 			}
 		}
+		if (c->designate_at_ms >= 0 && !c->designated && !c->smuggled &&
+				now_ms() >= c->designate_at_ms) {
+			/* `frame_done` is addressed to the surface, so the smuggling
+			 * variant waits for the shim to have minted one; the designation
+			 * is on the session object and needs no such wait. */
+			if (c->smuggle_fd) {
+				if (c->surface_created) {
+					send_smuggled_fd(c);
+				}
+			} else {
+				send_designation(c);
+			}
+		}
 		if (c->frame_due) {
 			struct timespec now;
 			clock_gettime(CLOCK_MONOTONIC, &now);
@@ -1380,12 +1571,22 @@ int main(int argc, char **argv) {
 
 	trace("SUMMARY commits=%llu frame_dones=%llu buffer_dones=%llu max_inflight=%d "
 		"last_damage_area=%llu last_damage_rects=%d seat_sends=%llu "
-		"idle_edges=%llu idle_held=%d failures=%d",
+		"idle_edges=%llu idle_held=%d designated=%d smuggled=%d failures=%d",
 		(unsigned long long)c->commits, (unsigned long long)c->frame_dones,
 		(unsigned long long)c->buffer_dones, c->max_inflight,
 		(unsigned long long)c->last_damage_area, c->last_damage_rects,
 		(unsigned long long)c->seat_sends, c->idle_edges, c->idle_held ? 1 : 0,
-		c->failures);
+		c->designated ? 1 : 0, c->smuggled ? 1 : 0, c->failures);
+
+	/* A run that asked for a designation and never sent one proved nothing;
+	 * say so rather than letting the script assert against an event that was
+	 * never emitted. */
+	if (c->designate_path != NULL && !c->designated && !c->smuggled) {
+		fail(c, "the run ended before the %s was sent -- raise --run-ms above "
+		        "--designate-after-ms (and, with --smuggle-fd, the shim must "
+		        "have created its surface by then)",
+			c->smuggle_fd ? "smuggled descriptor" : "designation");
+	}
 
 	/* Hang up: socketpair EOF is how the core tells a shim to go away, and
 	 * the first rung of the P1.5.3 shutdown ladder. */
@@ -1395,6 +1596,9 @@ int main(int argc, char **argv) {
 	}
 	if (c->retained_fd >= 0) {
 		close(c->retained_fd);
+	}
+	if (c->designate_fd >= 0) {
+		close(c->designate_fd);
 	}
 
 	int status = 0;

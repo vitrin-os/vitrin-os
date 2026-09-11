@@ -19,19 +19,30 @@ Request opcodes (document order):
     vitrin_launcher:         launch=0               (since=2)
     vitrin_layout_focus:     focus=0                (since=2)
     vitrin_layout_arrange:   set_fullscreen=0       (since=2)
+    vitrin_powerbox:         request_file=0, request_dir=1
+                                                    (both since=2)
     vitrin_egress:           request_connect=0      (since=2)
 
 NOT ENCODED HERE, and named rather than left as a gap in the table above:
-`vitrin_grant.get_powerbox`, `vitrin_grant.get_egress`, and everything on
-`vitrin_powerbox` and `vitrin_egress`. The two mint opcodes are listed because
-they are principal-facing and this module's tables claim to be that half of the
-IDL, but no codec below emits them: each verb is outside every deployment's
-served set (no core-drawn picker and no consent copy for it — P2.6.6/P2.6.8;
-no mediating proxy — P2.7.3), so an SDK call that minted either facet could
-only ever reach a refusal. Adding the codecs belongs to those tasks, alongside
-the mechanisms that make an answer possible. The two facets' own messages are
-left out of both tables entirely rather than listed and disowned, because
-neither facet is reachable without its mint.
+`vitrin_grant.get_egress` and everything on `vitrin_egress`. The mint opcode is
+listed because it is principal-facing and this module's tables claim to be that
+half of the IDL, but no codec below emits it: `egress` is outside every
+deployment's served set — what is missing is the out-of-core mediating proxy a
+connection would be made through (P2.7.3) — so an SDK call that minted the
+facet could only ever reach a refusal. Adding the codecs belongs to that task,
+alongside the mechanism that makes an answer possible. That facet's own
+messages are left out of both tables entirely rather than listed and disowned,
+because it is not reachable without its mint.
+
+`vitrin_grant.get_powerbox` and `vitrin_powerbox` were in that paragraph too,
+on the same argument, until P2.6.6 landed the core-drawn picker and the
+reference core moved `designate_file` into its served set. The argument is
+unchanged and it stopped applying: a deployment now exists that can answer an
+ask with a descriptor, so an SDK that cannot make one is what would be missing.
+What did NOT change is that `designate_file` is a **deployment property** — a
+deployment with no picker still refuses it — which is why encoding these five
+messages (the mint, the two asks, the two terminals) is not a claim that any
+particular core serves the verb.
 
 Event opcodes (document order):
     vitrin_handshake:        error=0, done=1
@@ -40,6 +51,8 @@ Event opcodes (document order):
     vitrin_consent:          state=0
     vitrin_view:             frame_ready=0 (fd_count=1)
     vitrin_launcher:         launched=0                  (since=2)
+    vitrin_powerbox:         designated=0 (fd_count=1), refused=1
+                                                        (both since=2)
     vitrin_egress:           connected=0 (fd_count=1), connect_failed=1
                                                         (both since=2)
 """
@@ -66,16 +79,18 @@ OP_MOVE = 0
 OP_BUTTON = 1
 OP_SCROLL = 2
 OP_TYPE = 0
-# Three of vitrin_grant's five since="2" structural mints, in document order.
-# The other two are `get_powerbox` (opcode 3) and `get_egress` (opcode 4),
-# listed in the table above and deliberately not encoded here -- see the note
-# under it.
+# Four of vitrin_grant's five since="2" structural mints, in document order.
+# The fifth is `get_egress` (opcode 4), listed in the table above and
+# deliberately not encoded here -- see the note under it.
 OP_GET_LAUNCHER = 0
 OP_GET_LAYOUT_FOCUS = 1
 OP_GET_LAYOUT_ARRANGE = 2
+OP_GET_POWERBOX = 3
 OP_LAUNCH = 0
 OP_FOCUS = 0
 OP_SET_FULLSCREEN = 0
+OP_REQUEST_FILE = 0
+OP_REQUEST_DIR = 1
 
 
 def encode_hello(
@@ -213,6 +228,59 @@ def encode_set_fullscreen(facet_oid: int, *, mode: int) -> bytes:
     return MessageEncoder().put_uint(int(mode)).finish(facet_oid, OP_SET_FULLSCREEN)
 
 
+def encode_get_powerbox(grant_oid: int, *, facet_id: int) -> bytes:
+    """`vitrin_grant.get_powerbox` — the fourth since=2 structural mint.
+
+    Neither reply-bearing nor refusable, like its three siblings: it allocates
+    the powerbox facet and nothing else. A grant that does not hold
+    `designate_file` still mints fine and refuses on first *use*, because
+    refusing the mint would turn it into an oracle for what the grant holds.
+    """
+    return MessageEncoder().put_new_id(facet_id).finish(grant_oid, OP_GET_POWERBOX)
+
+
+def encode_request_file(facet_oid: int, *, mode: int) -> bytes:
+    """`vitrin_powerbox.request_file` — ask the human to designate one file.
+
+    It names no file, and cannot. The whole security property of this facet is
+    that the path never crosses the wire in either direction: the request
+    raises the core-drawn picker, the human chooses in front of the trusted
+    indicator, and what comes back is a descriptor. There is deliberately no
+    filter, suggestion, hint or starting-directory argument either — each would
+    be an agent-supplied string steering what the human sees in a window the
+    human is meant to trust, and a signature is immutable forever.
+
+    `mode` is :class:`~vitrin_os.protocol.DesignationMode`: 0 read, 1
+    read_write. It selects the chrome the picker opens with (an open dialog, or
+    one that also offers to create) and is a ceiling, never a promise — the
+    human may narrow it, and `designated.mode` carries what was approved. An
+    out-of-range value is fatal `invalid_argument` server-side (the enum
+    argument is whole-value checked by the decoder), so it is rejected here
+    rather than sent: a client-side bug must not cost the caller its
+    connection.
+    """
+    if mode not in tuple(protocol.DesignationMode):
+        raise ValueError(f"request_file mode {mode} is outside vitrin_powerbox.mode")
+    return MessageEncoder().put_uint(int(mode)).finish(facet_oid, OP_REQUEST_FILE)
+
+
+def encode_request_dir(facet_oid: int) -> bytes:
+    """`vitrin_powerbox.request_dir` — ask for one directory subtree.
+
+    No arguments at all, and the missing `mode` is argued rather than
+    accidental: a subtree picker has one chrome, so a mode here would steer
+    nothing and would put the widest ask this verb can make — read-write over a
+    whole subtree — in the least visible place. The human's tick in the picker
+    decides it and `designated.mode` carries the answer.
+
+    A subtree arrives as ONE directory descriptor, never a batch: the receiver
+    walks it with the kernel's own `openat`, which is what makes "subtree" a
+    containment boundary the kernel enforces rather than a prefix match on
+    strings this protocol never sees.
+    """
+    return MessageEncoder().finish(facet_oid, OP_REQUEST_DIR)
+
+
 def encode_move(pointer_oid: int, *, x: int, y: int) -> bytes:
     return MessageEncoder().put_int(x).put_int(y).finish(pointer_oid, OP_MOVE)
 
@@ -333,6 +401,106 @@ class LaunchedEvent:
 
 
 @dataclass(frozen=True)
+class DesignatedEvent:
+    """vitrin_powerbox.designated — the descriptor the human designated.
+
+    One of the two terminals of an admitted ask (the other is
+    :class:`PowerboxRefusedEvent`), and the only message in this SDK that hands
+    the caller a resource.
+
+    **The descriptor is yours to close.** Ownership transfers on receipt: the
+    core closes its own copy after sending, and nothing in this SDK will close
+    ``fd`` for you — ``os.close(event.fd)`` when you are done with it. That is
+    unlike every other value this SDK returns, and unlike :class:`Frame` in
+    particular, which is materialized close-after-copy precisely so no caller
+    owes anything. Here the descriptor *is* the payload, so it cannot be copied
+    out and closed on your behalf.
+
+    **``name`` is display-only and there is no path to be had.** It is the
+    basename of what the human chose, carried so a client can say what it was
+    given; it is not a path, it is not resolvable, and re-opening "the file
+    called that" is not the same act as using this descriptor. The point of a
+    powerbox is that you were handed the *thing* rather than a name to
+    re-resolve — treating the name as a path reintroduces exactly the race the
+    descriptor closed, in which the name comes to mean a different file between
+    the human's confirmation and your open. (Withholding the path is not
+    claimed as confidentiality: whoever holds the descriptor can read the path
+    out of ``/proc/self/fd``. It is withheld so that no path is ever part of
+    this interface's contract.)
+
+    "Basename" is the *server's* contract and nothing here verifies it: the
+    IDL requires the exact bytes of the human's choice, unchanged and
+    unmarked, so this SDK passes them through and checks only the 255-byte
+    bound. A name carrying a path separator, a newline or a control character
+    would be a server contract violation this SDK does not detect — one more
+    reason to render ``name`` and never resolve it.
+
+    **Both copies share a file offset.** The same descriptor is delivered to
+    the asking agent here and to the realm's shim as
+    ``vitrin_shim_session.designation``; the core resolves the human's choice
+    ONCE and sends that one descriptor twice, and ``SCM_RIGHTS`` installs in
+    each receiver a descriptor referring to the **same open file description**
+    — what ``dup(2)`` produces, not what a second ``open`` would. So a ``read``
+    by either side advances the other's cursor, an ``lseek`` by either moves
+    the other, and for a directory designation the shared position is the
+    ``getdents`` cursor, so two receivers that both walk the subtree each see
+    part of it and neither sees all of it. A receiver that must not be
+    disturbed uses positional I/O (``os.pread``/``os.pwrite``, which never
+    touch the shared offset) or, for a directory, opens a fresh description
+    from the descriptor it holds (``os.open(".", O_RDONLY | O_DIRECTORY,
+    dir_fd=fd)``), which stays inside the designated subtree. ``os.dup`` does
+    **not** help — it makes another descriptor onto the very description being
+    shared. This is inherent to resolving the human's choice once, not a defect
+    to be fixed by opening twice: two opens are two resolutions, and between
+    them the name could come to mean a different file.
+
+    ``mode`` is the **effective** access the human approved, which may be
+    narrower than the ask — a ``request_file(write=True)`` answered
+    :attr:`~vitrin_os.protocol.DesignationMode.READ` is an approval, not a
+    refusal. It describes what the core opened the descriptor with; it is not a
+    promise about the file's permissions, which the kernel enforces and may
+    change underneath any holder.
+
+    ``designation_id`` is the core's own opaque id, unique for the life of the
+    session, matching the journal record and the realm's copy of this
+    designation. ``kind`` says whether the descriptor is a file or a directory
+    subtree.
+
+    This descriptor **outlives the grant**. Revocation and expiry stop future
+    asks and kill the grant row; they do not close what has already been
+    delivered, on either connection. A file descriptor that has crossed a
+    socket is kernel authority the core cannot recall.
+    """
+
+    fd: int
+    designation_id: int
+    kind: int
+    mode: int
+    name: str
+
+
+@dataclass(frozen=True)
+class PowerboxRefusedEvent:
+    """vitrin_powerbox.refused — an admitted ask that produced no descriptor.
+
+    The other terminal of an ask the chokepoint ALLOWED: the human declined,
+    the card expired, the core would not designate what they chose, or no card
+    could be raised at all. It is **not an exception** in this SDK and is
+    returned, not raised — a human declining to hand over a file is the system
+    working, and an agent that treated it as an error would be treating the
+    human as a fault.
+
+    Not a second enforcement voice either. Authority questions are answered by
+    ``vitrin_grant.refused``, from the one chokepoint, for every verb; every
+    ``code`` here (:class:`~vitrin_os.protocol.PowerboxRefusal`) is compatible
+    with a perfectly live grant, and asking again later is legal, bounded by
+    the same rate ceiling as any other use.
+    """
+
+    code: int
+
+
+@dataclass(frozen=True)
 class ConsentStateEvent:
     """vitrin_consent.state — prompt lifecycle transition."""
 
@@ -361,6 +529,8 @@ Event = (
     | ConsentStateEvent
     | FrameReadyEvent
     | LaunchedEvent
+    | DesignatedEvent
+    | PowerboxRefusedEvent
 )
 
 
@@ -417,6 +587,21 @@ def _decode_frame_ready(dec: MessageDecoder, fd: int | None) -> FrameReadyEvent:
     )
 
 
+def _decode_designated(dec: MessageDecoder, fd: int | None) -> DesignatedEvent:
+    assert fd is not None  # guaranteed by the fd_expected check in decode_event
+    return DesignatedEvent(
+        fd=fd,
+        designation_id=dec.uint(),
+        kind=dec.uint(),
+        mode=dec.uint(),
+        name=dec.string(max_bytes=protocol.MAX_DESIGNATION_NAME_BYTES),
+    )
+
+
+def _decode_powerbox_refused(dec: MessageDecoder, fd: int | None) -> PowerboxRefusedEvent:
+    return PowerboxRefusedEvent(code=dec.uint())
+
+
 # interface name -> opcode -> (expects_fd, decoder)
 _EVENT_DECODERS: dict[
     str, dict[int, tuple[bool, Callable[[MessageDecoder, int | None], Event]]]
@@ -430,6 +615,12 @@ _EVENT_DECODERS: dict[
     "vitrin_consent": {0: (False, _decode_consent_state)},
     "vitrin_view": {0: (True, _decode_frame_ready)},
     "vitrin_launcher": {0: (False, _decode_launched)},
+    # `designated` is the second fd-bearing event this SDK decodes, and the
+    # only one whose fd is handed on to the caller rather than consumed.
+    "vitrin_powerbox": {
+        0: (True, _decode_designated),
+        1: (False, _decode_powerbox_refused),
+    },
     # vitrin_realm, vitrin_actuator_pointer, and vitrin_actuator_text carry
     # no events in version 1.
     "vitrin_realm": {},

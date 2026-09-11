@@ -737,26 +737,39 @@ pub(crate) struct UseEnv<'a> {
 /// the embedder invent an authority answer no authority check produced.
 /// Three variants, mapped at one site.
 ///
-/// **`Busy` and `Full` are constructed by no shipped sink**, because the only
-/// sink any deployment installs returns `Unavailable` — there is no picker to
-/// be busy with. They are here because the ledger that produces them exists
-/// and is tested, and because a mechanism enum that named only the case the
-/// core is currently in would have to be widened by whoever lands the picker,
-/// at exactly the moment they are least likely to notice the chokepoint needs
-/// a new arm.
+/// **Two variants, and only one of them is an authority answer.**
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DesignateRefusal {
     /// **This deployment has no picker at all.** Not a policy answer: a verb
     /// served with no mechanism behind it is the condition the IDL forbids,
-    /// so it maps to `internal` and says so in the log. Every deployment
-    /// answers this today.
+    /// so it maps to `internal` and says so in the log. A deployment whose
+    /// configured picker root could not be opened at startup answers this.
     Unavailable,
-    /// A picker for this principal is already up -- the ledger's
-    /// per-principal rule.
-    Busy,
-    /// The ledger is at its resource bound.
-    Full,
+    /// **The sink produced this ask's one terminal itself, on the facet.**
+    ///
+    /// The chokepoint must then voice nothing at all, and this variant is how
+    /// the sink says so. It is *not* a refusal code and carries none: what
+    /// went out is `vitrin_powerbox.refusal`, the picker's own terminal
+    /// vocabulary, sent by the thing that owns cards.
+    ///
+    /// It exists because the ledger's two open refusals -- a card already up
+    /// for this principal, and the ledger at its resource bound -- are **not**
+    /// chokepoint refusals. Both were once mapped to `capacity`, and the IDL
+    /// forbids that in as many words: `capacity` means the deployment is at
+    /// its REALM capacity and is reachable only through `realm_launch`, so a
+    /// server voicing it for a full picker ledger "would answer a question
+    /// about cards with a code about realms, and an agent reading it
+    /// correctly would conclude the deployment could launch no realm". Both
+    /// are also discovered *after* the ask was admitted, which is exactly the
+    /// boundary between the two voices.
+    ///
+    /// Without this variant the sink had no way to answer on the facet at
+    /// all: the chokepoint's `Ok` arm demands a `DesignationId` the ledger
+    /// refused to mint, and its `Err` arm voices a second terminal on top of
+    /// the one the sink already sent. Exactly one terminal per admitted ask
+    /// is the property; this is what keeps it.
+    Answered,
 }
 
 /// Everything the embedder is told about an admitted designation ask.
@@ -1581,51 +1594,50 @@ impl Chokepoint {
                         spent_once,
                         attention_claimed,
                     }),
-                    // No card went up, so the terminal IS produced here, in
-                    // this same dispatch, and the client is answered once.
+                    // No card went up, so the terminal IS produced in this
+                    // same dispatch, and the client is answered exactly once.
+                    // **Which voice produces it depends on which refusal it
+                    // is**, and the split is the IDL's, not a convenience.
                     //
-                    // **Both ledger refusals voice `capacity`, and the choice
-                    // is deliberate.** `vitrin_powerbox.refusal` has its own
-                    // `busy` entry for the per-principal single-picker rule,
-                    // and it is tempting to reach for it -- but that enum is
-                    // the *picker's* terminal vocabulary, sent on the facet by
-                    // whatever raises and dismisses a card. Building one here
-                    // would put a second terminal voice inside the chokepoint,
-                    // and `single_enforcement_path_is_grep_provable` counts
+                    // `vitrin_powerbox.refusal` is the *picker's* terminal
+                    // vocabulary, sent on the facet by whatever raises and
+                    // dismisses a card. Building one here would put a second
+                    // terminal voice inside the chokepoint, and
+                    // `single_enforcement_path_is_grep_provable` counts
                     // refusal-event construction sites precisely so that a
-                    // second one cannot appear unnoticed.
-                    //
-                    // `vitrin_grant.refusal.capacity` already means what this
-                    // situation is -- the mechanism has no room right now, and
-                    // asking later is legal -- and the launch arm set the
-                    // precedent by mapping `LaunchRefusal::Capacity` to it for
-                    // the same class of answer. So the authority voice says
-                    // `capacity` through the one existing site, and the
-                    // powerbox's `busy` stays with the picker that will send
-                    // it (P2.6.6), where the card it describes actually exists.
-                    Err(refusal) => {
-                        let code = match refusal {
-                            // A verb served with no mechanism behind it. Loud,
-                            // because it is a deployment error rather than an
-                            // answer the human or the policy gave.
-                            DesignateRefusal::Unavailable => {
-                                tracing::warn!(
-                                    ?verb,
-                                    "a designation was admitted but this deployment has no \
-                                     picker; refusing internal"
-                                );
-                                Refusal::Internal
-                            }
-                            DesignateRefusal::Full => {
-                                tracing::warn!(
-                                    ?verb,
-                                    "the designation ledger is at its resource bound; refusing \
-                                     capacity"
-                                );
-                                Refusal::Capacity
-                            }
-                            DesignateRefusal::Busy => Refusal::Capacity,
-                        };
+                    // second one cannot appear unnoticed. So the sink sends it
+                    // and reports [`DesignateRefusal::Answered`], and this arm
+                    // voices nothing -- see that variant's docs for why
+                    // `capacity` was the wrong home for those conditions.
+                    Err(DesignateRefusal::Answered) => {
+                        // The chain admitted this use: the rung was spent, the
+                        // rate token taken, the attention window claimed. What
+                        // the mechanism then answered is a facet-level fact
+                        // the journal records at the sink. Reporting
+                        // `Admitted` here rather than a refusal keeps those
+                        // admission facts on the line that owns them --
+                        // `an_owed_outcome_reports_the_same_admission_facts_a_synchronous_one_does`
+                        // is the same argument for the `Owed` arm.
+                        //
+                        // `frame: None`: a designation delivers no
+                        // observation, and this one delivered nothing at all.
+                        Ok(UseOutcome::Admitted {
+                            grant: allowed.grant_id,
+                            frame: None,
+                            spent_once,
+                            attention_claimed,
+                        })
+                    }
+                    // A verb served with no mechanism behind it. Loud, because
+                    // it is a deployment error rather than an answer the human
+                    // or the policy gave.
+                    Err(DesignateRefusal::Unavailable) => {
+                        tracing::warn!(
+                            ?verb,
+                            "a designation was admitted but this deployment has no picker; \
+                             refusing internal"
+                        );
+                        let code = Refusal::Internal;
                         let voiced = self.voice_refusal(
                             req.grant_wire_id,
                             verb,
@@ -2498,12 +2510,14 @@ mod tests {
 
     /// A grant row carrying `designate_file`.
     ///
-    /// **Test-only, and it widens something the shipped build does not.**
-    /// `designate_file` is outside `SERVED_VERB_BITS`, so no petition can
-    /// mint a row that carries it and step 4 refuses every real designation
-    /// `not_granted` long before the arm below is reached. That is asserted
-    /// in `a_designation_is_unreachable_in_the_shipped_build`, which is what
-    /// stops these tests from being read as evidence that anything serves it.
+    /// **No longer a widening.** `designate_file` is inside
+    /// `SERVED_VERB_BITS` since P2.6.6 (issue #190), so a petition can mint
+    /// exactly this row and the arm below is on a live path -- which is what
+    /// `a_designation_is_served_and_a_pickerless_deployment_still_refuses_loudly`
+    /// now asserts, in place of the unreachability claim that stood here.
+    /// Building the row by hand is still what these tests want, for the
+    /// ordinary reason: they are about the chokepoint's arm, not about
+    /// petition admission.
     fn designation_row(
         table: &mut crate::grants::GrantTable,
         who: &PrincipalIdentity,
@@ -2602,24 +2616,86 @@ mod tests {
         (outcome, seen)
     }
 
-    /// **The shipped build never reaches the arm the tests below exercise**,
-    /// and that is asserted rather than assumed.
+    /// **The verb is served, and a deployment with no picker behind it still
+    /// refuses loudly** — the two halves of the same rule, asserted together
+    /// because either alone is misleading.
     ///
-    /// `designate_file` is outside `SERVED_VERB_BITS`, so no petition resolves
-    /// `granted` for it, no row carries the bit, and step 4 refuses every real
-    /// designation `not_granted`. Everything below runs against a row this
-    /// module built by hand. If this assertion ever fails, the tests below
-    /// stopped being statements about a mechanism and became statements about
-    /// a deployment, and each needs re-reading.
+    /// This test replaces `a_designation_is_unreachable_in_the_shipped_build`,
+    /// which asserted that `designate_file` was **outside**
+    /// `SERVED_VERB_BITS` so that serving it could never happen silently.
+    /// **This is the change it was written for** (P2.6.6, issue #190): the
+    /// core-drawn picker exists, the bit moved in, and the guard's job now
+    /// inverts. It stops being "nothing serves this" and becomes "serving it
+    /// is not on its own enough" — because a verb served with no mechanism
+    /// behind it is the condition the IDL forbids, and the *bit* is not the
+    /// mechanism. [`UseEnv::designate`] is; a deployment that could not open
+    /// its picker root installs a sink that refuses
+    /// [`DesignateRefusal::Unavailable`], and that must reach the client as
+    /// `internal` rather than as anything a human could be blamed for.
+    ///
+    /// The tests below therefore run against a live path now, not an
+    /// unreachable one, and each is a statement about a deployment as well as
+    /// about a mechanism.
     #[test]
-    fn a_designation_is_unreachable_in_the_shipped_build() {
-        assert_eq!(
+    fn a_designation_is_served_and_a_pickerless_deployment_still_refuses_loudly() {
+        assert_ne!(
             Verb::DESIGNATE_FILE.bits() & crate::grants::SERVED_VERB_BITS,
             0,
-            "SERVED_VERB_BITS gained `designate_file` without the picker (P2.6.6) or its \
-             consent copy (P2.6.8); the deferred-terminal tests below are now claims about a \
-             live path and must be re-read as such"
+            "`designate_file` left SERVED_VERB_BITS: no petition can mint a row carrying it, \
+             so step 4 refuses every designation `not_granted` and the picker is unreachable \
+             however well it works"
         );
+        // ...and the bit alone admits nothing. A deployment with no picker
+        // answers `internal` -- the code that says the core is broken -- never
+        // a policy-shaped refusal that would read as the human having decided
+        // something.
+        let (outcome, seen) = designate_once(
+            crate::grants::PersistenceRung::WhileRunning,
+            AskedFor::Dir,
+            Err(DesignateRefusal::Unavailable),
+        );
+        assert!(
+            matches!(
+                outcome,
+                UseOutcome::Refused {
+                    code: Refusal::Internal,
+                    voiced: true
+                }
+            ),
+            "a served verb with no mechanism behind it must answer internal and voice it, \
+             got {outcome:?}"
+        );
+        assert!(seen.is_some(), "the sink is consulted before the refusal");
+    }
+
+    /// **A terminal the sink produced itself silences the chokepoint.**
+    ///
+    /// The ledger's `busy` and `full` are answered on the powerbox facet by
+    /// whatever owns cards, so exactly one terminal reaches the client. A
+    /// chokepoint that voiced a `vitrin_grant.refused` beside it would be the
+    /// second, and the client would pair them positionally against one ask.
+    #[test]
+    fn a_facet_answered_designation_voices_nothing_at_the_chokepoint() {
+        let (outcome, seen) = designate_once(
+            crate::grants::PersistenceRung::Once,
+            AskedFor::File { write: false },
+            Err(DesignateRefusal::Answered),
+        );
+        let UseOutcome::Admitted {
+            frame, spent_once, ..
+        } = outcome
+        else {
+            panic!(
+                "a sink that answered on the facet must leave the chokepoint silent, got \
+                 {outcome:?}"
+            );
+        };
+        assert!(frame.is_none(), "a designation delivers no observation");
+        assert!(
+            spent_once,
+            "the admission still spent the rung, and the journal still owes a grant_spent line"
+        );
+        assert!(seen.is_some(), "the sink was consulted");
     }
 
     /// **An admitted ask whose card goes up is `Owed`, not `Admitted`.**
@@ -2694,61 +2770,6 @@ mod tests {
             "the sink must be told the rung was spent, or the redemption cannot tell \\
              \"this row is Spent because of me\" from \"this row died\""
         );
-    }
-
-    /// **A deployment with no picker refuses `internal`, loudly**, and does
-    /// not owe anything.
-    ///
-    /// Every deployment today. A verb served with no mechanism behind it is
-    /// the condition the IDL forbids, so the answer must be the one that says
-    /// the core is broken — never a policy-shaped refusal that would read as
-    /// the human having decided something.
-    #[test]
-    fn a_designation_with_no_picker_is_refused_internal() {
-        let (outcome, seen) = designate_once(
-            crate::grants::PersistenceRung::WhileRunning,
-            AskedFor::Dir,
-            Err(DesignateRefusal::Unavailable),
-        );
-        assert!(
-            matches!(
-                outcome,
-                UseOutcome::Refused {
-                    code: Refusal::Internal,
-                    voiced: true
-                }
-            ),
-            "no picker must answer internal and voice it, got {outcome:?}"
-        );
-        assert!(seen.is_some(), "the sink is consulted before the refusal");
-    }
-
-    /// A card already up, or a full ledger, answers `capacity` — the code
-    /// that means "no room now, asking later is legal".
-    ///
-    /// **Not the powerbox's own `busy`.** That enum is the picker's terminal
-    /// vocabulary, sent on the facet by whatever raises and dismisses a card;
-    /// building one inside the chokepoint would add a second terminal voice
-    /// to a function whose single-voice property is grep-proved.
-    #[test]
-    fn a_busy_or_full_ledger_answers_capacity() {
-        for refusal in [DesignateRefusal::Busy, DesignateRefusal::Full] {
-            let (outcome, _) = designate_once(
-                crate::grants::PersistenceRung::WhileRunning,
-                AskedFor::Dir,
-                Err(refusal),
-            );
-            assert!(
-                matches!(
-                    outcome,
-                    UseOutcome::Refused {
-                        code: Refusal::Capacity,
-                        voiced: true
-                    }
-                ),
-                "{refusal:?} must answer capacity, got {outcome:?}"
-            );
-        }
     }
 
     /// **An owed admission reports its admission facts**, so the journal

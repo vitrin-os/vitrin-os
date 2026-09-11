@@ -546,6 +546,12 @@ class ConsentInjector:
         "prompt",
         "band",
         "decided-ack",
+        # The picker's replies (P2.6.6, issue #190). Listed here for the
+        # reason every other verb is: an unknown line is a loud failure, so a
+        # core that grew a reply this harness cannot read says so rather than
+        # having it silently dropped on the floor.
+        "picker",
+        "picker-ack",
     )
 
     def __init__(self, sock: "socket_mod.socket") -> None:
@@ -772,6 +778,79 @@ class ConsentInjector:
         self.sock.sendall(f"decide {token} {choice}\n".encode())
         return self._next_reply("decided-ack", timeout)[1]
 
+    # -- the picker's four verbs (P2.6.6, issue #190) ----------------------
+    #
+    # A picker raises NO edge on this channel: `raised`/`lowered` are emitted
+    # from the armed-*petition* transition (`HeadlessState::service_consent`),
+    # and a designation's armed prompt carries a `Subject::Designation`, so
+    # `raised_petition()` stays `None` throughout. `list` is therefore the only
+    # way to learn a picker is up, and `await_picker` below is the poll that
+    # replaces the block-on-an-edge every consent caller uses.
+
+    def picker(self, timeout: float = 30.0) -> dict[str, object]:
+        """Snapshot the raised picker (`list`), or report that none is up.
+
+        Seven fields: `state` (`shown`/`none`), `designation`, `cursor`,
+        `visible`, `focus` (`listing`/`confirm`/`cancel`) and `selected` --
+        the selected row's raw filename BYTES, hex-encoded, because a filename
+        is arbitrary bytes and this channel is printable ASCII by the core's
+        own parse rule. `selected` is `None` when nothing is selected (an
+        empty directory, or a filter matching no row).
+
+        Deliberately no verb asks for the whole listing: a directory of ten
+        thousand entries would be an unbounded reply on a channel whose every
+        other message is bounded.
+        """
+        self.sock.sendall(b"list\n")
+        fields = self._next_reply("picker", timeout)
+        if len(fields) != 7:
+            raise InjectorFailed(f"malformed `picker` reply: {fields!r}")
+        state, designation, cursor, visible, focus, selected = fields[1:]
+        return {
+            "state": state,
+            "designation": None if designation == "-" else designation,
+            "cursor": int(cursor),
+            "visible": int(visible),
+            "focus": None if focus == "-" else focus,
+            "selected": None if selected == "-" else bytes.fromhex(selected),
+        }
+
+    def await_picker(self, timeout: float = 30.0, poll: float = 0.05) -> dict[str, object]:
+        """Poll `list` until a picker is up, or fail loudly.
+
+        The picker's counterpart to `await_raised`, and a poll rather than a
+        block for the reason in this section's comment: there is no edge to
+        block on.
+        """
+        deadline = time.monotonic() + timeout
+        last: dict[str, object] = {}
+        while time.monotonic() < deadline:
+            last = self.picker(timeout=max(deadline - time.monotonic(), 0.1))
+            if last["state"] == "shown":
+                return last
+            time.sleep(poll)
+        raise InjectorFailed(
+            f"no picker was raised within {timeout:.0f}s; the core's last `list` reply was "
+            f"{last!r}. A deployment with no `[[picker]]` table in its realm.toml serves NO "
+            "designations and refuses every ask `internal`."
+        )
+
+    def navigate(self, motion: str, timeout: float = 30.0) -> str:
+        """Queue one motion (`up`/`down`/`in`/`out`/`first`/`last`/`page-up`/
+        `page-down`); return the ack word (`queued`/`no-picker`)."""
+        self.sock.sendall(f"navigate {motion}\n".encode())
+        return self._next_reply("picker-ack", timeout)[1]
+
+    def confirm(self, timeout: float = 30.0) -> str:
+        """Commit whatever the picker has focused; return the ack word."""
+        self.sock.sendall(b"confirm\n")
+        return self._next_reply("picker-ack", timeout)[1]
+
+    def cancel(self, timeout: float = 30.0) -> str:
+        """Tab to Cancel and commit it; return the ack word."""
+        self.sock.sendall(b"cancel\n")
+        return self._next_reply("picker-ack", timeout)[1]
+
     def send_raw(self, raw: bytes) -> None:
         """Write arbitrary bytes -- for the fail-closed component tests."""
         self.sock.sendall(raw)
@@ -841,6 +920,7 @@ class Core:
         landlock: str | None = None,
         binds: tuple[str, ...] = (),
         realm_init: str | os.PathLike[str] | None = None,
+        picker_root: str | os.PathLike[str] | None = None,
     ) -> None:
         self.runtime = pathlib.Path(runtime_dir or tempfile.mkdtemp(prefix="vitrin-it-"))
         self._owns_runtime = runtime_dir is None
@@ -893,6 +973,17 @@ class Core:
         # and then starts a core against it, which a rewrite-and-chmod on
         # every construction would silently undo — leaving a test that
         # asserts a refusal against a file that no longer deserves one.
+        # A `picker_root` that would be silently dropped is worse than one
+        # that is refused: the core would come up serving no designations, and
+        # every ask would be answered `internal` — which looks exactly like a
+        # deployment that meant to have no picker. Refuse rather than ignore.
+        if picker_root is not None and not write_config:
+            raise ValueError(
+                "picker_root needs write_config=True: the [[picker]] table is "
+                "appended to the config this constructor writes, so with "
+                "write_config=False it would be dropped and the core would "
+                "serve no designations while the test believed it did"
+            )
         if write_config:
             self.principals.write_text(
                 f'[[principal]]\nidentity = "{DEMO_IDENTITY}"\ntoken = "{DEMO_TOKEN}"\n'
@@ -973,6 +1064,20 @@ class Core:
                         for rid in ("realm-0", *realms, *templates)
                     )
                 )
+            # The `[[picker]]` table (P2.6.6, issue #190). Appended after the
+            # realm tables because the loader's table parser is positional --
+            # a `root =` line before any table header has no table to land in.
+            #
+            # **Opt-in, and there is deliberately no default here either.**
+            # `crates/vitrin-core/src/main.rs` has no `$HOME` fallback: a
+            # deployment that declares no `[[picker]]` root serves NO
+            # designations and refuses every `vitrin_powerbox` ask `internal`.
+            # So a test that forgets this does not get a degraded picker, it
+            # gets a chokepoint refusal -- which is why the picker gate asserts
+            # the root is configured before it asks for anything.
+            if picker_root is not None:
+                with open(self.realm, "a") as fh:
+                    fh.write(f"\n[[picker]]\nroot = {_toml_string(os.fspath(picker_root))}\n")
 
         argv = [
             # Empty unless `VITRIN_CORE_WRAPPER` is set; see

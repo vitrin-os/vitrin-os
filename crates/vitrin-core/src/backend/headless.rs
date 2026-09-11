@@ -914,6 +914,12 @@ impl HeadlessState {
                 Some(Request::Describe) => self.answer_describe(),
                 Some(Request::Band) => self.answer_band(),
                 Some(Request::Decide { token, choice }) => self.answer_decide(token, choice),
+                Some(Request::List) => self.answer_list(),
+                Some(Request::Navigate(motion)) => {
+                    self.queue_picker(crate::picker::keys::PickerStep::Move(motion));
+                }
+                Some(Request::Confirm) => self.answer_confirm(),
+                Some(Request::Cancel) => self.answer_cancel(),
             }
         }
         true
@@ -1010,6 +1016,137 @@ impl HeadlessState {
         }
     }
 
+    /// Answer `list`: report the raised picker's state, or that none is up.
+    ///
+    /// A pure read. It recomposites nothing — unlike `describe`, there is no
+    /// raster to be consistent with, because **nothing in this tree draws a
+    /// picker** (see `ConsentGrab::raise_picker`). What this reports is the
+    /// *state* a renderer would draw, which is what a harness driving keys can
+    /// act on.
+    fn answer_list(&mut self) {
+        let raised = self.grab.raised_designation();
+        let line = match (raised, self.runtime.kernel.picker.as_ref()) {
+            (Some(id), Some(session)) => {
+                let selected = session
+                    .selected_name()
+                    .map(|name| {
+                        let mut hex = String::with_capacity(name.len() * 2);
+                        for byte in name {
+                            hex.push(char::from_digit(u32::from(byte >> 4), 16).expect("nibble"));
+                            hex.push(char::from_digit(u32::from(byte & 0x0f), 16).expect("nibble"));
+                        }
+                        hex
+                    })
+                    .unwrap_or_else(|| "-".into());
+                format!(
+                    "picker shown {} {} {} {} {selected}",
+                    id.get(),
+                    session.cursor(),
+                    session.visible(),
+                    match session.focus() {
+                        crate::picker::session::Focus::Listing => "listing",
+                        crate::picker::session::Focus::Confirm => "confirm",
+                        crate::picker::session::Focus::Cancel => "cancel",
+                    },
+                )
+            }
+            // A grab holding a picker with no session behind it, or the
+            // reverse, is a core bug rather than a state a harness should be
+            // told about as if it were normal -- but it is reported as `none`
+            // rather than asserted, on this file's own defence-in-depth
+            // precedent, and logged so it is not silent.
+            (Some(_), None) | (None, Some(_)) => {
+                tracing::error!("the picker grab and the picker session disagree");
+                "picker none - 0 0 - -".to_string()
+            }
+            (None, None) => "picker none - 0 0 - -".to_string(),
+        };
+        if let Some(injector) = self.injector.as_mut() {
+            injector.send_line(&line, None);
+        }
+    }
+
+    /// Queue one picker step, or say why not.
+    ///
+    /// The whole of what the three driving verbs do: they land in the same
+    /// grab queue a physical key lands in, and
+    /// `session::service_picker_round` drains and applies them. A step naming
+    /// a designation that has since been redeemed or expired is dropped there,
+    /// exactly as a slow human's keystroke is.
+    fn queue_picker(&mut self, step: crate::picker::keys::PickerStep) {
+        use crate::consent::injector::PickerAck;
+        let ack = match self.grab.raised_designation() {
+            Some(id) => {
+                let (peer_pid, peer_uid) = self
+                    .injector
+                    .as_ref()
+                    .map(|inj| inj.peer_cred())
+                    .unwrap_or((None, 0));
+                tracing::warn!(
+                    %id,
+                    ?step,
+                    peer_pid = ?peer_pid,
+                    peer_uid,
+                    "consent-injector: synthesizing a human keystroke on the raised picker \
+                     (issue #190; this build path never ships)"
+                );
+                self.grab.queue_step(id, step);
+                PickerAck::Queued
+            }
+            None => PickerAck::NoPicker,
+        };
+        if let Some(injector) = self.injector.as_mut() {
+            injector.send_line(&format!("picker-ack {}", ack.word()), None);
+        }
+    }
+
+    /// Answer `confirm`: commit whatever the picker has focused.
+    ///
+    /// If focus is on Cancel, this first walks it back to the listing — a
+    /// human pressing Return with Cancel focused would cancel, and a harness
+    /// asking to *confirm* means the other thing. The walk is Tab presses,
+    /// through the same focus ring, rather than a private setter.
+    fn answer_confirm(&mut self) {
+        use crate::picker::keys::PickerStep;
+        if self
+            .runtime
+            .kernel
+            .picker
+            .as_ref()
+            .is_some_and(|s| s.focus() == crate::picker::session::Focus::Cancel)
+        {
+            self.queue_picker_quietly(PickerStep::FocusNext);
+        }
+        self.queue_picker(PickerStep::Confirm);
+    }
+
+    /// Answer `cancel`: Tab to the Cancel button, then commit it.
+    fn answer_cancel(&mut self) {
+        use crate::picker::keys::PickerStep;
+        use crate::picker::session::Focus;
+        // The ring is Listing -> Confirm -> Cancel -> Listing, so this is the
+        // number of Tabs a human would press from where the picker is now.
+        // Read from the session rather than assumed, because a harness may
+        // have moved focus already.
+        let steps = match self.runtime.kernel.picker.as_ref().map(|s| s.focus()) {
+            Some(Focus::Listing) => 2,
+            Some(Focus::Confirm) => 1,
+            Some(Focus::Cancel) | None => 0,
+        };
+        for _ in 0..steps {
+            self.queue_picker_quietly(PickerStep::FocusNext);
+        }
+        self.queue_picker(PickerStep::Confirm);
+    }
+
+    /// Queue a step without acking it: the intermediate Tab presses a
+    /// `confirm` or a `cancel` is made of. One verb, one ack.
+    fn queue_picker_quietly(&mut self, step: crate::picker::keys::PickerStep) {
+        if let Some(id) = self.grab.raised_designation() {
+            self.grab.queue_step(id, step);
+        }
+    }
+
     /// Answer `decide <token> <button>`: validate, then enqueue at most one
     /// decision. See [`Self::service_injector`] for the fail-closed table.
     fn answer_decide(
@@ -1035,7 +1172,7 @@ impl HeadlessState {
                 // The armed petition is the authority on what is on screen;
                 // the channel's token is only a name for it. A disagreement
                 // is a race with `retire_stale`, and it fails closed.
-                if self.grab.armed_petition() != Some(petition) {
+                if self.grab.raised_petition() != Some(petition) {
                     DecideAck::UnknownToken
                 } else if !self
                     .view
@@ -1133,7 +1270,7 @@ impl session::RuntimeHost for HeadlessState {
         let size = self.view.output.size;
         self.grab
             .set_view((size.w.max(0) as u32, size.h.max(0) as u32));
-        let before = self.grab.armed_petition();
+        let before = self.grab.raised_petition();
         // Three disjoint field borrows, which is the whole reason `grab` is a
         // field of the state rather than of the view: `service_consent_round`
         // needs the registry and the recorder (inside `runtime`) live at the
@@ -1156,7 +1293,7 @@ impl session::RuntimeHost for HeadlessState {
             // redraws immediately after this returns.
             self.runtime.dirty = true;
         }
-        let after = self.grab.armed_petition();
+        let after = self.grab.raised_petition();
         if before != after {
             if let Some(injector) = self.injector.as_mut() {
                 if let Some(gone) = before {
@@ -1166,6 +1303,32 @@ impl session::RuntimeHost for HeadlessState {
                     injector.note_raised(up);
                 }
             }
+        }
+    }
+
+    /// Drive the core-drawn file picker for this dispatch round (P2.6.6,
+    /// issue #190), on the injector build only.
+    ///
+    /// The same shape and the same grab as [`Self::service_consent`]. It is
+    /// the injector build alone for that method's reason: a plain headless
+    /// session has no grab in its hook stack and nothing that could answer a
+    /// card, so a picker raised there would be a seized keyboard nobody is at.
+    #[cfg(feature = "consent-injector")]
+    fn service_picker(&mut self, now: std::time::Instant) {
+        if self.injector.is_none() {
+            return;
+        }
+        let size = self.view.output.size;
+        self.grab
+            .set_view((size.w.max(0) as u32, size.h.max(0) as u32));
+        if session::service_picker_round(
+            &mut self.grab,
+            &mut self.runtime,
+            &mut self.view.output.consent,
+            now,
+            session::PromptVisibility::Reachable,
+        ) {
+            self.runtime.dirty = true;
         }
     }
 }
@@ -4079,6 +4242,10 @@ mod tests {
                     }
                     state.headless.loop_signal.stop();
                 }
+                // This harness asks for no turns, so one arriving would mean
+                // the source invented it. Panicking rather than ignoring keeps
+                // that from passing as a quiet no-op.
+                ConnectionEvent::Woken => panic!("a turn nobody asked for"),
                 ConnectionEvent::Fault(reason) => panic!("transport fault: {reason}"),
             })
             .expect("insert connection source");

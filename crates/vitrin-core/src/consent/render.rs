@@ -44,8 +44,14 @@
 use vitrin_protocol::generated::vitrin_grant::Verb;
 
 use super::{Choice, PanelContent, PromptContent};
+use crate::designation::AskedFor;
+use crate::grants::RealmId;
+use crate::identity::PrincipalIdentity;
 use crate::paint::canvas::{Canvas, Rect};
-use crate::paint::text::Text;
+use crate::paint::script::Group;
+use crate::paint::text::{Text, Vetted, NAME_PX};
+use crate::paint::transcript::{Class, Transcript};
+use crate::picker::session::{Focus, NAME_FIELD_PX};
 use crate::scene::BYTES_PER_PIXEL;
 
 // ---------------------------------------------------------------------------
@@ -114,6 +120,50 @@ const PANEL_ROW_H: u32 = 22;
 const PANEL_H: u32 = PANEL_ROWS as u32 * PANEL_ROW_H;
 /// Width of the scroll thumb's gutter, inset from the content column's right.
 const PANEL_THUMB_W: u32 = 4;
+/// Width of the **collision gutter**: the reserved column
+/// [`crate::picker::listing`]'s repair mark is drawn in.
+///
+/// Wide enough for `#999`, the largest mark that module will emit, at
+/// [`NAME_PX`] — `every_gutter_mark_fits_its_reserved_column` measures that
+/// against the shipped face rather than trusting this sentence.
+///
+/// It is a *reserved* column in the strong sense: the name field is elided to
+/// [`NAME_FIELD_PX`] and this sits beyond both that width and the script
+/// column, so no name can grow into it. That is the property the repair
+/// depends on — a mark inside the name would be the first thing elision cut,
+/// on exactly the long-shared-prefix rows that need it.
+const PANEL_GUTTER_W: u32 = 40;
+/// Gap between the name field and the script column, and between the script
+/// column and the gutter.
+const PANEL_GUTTER_GAP: u32 = 8;
+
+/// Left edge of the script-label column, card-local.
+fn script_x() -> u32 {
+    CONTENT_X + NAME_FIELD_PX + PANEL_GUTTER_GAP
+}
+
+/// Left edge of the collision gutter, card-local. Right-anchored: the gutter
+/// hugs the thumb so its position does not move when a script label is long.
+fn gutter_x() -> u32 {
+    CONTENT_X + CONTENT_W - PANEL_THUMB_W - 4 - PANEL_GUTTER_W
+}
+
+/// The three columns must fit inside the content column, or the gutter would
+/// overlap the name field and the reservation above would be a sentence
+/// rather than a fact. A build-time check, because the alternative is finding
+/// out by reading a golden.
+///
+/// This says nothing about the *script label* fitting: a label's width is a
+/// property of the shipped face, which no `const` can measure. What it
+/// guarantees is only that `script_x() <= gutter_x()` — that the column
+/// exists. `the_widest_script_label_fits_its_column` is what measures whether
+/// anything can be written in it, and it is a separate, runtime check for
+/// that reason.
+const _: () = assert!(
+    CONTENT_X + NAME_FIELD_PX + 2 * PANEL_GUTTER_GAP + PANEL_GUTTER_W + PANEL_THUMB_W + 4
+        <= CONTENT_X + CONTENT_W,
+    "the picker's name field, script column and gutter do not fit the card"
+);
 
 // ---------------------------------------------------------------------------
 // Palette (RGB; the card is opaque, so no alpha travels with these)
@@ -133,6 +183,74 @@ const RULE_RGBA: [u8; 4] = [0x2b, 0x30, 0x3b, 0xff];
 const BUTTON_BG: [u8; 4] = [0x22, 0x27, 0x31, 0xff];
 const BUTTON_BORDER: [u8; 4] = [0x5c, 0x66, 0x78, 0xff];
 const BUTTON_FG: [u8; 3] = [0xf1, 0xf4, 0xf9];
+/// The highlighted panel row's fill. A lifted grey rather than the accent —
+/// see [`draw_panel`] on why a resting cursor must not look armed.
+const PANEL_SELECTED_BG: [u8; 4] = [0x2b, 0x33, 0x42, 0xff];
+
+// ---------------------------------------------------------------------------
+// The transcript palette (P2.6.6)
+// ---------------------------------------------------------------------------
+
+/// How a [`Transcript`]'s three run classes are coloured.
+///
+/// A struct rather than three loose constants because the *set* is the
+/// safety property: what makes an escape legible is that its colour differs
+/// from the other two, and a palette that lost that would still compile as
+/// three constants. `the_three_run_classes_are_three_distinct_colours` holds
+/// it.
+struct RunPalette {
+    ascii: [u8; 3],
+    native: [u8; 3],
+    escaped: [u8; 3],
+}
+
+impl RunPalette {
+    fn of(&self, class: Class) -> [u8; 3] {
+        match class {
+            Class::Ascii => self.ascii,
+            Class::Native => self.native,
+            Class::Escaped => self.escaped,
+        }
+    }
+}
+
+/// A filename's own colours.
+///
+/// - `ascii` is the unremarkable case and is deliberately the same
+///   [`VALUE_FG`] the rest of the card's values use: the overwhelming
+///   majority of rows are ASCII, and tinting them all would make the tint
+///   mean nothing.
+/// - `native` is a character drawn as itself outside ASCII. Warm, so a
+///   Cyrillic or Japanese run reads as *different* without reading as
+///   *wrong*: it is not an error, and colouring it like one would train the
+///   human to distrust their own language's filenames.
+/// - `escaped` is a character that was **not** drawn as itself. Cold and
+///   saturated, because this is the one that says the transcript intervened —
+///   a bidi override, a combining mark, an undecodable byte, or a
+///   minority-script letter inside a word. It is a second tell, independent
+///   of the glyph shapes, which is the point: a human who cannot see that
+///   `\u{0435}` was a Cyrillic letter can still see that the row changed
+///   colour where an all-Latin row would not have.
+const NAME_PALETTE: RunPalette = RunPalette {
+    ascii: VALUE_FG,
+    native: [0xe8, 0xc0, 0x6a],
+    escaped: [0xff, 0x8b, 0x8b],
+};
+
+/// The gutter mark's colours. Core-minted `#N` is ASCII and takes the accent,
+/// so the mark reads as the core speaking about the row rather than as part
+/// of the row's own name. The other two arms are not decoration: a mark that
+/// somehow stopped being core-minted ASCII would still announce itself rather
+/// than passing as a normal mark.
+const TAG_PALETTE: RunPalette = RunPalette {
+    ascii: [0x4d, 0x9d, 0xe0],
+    native: [0xe8, 0xc0, 0x6a],
+    escaped: [0xff, 0x8b, 0x8b],
+};
+
+/// The script label beside a row. Muted: it is metadata about the name, not
+/// part of it.
+const SCRIPT_FG: [u8; 3] = MUTED_FG;
 
 // ---------------------------------------------------------------------------
 // Copy
@@ -251,7 +369,7 @@ const EXPIRY_UNBOUNDED: &str = "no time limit - bounded only by the choice below
 /// It deliberately does not say "and observe it": launching confers nothing
 /// over what was launched, and a line that implied otherwise would ask for
 /// consent to authority this grant does not carry.
-const VERB_CATALOGUE: [(Verb, &str, &str); 6] = [
+const VERB_CATALOGUE: [(Verb, &str, &str); 7] = [
     (Verb::OBSERVE, "observe", "capture frames of this realm"),
     (
         Verb::ACTUATE_POINTER,
@@ -279,13 +397,69 @@ const VERB_CATALOGUE: [(Verb, &str, &str); 6] = [
         "realm_launch",
         "start the program named above, as a new app, as often as its rate limit allows",
     ),
+    // **The one line here that a fuller review still owes** (P2.6.8, Q13).
+    // It exists because P2.6.6 moved `designate_file` into
+    // `SERVED_VERB_BITS`, and the test below refuses to let a servable verb
+    // go unnamed on a card -- so this is the minimum honest copy rather than
+    // the considered copy.
+    //
+    // What it must get right, and does: the verb is authority to *ask*, the
+    // human chooses each time, and the descriptor **survives revocation**.
+    // That last clause is the one a human cannot infer and the IDL states
+    // outright -- "revocation stops future designations and kills the grant
+    // row while the payload keeps every fd already handed over until its
+    // realm dies" -- so a card that omitted it would describe an authority
+    // the deployment cannot actually take back as one it can.
+    (
+        Verb::DESIGNATE_FILE,
+        "designate_file",
+        "ask you to pick one file or folder to hand over - you choose each time, and what you \
+         hand over stays readable by this app until it exits, even if you revoke this grant",
+    ),
 ];
 
 // ---------------------------------------------------------------------------
 // Output
 // ---------------------------------------------------------------------------
 
-/// One rendered choice: the decision it stands for and where it was drawn, in
+/// What pressing one of a card's buttons means.
+///
+/// Two card kinds share one renderer, and they ask different questions:
+/// a grant-request card offers [`Choice`]es, and a picker card
+/// ([`PickerContent`]) offers Confirm and Cancel. This enum is what keeps
+/// them one seam without letting them be confused for one another — see
+/// [`ButtonBox::as_choice`], which is the only way a button becomes something
+/// a petition can be resolved with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CardAction {
+    /// A decision on the pending petition.
+    Decide(Choice),
+    /// The picker's commit: designate the highlighted row.
+    Confirm,
+    /// The picker's refusal.
+    Cancel,
+}
+
+impl CardAction {
+    /// The button caption. Exhaustive over the enum for [`Choice::label`]'s
+    /// reason: an action added here fails to compile until somebody decides
+    /// what to call it in front of a human.
+    pub fn label(self) -> &'static str {
+        match self {
+            CardAction::Decide(choice) => choice.label(),
+            // Not "OK". The verb the human is taking is handing over one
+            // named thing, and a caption that named no act would read as
+            // acknowledging a message rather than as taking one.
+            CardAction::Confirm => "Hand over the selected item",
+            // Not "Close". Cancelling *refuses* the ask -- the agent is told
+            // `cancelled`, and a `once` rung is spent by it -- and a caption
+            // that read as dismissing a window would understate that.
+            CardAction::Cancel => "Cancel - hand over nothing",
+        }
+    }
+}
+
+/// One rendered button: what pressing it means and where it was drawn, in
 /// **card-local** pixels.
 ///
 /// The P1.7.2 seam. That task maps a grabbed pointer event into card-local
@@ -293,6 +467,38 @@ const VERB_CATALOGUE: [(Verb, &str, &str); 6] = [
 /// [`super::ConsentSurface::card_origin`]) and hits it against these
 /// rectangles; the rectangles are produced by the same pass that paints the
 /// buttons, so what the human clicks and what the human sees cannot diverge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ButtonBox {
+    pub action: CardAction,
+    pub rect: Rect,
+}
+
+impl ButtonBox {
+    /// This button as a petition decision, or `None` if it is not one.
+    ///
+    /// **The narrowing [`super::grab::ConsentGrab`] snapshots through.** A
+    /// grab's armed prompt holds only the buttons this returns `Some` for, so
+    /// a picker's Confirm and Cancel are not merely ignored by
+    /// `ConsentGrab::commit` — they are *absent* from the geometry it
+    /// hit-tests, and a [`super::grab::Decision`] (which names a
+    /// `PetitionId`, and a designation has none) is therefore unconstructible
+    /// from a picker card rather than merely unconstructed. That is
+    /// `raise_picker`'s "no button rectangles exist" property, kept now that
+    /// a picker card really does paint buttons.
+    pub fn as_choice(&self) -> Option<ChoiceBox> {
+        match self.action {
+            CardAction::Decide(choice) => Some(ChoiceBox {
+                choice,
+                rect: self.rect,
+            }),
+            CardAction::Confirm | CardAction::Cancel => None,
+        }
+    }
+}
+
+/// One rendered choice: the decision it stands for and where it was drawn, in
+/// **card-local** pixels. [`ButtonBox`] narrowed to the buttons that resolve a
+/// petition; see [`ButtonBox::as_choice`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ChoiceBox {
     pub choice: Choice,
@@ -305,8 +511,25 @@ pub(crate) struct Card {
     pub rgba: Vec<u8>,
     pub width: u32,
     pub height: u32,
-    /// Every choice offered, in render order (left to right).
+    /// Every **petition decision** offered, in render order (left to right).
+    ///
+    /// [`Self::controls`] filtered through [`ButtonBox::as_choice`], and the
+    /// filtering is where the safety lives rather than in any caller: a
+    /// picker card paints Confirm and Cancel, neither of which is a
+    /// [`Choice`], so a picker card's `buttons` is **empty by construction**.
+    /// [`super::grab::ConsentGrab`] snapshots exactly this field, so the
+    /// rectangles it hit-tests into a [`super::grab::Decision`] cannot
+    /// include a button that answers no petition — which matters, because a
+    /// `Decision` names a `PetitionId` and a designation has none.
     pub buttons: Vec<ChoiceBox>,
+    /// Every button the card actually painted, in render order, whether or
+    /// not it decides a petition.
+    ///
+    /// The paint-and-report seam [`ButtonBox`] describes, unfiltered: a
+    /// rectangle here is a rectangle the same pass painted, so what a test
+    /// (or a future pointer path) aims at and what the human sees cannot
+    /// diverge. [`Self::buttons`] is this narrowed, never a second traversal.
+    pub controls: Vec<ButtonBox>,
     /// Every interactive slot and where it was drawn, card-local, in render
     /// order — `Some` **exactly when [`draw_panel`] ran**.
     ///
@@ -343,11 +566,26 @@ enum Row {
     Rule,
     /// One line of text, already wrapped to fit [`CONTENT_W`].
     Line { text: String, px: f32, rgb: [u8; 3] },
-    /// The choice row.
-    Buttons,
+    /// One line of **transcribed** text — a filename, a path, or the human's
+    /// filter query — drawn through the widened door
+    /// ([`Text::draw_runs`]) with each [`Class`] run in its own colour, and
+    /// elided to `width` rather than wrapped.
+    ///
+    /// Separate from [`Row::Line`] because the two doors are separate
+    /// ([`crate::paint::text`]'s module docs): `Line` substitutes anything
+    /// outside ASCII printables, which is right for an operator-written
+    /// `realm.toml` path and would silently destroy the very distinctions a
+    /// transcript exists to preserve.
+    Transcribed { text: Transcript, width: u32 },
+    /// The button row: the actions it offers in render order, and which of
+    /// them (if any) holds keyboard focus.
+    Buttons {
+        actions: Vec<CardAction>,
+        focused: Option<usize>,
+    },
     /// The interactive panel. Its height is [`PANEL_H`] and does not depend
     /// on what it holds — see [`PANEL_ROWS`].
-    Panel,
+    Panel(PanelContent),
 }
 
 /// Lay out and draw `prompt`.
@@ -359,14 +597,31 @@ enum Row {
 pub(crate) fn rasterize(prompt: &PromptContent) -> Card {
     let mut text = Text::new();
     let rows = rows(prompt, &mut text);
+    draw_card(&mut text, &rows)
+}
 
+/// Lay out and draw the **picker card** (P2.6.6, issue #190).
+///
+/// [`rasterize`]'s sibling, through the same row list, the same two passes and
+/// the same [`draw_card`] — which is the point. A second card in the TCB is a
+/// second place for a golden to drift ([`crate::paint`]'s rule), so the only
+/// thing that differs between a grant-request card and a picker card is the
+/// rows they build.
+pub(crate) fn rasterize_picker(content: &PickerContent) -> Card {
+    let mut text = Text::new();
+    let rows = picker_rows(content, &mut text);
+    draw_card(&mut text, &rows)
+}
+
+/// Measure `rows`, allocate the card, and draw them.
+fn draw_card(text: &mut Text, rows: &[Row]) -> Card {
     let height = PAD_TOP
         + PAD_BOTTOM
         + 2 * BORDER
-        + rows.iter().map(|row| row_height(row, &text)).sum::<u32>();
+        + rows.iter().map(|row| row_height(row, text)).sum::<u32>();
 
     let mut rgba = vec![0u8; CARD_WIDTH as usize * height as usize * BYTES_PER_PIXEL];
-    let mut buttons = Vec::new();
+    let mut controls: Vec<ButtonBox> = Vec::new();
     let mut panel = None;
     // A canvas of the exact size we just allocated cannot be refused; the
     // `else` arm keeps a core bug from becoming a panic in a compositor loop
@@ -376,7 +631,8 @@ pub(crate) fn rasterize(prompt: &PromptContent) -> Card {
             rgba,
             width: CARD_WIDTH,
             height,
-            buttons,
+            buttons: Vec::new(),
+            controls,
             // An empty card drew no panel, so it is not navigable. Stated
             // rather than defaulted: the alternative -- reporting slots that
             // were never painted -- is the exact divergence `Card::panel`'s
@@ -409,7 +665,7 @@ pub(crate) fn rasterize(prompt: &PromptContent) -> Card {
     );
 
     let mut y = (BORDER + PAD_TOP) as i32;
-    for row in &rows {
+    for row in rows {
         match row {
             Row::Space(_) => {}
             Row::Rule => {
@@ -434,47 +690,95 @@ pub(crate) fn rasterize(prompt: &PromptContent) -> Card {
                     *rgb,
                 );
             }
-            Row::Buttons => {
-                buttons = draw_buttons(&mut canvas, &mut text, prompt, y);
+            Row::Transcribed { text: t, width } => {
+                let metrics = text.line_metrics(NAME_PX);
+                draw_transcribed(
+                    &mut canvas,
+                    text,
+                    t,
+                    CONTENT_X as i32,
+                    y + metrics.ascent as i32,
+                    *width,
+                    &NAME_PALETTE,
+                );
             }
-            Row::Panel => {
-                // `Row::Panel` is only ever pushed when `prompt.panel` is
-                // `Some` (see `rows`), so the `else` arm is unreachable; it
-                // leaves `panel` as `None` rather than reporting slots
-                // nothing painted.
-                if let Some(content) = prompt.panel.as_ref() {
-                    panel = Some(draw_panel(&mut canvas, content, y));
-                }
+            Row::Buttons { actions, focused } => {
+                controls = draw_buttons(&mut canvas, text, actions, *focused, y);
+            }
+            Row::Panel(content) => {
+                panel = Some(draw_panel(&mut canvas, text, content, y));
             }
         }
-        y += row_height(row, &text) as i32;
+        y += row_height(row, text) as i32;
     }
 
     Card {
+        // Narrowed here and nowhere else, so the two lists come from one
+        // paint pass: see `Card::buttons`.
+        buttons: controls.iter().filter_map(ButtonBox::as_choice).collect(),
         rgba,
         width: CARD_WIDTH,
         height,
-        buttons,
+        controls,
         panel,
     }
 }
 
 /// Paint the interactive panel and report where each slot landed.
 ///
-/// Paints and reports in one pass, for [`ChoiceBox`]' reason: a slot the human
+/// Paints and reports in one pass, for [`ButtonBox`]' reason: a slot the human
 /// can hit is a slot that was drawn, and there is no second traversal that
 /// could compute a rectangle the pixels disagree with.
 ///
-/// **Draws no text.** Every slot is a rectangle, and the highlighted one is
-/// stroked. That is not a placeholder for a nicer panel later — it is the
-/// boundary this type keeps: [`super::PromptContent`] has no string field, so
-/// nothing here has a string to draw. Whatever eventually puts *names* in
-/// these slots has to make its own honest argument about attacker-influenced
-/// bytes on a trusted surface, and it must make it in its own type rather
-/// than inheriting this one's silence.
-fn draw_panel(canvas: &mut Canvas<'_>, content: &PanelContent, y: i32) -> Vec<SlotBox> {
+/// # What a row draws, and the three independent tells
+///
+/// This drew **no text at all** until P2.6.6 — every slot was a bare
+/// rectangle, because [`PanelContent`] carried no name to put in one. It
+/// carries [`Transcript`]s now, and that type's doc makes the argument for
+/// why that is admissible. What this function owes is drawing them so that a
+/// human can act on the distinctions the transcript preserved:
+///
+/// 1. **The name**, transcribed, with each [`Class`] run in its own colour —
+///    [`NAME_PALETTE`]`.ascii` for ASCII, `.native` for a character drawn as
+///    itself outside ASCII, `.escaped` for one that was not drawn as itself
+///    at all. An escape is therefore a *second*, independent tell beyond the
+///    character shapes: a human who cannot tell `\u{0435}` from a Cyrillic
+///    letter by its glyphs can still see that the row changed colour.
+/// 2. **The script label**, naming any non-Latin group present, so a wholly
+///    Cyrillic lookalike announces itself where the mixed-script rule (which
+///    only fires *within* a word) has nothing to say.
+/// 3. **The gutter mark**, when [`crate::picker::listing`] found this row
+///    rendering the same as another in the same listing.
+///
+/// Each is drawn from its own field, so losing one does not silently lose the
+/// others.
+///
+/// # The gutter is reserved, and the name column is exactly the digest's
+///
+/// The name is elided to [`NAME_FIELD_PX`] — the constant
+/// [`crate::picker::session`] elides and digests at — so the column the
+/// collision repair reasons about and the column this paints are the same
+/// number rather than two numbers that happen to agree. That module used to
+/// record the obligation as owed and unmet ("nothing checks it against a
+/// renderer, because there is no renderer"); this is the renderer, and
+/// `the_name_column_is_exactly_the_width_the_digest_elides_at` is the check.
+/// The gutter sits [`PANEL_GUTTER_GAP`] plus a script column to the right of
+/// that width, so elision cannot reach it — which is the whole reason the
+/// repair's mark is a gutter and not a suffix.
+///
+/// Elision bounds the name's **advance**, not its ink: 148 of the 5460 routed
+/// glyphs spill right of their advance, by a pixel or two. The gap after the
+/// name column absorbs that; the gutter is more than a hundred pixels
+/// further right and cannot be reached by it.
+fn draw_panel(
+    canvas: &mut Canvas<'_>,
+    text: &mut Text,
+    content: &PanelContent,
+    y: i32,
+) -> Vec<SlotBox> {
     let mut slots = Vec::with_capacity(PANEL_ROWS as usize);
     let slot_w = CONTENT_W - PANEL_THUMB_W - 4;
+    let metrics = text.line_metrics(NAME_PX);
     for index in 0..PANEL_ROWS {
         let rect = Rect {
             x: CONTENT_X as i32,
@@ -485,15 +789,48 @@ fn draw_panel(canvas: &mut Canvas<'_>, content: &PanelContent, y: i32) -> Vec<Sl
         // A slot beyond what the content fills is drawn as background: it is
         // still a rectangle and still reported, so the geometry a refresh
         // produces never changes shape, only appearance.
-        let filled = index < content.filled;
-        if filled {
-            canvas.fill_rect(rect, RULE_RGBA);
-        }
-        if content.highlight == Some(index) && filled {
-            // Stroked, not filled: a highlight marks where the pointer is
-            // resting and confers nothing. Filling it in the accent colour
-            // would make a hover look like the armed state a press produces.
+        let row = content.rows.get(index as usize);
+        if content.highlight == Some(index) && row.is_some() {
+            // The highlighted row is filled *and* stroked. On the picker this
+            // is the row a confirm commits, so it has to be unmissable; the
+            // fill is a quiet grey rather than the accent, because filling it
+            // in the accent colour would make a resting cursor look like the
+            // armed state a press produces.
+            canvas.fill_rect(rect, PANEL_SELECTED_BG);
             canvas.stroke_rect(rect, ACCENT, BORDER);
+        }
+        if let Some(row) = row {
+            let baseline = panel_baseline(rect.y, metrics);
+            draw_transcribed(
+                canvas,
+                text,
+                &row.name,
+                CONTENT_X as i32,
+                baseline,
+                NAME_FIELD_PX,
+                &NAME_PALETTE,
+            );
+            if let Some(label) = script_label(&row.name) {
+                let ly = rect.y
+                    + ((PANEL_ROW_H.saturating_sub(text.line_metrics(LABEL_PX).height)) / 2) as i32
+                    + text.line_metrics(LABEL_PX).ascent as i32;
+                text.draw(canvas, &label, LABEL_PX, script_x() as i32, ly, SCRIPT_FG);
+            }
+            if let Some(tag) = row.tag.as_ref() {
+                // The mark is drawn in the accent, not in a name colour: it
+                // is the core speaking about the row rather than part of the
+                // row's own name, and a human must be able to tell those
+                // apart on a surface whose whole job is that distinction.
+                draw_transcribed(
+                    canvas,
+                    text,
+                    tag,
+                    gutter_x() as i32,
+                    baseline,
+                    PANEL_GUTTER_W,
+                    &TAG_PALETTE,
+                );
+            }
         }
         slots.push(SlotBox { index, rect });
     }
@@ -578,9 +915,9 @@ fn rows(prompt: &PromptContent, text: &mut Text) -> Vec<Row> {
     // **The only condition anywhere that makes a card navigable.** Nothing in
     // the shipped tree constructs a `PanelContent`, so this is `None` in
     // every card this core can build today -- see `PromptContent::panel`.
-    if prompt.panel.is_some() {
+    if let Some(panel) = prompt.panel.as_ref() {
         rows.push(Row::Space(12));
-        rows.push(Row::Panel);
+        rows.push(Row::Panel(panel.clone()));
     }
 
     // The last field's trailing gap plus this one give the separator the same
@@ -588,7 +925,17 @@ fn rows(prompt: &PromptContent, text: &mut Text) -> Vec<Row> {
     rows.push(Row::Space(4));
     rows.push(Row::Rule);
     rows.push(Row::Space(16));
-    rows.push(Row::Buttons);
+    rows.push(Row::Buttons {
+        actions: prompt
+            .choices()
+            .into_iter()
+            .map(CardAction::Decide)
+            .collect(),
+        // A grant-request card is answered by pointer, never by keyboard
+        // (`grab`'s keyboard section: no key answers a consent prompt), so
+        // there is no focus to draw.
+        focused: None,
+    });
     rows
 }
 
@@ -598,11 +945,12 @@ fn row_height(row: &Row, text: &Text) -> u32 {
         Row::Space(n) => *n,
         Row::Rule => RULE_H,
         Row::Line { px, .. } => text.line_metrics(*px).height,
-        Row::Buttons => BUTTON_H,
+        Row::Transcribed { .. } => text.line_metrics(NAME_PX).height,
+        Row::Buttons { .. } => BUTTON_H,
         // A CONSTANT, and never a function of the panel's content. See
         // `PANEL_ROWS`: this is what keeps a refresh from resizing the card,
         // moving its origin, or moving the choice row under a finger.
-        Row::Panel => PANEL_H,
+        Row::Panel(_) => PANEL_H,
     }
 }
 
@@ -652,20 +1000,26 @@ fn duration_text(ms: u32) -> String {
     }
 }
 
-/// Draw the choice row at `y` and report where each button landed.
+/// Draw the button row at `y` and report where each button landed.
 ///
 /// Equal widths, computed once and used for every button; the row is centered
 /// inside the content column and any remainder from the integer division goes
 /// to the outer margins (module docs: no choice may be a pixel wider than
 /// another).
+///
+/// **The equal-geometry rule applies to the picker's two buttons too**, and
+/// for the same reason one level over: Confirm hands a descriptor to an agent
+/// and Cancel hands over nothing, so a TCB that drew one of them larger,
+/// brighter or first-among-equals would be steering a decision it exists to
+/// ask.
 fn draw_buttons(
     canvas: &mut Canvas<'_>,
     text: &mut Text,
-    prompt: &PromptContent,
+    actions: &[CardAction],
+    focused: Option<usize>,
     y: i32,
-) -> Vec<ChoiceBox> {
-    let choices = prompt.choices();
-    let n = choices.len() as u32;
+) -> Vec<ButtonBox> {
+    let n = actions.len() as u32;
     if n == 0 {
         return Vec::new();
     }
@@ -677,8 +1031,8 @@ fn draw_buttons(
     let used = width * n + gaps;
     let mut x = CONTENT_X as i32 + ((CONTENT_W - used) / 2) as i32;
 
-    let mut boxes = Vec::with_capacity(choices.len());
-    for choice in choices {
+    let mut boxes = Vec::with_capacity(actions.len());
+    for (i, action) in actions.iter().enumerate() {
         let rect = Rect {
             x,
             y,
@@ -686,22 +1040,357 @@ fn draw_buttons(
             h: BUTTON_H,
         };
         canvas.fill_rect(rect, BUTTON_BG);
-        canvas.stroke_rect(rect, BUTTON_BORDER, 1);
+        // The focus ring is the *only* thing that distinguishes one button
+        // from another here, and it moves with Tab rather than being a
+        // property of which button this is. The fill, the size and the type
+        // stay identical, so this is a statement about where the keyboard is
+        // and not about which answer the card prefers.
+        if focused == Some(i) {
+            canvas.stroke_rect(rect, ACCENT, BORDER);
+        } else {
+            canvas.stroke_rect(rect, BUTTON_BORDER, 1);
+        }
 
         // Caption centered in the box. Measured with the same engine that
         // draws it, so a caption that grows past its button is visibly
         // clipped by the canvas rather than silently mis-centered.
-        let label = choice.label();
+        let label = action.label();
         let label_w = text.width(label, BUTTON_PX);
         let metrics = text.line_metrics(BUTTON_PX);
         let tx = x + ((width.saturating_sub(label_w)) / 2) as i32;
         let ty = y + ((BUTTON_H.saturating_sub(metrics.height)) / 2) as i32 + metrics.ascent as i32;
         text.draw(canvas, label, BUTTON_PX, tx, ty, BUTTON_FG);
 
-        boxes.push(ChoiceBox { choice, rect });
+        boxes.push(ButtonBox {
+            action: *action,
+            rect,
+        });
         x += (width + BUTTON_GAP) as i32;
     }
     boxes
+}
+
+// ---------------------------------------------------------------------------
+// The picker card (P2.6.6, issue #190)
+// ---------------------------------------------------------------------------
+
+/// Everything the picker card is allowed to say about one raised designation.
+///
+/// [`PromptContent`]'s sibling, and it keeps the same rule with one widening
+/// that [`PanelContent`] argues for at length: the fields are typed
+/// core-derived values, and the only variable *text* on the card is
+/// [`Transcript`]s, which nothing but
+/// [`crate::paint::transcript::encode`] can produce. There is no free-text
+/// field here either.
+///
+/// **Why this is a second card rather than a panelled [`PromptContent`].** A
+/// designation grants nothing: it hands over one descriptor the human picked,
+/// and it resolves no petition. A grant-request card asks "may this principal
+/// have this authority" and offers Allow/Deny. Drawing that card for a
+/// designation would put Allow and Deny under a question they do not answer,
+/// which is what [`super::grab::ConsentGrab::raise_picker`] refuses to do.
+/// The two share the renderer, the palette, the panel and the placement; they
+/// do not share the question.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PickerContent {
+    /// The principal that asked. From `vitrin_principal.bound`, by way of the
+    /// designation ticket — never anything the client sent with the ask.
+    pub principal: PrincipalIdentity,
+    /// The realm the grant named when the ask was admitted.
+    pub realm: RealmId,
+    /// What was asked for. Decides the title, the consequence line, and
+    /// nothing else.
+    pub ask: AskedFor,
+    /// Where inside the picker root the human is standing, as the components
+    /// walked from it joined by `/` and put through `encode`.
+    ///
+    /// **Attacker-influenced, exactly like a row**: a directory the human
+    /// descended into was named by whoever created it. It is a `Transcript`
+    /// for that reason and not for symmetry.
+    pub location: Transcript,
+    /// The listing.
+    pub panel: PanelContent,
+    /// Which control the keyboard is on.
+    pub focus: Focus,
+}
+
+/// The picker card's title, by what was asked for.
+const TITLE_PICK_FILE: &str = "Choose a file to hand over";
+const TITLE_PICK_DIR: &str = "Choose a folder to hand over";
+
+/// What confirming actually does, per ask.
+///
+/// Each line says the same three things the verb catalogue's `designate_file`
+/// entry says, because they are the facts a human cannot infer and the IDL
+/// states outright: **one** item, a handle that lasts until the app exits,
+/// and a handle revoking the grant does not take back.
+///
+/// The directory line deliberately does **not** claim read-only. The
+/// descriptor is opened `O_RDONLY`, but a directory descriptor is an anchor
+/// rather than a permission: what the app opens *through* it carries its own
+/// mode. Saying "read-only" would be the kind of narrow-sounding claim a human
+/// would rely on and this core does not enforce.
+const CONSEQUENCE_READ: &str =
+    "This app gets a read-only handle to the one file you pick, and keeps it until it exits. \
+     Revoking the grant does not take it back.";
+const CONSEQUENCE_WRITE: &str =
+    "This app gets a read-and-write handle to the one file you pick, and keeps it until it \
+     exits. Revoking the grant does not take it back.";
+const CONSEQUENCE_DIR: &str =
+    "This app gets a handle to the one folder you pick and can reach everything under it, and \
+     keeps it until it exits. Revoking the grant does not take it back.";
+
+const LABEL_LOCATION: &str = "Folder";
+const LABEL_FILTER: &str = "Filter";
+/// What the location field says at the top of the picker root. Not the root's
+/// filesystem path: that is the operator's business, it is not something the
+/// human chose, and printing it would put an operator-written path on the one
+/// surface this card is trying to keep small.
+const LOCATION_ROOT: &str = "(the folder this deployment offers)";
+/// What the filter field says before anything is typed.
+const FILTER_EMPTY: &str = "(type to filter)";
+
+/// **Escape is named, and named as not working here.**
+///
+/// A human in front of a modal card reaches for Escape, and on this one it
+/// does nothing: it belongs to the dead-man chord ([`crate::picker::keys`]),
+/// which is a decision this card must not leave the human to discover by
+/// pressing it. So the hint says which keys do work *and* says what Escape is
+/// instead — a card that silently swallowed the key a human reaches for to
+/// stop something would be the worst possible place to be quiet.
+const PICKER_HINT: &str =
+    "Arrows move, Tab reaches the buttons, typing filters. Escape does not close this card - it \
+     is the emergency chord.";
+
+/// The picker card's rows, top to bottom.
+fn picker_rows(content: &PickerContent, text: &mut Text) -> Vec<Row> {
+    let mut rows = Vec::new();
+    let line = |rows: &mut Vec<Row>, s: &str, px: f32, rgb: [u8; 3]| {
+        rows.push(Row::Line {
+            text: s.to_string(),
+            px,
+            rgb,
+        });
+    };
+
+    let (title, consequence) = match content.ask {
+        AskedFor::File { write: false } => (TITLE_PICK_FILE, CONSEQUENCE_READ),
+        AskedFor::File { write: true } => (TITLE_PICK_FILE, CONSEQUENCE_WRITE),
+        AskedFor::Dir => (TITLE_PICK_DIR, CONSEQUENCE_DIR),
+    };
+    line(&mut rows, title, TITLE_PX, TITLE_FG);
+    rows.push(Row::Space(6));
+    for wrapped in text.wrap(consequence, LABEL_PX, CONTENT_W, 3) {
+        line(&mut rows, &wrapped, LABEL_PX, MUTED_FG);
+    }
+    rows.push(Row::Space(14));
+    rows.push(Row::Rule);
+    rows.push(Row::Space(14));
+
+    // Who is asking, and where. Both are the same values the grant-request
+    // card draws, from the same types, so a human who has seen one card knows
+    // where to look on the other.
+    let field = |rows: &mut Vec<Row>, text: &mut Text, label: &str, value: &str| {
+        line(rows, label, LABEL_PX, MUTED_FG);
+        rows.push(Row::Space(LABEL_GAP));
+        for wrapped in text.wrap(value, VALUE_PX, CONTENT_W, MAX_VALUE_LINES) {
+            line(rows, &wrapped, VALUE_PX, VALUE_FG);
+        }
+        rows.push(Row::Space(GROUP_GAP));
+    };
+    field(
+        &mut rows,
+        text,
+        LABEL_PRINCIPAL,
+        &content.principal.to_string(),
+    );
+    field(&mut rows, text, LABEL_REALM, &content.realm.to_string());
+
+    // Where the human is standing. Transcribed, because a directory name is
+    // whatever whoever created it chose.
+    line(&mut rows, LABEL_LOCATION, LABEL_PX, MUTED_FG);
+    rows.push(Row::Space(LABEL_GAP));
+    if content.location.text.is_empty() {
+        line(&mut rows, LOCATION_ROOT, NAME_PX, MUTED_FG);
+    } else {
+        rows.push(Row::Transcribed {
+            text: content.location.clone(),
+            width: CONTENT_W,
+        });
+    }
+    rows.push(Row::Space(GROUP_GAP));
+
+    // The query echo. A human filtering has to be able to see what the core
+    // thinks they typed, or a swallowed or mis-decoded keystroke reads as a
+    // directory that suddenly has fewer files in it.
+    line(&mut rows, LABEL_FILTER, LABEL_PX, MUTED_FG);
+    rows.push(Row::Space(LABEL_GAP));
+    if content.panel.query.text.is_empty() {
+        line(&mut rows, FILTER_EMPTY, NAME_PX, MUTED_FG);
+    } else {
+        rows.push(Row::Transcribed {
+            text: content.panel.query.clone(),
+            width: CONTENT_W,
+        });
+    }
+    rows.push(Row::Space(10));
+
+    rows.push(Row::Panel(content.panel.clone()));
+
+    rows.push(Row::Space(10));
+    rows.push(Row::Rule);
+    rows.push(Row::Space(14));
+    rows.push(Row::Buttons {
+        actions: vec![CardAction::Confirm, CardAction::Cancel],
+        focused: match content.focus {
+            Focus::Listing => None,
+            Focus::Confirm => Some(0),
+            Focus::Cancel => Some(1),
+        },
+    });
+    rows.push(Row::Space(10));
+    for wrapped in text.wrap(PICKER_HINT, LABEL_PX, CONTENT_W, 2) {
+        line(&mut rows, &wrapped, LABEL_PX, MUTED_FG);
+    }
+    rows
+}
+
+/// Draw one transcript at `baseline`, tinting each run and eliding to
+/// `max_w`; returns the advance actually drawn.
+///
+/// # Why this measures with `width_vetted` and never `Text::width`
+///
+/// [`Text::width`] measures through the ASCII substitution, so it measures a
+/// natively-drawn `é` or `漢` as `?` — roughly half the advance of a wide
+/// glyph. A column laid out with `width` and drawn with [`Text::draw_runs`]
+/// would be laid out for text it is not drawing, and a Japanese filename
+/// would run past the end of the name field and into the gutter the collision
+/// repair reserves. Every measurement here goes through
+/// [`Text::elide_vetted`], which is the same pen over the same characters as
+/// the draw.
+///
+/// # The ellipsis is its own colour
+///
+/// A cut name is a name the human is not seeing all of, which on this surface
+/// is a fact about trust and not about typography — two files sharing a long
+/// prefix are exactly the pair a spoof is built from. So the marker is drawn
+/// in [`MUTED_FG`] rather than in the colour of the run it follows, and the
+/// gutter mark (drawn separately, and reserved from elision) is what actually
+/// separates such a pair.
+fn draw_transcribed(
+    canvas: &mut Canvas<'_>,
+    text: &mut Text,
+    transcript: &Transcript,
+    x: i32,
+    baseline: i32,
+    max_w: u32,
+    palette: &RunPalette,
+) -> u32 {
+    let Some(whole) = Vetted::new(&transcript.text) else {
+        // Unreachable: `encode` emits only characters `route` admits, which
+        // is exactly `Vetted`'s check. Answered rather than asserted, on this
+        // module's standing rule -- a core bug must not become a panic in a
+        // compositor loop -- and loudly, because a transcript this renderer
+        // cannot draw would mean the two halves of #190 had drifted apart.
+        tracing::error!("a transcript reached the picker card that the renderer cannot draw");
+        return 0;
+    };
+    let cut = text.elide_vetted(&whole, max_w);
+    let end = cut.unwrap_or(transcript.text.len());
+
+    let mut runs: Vec<(Vetted<'_>, [u8; 3])> = Vec::new();
+    for (range, class) in &transcript.runs {
+        let (start, stop) = (range.start.min(end), range.end.min(end));
+        if start >= stop {
+            continue;
+        }
+        // Run boundaries are character boundaries (`encode` emits whole
+        // characters) and so is `end` (`elide_vetted` walks `char_indices`),
+        // so this slice cannot split a codepoint.
+        let Some(v) = Vetted::new(&transcript.text[start..stop]) else {
+            continue;
+        };
+        runs.push((v, palette.of(*class)));
+    }
+    if cut.is_some() {
+        let ellipsis = Vetted::new(crate::paint::text::ELLIPSIS)
+            .expect("`...` is ASCII, which the router admits");
+        runs.push((ellipsis, MUTED_FG));
+    }
+    text.draw_runs(canvas, &runs, x, baseline)
+}
+
+/// The text baseline of a panel row whose slot starts at `top`.
+///
+/// Factored out because the picker card's tests reconstruct a row's expected
+/// pixels and have to place them where the renderer really placed them; a
+/// test that recomputed this from its own arithmetic would pass while drifting
+/// from the thing it is checking.
+fn panel_baseline(top: i32, metrics: crate::paint::text::LineMetrics) -> i32 {
+    top + ((PANEL_ROW_H.saturating_sub(metrics.height)) / 2) as i32 + metrics.ascent as i32
+}
+
+/// The scripts named beside a row, or `None` when there is nothing to say.
+///
+/// **Latin is not named**, and that is a decision rather than an oversight.
+/// [`Transcript::groups`] is the honest set of what is on screen, and an ASCII
+/// filename really is Latin — but a label on every row of every listing is a
+/// label nobody reads, and this label's whole job is to make an *unusual* row
+/// announce itself. So the renderer names what a reader of this deployment's
+/// alphabet would not otherwise expect, which is exactly the case the label
+/// exists for: the mixed-script rule fires only *within* a word, so a wholly
+/// Cyrillic lookalike passes it cleanly and this is what tells the human.
+///
+/// Escaped characters contribute nothing, because `encode` already leaves
+/// them out of `groups`: naming a script that was not drawn would describe
+/// something the human cannot see.
+///
+/// **Elision is the one exception, and it errs loud.** `groups` is a property
+/// of the whole transcript, and [`draw_panel`] labels a row from it even when
+/// [`NAME_FIELD_PX`] cut the only Cyrillic word off the end. So a long name
+/// can carry a label for a script that is not on screen. Left that way on
+/// purpose: the alternative is recomputing the set over the surviving prefix,
+/// which would *drop* the warning on exactly the rows elision makes hardest
+/// to read, and this label's failure direction has to be "says more than is
+/// visible", never "says less".
+///
+/// # `Japanese` cannot reach this today, and that is a gap rather than a
+/// design
+///
+/// [`crate::paint::transcript::encode`] marks a character drawable only when
+/// [`crate::paint::script::route`] returns `Route::Vector`, and Japanese
+/// routes to `Route::Atlas`. So a kana or Han character is escaped, never
+/// added to `groups`, and this arm is unreachable — the pre-rasterized atlas
+/// that exists to draw it is not reached from a filename at all.
+/// `the_script_label_is_not_vacuous` measures the two groups that *do* reach
+/// it and states this one as unreachable rather than leaving a reader to
+/// assume all four work. Closing it is a change to `encode`'s drawability
+/// test, not to this function, and it is not this task's.
+fn script_label(transcript: &Transcript) -> Option<String> {
+    let named: Vec<&'static str> = transcript
+        .groups
+        .iter()
+        .filter(|group| **group != Group::Latin)
+        .map(|group| group_name(*group))
+        .collect();
+    (!named.is_empty()).then(|| named.join(SCRIPT_JOIN))
+}
+
+/// Separator when a name draws characters from more than one non-Latin group.
+/// Reachable across word boundaries (`αβ.где`), which
+/// [`crate::paint::script::permitted`] allows because the mixing is not inside
+/// one word.
+const SCRIPT_JOIN: &str = "+";
+
+/// A group's name, exhaustively matched so a group added to the enum fails to
+/// compile until somebody decides what to call it in front of a human.
+fn group_name(group: Group) -> &'static str {
+    match group {
+        Group::Latin => "Latin",
+        Group::Greek => "Greek",
+        Group::Cyrillic => "Cyrillic",
+        Group::Japanese => "Japanese",
+    }
 }
 
 #[cfg(test)]
@@ -948,24 +1637,34 @@ mod tests {
         // WS-E.1.4 (issue #210) moved `layout_arrange` and `layout_focus`
         // out on the same terms.
         //
-        // vitrin-verb-set: unserved-verbs = observe_cursor, designate_file, egress
+        // vitrin-verb-set: unserved-verbs = observe_cursor, egress
         //
-        // Three verbs are pinned here. `observe_cursor` stays, and for a
+        // **Two verbs are pinned here: `observe_cursor` and `egress`.** The
+        // marker is not the enumeration -- this sentence is, and it is what a
+        // reader believes -- so both are named on it rather than left to the
+        // paragraphs below.
+        //
+        // `observe_cursor` stays, and for a
         // reason that has not moved: per-principal cursor *delivery* is
         // still M2's (D-017/D-019 both say so in as many words), so serving
         // the verb would widen a capture with a cursor the core does not
         // have.
         //
-        // **Re-pinned by P2.6.5 (issue #189) in the other direction** — the
-        // first time this pin has *grown*. `designate_file` (64) is appended
-        // to the IDL and is classified **unserved**, deliberately and not for
-        // lack of time: Q13's rule is that no verb is served before its
-        // human-readable consent copy exists (P2.6.8), and there is no picker
-        // to mint a descriptor either (P2.6.6). So it gets **no catalogue
-        // line above** — a line here would be prompt copy for a verb no
-        // petition can ever carry to a prompt, which is the exact failure the
-        // second assertion in this test forbids. When P2.6.8 writes the copy,
-        // this pin shrinks again and a line goes in above, in one change.
+        // **`designate_file` (64) LEFT this pin at P2.6.6 (issue #190)**,
+        // the third shrink. It was appended to the IDL at P2.6.5 and pinned
+        // unserved on two grounds — no picker to mint a descriptor, and no
+        // consent copy under Q13's rule. The first ground is gone: the
+        // core-drawn picker ([`crate::picker`]) exists and the chokepoint has
+        // a sink to reach it.
+        //
+        // **The second ground is not gone, and this is the honest place to
+        // say so.** P2.6.8 owns the considered copy; the catalogue line above
+        // is the minimum that keeps the card from omitting a verb it is
+        // asking a human to approve. So Q13's rule is met in the letter — the
+        // verb is named on the card — and the review that would make it met
+        // in spirit is still owed. That is a weaker state than
+        // `realm_launch`'s, whose copy was written by the task that served
+        // it, and the difference is recorded rather than smoothed over.
         //
         // **`egress` (128) JOINED the pin at P2.7.2 (issue #196)**, the
         // second growth, and again
@@ -985,12 +1684,12 @@ mod tests {
         // changes what the wire can express; only a mechanism changes what
         // this core can enforce, and only the second moves a bit out of
         // `UNSERVED_VERB_BITS`. The same is true of `designate_file` and
-        // `vitrin_powerbox`. `egress` leaves this pin when P2.7.3 lands
-        // the proxy and P2.6.8's Q13 copy review clears its line, not
-        // before.
+        // `vitrin_powerbox`, whose facet landed a release before its
+        // mechanism did. `egress` leaves this pin when P2.7.3 lands the
+        // proxy, not before.
         assert_eq!(
             crate::grants::UNSERVED_VERB_BITS,
-            (Verb::OBSERVE_CURSOR | Verb::DESIGNATE_FILE | Verb::EGRESS).bits(),
+            (Verb::OBSERVE_CURSOR | Verb::EGRESS).bits(),
             "the IDL defines a verb this module has not classified as served \
              or unserved (D-017/D-018)"
         );
@@ -1039,7 +1738,8 @@ mod tests {
                 "actuate_text",
                 "layout_arrange",
                 "layout_focus",
-                "realm_launch"
+                "realm_launch",
+                "designate_file"
             ]
         );
     }
@@ -1158,5 +1858,762 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -----------------------------------------------------------------
+    // The picker card (P2.6.6, issue #190)
+    // -----------------------------------------------------------------
+
+    use crate::consent::tests::{picker_fixture, picker_row_names};
+    use crate::consent::PanelRow;
+    use crate::paint::transcript::encode;
+
+    /// A picker card whose panel holds exactly `names`, nothing highlighted
+    /// and nothing marked — so a row's pixels are the row's alone, with card
+    /// background above and below it and no fill under it.
+    fn card_of(names: &[&[u8]]) -> Card {
+        let mut content = picker_fixture();
+        content.panel.rows = names
+            .iter()
+            .map(|name| PanelRow {
+                name: encode(name),
+                tag: None,
+            })
+            .collect();
+        content.panel.highlight = None;
+        content.panel.offset = 0;
+        content.panel.total = names.len() as u32;
+        rasterize_picker(&content)
+    }
+
+    /// The pixels of one panel row's **name field** — the column the digest
+    /// elides at, and nothing else: the script label and the gutter live to
+    /// the right of it and are outside this crop by construction.
+    fn name_field(card: &Card, index: usize) -> Vec<[u8; 4]> {
+        let slot = card.panel.as_ref().expect("a picker card paints a panel")[index];
+        let mut out = Vec::new();
+        for row in 0..PANEL_ROW_H {
+            for col in 0..NAME_FIELD_PX {
+                out.push(px(card, CONTENT_X + col, slot.rect.y as u32 + row));
+            }
+        }
+        out
+    }
+
+    /// The same crop, drawn from scratch out of runs a test spells out in
+    /// ASCII — the reference a rasterized row is compared against.
+    fn reference_name_field(runs: &[(&str, [u8; 3])]) -> Vec<[u8; 4]> {
+        let (w, h) = (NAME_FIELD_PX, PANEL_ROW_H);
+        let mut buf = vec![0u8; w as usize * h as usize * BYTES_PER_PIXEL];
+        let mut text = Text::new();
+        let baseline = panel_baseline(0, text.line_metrics(NAME_PX));
+        {
+            let mut canvas = Canvas::new(&mut buf, w, h).expect("scratch canvas");
+            canvas.fill_rect(Rect { x: 0, y: 0, w, h }, CARD_BG);
+            let vetted: Vec<(Vetted<'_>, [u8; 3])> = runs
+                .iter()
+                .map(|(s, rgb)| {
+                    (
+                        Vetted::new(s).expect("the reference runs are drawable"),
+                        *rgb,
+                    )
+                })
+                .collect();
+            text.draw_runs(&mut canvas, &vetted, 0, baseline);
+        }
+        buf.chunks_exact(BYTES_PER_PIXEL)
+            .map(|p| [p[0], p[1], p[2], p[3]])
+            .collect()
+    }
+
+    /// **A bidi override renders transcribed — checked on the pixels.**
+    ///
+    /// `U+202E RIGHT-TO-LEFT OVERRIDE` is the classic filename spoof: with a
+    /// bidi algorithm, `\u{202E}txt.exe` displays as `exe.txt`. This renderer
+    /// has no bidi algorithm and must not grow one
+    /// ([`crate::paint::script`]), so the override has to be *shown* rather
+    /// than obeyed or dropped.
+    ///
+    /// Asserted against the **rasterized card**, not against the transcript
+    /// string, and that distinction is the whole point of the test: a
+    /// renderer that produced the right transcript and then drew something
+    /// else — substituted it, reordered it, dropped the escape — would pass a
+    /// string comparison and fail here. The reference is built by drawing the
+    /// escape form's own ASCII characters through the same primitive, so what
+    /// this asserts is "the pixels on the card are the pixels of
+    /// `\u{202E}txt.exe` spelled out".
+    #[test]
+    fn a_bidi_override_is_drawn_transcribed_on_the_card_itself() {
+        let card = card_of(&["\u{202E}txt.exe".as_bytes()]);
+        assert_eq!(
+            name_field(&card, 0),
+            reference_name_field(&[
+                ("\\u{202E}", NAME_PALETTE.escaped),
+                ("txt.exe", NAME_PALETTE.ascii),
+            ]),
+            "the override must be drawn as its escape form, in the escaped tint"
+        );
+
+        // ...and it did not silently vanish: a row named `txt.exe` with no
+        // override draws different pixels. Without this the assertion above
+        // would also pass on a renderer that dropped the character and drew
+        // an escape form out of nowhere.
+        let plain = card_of(&[b"txt.exe"]);
+        assert_ne!(
+            name_field(&card, 0),
+            name_field(&plain, 0),
+            "an override that made no difference to the pixels would be an \
+             override the human cannot see"
+        );
+    }
+
+    /// **A combining-mark stack renders transcribed — checked on the pixels.**
+    ///
+    /// The other half of the same hazard. There is no mark positioning here,
+    /// so a combining acute would render as a spacing glyph *beside* its base
+    /// rather than over it — `a\u{0301}` drawn naively is two characters that
+    /// look like one wrong one. Transcribing it is the honest answer, and
+    /// this checks the card really does it.
+    #[test]
+    fn a_combining_mark_is_drawn_transcribed_on_the_card_itself() {
+        let card = card_of(&["a\u{0301}\u{0302}.txt".as_bytes()]);
+        assert_eq!(
+            name_field(&card, 0),
+            reference_name_field(&[
+                ("a", NAME_PALETTE.ascii),
+                ("\\u{0301}\\u{0302}", NAME_PALETTE.escaped),
+                (".txt", NAME_PALETTE.ascii),
+            ]),
+            "each combining mark must be drawn as its own escape form"
+        );
+    }
+
+    /// A natively-drawn non-ASCII run is drawn as itself, in the native tint.
+    ///
+    /// The complement of the two tests above, and it has to be here or they
+    /// would be equally satisfied by a renderer that escaped *everything*.
+    #[test]
+    fn a_drawable_non_ascii_run_is_drawn_as_itself_and_tinted() {
+        let card = card_of(&["отчёт.pdf".as_bytes()]);
+        assert_eq!(
+            name_field(&card, 0),
+            reference_name_field(&[("отчёт", NAME_PALETTE.native), (".pdf", NAME_PALETTE.ascii),]),
+            "a Cyrillic word with an ASCII extension is drawn, not escaped"
+        );
+    }
+
+    /// **The escape tint is a second, independent tell.**
+    ///
+    /// The mixed-script rule escapes the Cyrillic `е` inside `rеsume.pdf`, and
+    /// the escape form is what a human reads. That form is drawn in a colour
+    /// no ASCII run uses, so a human who does not parse `\u{0435}` still sees
+    /// that this row is not what it looks like.
+    #[test]
+    fn a_mixed_script_word_escapes_its_minority_in_the_escaped_tint() {
+        let card = card_of(&["rеsume.pdf".as_bytes()]);
+        assert_eq!(
+            name_field(&card, 0),
+            reference_name_field(&[
+                ("r", NAME_PALETTE.ascii),
+                ("\\u{0435}", NAME_PALETTE.escaped),
+                ("sume.pdf", NAME_PALETTE.ascii),
+            ])
+        );
+        // The lookalike it defends against draws differently, which is the
+        // only thing that makes the defence worth anything.
+        assert_ne!(
+            name_field(&card, 0),
+            name_field(&card_of(&[b"resume.pdf"]), 0)
+        );
+    }
+
+    /// The three run classes are three **distinct** colours.
+    ///
+    /// Asserted on the palette directly rather than through the golden,
+    /// because the golden's readable half is a mean-luma reduction and cannot
+    /// witness a colour at all (see `picker_card_golden`). Luminance is
+    /// checked too: a palette whose three entries differed only in hue would
+    /// be invisible to a colour-blind human, and this surface is not a place
+    /// to rely on hue alone.
+    #[test]
+    fn the_three_run_classes_are_three_distinct_colours() {
+        let p = &NAME_PALETTE;
+        assert_ne!(p.ascii, p.native);
+        assert_ne!(p.ascii, p.escaped);
+        assert_ne!(p.native, p.escaped);
+        let luma = |c: [u8; 3]| {
+            (u32::from(c[0]) * 299 + u32::from(c[1]) * 587 + u32::from(c[2]) * 114) / 1000
+        };
+        for (a, b) in [
+            (p.ascii, p.native),
+            (p.ascii, p.escaped),
+            (p.native, p.escaped),
+        ] {
+            assert!(
+                luma(a).abs_diff(luma(b)) >= 8,
+                "{a:?} and {b:?} differ by less than 8 in luminance, so the tint \
+                 would carry no signal without colour vision"
+            );
+        }
+    }
+
+    /// The pixels of one panel row across **everything left of the gutter** —
+    /// the name field plus the space beyond it a name must never occupy.
+    ///
+    /// Wider than [`name_field`] on purpose: a column that elided too
+    /// generously would draw *past* the name field, and a crop that stopped
+    /// at the field would be blind to exactly the defect it is looking for.
+    fn row_span(card: &Card, index: usize) -> Vec<[u8; 4]> {
+        let slot = card.panel.as_ref().expect("a picker card paints a panel")[index];
+        let mut out = Vec::new();
+        for row in 0..PANEL_ROW_H {
+            for col in CONTENT_X..gutter_x() {
+                out.push(px(card, col, slot.rect.y as u32 + row));
+            }
+        }
+        out
+    }
+
+    /// **The name column really is the width the digest elides at.**
+    ///
+    /// The obligation [`crate::picker::session`] recorded as owed while there
+    /// was no renderer to check it against. It is checked through both
+    /// shipped implementations rather than by comparing two constants, which
+    /// would be an identity — and it is built **at the cut point itself**,
+    /// because a pair that differs far past the cut would go on drawing alike
+    /// however generously the renderer elided, and a pair that differs far
+    /// before it would go on drawing differently however meanly it did.
+    ///
+    /// So the fixture asks [`Text::elide_vetted`] where the cut falls and
+    /// puts the difference on either side of exactly that character:
+    ///
+    /// - differing at the **first dropped** character: the digest says alike,
+    ///   and the card must draw them alike. A column even one character wider
+    ///   than the digest's would draw the difference and fail.
+    /// - differing at the **last kept** character: the digest says apart, and
+    ///   the card must draw them apart. A column one character narrower would
+    ///   cut the difference away and fail.
+    #[test]
+    fn the_name_column_is_exactly_the_width_the_digest_elides_at() {
+        use crate::picker::session::digest_for_test;
+
+        // Where the renderer's own elision falls on a name of this shape.
+        let long = "a".repeat(200);
+        let mut text = Text::new();
+        let cut = text
+            .elide_vetted(
+                &Vetted::new(&long).expect("ASCII is drawable"),
+                NAME_FIELD_PX,
+            )
+            .expect("200 characters do not fit the name field");
+        assert!(
+            cut > 8 && cut < 200,
+            "the fixture must really be elided: cut at {cut}"
+        );
+
+        let at = |index: usize, differing: char| {
+            let mut name = "a".repeat(index);
+            name.push(differing);
+            name.push_str(&"z".repeat(40));
+            name.into_bytes()
+        };
+
+        // Differing at the first character elision drops.
+        let (a, b) = (at(cut, 'b'), at(cut, 'c'));
+        assert_eq!(
+            digest_for_test(&a),
+            digest_for_test(&b),
+            "fixture check: a difference past the cut must be invisible to the digest, \
+             or the assertion below is a statement about nothing"
+        );
+        let card = card_of(&[&a, &b]);
+        assert_eq!(
+            row_span(&card, 0),
+            row_span(&card, 1),
+            "the digest judged these rows identical, so the card must draw them \
+             identically -- a name column wider than the digest's would draw the \
+             character the digest could not see"
+        );
+
+        // Differing at the last character elision keeps.
+        let (a, b) = (at(cut - 1, 'b'), at(cut - 1, 'c'));
+        assert_ne!(
+            digest_for_test(&a),
+            digest_for_test(&b),
+            "fixture check: a difference before the cut must be visible to the digest"
+        );
+        let card = card_of(&[&a, &b]);
+        assert_ne!(
+            row_span(&card, 0),
+            row_span(&card, 1),
+            "the digest judged these rows different, so the card must draw them \
+             differently -- a name column narrower than the digest's would cut away \
+             the difference the repair thought the human could see"
+        );
+    }
+
+    /// **Nothing a name can contain reaches the reserved gutter.**
+    ///
+    /// The property the whole gutter design rests on: elision shortens the
+    /// name, and the mark lives where elision cannot reach. Driven with the
+    /// widest thing the router admits rather than with a plausible filename,
+    /// because "a realistic name fits" is not the claim.
+    #[test]
+    fn no_name_can_reach_the_reserved_gutter() {
+        // Repeated `W` and `ё`: the widest ASCII glyph and a non-ASCII one,
+        // long enough that no elision could leave it short.
+        let long = "WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW"
+            .repeat(3)
+            .into_bytes();
+        let wide = "ёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёёё"
+            .repeat(3)
+            .into_bytes();
+        let escapes = "\u{202E}\u{202E}\u{202E}\u{202E}\u{202E}\u{202E}\u{202E}\u{202E}"
+            .repeat(4)
+            .into_bytes();
+        let card = card_of(&[&long, &wide, &escapes]);
+        let slots = card.panel.as_ref().expect("a panel");
+        for (index, slot) in slots.iter().enumerate().take(3) {
+            for row in 0..PANEL_ROW_H {
+                for col in gutter_x()..(gutter_x() + PANEL_GUTTER_W) {
+                    assert_eq!(
+                        px(&card, col, slot.rect.y as u32 + row),
+                        CARD_BG,
+                        "row {index} put ink at ({col}, {row}) inside the gutter the \
+                         collision repair reserves"
+                    );
+                }
+            }
+        }
+
+        // ...and the gutter is not merely empty because nothing is ever drawn
+        // there: a marked row inks it.
+        let mut content = picker_fixture();
+        content.panel.rows = vec![PanelRow {
+            name: encode(&long),
+            tag: Some(encode(b"#12")),
+        }];
+        content.panel.highlight = None;
+        let marked = rasterize_picker(&content);
+        let slot = marked.panel.as_ref().expect("a panel")[0];
+        let inked = (0..PANEL_ROW_H)
+            .flat_map(|row| {
+                (gutter_x()..(gutter_x() + PANEL_GUTTER_W))
+                    .map(move |col| (col, slot.rect.y as u32 + row))
+            })
+            .filter(|&(x, y)| px(&marked, x, y) != CARD_BG)
+            .count();
+        assert!(
+            inked > 0,
+            "a marked row must actually paint its gutter mark"
+        );
+    }
+
+    /// The largest mark the repair can emit fits the column reserved for it.
+    #[test]
+    fn every_gutter_mark_fits_its_reserved_column() {
+        let mut text = Text::new();
+        // `#999` is the widest, by `crate::picker::listing::MAX_TAG`.
+        let widest = encode(b"#999");
+        let v = Vetted::new(&widest.text).expect("core-minted ASCII is drawable");
+        assert!(
+            text.width_vetted(&v) <= PANEL_GUTTER_W,
+            "the widest gutter mark is {} px in a {PANEL_GUTTER_W} px column",
+            text.width_vetted(&v)
+        );
+    }
+
+    /// The script label names what a reader would not expect, and is not
+    /// vacuous — it really appears for the groups that can reach it.
+    ///
+    /// `Japanese` is deliberately absent from the reachable set: `encode`
+    /// admits only vector-routed characters, and Japanese routes to the
+    /// atlas, so it is always escaped and never lands in `groups`. Recorded
+    /// here as a measured fact rather than left for a reader to assume the
+    /// fourth group works like the other three.
+    #[test]
+    fn the_script_label_is_not_vacuous() {
+        assert_eq!(
+            script_label(&encode("отчёт.pdf".as_bytes())).as_deref(),
+            Some("Cyrillic")
+        );
+        assert_eq!(
+            script_label(&encode("λόγος.txt".as_bytes())).as_deref(),
+            Some("Greek")
+        );
+        // Pure Latin says nothing: a label on every row is a label nobody
+        // reads, and this one exists to make an unusual row stand out.
+        assert_eq!(script_label(&encode(b"notes.txt")), None);
+        // The escaped minority is not named, because it was not drawn.
+        assert_eq!(script_label(&encode("rеsume.pdf".as_bytes())), None);
+        // The measured gap.
+        let japanese = encode("論文.txt".as_bytes());
+        assert_eq!(
+            script_label(&japanese),
+            None,
+            "Japanese is escaped by `encode`, so it never reaches `groups` -- \
+             the atlas is unreachable from a filename today"
+        );
+        assert!(japanese.text.contains("\\u{"), "...because it is escaped");
+    }
+
+    /// The label is drawn beside the row, not merely computed.
+    #[test]
+    fn a_non_latin_row_paints_its_script_label() {
+        let labelled = card_of(&["отчёт.pdf".as_bytes()]);
+        let plain = card_of(&[b"notes.txt"]);
+        let slot = labelled.panel.as_ref().expect("a panel")[0];
+        let ink = |card: &Card| {
+            (0..PANEL_ROW_H)
+                .flat_map(|row| {
+                    (script_x()..gutter_x()).map(move |col| (col, slot.rect.y as u32 + row))
+                })
+                .filter(|&(x, y)| px(card, x, y) != CARD_BG)
+                .count()
+        };
+        assert!(ink(&labelled) > 0, "the script column must be painted");
+        assert_eq!(ink(&plain), 0, "an all-Latin row must not be labelled");
+    }
+
+    /// **The widest label the enum can produce fits between the name field
+    /// and the gutter.**
+    ///
+    /// The const assert beside [`PANEL_GUTTER_W`] proves only that the column
+    /// *exists* (`script_x() <= gutter_x()`); a label's width is a property
+    /// of the shipped face, which no `const` can measure. Without this, a
+    /// widened gutter or a longer group name would push the label into the
+    /// reserved column and the only witness would be a blessed golden nobody
+    /// reads closely — the same shape as
+    /// `every_gutter_mark_fits_its_reserved_column`, on the other side of the
+    /// same gap.
+    ///
+    /// Measured with [`Text::width`] and not `width_vetted`, because
+    /// [`draw_panel`] draws the label with [`Text::draw`]: the label is
+    /// `&'static str` core copy, not a transcript, and the measurement has to
+    /// be the one that matches the door it goes through.
+    #[test]
+    fn the_widest_script_label_fits_its_column() {
+        let all = [Group::Latin, Group::Greek, Group::Cyrillic, Group::Japanese];
+        // A group added to the enum fails to compile here until somebody
+        // decides whether it belongs in `all` above. The match is what the
+        // compiler checks; extending the array is still a human step, and
+        // saying so is cheaper than implying the array is exhaustive by
+        // construction.
+        for group in all {
+            match group {
+                Group::Latin | Group::Greek | Group::Cyrillic | Group::Japanese => {}
+            }
+        }
+        let widest = all
+            .iter()
+            .filter(|group| **group != Group::Latin)
+            .map(|group| group_name(*group))
+            .collect::<Vec<_>>()
+            .join(SCRIPT_JOIN);
+        let mut text = Text::new();
+        let w = text.width(&widest, LABEL_PX);
+        let column = gutter_x() - script_x();
+        assert!(
+            w <= column,
+            "the widest script label {widest:?} is {w} px in a {column} px column, so it \
+             would be drawn into the gutter the collision repair reserves"
+        );
+    }
+
+    /// **A picker card offers no petition decision, and cannot.**
+    ///
+    /// [`Card::buttons`] is [`Card::controls`] narrowed by
+    /// [`ButtonBox::as_choice`], so this is a property of the split rather
+    /// than of what `picker_rows` happens to push — and it is what keeps
+    /// `ConsentGrab`'s snapshot unable to produce a `Decision` for a
+    /// designation.
+    #[test]
+    fn a_picker_card_paints_confirm_and_cancel_and_no_choice() {
+        let card = rasterize_picker(&picker_fixture());
+        assert_eq!(
+            card.controls.iter().map(|b| b.action).collect::<Vec<_>>(),
+            vec![CardAction::Confirm, CardAction::Cancel]
+        );
+        assert!(
+            card.buttons.is_empty(),
+            "a designation grants nothing, so its card must offer no Allow and no Deny"
+        );
+        // The mirror: a grant-request card offers only decisions.
+        let prompt = rasterize(&crate::consent::tests::prompt_fixture());
+        assert_eq!(prompt.buttons.len(), prompt.controls.len());
+        assert!(prompt
+            .controls
+            .iter()
+            .all(|b| matches!(b.action, CardAction::Decide(_))));
+    }
+
+    /// The picker's two buttons get identical geometry, and are painted where
+    /// they are reported.
+    #[test]
+    fn the_pickers_buttons_are_equal_and_painted_where_reported() {
+        let card = rasterize_picker(&picker_fixture());
+        let rects: Vec<Rect> = card.controls.iter().map(|b| b.rect).collect();
+        assert_eq!(rects.len(), 2);
+        assert_eq!(
+            rects[0].w, rects[1].w,
+            "Confirm and Cancel must be equally wide"
+        );
+        assert_eq!(rects[0].h, rects[1].h);
+        assert_eq!(rects[0].y, rects[1].y);
+        assert!(rects[0].x + rects[0].w as i32 <= rects[1].x);
+        for b in &card.controls {
+            let (x, y) = (b.rect.x as u32, b.rect.y as u32);
+            assert_eq!(px(&card, x, y), BUTTON_BORDER, "button border corner");
+            assert_eq!(px(&card, x + 2, y + 2), BUTTON_BG, "button interior");
+        }
+        let mut text = Text::new();
+        for b in &card.controls {
+            let w = text.width(b.action.label(), BUTTON_PX);
+            assert!(
+                w <= b.rect.w,
+                "caption {:?} is {w} px in a {} px button -- it would be clipped",
+                b.action.label(),
+                b.rect.w
+            );
+        }
+    }
+
+    /// Tab moves a focus ring between the two buttons, and the ring is the
+    /// only thing that moves: the card's size, the button geometry and the
+    /// captions are identical in all three focus states.
+    #[test]
+    fn focus_moves_a_ring_and_nothing_else() {
+        let mut listing = picker_fixture();
+        listing.focus = Focus::Listing;
+        let mut on_confirm = picker_fixture();
+        on_confirm.focus = Focus::Confirm;
+        let mut on_cancel = picker_fixture();
+        on_cancel.focus = Focus::Cancel;
+
+        let cards = [
+            rasterize_picker(&listing),
+            rasterize_picker(&on_confirm),
+            rasterize_picker(&on_cancel),
+        ];
+        for pair in cards.windows(2) {
+            assert_eq!(
+                pair[0].height, pair[1].height,
+                "focus must not resize the card"
+            );
+            assert_eq!(
+                pair[0].controls, pair[1].controls,
+                "focus must not move a button under a human's hand"
+            );
+            assert_ne!(pair[0].rgba, pair[1].rgba, "focus must be visible");
+        }
+        // The ring is on the focused button and nowhere else.
+        let ring = |card: &Card, i: usize| {
+            let r = card.controls[i].rect;
+            px(card, r.x as u32, r.y as u32 + r.h / 2) == ACCENT
+        };
+        assert!(!ring(&cards[0], 0) && !ring(&cards[0], 1));
+        assert!(ring(&cards[1], 0) && !ring(&cards[1], 1));
+        assert!(!ring(&cards[2], 0) && ring(&cards[2], 1));
+    }
+
+    /// Every row the panel was given is actually drawn.
+    ///
+    /// Cheap, and it is the assertion that would have caught a windowing bug
+    /// silently showing the human seven of eight files.
+    #[test]
+    fn every_row_the_panel_carries_is_painted() {
+        let names = picker_row_names();
+        let refs: Vec<&[u8]> = names.iter().map(Vec::as_slice).collect();
+        let card = card_of(&refs);
+        let slots = card.panel.as_ref().expect("a panel");
+        assert_eq!(slots.len(), PANEL_ROWS as usize);
+        for (index, slot) in slots.iter().enumerate() {
+            let inked = (0..PANEL_ROW_H)
+                .flat_map(|row| {
+                    (CONTENT_X..(CONTENT_X + NAME_FIELD_PX))
+                        .map(move |col| (col, slot.rect.y as u32 + row))
+                })
+                .filter(|&(x, y)| px(&card, x, y) != CARD_BG)
+                .count();
+            assert!(inked > 0, "row {index} was given a name and drew nothing");
+        }
+        // A shorter panel leaves the remaining slots empty rather than
+        // reusing the previous content, and the card is the same height.
+        let short = card_of(&refs[..2]);
+        assert_eq!(
+            short.height, card.height,
+            "the panel's height is a constant"
+        );
+        let slot = short.panel.as_ref().expect("a panel")[5];
+        for row in 0..PANEL_ROW_H {
+            for col in CONTENT_X..(CONTENT_X + NAME_FIELD_PX) {
+                assert_eq!(px(&short, col, slot.rect.y as u32 + row), CARD_BG);
+            }
+        }
+    }
+
+    /// The query the human typed is echoed, and an empty one says so rather
+    /// than leaving a blank the human could read as "no matches".
+    #[test]
+    fn the_filter_query_is_echoed() {
+        let mut typed = picker_fixture();
+        typed.panel.query = encode("réport".as_bytes());
+        let mut empty = picker_fixture();
+        empty.panel.query = encode(b"");
+
+        let with = rasterize_picker(&typed);
+        let without = rasterize_picker(&empty);
+        assert_ne!(with.rgba, without.rgba, "the echo must be visible");
+        assert_eq!(
+            with.height, without.height,
+            "typing must not resize the card: the buttons stay where the human's hand is"
+        );
+
+        let mut text = Text::new();
+        let lines = line_texts_of(picker_rows(&empty, &mut text));
+        assert!(
+            lines.iter().any(|l| l == FILTER_EMPTY),
+            "an empty query must say what the field is for: {lines:?}"
+        );
+    }
+
+    /// The card names who is asking, in which realm, and where the human is
+    /// standing — and the location goes through the transcript, because a
+    /// directory's name is whatever whoever made it chose.
+    #[test]
+    fn the_card_names_the_asker_the_realm_and_the_location() {
+        let mut text = Text::new();
+        let content = picker_fixture();
+        let lines = line_texts_of(picker_rows(&content, &mut text));
+        assert!(lines.iter().any(|l| l == LABEL_PRINCIPAL));
+        assert!(lines
+            .iter()
+            .any(|l| l.contains(crate::consent::tests::PROMPT_IDENTITY)));
+        assert!(lines.iter().any(|l| l == LABEL_REALM));
+        assert!(lines.iter().any(|l| l == LABEL_LOCATION));
+
+        // At the root the location field says so instead of naming a path the
+        // operator chose and the human did not.
+        let mut at_root = picker_fixture();
+        at_root.location = encode(b"");
+        let root_lines = line_texts_of(picker_rows(&at_root, &mut text));
+        assert!(root_lines.iter().any(|l| l == LOCATION_ROOT));
+
+        // ...and a location really reaches the pixels, not just the row list.
+        assert_ne!(
+            rasterize_picker(&content).rgba,
+            rasterize_picker(&at_root).rgba
+        );
+    }
+
+    /// The consequence line says the three things a human cannot infer, and
+    /// says the right one for each ask.
+    #[test]
+    fn the_card_says_what_confirming_actually_costs() {
+        for (ask, expected) in [
+            (AskedFor::File { write: false }, CONSEQUENCE_READ),
+            (AskedFor::File { write: true }, CONSEQUENCE_WRITE),
+            (AskedFor::Dir, CONSEQUENCE_DIR),
+        ] {
+            let mut content = picker_fixture();
+            content.ask = ask;
+            let mut text = Text::new();
+            let lines = line_texts_of(picker_rows(&content, &mut text)).join(" ");
+            // The wrapped line list is compared word by word, because `wrap`
+            // may break the sentence anywhere.
+            for word in expected.split_whitespace() {
+                assert!(
+                    lines.contains(word),
+                    "the {ask:?} card must say {word:?}: {lines}"
+                );
+            }
+        }
+        for line in [CONSEQUENCE_READ, CONSEQUENCE_WRITE, CONSEQUENCE_DIR] {
+            assert!(
+                line.contains("until it exits"),
+                "the card must say the handle outlives the ask: {line}"
+            );
+            assert!(
+                line.to_lowercase().contains("revok"),
+                "the card must say revocation does not take it back: {line}"
+            );
+        }
+        assert!(
+            !CONSEQUENCE_DIR.contains("read-only"),
+            "a directory descriptor is an anchor, not a permission: what the app opens \
+             through it carries its own mode, so the card must not claim read-only"
+        );
+    }
+
+    /// **Escape is named, and named as not working.**
+    ///
+    /// A human in front of a modal card reaches for Escape; on this one it is
+    /// the dead-man chord and does nothing. A card that stayed silent about
+    /// that would leave the human to find out by pressing the key they reach
+    /// for to stop something.
+    #[test]
+    fn the_card_says_escape_does_not_close_it() {
+        let lower = PICKER_HINT.to_lowercase();
+        assert!(lower.contains("escape"));
+        assert!(lower.contains("tab"));
+        let mut text = Text::new();
+        let lines = line_texts_of(picker_rows(&picker_fixture(), &mut text)).join(" ");
+        assert!(
+            lines.to_lowercase().contains("escape"),
+            "the hint must survive wrapping onto the card: {lines}"
+        );
+    }
+
+    /// The picker card, like the consent card, draws only what it was given.
+    #[test]
+    fn the_picker_only_draws_content_it_was_given() {
+        let base = rasterize_picker(&picker_fixture());
+        assert_eq!(base.rgba, rasterize_picker(&picker_fixture()).rgba);
+
+        let mut other_principal = picker_fixture();
+        other_principal.principal =
+            crate::identity::PrincipalIdentity::parse("vitrin://local/agent/other").unwrap();
+        assert_ne!(base.rgba, rasterize_picker(&other_principal).rgba);
+
+        let mut other_realm = picker_fixture();
+        other_realm.realm = crate::grants::RealmId::new("kiosk");
+        assert_ne!(base.rgba, rasterize_picker(&other_realm).rgba);
+
+        let mut other_rows = picker_fixture();
+        other_rows.panel.rows.truncate(3);
+        assert_ne!(base.rgba, rasterize_picker(&other_rows).rgba);
+
+        let mut other_highlight = picker_fixture();
+        other_highlight.panel.highlight = Some(3);
+        assert_ne!(base.rgba, rasterize_picker(&other_highlight).rgba);
+
+        let mut other_ask = picker_fixture();
+        other_ask.ask = AskedFor::Dir;
+        assert_ne!(base.rgba, rasterize_picker(&other_ask).rgba);
+    }
+
+    /// The picker card is opaque everywhere, which is what lets
+    /// `Canvas::blit_opaque` composite it as a row copy.
+    #[test]
+    fn the_picker_card_is_opaque_everywhere() {
+        let card = rasterize_picker(&picker_fixture());
+        assert_eq!(
+            card.rgba.len(),
+            card.width as usize * card.height as usize * BYTES_PER_PIXEL
+        );
+        assert!(card
+            .rgba
+            .chunks_exact(BYTES_PER_PIXEL)
+            .all(|p| p[3] == 0xff));
+    }
+
+    /// Every line one picker card renders, in order.
+    fn line_texts_of(rows: Vec<Row>) -> Vec<String> {
+        rows.into_iter()
+            .filter_map(|row| match row {
+                Row::Line { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect()
     }
 }

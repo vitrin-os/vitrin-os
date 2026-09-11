@@ -41,7 +41,10 @@
 //! surface to share it: the *authority* claims live in [`crate::consent`] and
 //! [`crate::lock`], and this module cannot participate in one.
 
+pub(crate) mod atlas;
 pub(crate) mod canvas;
+pub(crate) mod script;
+pub(crate) mod transcript;
 pub(crate) mod text;
 
 /// Center a `w x h` box in a `view_w x view_h` view. Truncating division, so

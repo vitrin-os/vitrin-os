@@ -339,16 +339,16 @@ endpoint and a blanket egress grant is inexpressible rather than refused.
 Having a facet is not being served, and both of those two are the proof: a
 facet is a request to ask through, a mechanism is what answers.
 
-<!-- vitrin-verb-set: unserved-verbs = observe_cursor, designate_file, egress | count: three -->
-So the count this enumeration exists to answer is **three**: `observe_cursor`,
-`designate_file`
+<!-- vitrin-verb-set: unserved-verbs = observe_cursor, egress | count: two -->
+So the count this enumeration exists to answer is **two**: `observe_cursor`
 and `egress` are the verbs no deployment serves today, and `layout_arrange`,
-`layout_focus` and `realm_launch` have each left that posture. That count is
+`layout_focus`, `realm_launch` and `designate_file` have each left that
+posture. That count is
 not a sentence anyone has to remember: `cargo xtask verb-sets --check`
 derives the set from the IDL and from the reference core's `SERVED_VERB_BITS`
 and fails on every surface still enumerating the old one — as it did on this
 very paragraph, which said "two" while a parallel branch was landing the
-third.
+third, and again when the core-drawn picker took `designate_file` back out.
 
 ---
 
@@ -627,8 +627,12 @@ designation.
 `retry_after_ms` is greater than zero only for `rate_limited`.
 Which codes a given use can draw is not uniform: `preempted` and
 `consent_held` are attention-shaped (actuation and the layout verbs; never
-egress; **undecided for designation**, which P2.6.6 answers when it builds the
-picker), `capacity` is launch-only, and a launch is
+egress; and **never a designation ask** — P2.6.6 closed that set, and the same
+change made `consent_held` reach the *other* direction, so a principal's own
+pending designation now mutes that principal's actuation exactly as its own
+pending petition does), `capacity` is launch-only — a full **picker** ledger is
+answered by [`vitrin_powerbox.refusal`](13-vitrin_powerbox.md#refusal)'s `busy`
+on the facet, never by this enum — and a launch is
 never refused `no_surface` (a vacant realm is the state `realm_launch` exists
 to leave). The single voice is the invariant; the applicable set is per-verb
 and is stated on each facet's page. One code is also **conditional**:
@@ -640,8 +644,13 @@ own journal why one layout request landed and an identical one did not (see
 
 **The human's answer** — `vitrin_powerbox.refused(code)` *(since 2)* is the
 terminal of a designation ask that the chokepoint **allowed** and that still
-produced no descriptor: the human cancelled the picker, it expired, one was
-already up, or the core would not resolve what they chose. It is deliberately
+produced no descriptor: the human cancelled the picker, it expired, **no card
+could be raised** (one was already up for that principal, or the deployment's
+designation ledger was full), or the core would not resolve what they chose.
+`busy` is the one of the four for which nothing reached the human, and it lives
+on the facet rather than in `refusal` because it is discovered *after*
+admission — the boundary between the two voices — and because `capacity` is an
+answer about **realms**. It is deliberately
 **not** a second enforcement voice — every one of its codes is compatible with
 a perfectly live grant, and the chokepoint's own answer to the same request is
 still `vitrin_grant.refused(designate_file, …)`. Two answerers, two events,
@@ -844,6 +853,27 @@ one request — that is the part of this rule that has not moved.
 `designated`'s own one-of pairing is forced by the type system
 exactly as `frame_ready`'s and `connected`'s are: an `fd` argument has no null
 form.
+
+**"In request order" is a named open gap on the powerbox pair, and today only
+there.** The rule binds every implementation, and the reference core's
+designation machinery does not meet it — unreachable while no deployment serves
+the verb, and a mispairing the day one does. The miss is structural: an admitted
+designation ask owes its terminal
+across *human* time, while a second ask behind it is refused
+[`busy`](13-vitrin_powerbox.md#refusal) inside its own dispatch turn and
+answered at once — so the second terminal precedes the first, and
+[`refused`](13-vitrin_powerbox.md#refused) carries no id with which to re-pair
+them. Closing it needs per-facet ordering state the enforcement chokepoint does
+not have, and which no other verb has ever needed because every other admitted
+use completes inside the call it was asked in — **true of today rather than
+structurally**, since
+[`request_connect`](19-vitrin_egress.md#request_connect)'s admitted terminal is
+the far end's answer and cannot complete in the dispatch turn either, so egress
+takes the same shape the day a proxy exists for it to admit anything. Until then
+a client **must not
+pipeline designation asks**; the full statement, and why the id cannot simply be
+added to that event, is on
+[`request_file`](13-vitrin_powerbox.md#request_file).
 
 **This table and the counts over it are hand-kept, and that is a decision with
 a reason rather than an unbuilt tool.** `cargo xtask protocol-tables --check`

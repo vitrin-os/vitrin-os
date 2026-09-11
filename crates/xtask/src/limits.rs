@@ -2424,7 +2424,7 @@ pub const CLAIMS: &[Claim] = &[
             },
             Evidence::Contains {
                 path: "crates/vitrin-core/src/grants.rs",
-                needle: "pub(crate) const SERVED_VERB_BITS: u32 = 1 | 2 | 4 | 16 | 32 | 512;",
+                needle: "pub(crate) const SERVED_VERB_BITS: u32 = 1 | 2 | 4 | 16 | 32 | 64 | 512;",
                 means: "the three verbs the page fences IN (layout_arrange 16, layout_focus 32, \
                         realm_launch 512) and the three it fences OUT (observe 1, \
                         actuate_pointer 2, actuate_text 4) are all six SERVED by this core, \
@@ -2432,7 +2432,329 @@ pub const CLAIMS: &[Claim] = &[
                         rather than a restatement of what the core already declines. If this \
                         constant moves, the fence is being drawn across a different set and \
                         the page has to be re-read -- in particular, a verb LEAVING this set \
-                        would make the page promise a shell an authority no deployment serves.",
+                        would make the page promise a shell an authority no deployment serves. \
+                        P2.6.6 added designate_file (64) and the page was re-read rather than \
+                        reworded: a verb JOINING the set cannot falsify the claim, which is \
+                        about those six being served, and the shell fence does not carry \
+                        designate_file either way. The needle moved; the sentence did not.",
+            },
+        ],
+    },
+    // ---------------------------------------------------------------------
+    // #190's three, and the first rows in this table whose subject is what a
+    // human SEES rather than what a realm may reach.
+    //
+    // **All three are LIMITS and README only, and the site's omission is a
+    // decision recorded here rather than drift.** The site's limit table is
+    // the landing page's "it can drive a real panel, it is not a desktop"
+    // warning box, and no sentence on that page mentions a file picker at
+    // all -- so a row about one would have to introduce the feature before
+    // it could bound it, which is the opposite of what an eleven-row warning
+    // box is for. The rule the plan document's surface table states still
+    // binds: the site may never carry a claim the limits page does not, or
+    // carry one more weakly. Carrying nothing is neither. The precedent is
+    // `media-keys-reach-an-app-that-cannot-act`, which is off the site for
+    // the same class of reason and says so in the same place.
+    //
+    // **What no table here can hold**: these three limits have no enumerating
+    // home in `docs/plan/`, so `cross_check_limit_sets` does not see them and
+    // they carry no `<!-- limit: -->` marker on the page. That is the module
+    // docs' "cannot see an unmarked paragraph on the limits page" hole, live
+    // and named. Whoever owns the picker's plan document should enumerate
+    // them there and mark the three paragraphs; until then the SET half of
+    // this gate is silent about them and only the anchors and the evidence
+    // below hold anything.
+    Claim {
+        id: "picker-transcribes-shaped-and-bidi-scripts",
+        says: "The core-drawn file picker draws no script that needs shaping or bidi: Arabic, \
+               Hebrew, Devanagari and Thai are transcribed as \\u{XXXX} escapes. It is a \
+               refusal and not a deferral -- a bidi algorithm on the trusted surface IS the \
+               RTL-override filename spoof, so the absence of shaping is what makes that \
+               attack inert.",
+        issue: "No issue, and deliberately, on `accessibility-absent`'s precedent: this is an \
+                exclusion rather than a deferral, and an issue would imply a schedule. #190 \
+                (open) is the issue that BUILT the picker with this property, not one \
+                tracking its removal; both published surfaces link it so a reader can find \
+                the work, which is why this row does not lean on the citation check.",
+        // TWO anchors per surface. The first alone would be satisfiable by a
+        // page that published the transcription as a TODO, which is the exact
+        // misreading this limit exists to prevent -- so the second pins the
+        // reason the four scripts can never be added, and that sentence exists
+        // on both surfaces only because this limit does.
+        surfaces: &[
+            Anchor {
+                path: LIMITS,
+                needle: "Arabic, Hebrew, Devanagari or Thai",
+            },
+            Anchor {
+                path: LIMITS,
+                needle: "bidi algorithm on the trusted surface is the RTL-override filename spoof",
+            },
+            Anchor {
+                path: README,
+                needle: "Arabic, Hebrew, Devanagari or Thai",
+            },
+            Anchor {
+                path: README,
+                needle: "bidi algorithm on the trusted surface is the RTL-override filename spoof",
+            },
+        ],
+        evidence: &[
+            // The whole set of scripts the vector face may be asked for, as
+            // one needle rather than four. A `Contains` cannot see an ADDED
+            // range if it only pins one arm of the match, and an added range
+            // is precisely how this claim would go false -- so the needle is
+            // the entire arm list, and widening it anywhere reddens this row.
+            // The four published scripts are outside every one of these
+            // ranges: Arabic U+0600, Hebrew U+0590, Devanagari U+0900, Thai
+            // U+0E00.
+            Evidence::Contains {
+                path: "crates/vitrin-core/src/paint/script.rs",
+                needle:
+                    "let in_vector_script = matches!(ch, ' '..='~' | '\\u{00A1}'..='\\u{024F}' \
+                         | '\\u{0370}'..='\\u{03FF}' | '\\u{0400}'..='\\u{04FF}' );",
+                means: "the vector face is still asked for exactly these four ranges, none of \
+                        which contains Arabic, Hebrew, Devanagari or Thai. If this fires, the \
+                        routed set moved: either a script was added (and the published \
+                        'transcribed' is now false, in the direction that matters -- a name \
+                        would be DRAWN by a path with no shaping) or the shape of the decision \
+                        changed and the page has to be re-read before the wording moves.",
+            },
+            // The second half of the spoof argument, and the one a reader is
+            // most likely to assume rather than check: it is not enough that
+            // the renderer ignores bidi, the control characters themselves
+            // must not survive into the drawn text. They are denied wholesale.
+            Evidence::Contains {
+                path: "crates/vitrin-core/src/paint/script.rs",
+                needle: "| 0x00AD | 0x061C | 0x200B..=0x200F | 0x202A..=0x202E",
+                means: "the bidi controls (U+202A..U+202E, and the Arabic letter mark U+061C) \
+                        are still refused at routing, so an RTL override embedded in a \
+                        filename is transcribed and visible rather than obeyed. The published \
+                        claim that the spoof is inert leans on BOTH halves -- no bidi \
+                        algorithm, and no bidi control reaching the drawn text -- and this is \
+                        the half that lives in a range list somebody could widen.",
+            },
+            // The published spelling of the escape. Both pages print
+            // `\u{XXXX}` and say four hex digits inside the BMP and six above
+            // it; that is a fact about this format string and nothing else.
+            Evidence::Contains {
+                path: "crates/vitrin-core/src/paint/transcript.rs",
+                needle: "text.push_str(&format!(\"{SIGIL}u{{{cp:04X}}}\"));",
+                means: "an undrawable scalar inside the BMP is still transcribed as \
+                        `\\u{XXXX}` with four upper-case hex digits, which is the form both \
+                        published pages show. Change the escape syntax and the pages are \
+                        showing readers a form the picker no longer draws.",
+            },
+            // The Hebrew sentence is a MEASUREMENT of one vendored file (87 of
+            // the block's 112 codepoints have a glyph in this face; 78%
+            // rounded), and nothing in this repository recomputes it -- stated
+            // on the page as a reading rather than as a check. What can be
+            // held is that the file is the same file, which is what this
+            // constant does. If the face is swapped, the reading has to be
+            // taken again before the sentence stays.
+            Evidence::Contains {
+                path: "crates/vitrin-core/src/paint/text.rs",
+                needle: "const FONT_LEN: usize = 410_820;",
+                means: "the vendored vector face is byte-for-byte the one the published Hebrew \
+                        coverage figure was measured from. It is NOT a check of the figure: \
+                        no test in this tree counts the face's Hebrew glyphs. A swapped face \
+                        fails the build here and the page's '87 of that block's 112 \
+                        codepoints' must be re-measured rather than reworded.",
+            },
+        ],
+    },
+    Claim {
+        id: "picker-transcribes-kanji-outside-the-subset",
+        says: "The picker's Japanese alphabet is a declared subset -- kana complete, plus JIS X \
+               0208 level 1 -- and a kanji outside it is transcribed like any other undrawable \
+               character.",
+        issue: "No issue: the subset is a decided bound with a re-runnable derivation written \
+                into `crates/vitrin-core/assets/fonts/kana-atlas.codepoints`, not work \
+                somebody left unfinished. #190 (open) built the picker that draws it.",
+        surfaces: &[
+            Anchor {
+                path: LIMITS,
+                needle: "JIS X 0208 level 1",
+            },
+            // The consequence, anchored separately from the standard's name:
+            // a page could name the subset while describing it as complete
+            // coverage, which is the understating-the-gap direction.
+            Anchor {
+                path: LIMITS,
+                needle: "a kanji outside that set is transcribed",
+            },
+            Anchor {
+                path: README,
+                needle: "JIS X 0208 level 1",
+            },
+            Anchor {
+                path: README,
+                needle: "a kanji outside that set is transcribed",
+            },
+        ],
+        evidence: &[
+            // The routing tail, taken as one needle through `Route::Escape`:
+            // the atlas is ASKED (`covers`) rather than trusted by range, and
+            // a character it does not hold falls through to the escape. Both
+            // halves are the claim. A range test in place of the query is how
+            // this would go false -- and it is not hypothetical, it is the
+            // defect `vetted_admits_nothing_no_glyph_source_can_draw` found in
+            // the Greek block, where seventeen codepoints routed to a face
+            // that had no glyph for any of them.
+            Evidence::Contains {
+                path: "crates/vitrin-core/src/paint/script.rs",
+                needle: "if matches!(group_of(ch), Some(Group::Japanese)) && \
+                         super::atlas::covers(ch) { return Route::Atlas; } Route::Escape",
+                means: "the atlas is still asked whether it holds a character, and a \
+                        Japanese character it does not hold still falls through to \
+                        `Route::Escape` -- which is what makes 'a kanji outside that set is \
+                        transcribed' true rather than aspirational. If the query is replaced \
+                        by a range, characters with no glyph route to a draw and distinct \
+                        filenames start rendering as the same `.notdef` box.",
+            },
+            // The declared alphabet itself: the subset rule lives in the
+            // generator's input file, which is read by both the generator and
+            // the checker, so the published sentence quotes a rule rather than
+            // describing one.
+            Evidence::Contains {
+                path: "crates/vitrin-core/assets/fonts/kana-atlas.codepoints",
+                needle: "the 2965 characters of JIS X 0208 **level 1** (rows/ku 16..47)",
+                means: "the file that declares the picker's alphabet still states its rule as \
+                        JIS X 0208 level 1, rows/ku 16..47. Read this for exactly what it \
+                        holds and no more: the rule lives in a `#` comment, and BOTH readers \
+                        of that file -- the generator and `cargo xtask kana-atlas --check` -- \
+                        skip comment lines (`parse_declared`), so NOTHING in this tree \
+                        re-derives the codepoint list from the rule. What is machine-held is \
+                        that the atlas covers exactly the declared list, in both directions, \
+                        and that the list's size is still 3152 (the `atlas-glyph-count` \
+                        DERIVED row). The rule itself is held by this grep and by the CPython \
+                        recipe printed beside it, which a human re-runs. If it changes, both \
+                        published pages name the wrong standard's wrong level.",
+            },
+            Evidence::Contains {
+                path: "crates/vitrin-core/assets/fonts/kana-atlas.codepoints",
+                needle: "level 2 (a further 3390) is deliberately out",
+                means: "the excluded half is still 3390 characters and still excluded on \
+                        purpose. Both pages publish that number as what 'subsetted' costs a \
+                        reader; it is not derivable from anything else in the tree.",
+            },
+            // The asset the count and the subset are properties OF. Same
+            // tripwire shape as FONT_LEN above, and the same reason: a
+            // regenerated atlas must fail a build rather than quietly change
+            // which names the picker can draw.
+            Evidence::Contains {
+                path: "crates/vitrin-core/src/paint/atlas.rs",
+                needle: "const ATLAS_LEN: usize = 658_011;",
+                means: "the vendored atlas is byte-for-byte the one whose glyph count and \
+                        alphabet both pages publish. A regenerated atlas fails here, which is \
+                        the moment to re-read the pages -- the `atlas-glyph-count` DERIVED row \
+                        then holds the number itself across all three of its renderings.",
+            },
+        ],
+    },
+    Claim {
+        id: "picker-row-distinctness-is-per-listing",
+        says: "The picker guarantees that no two rows of ONE listing render alike, and does not \
+               guarantee that two files in different directories render differently. Global \
+               pixel-injectivity is impossible: a row is a bounded raster and the set of legal \
+               filenames is not finite.",
+        issue: "No issue: this is a boundary rather than a gap. There is no version of this \
+                picker in which the global property holds, so nothing could track closing it. \
+                #190 (open) built the per-listing repair that the boundary is stated against.",
+        surfaces: &[
+            // The bound and the guarantee, one anchor each. Publishing the
+            // guarantee without the bound is the failure this limit exists to
+            // prevent -- a reader who takes "no two rows render alike" as a
+            // global property has been told something false -- so a surface
+            // carrying only one of the two fails here.
+            Anchor {
+                path: LIMITS,
+                needle: "Global pixel-injectivity is impossible",
+            },
+            Anchor {
+                path: LIMITS,
+                needle: "no two rows of one listing",
+            },
+            Anchor {
+                path: README,
+                needle: "Global pixel-injectivity is impossible",
+            },
+            Anchor {
+                path: README,
+                needle: "no two rows of one listing",
+            },
+        ],
+        evidence: &[
+            // "Per listing" is a property of WHERE the grouping happens: one
+            // map, built inside one `build` call, over the rows of that call.
+            // Nothing persists between listings, which is exactly why the
+            // guarantee cannot be global.
+            Evidence::Contains {
+                path: "crates/vitrin-core/src/picker/listing.rs",
+                needle: "let mut groups: HashMap<RowDigest, Vec<usize>> = HashMap::new();",
+                means: "collisions are still found by grouping the rows of THIS listing, in a \
+                        map that lives no longer than the call. If this became a persistent \
+                        index across directories the published boundary would be understated \
+                        -- and the reverse, dropping the grouping, would make the per-listing \
+                        guarantee false.",
+            },
+            // The refusal. Without it the published sentence would be a
+            // promise the code cannot keep for a group larger than the gutter
+            // can label, and drawing two rows it cannot tell apart is the one
+            // outcome this whole mechanism exists to prevent.
+            Evidence::Contains {
+                path: "crates/vitrin-core/src/picker/listing.rs",
+                needle: "Unseparable { alike: usize }",
+                means: "a collision group the gutter cannot label still REFUSES the listing. \
+                        Both pages publish the guarantee as unconditional-or-refused; if this \
+                        variant goes away the guarantee is silently conditional instead.",
+            },
+            // The published spelling of the mark itself. `docs/book/src/limits.md`
+            // shows a reader `#1`, `#2` as the thing they will see in the
+            // gutter, and until this row nothing held that: the repair could
+            // have started minting `(1)` with both surfaces green, which is the
+            // shape of drift a page showing a literal is most exposed to.
+            // Pinned where the mark is MINTED rather than where it is drawn --
+            // `consent::render`'s job is only to reserve room for it, and the
+            // reservation is already held there by a build-time assert and by
+            // `every_gutter_mark_fits_its_reserved_column`.
+            Evidence::Contains {
+                path: "crates/vitrin-core/src/picker/listing.rs",
+                needle: "rows[i].tag = Some(format!(\"#{}\", n + 1));",
+                means: "a repaired row's mark is still `#1`, `#2`, ... -- the form the limits \
+                        page shows a reader in as many characters. Change the mint and the \
+                        page is describing a gutter the picker does not draw.",
+            },
+            // The digest is over PIXELS, not over the transcript's text. This
+            // is the difference between a repair that does something and one
+            // that is vacuous by construction: transcripts are globally
+            // injective, so a text-keyed digest would never find a collision
+            // and the gutter would stay empty while claiming to protect
+            // against look-alikes.
+            Evidence::Contains {
+                path: "crates/vitrin-core/src/picker/session.rs",
+                needle: "*blake3::hash(&self.buf).as_bytes()",
+                means: "rows are still digested by the pixels they draw into a real buffer \
+                        rather than by their text. A text-keyed digest finds no collisions \
+                        ever, which would leave both pages describing a repair that never \
+                        fires.",
+            },
+            // The half both pages call global, and the reason it is weaker
+            // than pixels: it is about TEXT. It is proven rather than
+            // asserted, and the proof is a named test.
+            Evidence::Contains {
+                path: "crates/vitrin-core/src/paint/transcript.rs",
+                needle: "fn encode_is_injective_because_decode_inverts_it()",
+                means: "the named witness for the global half both pages state -- distinct \
+                        bytes produce distinct transcript TEXT -- is still in the tree. Note \
+                        what a grep for a test NAME can and cannot hold: it fails when the \
+                        witness is deleted or renamed, and it is blind to the witness being \
+                        gutted while keeping its name. The name is worth pinning anyway \
+                        because it carries the ARGUMENT (`decode` is a left inverse, and a \
+                        function with a left inverse is injective) rather than a description \
+                        of a round trip -- which is why `encode_and_decode_round_trip` would \
+                        redden this. What stands behind the name is review and the module's \
+                        own docs, not this row.",
             },
         ],
     },
@@ -2909,6 +3231,70 @@ pub const DERIVED: &[Derived] = &[
             context: " interfaces at wire version",
         }],
     },
+    Derived {
+        id: "atlas-glyph-count",
+        says: "how many glyphs the picker's Japanese atlas holds. It is the size of a declared \
+               set -- one line in the generated provenance file, equal by construction to the \
+               number of codepoints in kana-atlas.codepoints -- and three published surfaces \
+               spell it three different ways, which is exactly the shape a literal Anchor \
+               cannot cascade across.",
+        issue: "Refs #190, which built the picker this bounds. The NOTICE rendering is the \
+                one that motivated the row: it has stated the count since the atlas was \
+                vendored, for a licensing reason rather than a limits one, and nothing held \
+                it to the asset -- a regenerated atlas would have left a stale number in the \
+                normative path->license map with every check green.",
+        // The generated provenance line, not the codepoints file's own trailing
+        // comment and not `atlas.rs`'s doc header. Those two also state 3152,
+        // and both are prose ABOUT the asset; this line is emitted by the
+        // generator from the asset itself, which makes it the only one of the
+        // three that cannot be edited into agreement by hand. The `\n` prefix
+        // is the documented disambiguation and is load-bearing here: `glyphs`
+        // alone would also match the header sentence if one is ever added.
+        source: Source::File {
+            path: "crates/vitrin-core/assets/fonts/kana-atlas.provenance",
+            reads: &[Read {
+                after: "\nglyphs ",
+                shape: Shape::Digits,
+            }],
+        },
+        // THREE surfaces, and the two registers are not interchangeable: the
+        // limits pages count GLYPHS (what the picker can draw) and NOTICE
+        // counts DECLARED CODEPOINTS (what was rasterized from an OFL face).
+        // They are the same number because the generator rasterizes exactly the
+        // declared set and `cargo xtask kana-atlas --check` holds the two to
+        // each other; they are different sentences to their readers.
+        //
+        // The context for the two limits surfaces is ` glyphs at one size` and
+        // not ` glyphs`, because `docs/book/src/limits.md` also says "the
+        // number of glyphs the picker's Japanese atlas holds" in its own
+        // account of what this gate covers -- a true sentence that is not a
+        // rendering, and a broader context would redden it.
+        //
+        // NOT held, and written down rather than assumed: three more places in
+        // the tree restate this number -- `crates/vitrin-core/src/paint/atlas.rs`'s
+        // header, the fonts directory's `README.md` (three times, in three
+        // registers), and `crates/xtask/src/kana_atlas.rs`. Those are code and
+        // asset documentation rather than published surfaces, so they are the
+        // MIRRORS table's shape rather than this one's, and no row holds them
+        // today.
+        renderings: &[
+            Rendering {
+                path: LIMITS,
+                render: atlas_glyphs_at_one_size,
+                context: " glyphs at one size",
+            },
+            Rendering {
+                path: README,
+                render: atlas_glyphs_at_one_size,
+                context: " glyphs at one size",
+            },
+            Rendering {
+                path: NOTICE,
+                render: atlas_declared_codepoints,
+                context: " declared codepoints",
+            },
+        ],
+    },
 ];
 
 /// Code-to-code mirrors: a value duplicated in a second file, with a comment
@@ -3218,6 +3604,14 @@ pub const COVERED_CLAIMS: &[&str] = &[
     // nowhere, so the two evidence rows hold the facts about this build that
     // the published paragraph leans on and nothing holds the un-builtness.
     "shell-realm-reaches-one-more-thing-than-an-app-realm",
+    // #190's three. The first rows here whose subject is what a human SEES,
+    // and the first three that are LIMITS+README with the site carrying
+    // nothing -- see the block comment above them in CLAIMS for why that is a
+    // decision rather than an omission, and for the SET-half hole none of the
+    // three closes.
+    "picker-transcribes-shaped-and-bidi-scripts",
+    "picker-transcribes-kanji-outside-the-subset",
+    "picker-row-distinctness-is-per-listing",
 ];
 
 /// Every derived value this gate covers. Same contract as [`COVERED_CLAIMS`],
@@ -3243,6 +3637,11 @@ pub const COVERED_DERIVED: &[&str] = &[
     // Rust constant or a measurement, and the first whose set-half is held by
     // a test rather than by a second rendering.
     "protocol-interface-count",
+    // #190's, and the first derived value whose canonical source is a
+    // GENERATED provenance line rather than a constant, a measurement or the
+    // IDL. It is also the first whose renderings span a limits surface and the
+    // license map, which is why the two registers differ.
+    "atlas-glyph-count",
 ];
 
 /// Every code-to-code mirror this gate covers. Same contract as
@@ -3525,6 +3924,19 @@ fn verb_mask_lowest_undefined_bit(v: &[String]) -> String {
 /// size of the IDL's interface set.
 fn interfaces_at_wire_version(v: &[String]) -> String {
     format!("{} interfaces at wire version", v[0])
+}
+
+/// The limits surfaces' register: what the picker can DRAW, and the fact that
+/// there is exactly one size to draw it at.
+fn atlas_glyphs_at_one_size(v: &[String]) -> String {
+    format!("{} glyphs at one size", v[0])
+}
+
+/// `NOTICE`'s register: what was RASTERIZED from an OFL-licensed face. Same
+/// number, different sentence, different reader -- a packager asking what this
+/// file is derived from rather than a user asking what it can show them.
+fn atlas_declared_codepoints(v: &[String]) -> String {
+    format!("{} declared codepoints", v[0])
 }
 
 fn py_demo_identity(v: &[String]) -> String {

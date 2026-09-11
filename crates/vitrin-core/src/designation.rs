@@ -478,6 +478,37 @@ impl Ledger {
         Ok(id)
     }
 
+    /// Whether `id` still names an outstanding obligation.
+    ///
+    /// A read, never a spend: the picker round asks it every turn to find a
+    /// card whose obligation has left the ledger under it (a sweep expired
+    /// it, a teardown withdrew it, a realm death forgot it), and a query that
+    /// removed the ticket would answer the question by destroying it.
+    pub(crate) fn is_open(&self, id: DesignationId) -> bool {
+        self.open.contains_key(&id)
+    }
+
+    /// Read one outstanding ticket without spending it.
+    ///
+    /// Exists for exactly one caller — the raise, which needs the ask and the
+    /// deadline to build a picker and to copy the grab's backstop from. It
+    /// hands out a **shared** reference, so nothing reached through it can
+    /// become a redemption: [`Redeemed`] is produced only by [`Self::redeem`],
+    /// which consumes the ticket by value.
+    pub(crate) fn peek(&self, id: DesignationId) -> Option<&DesignationTicket> {
+        self.open.get(&id)
+    }
+
+    /// The oldest outstanding obligation, by id.
+    ///
+    /// Ascending id is minting order, so this is first-asked-first-shown:
+    /// the queue discipline the petition registry's `front_pending` already
+    /// uses, for the same reason (a human should meet asks in the order they
+    /// were made, not in whatever order a map iterates).
+    pub(crate) fn front_open(&self) -> Option<DesignationId> {
+        self.open.keys().next().copied()
+    }
+
     /// Whether this principal already owes a terminal.
     pub(crate) fn owes(&self, principal: &PrincipalIdentity) -> bool {
         self.open.values().any(|t| &t.principal == principal)

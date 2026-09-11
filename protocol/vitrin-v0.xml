@@ -635,15 +635,17 @@
         a petition resolves "unsupported" WHOLE - the server never quietly
         drops an unserved bit and grants the remainder, because an agent
         must never believe it holds authority nothing enforces.
-        <!-- vitrin-verb-set: unserved-verbs = observe_cursor, designate_file, egress | count: three -->
-        THREE bits are in that posture at EVERY deployment today -
-        observe_cursor, designate_file and egress, for three unrelated
+        <!-- vitrin-verb-set: unserved-verbs = observe_cursor, egress | count: two -->
+        TWO bits are in that posture at EVERY deployment today -
+        observe_cursor and egress, for two unrelated
         missing mechanisms named in the verb enum - and whichever others a
         given deployment declines are its own business rather than the
         wire's. That list read "observe_cursor and egress" until the
         P2.6.5 and P2.7.2 branches were merged, each having seen only its
-        own new bit, which is why it now carries the marker that derives
-        the set instead of a list a reader has to trust. A petition
+        own new bit; it then read three, and it reads two again now that
+        the reference core serves designate_file. Which is why it carries
+        the marker that derives the set instead of a list a reader has to
+        trust. A petition
         naming layout_arrange has one further admission-time answer,
         "layout_held", when the verb is already SPOKEN FOR for the output -
         by a live grant carrying it, or by another petition that is still
@@ -997,18 +999,20 @@
         that two parallel workstreams each drew a bit from it and neither
         collided is the registry doing its whole job.
 
-        <!-- vitrin-verb-set: unserved-verbs = observe_cursor, designate_file, egress -->
+        <!-- vitrin-verb-set: unserved-verbs = observe_cursor, egress -->
         DEFINED BUT UNSERVED. A verb may be defined here and refused
         "unsupported" by a deployment that does not serve it, exactly as
         the durable persistence rungs are. observe_cursor is refused by
         every deployment at version 2, because per-principal cursor
-        delivery does not exist. designate_file is refused by every
-        deployment too, and for a reason that is scheduled rather than
-        open-ended: no core-drawn picker exists to mint an fd (P2.6.6) and
-        no human-readable consent copy names what approving it costs
-        (P2.6.8, Q13's rule that no verb is served before its copy exists).
-        Both halves must land before any deployment may answer a
-        designate_file petition anything but "unsupported".
+        delivery does not exist. designate_file WAS in this posture and no
+        longer is: the core-drawn picker that mints an fd (P2.6.6) exists,
+        so whether a designate_file petition is answered "unsupported" is
+        now a property of the deployment rather than of the wire - a
+        deployment with no picker root it can open still answers so. Note
+        what has NOT landed with it: the human-readable consent copy that
+        names what approving it costs (P2.6.8, Q13's rule) is a minimum
+        line rather than a considered one, so a human approving this verb
+        today reads a card that names it and does not yet describe it.
         egress is refused by every deployment
         too, and for a reason that is about mechanism rather than about
         policy: the mediating proxy a connection would be made through
@@ -1016,12 +1020,12 @@
         names. Its FACET now exists (vitrin_egress, minted by get_egress),
         so the reason has narrowed since the bit landed - there is a
         request to exercise the verb, and there is nothing behind it.
-        Both of the two newest bits are therefore in this posture at once,
-        and their reasons are NOT the same one: designate_file waits on a
-        picker and its consent copy, egress on a proxy, and closing either
-        does nothing for the other.
-        layout_arrange, layout_focus and
-        realm_launch were in that same position when they were allocated
+        The two newest bits were both in this posture at once, and their
+        reasons were NOT the same one: designate_file waited on a picker,
+        egress on a proxy, and closing either did nothing for the other.
+        Closing the first is what left egress alone here.
+        layout_arrange, layout_focus, realm_launch and now designate_file
+        were in that same position when they were allocated
         and are now SERVABLE - each has a facet interface, a chokepoint arm
         and prompt copy - so whether a petition for one is answered
         "unsupported" is a property of the deployment rather than of the
@@ -1192,7 +1196,7 @@
       <entry name="observe_cursor" value="8" summary="capture frames that include the human principal's cursor - reading the human's attention, hence a verb and not a display preference; meaningful only alongside observe, and a petition naming it without observe resolves unsupported; another agent principal's cursor is not purchasable by this or any verb; refused unsupported in version 1"/>
       <entry name="layout_arrange" value="16" summary="arrange the granted realm's view, subject to the ordering invariants no grant can purchase; exercised through vitrin_layout_arrange, which defines set_fullscreen and no other request - place, resize, raise and stacking are absent rather than refused, because a scene showing one unstacked realm cannot honour them; at most one holder per output, counting a live grant that carries this verb AND a petition still pending for it, so a second petition while either exists resolves layout_held"/>
       <entry name="layout_focus" value="32" summary="bind the output to a view of the granted realm and direct input there - one act, because routing keys to a realm the human cannot see is focus theft in its sharpest form; exercised through vitrin_layout_focus; separate from layout_arrange because focus theft is at once the sharpest attack and the most legitimate need, so it must be attenuable alone"/>
-      <entry name="designate_file" value="64" summary="designate one file or one directory subtree to the granted realm, through the vitrin_powerbox facet; the human picks in a core-drawn picker and what crosses the wire is a file descriptor, never a path, so this is authority to ASK for a designation rather than authority over any named file; a delivered fd is kernel authority the core cannot recall, so revocation stops future designations and kills the grant row while the payload keeps every fd already handed over until its realm dies - PRD P2's revocation is immediate and transitive is FALSE for designations already made; refused unsupported in version 1, which cannot mint the facet at all, and by every deployment until the picker (P2.6.6) and its consent copy (P2.6.8) exist"/>
+      <entry name="designate_file" value="64" summary="designate one file or one directory subtree to the granted realm, through the vitrin_powerbox facet; the human picks in a core-drawn picker and what crosses the wire is a file descriptor, never a path, so this is authority to ASK for a designation rather than authority over any named file; a delivered fd is kernel authority the core cannot recall, so revocation stops future designations and kills the grant row while the payload keeps every fd already handed over until its realm dies - PRD P2's revocation is immediate and transitive is FALSE for designations already made; refused unsupported in version 1, which cannot mint the facet at all; at version 2 whether it is served is a property of the deployment, and the reference core has served it since P2.6.6 landed the core-drawn picker - a deployment with no picker root it can open answers internal rather than serving a verb with nothing behind it, and the human-readable consent copy that names what approving it costs is still owed (P2.6.8, Q13)"/>
       <entry name="egress" value="128" summary="open one outbound connection to the single host:port named by this grant's net: resource selector, through an out-of-core mediating proxy that asks the enforcement chokepoint per connection and holds no grant of its own; exercised through the vitrin_egress facet, which is a separate interface of its own rather than a request on the filesystem powerbox, since interface/@verb is one value per interface; the selector's grammar is wildcard-free, so a blanket egress grant is inexpressible rather than refused, and one selector covers exactly itself - though not every spelling of one endpoint is one selector, since the host is compared byte-exactly and kept as presented; SPECIFIED BUT NOT IMPLEMENTED ANYWHERE YET: a DNS name is to resolve only in the proxy and the addresses it resolved to at grant time are to be pinned into the grant row, so that a connection to an unpinned address is refused not_granted even under a name-scoped grant - no proxy, no resolver and no pinned column with a value exist today; the dotted SDK name is egress unchanged, the wire name carrying no underscore to replace; refused unsupported in version 1 and by every deployment at version 2 - the facet exists now, so what is missing is the proxy behind it rather than a request to ask through"/>
       <entry name="realm_launch" value="512" summary="launch the realm template this grant addresses into a new realm instance, through the vitrin_launcher facet; the template names the program and no command ever crosses the wire, so this is authority over an operator-written template rather than over an arbitrary command; bit 256 is allocated to a verb not yet defined here and was skipped rather than reused, as 64 was until designate_file landed on it and 128 was until egress did; refused unsupported in version 1, which cannot mint the facet at all, and by any deployment that does not serve it"/>
     </enum>
@@ -1257,34 +1261,75 @@
         realm has no live surface", which is the state realm_launch exists
         to leave, so a launch is never refused no_surface; preempted and
         consent_held are attention-shaped - they reach actuation and the
-        layout verbs, refuse neither a capture nor a launch, and never
-        reach egress, while whether they reach DESIGNATION is the one
-        question this enum leaves open rather than answers (see below);
-        capacity concerns creating a realm and so reaches only
-        realm_launch. A code's absence from a verb's reachable set is a
-        property of the operation, never a promise the code is unused.
+        layout verbs, refuse neither a capture nor a launch, and reach
+        neither egress nor a DESIGNATION ASK (see below, where designation
+        appears in both directions and only one of them is this code
+        refusing that verb); capacity concerns creating a realm and so
+        reaches only realm_launch. A code's absence from a verb's
+        reachable set is a property of the operation, never a promise the
+        code is unused.
 
         DESIGNATION reaches the grant-lifecycle four (not_granted,
-        expired, revoked, rate_limited) and internal, and it is the one
-        class whose set this document does not yet close. It is never
-        refused no_surface, for a reason that is neither launch's nor
-        egress's: a designation is delivered to the realm's SHIM, which
-        exists from the moment the realm does, whether or not its app has
-        ever committed a surface. capacity concerns realm creation and so
-        does not reach it. WHAT IS NOT SETTLED is preempted and
-        consent_held. Both are attention-shaped, and request_file and
-        request_dir are the only USES of a grant in this protocol that
-        raise a prompt of their own (a petition does too, but a petition
-        is not a use), so the argument that mutes an actuation while the
-        human's hand is on the input does not transfer unexamined to a
-        request whose whole purpose is to put something in front of that
-        same human. P2.6.6
-        answers it when it builds the picker; nothing here forecloses
-        either answer, and a server must not read the silence as licence
-        to give either code a third meaning. Note what IS settled: two
-        pickers colliding is already answered, by vitrin_powerbox.refusal
-        "busy" on the interface's own event. It is only the human's hand
-        that is undecided.
+        expired, revoked, rate_limited) and internal, AND NOTHING ELSE.
+        That set was left open when this facet landed and P2.6.6 closes it
+        here, code by code, because leaving it open while the picker
+        existed would have made the silence a licence this enum already
+        said it was not. It is never refused no_surface, for a reason that
+        is neither launch's nor egress's: a designation is delivered to
+        the realm's SHIM, which exists from the moment the realm does,
+        whether or not its app has ever committed a surface.
+
+        NEVER capacity, and that is the code most likely to be reached for
+        by mistake, because two conditions genuinely resemble it: a card
+        is already up for this principal, or the deployment's designation
+        ledger has no room for another. Both are real, and both are
+        answered on the FACET, by vitrin_powerbox.refusal "busy" - because
+        both are discovered AFTER the chokepoint admitted the ask, which
+        is the exact boundary between the two voices. capacity stays what
+        its own summary says: the deployment is at its REALM capacity and
+        no new realm can be created, reachable only through realm_launch.
+        A server that voiced capacity for a full picker ledger would
+        answer a question about cards with a code about realms, and an
+        agent reading it correctly would conclude the deployment could
+        launch no realm - which is the sharpest kind of wrong answer,
+        because it is actionable.
+
+        NEVER preempted. The argument that mutes an actuation while the
+        human's hand is on the input does not transfer: preempted exists
+        for something delivered INTO the human's realm past the human, and
+        an ask whose whole purpose is to put a card in front of that same
+        human is refused by their presence only if presence is read
+        backwards. request_file and request_dir are the only USES of a
+        grant in this protocol that raise a prompt of their own (a
+        petition does too, but a petition is not a use), and that is what
+        makes them the exception rather than what makes them undecided.
+
+        NEVER consent_held, on capacity's boundary rather than
+        preempted's. A second card in front of one human IS a real hazard
+        - it is the consent-fatigue shape - and it is answered where the
+        card is, by vitrin_powerbox.refusal "busy". THE REASON IS THE
+        ADMISSION BOUNDARY AND NOT ANY IGNORANCE ON THE CHOKEPOINT'S
+        PART, and getting that the wrong way round is easy: the chokepoint
+        can perfectly well learn that a card of this principal's is up -
+        it learns exactly that from the mechanism it consults, and the
+        paragraph below has it act on that knowledge to mute the same
+        principal's actuation - so an argument from what the chokepoint
+        cannot see would be false one paragraph after it was written.
+        What it may not do is answer the ask's OWN terminal for a
+        condition found AFTER it admitted the ask; that answer belongs to
+        the voice that raises and dismisses cards. And busy's second
+        condition is not principal-scoped at all: a designation ledger at
+        its resource bound is deployment-wide state, which is the one
+        thing capacity already means, about realms.
+
+        DESIGNATION APPEARS IN THIS ENUM IN THE OTHER DIRECTION TOO, and
+        reading the paragraph above as covering both is the misreading to
+        avoid. Nothing above says a designation ask is refused
+        consent_held; what consent_held now also names is the reverse -
+        while a designation of THIS principal's own is pending, that
+        principal's ACTUATION is refused consent_held until the picker
+        closes, exactly as its own pending petition already refuses it,
+        and its OBSERVATION continues. See that entry.
 
         EGRESS reaches the grant-lifecycle four (not_granted, expired,
         revoked, rate_limited) and internal, and NOTHING ELSE. It is never
@@ -1332,10 +1377,10 @@
       <entry name="revoked" value="2" summary="revoked by hold-Esc, panel, or policy; effective on the very next request"/>
       <entry name="rate_limited" value="3" summary="the token bucket is empty; retry_after_ms hints the refill"/>
       <entry name="preempted" value="4" summary="physical human input owns the target right now"/>
-      <entry name="consent_held" value="5" summary="the principal's own pending petition has a prompt up; that principal's actuation is refused (never delivered to the app) until the prompt closes; other principals' grants are unaffected"/>
+      <entry name="consent_held" value="5" summary="a prompt of that principal's OWN is up, and that principal's actuation is refused (never delivered to the app) until it closes; other principals' grants are unaffected. TWO prompts raise it, not one: the principal's own pending petition, and a designation of its own still waiting on the human - an ask the chokepoint admitted whose terminal (designated, or the powerbox's refused) has not arrived. Its OBSERVATION is refused by neither, which is the standing posture that a human answering a security question does not stop agents watching. The two prompts are deliberately NOT distinguished by this code: both mean WAIT rather than NO, both end with a terminal the agent is already waiting for, and an agent knows which of its own asks are outstanding - so a distinct entry would buy a distinction no client can act on and would oblige every SDK to name a second exception. What a client must never do is read this as a lifecycle answer and stop asking; that is what not_granted, expired and revoked are for"/>
       <entry name="no_surface" value="6" summary="the realm has no surface (its shim crashed or exited); never a stale frame"/>
       <entry name="internal" value="7" summary="server-side failure during this use (renderer, memfd, delivery)"/>
-      <entry name="capacity" value="8" summary="the deployment is at its realm capacity, so no new realm can be created; a policy answer rather than a server-side failure, which is why it is not internal - retrying is legal once a realm exits, and retry_after_ms is 0 because the core cannot know when that will be. NOTE, a deliberate exception: every other code answers from the asking principal's OWN grant, but this one answers from deployment-wide state, so a principal holding one launch grant can poll launch and watch the answer flip - observing that SOME other principal created or exited a realm. That is a low-bandwidth cross-principal side channel, inherent to answering the question at all, and it is named here rather than left to be discovered; a deployment that cannot afford it must not serve realm_launch, because no attenuation of a launch grant removes it"/>
+      <entry name="capacity" value="8" summary="the deployment is at its realm capacity, so no new realm can be created; a policy answer rather than a server-side failure, which is why it is not internal - retrying is legal once a realm exits, and retry_after_ms is 0 because the core cannot know when that will be. NOTE, a deliberate exception: every other code answers from the asking principal's OWN grant, but this one answers from deployment-wide state, so a principal holding one launch grant can poll launch and watch the answer flip - observing that SOME other principal created or exited a realm. That is a low-bandwidth cross-principal side channel, inherent to answering the question at all, and it is named here rather than left to be discovered; a deployment that cannot afford it must not serve realm_launch, because no attenuation of a launch grant removes it. REALM capacity, and only that: a designation ask that finds a card already up or the picker ledger full is answered on the powerbox's own facet by refusal busy, never here"/>
     </enum>
   </interface>
 
@@ -2187,6 +2232,26 @@
         agent's own answer was already delivered on its own connection
         before this event was sent.
 
+        THIS DESCRIPTOR SHARES ITS FILE OFFSET WITH THE ASKING AGENT'S,
+        and nothing about this signature suggests it, so it is stated
+        here. The core resolves the human's choice ONCE and sends that one
+        descriptor twice - to the agent as vitrin_powerbox.designated, and
+        to this realm here - and SCM_RIGHTS installs in each receiver a
+        descriptor onto the SAME OPEN FILE DESCRIPTION, which is what
+        dup(2) produces rather than what a second open would. So the app's
+        reads advance the agent's cursor and the agent's advance the
+        app's; for a directory designation the shared position is the
+        getdents cursor, so an agent and an app that both walk the subtree
+        each see part of it and neither sees all of it. A shim relaying
+        this fd cannot repair that and must not try - the app's remedies
+        are positional I/O (pread, pwrite) or a fresh description opened
+        from the descriptor it was handed (openat(dirfd, ".", ...)), and
+        dup is not one, since it makes another descriptor onto the very
+        description being shared. Resolving the choice twice instead would
+        let the two halves name two different files, which is what a
+        core-drawn picker exists to prevent, so the shared cursor is the
+        deliberate half of that trade.
+
         WHAT THE CORE CANNOT TAKE BACK. Once this fd crosses, it is kernel
         authority the core has no means to recall: no revocation, no
         expiry, and no dead-man chord closes a descriptor in another
@@ -2864,13 +2929,13 @@
       whether a petition for it is refused "unsupported" is a property of
       the deployment rather than of the wire: a deployment that will not
       host process creation answers "unsupported" rather than killing the
-      <!-- vitrin-verb-set: unserved-verbs = observe_cursor, designate_file, egress | count: three -->
-      connection. observe_cursor, designate_file and egress are the THREE
+      <!-- vitrin-verb-set: unserved-verbs = observe_cursor, egress | count: two -->
+      connection. observe_cursor and egress are the TWO
       bits left in
       that defined-but-unserved posture, refused by every deployment, and
-      their reasons are three different ones rather than one shared one -
-      no per-principal cursor delivery, no picker and consent copy, no
-      out-of-core proxy. The verb enum's own DEFINED BUT UNSERVED paragraph
+      their reasons are two different ones rather than one shared one -
+      no per-principal cursor delivery, no out-of-core proxy.
+      designate_file left this list when the core-drawn picker landed. The verb enum's own DEFINED BUT UNSERVED paragraph
       is the list; this sentence restates it and carries the same
       machine-checked marker, so the two cannot drift apart the way this
       one silently did while a second verb was landing beside it. Defining
@@ -3187,10 +3252,61 @@
       answers whether this grant may ask AT ALL - the chokepoint's own
       question, in the one voice that answers it for every verb, and it
       never reaches the human. This interface's refused answers what
-      happened AFTER the ask was allowed and the picker was raised: the
-      human declined, or the core would not designate what they chose. Both
-      are terminals of the same request and exactly one of the three
-      arrives; see request_file.
+      happened AFTER the ask was allowed: the human declined, the core
+      would not designate what they chose, or no card could be raised for
+      this ask at all ("busy"). Both are terminals of the same request and
+      exactly one of the three arrives; see request_file.
+
+      WHILE AN ASK IS PENDING, THIS PRINCIPAL'S ACTUATION IS MUTED AND ITS
+      OBSERVATION IS NOT. A card raised by this principal's own
+      request_file or request_dir holds that principal's actuate_pointer,
+      actuate_text, layout_focus and layout_arrange uses off with
+      vitrin_grant.refused(verb, "consent_held") until the terminal
+      arrives; its observe uses are not refused, on the standing posture
+      that a human answering a security question does not stop agents
+      watching. It is the same code a pending petition of this
+      principal's already raises, reused rather than duplicated, and the
+      full argument for that reuse is on the entry. Other principals are
+      unaffected in both directions. Two things this does NOT say: it does
+      not say a DESIGNATION ask is refused consent_held (it is not - see
+      vitrin_grant.refusal, which now closes designation's reachable set),
+      and it does not say the mute is an authority answer. consent_held
+      means WAIT; an agent that reads it as NO and stops asking has read
+      the one thing this code was chosen to keep distinguishable.
+
+      WHAT THE HUMAN SEES IS DRAWN BY THE CORE, AND FOUR SCRIPT FAMILIES
+      ARE TRANSCRIBED RATHER THAN DRAWN - permanently, as a published
+      limit rather than as work owed. The picker renders filenames with
+      the core's own SHAPING-FREE text path: it draws real Unicode where
+      it can, and it renders ARABIC, HEBREW, DEVANAGARI and THAI as a
+      transcription of their bytes instead of as their own glyphs. Which
+      repertoire a deployment's face covers is that deployment's (the
+      reference core's is Latin, Greek and Cyrillic plus kana and
+      subsetted kanji); the two PROHIBITIONS below are not, and neither is
+      the injectivity guarantee that follows from them.
+
+      THOSE FOUR ARE NOT A GAP WAITING ON A FONT. Drawing them correctly
+      needs a shaping engine (GSUB joining, GPOS mark positioning) and a
+      bidi algorithm, and A BIDI ALGORITHM ON THE TRUSTED SURFACE IS
+      ITSELF THE RTL-OVERRIDE FILENAME SPOOF - the attack in which a
+      filename reorders its own visible extension in front of the human.
+      The picker is the one surface in this system that must never
+      misstate what a name is, and reordering text on the human's behalf
+      is exactly that misstatement. So neither the shaping engine nor the
+      bidi algorithm is added, at any version.
+
+      THE TRANSCRIPTION IS A PROPERTY OF THE PIXELS AND NEVER OF THE WIRE.
+      designated.name carries the exact basename bytes the human's choice
+      has, unchanged and unmarked, at every version - a receiver that
+      re-renders it gets whatever its own text stack can do, which may be
+      more than the picker's. Two consequences a client must accept. A
+      human designating a file whose name is in one of those four scripts
+      approves a name they were shown a transcription of, so the core's
+      guarantee is injectivity - distinct bytes are drawn distinctly, and
+      the human is never shown one name for two files - rather than
+      legibility. And an agent must not infer anything about a filename
+      from what the picker drew, because it never sees what the picker
+      drew.
 
       WHAT THIS FACET IS NOT. It designates; it does not enumerate,
       browse, stat, or open by name. There is no request that lists what a
@@ -3249,11 +3365,11 @@
         one of three -
 
         designated(...) when the human chose and the core resolved the
-        choice safely; refused(code) when the picker was raised and
-        produced no descriptor (the human cancelled, the prompt expired,
-        one was already up, or the core would not designate what they
+        choice safely; refused(code) when the ask was ADMITTED and still
+        produced no descriptor (the human cancelled, the card expired, no
+        card could be raised, or the core would not designate what they
         chose); or vitrin_grant.refused(designate_file, ...) when the
-        chokepoint declined the ask before any picker was raised.
+        chokepoint declined the ask before anything reached the human.
 
         A three-way one-of rather than the usual pair, because there are
         genuinely two different questions with two different answerers: the
@@ -3288,8 +3404,43 @@
         capture_frame's do. Asks are rate-limited by the grant's
         max_event_rate like every other use of a grant, which is what stops
         an agent from raising pickers faster than a human can dismiss them;
-        the per-principal single-picker rule (refused "busy") is the other
+        the per-principal single-card rule (refused "busy") is the other
         half of the same protection.
+
+        REQUEST-ORDER PAIRING IS NORMATIVE AND IS A KNOWN OPEN GAP HERE.
+        The rule above binds every implementation, and the reference
+        core's designation machinery does not meet it - which costs
+        nothing while no deployment serves the verb and costs a mispairing
+        the day one does, which is the reason to record it now rather than
+        then. The shape of the miss is structural rather than a slip. A
+        first ask that is ADMITTED has its terminal owed across human time
+        - seconds, or the whole deadline - while a second ask arriving
+        behind it is refused "busy" inside its own dispatch turn and
+        answered immediately. So the second ask's terminal precedes the
+        first's, and a client pairing terminals positionally mispairs
+        them. Closing it needs per-facet ordering
+        state - a queue that holds a synchronous refusal until every
+        earlier ask on the same facet has been answered - which the
+        enforcement chokepoint does not have and which no other verb has
+        ever needed, because every other admitted use completes inside the
+        call it was asked in. THAT LAST CLAUSE IS TRUE OF TODAY RATHER
+        THAN OF THIS PROTOCOL, and is written that way so it is not read
+        as a structural guarantee: request_connect's admitted terminal is
+        the FAR END's answer (connected, or connect_failed) and cannot
+        complete in the dispatch turn either, so egress acquires this
+        exact shape the day a proxy exists for it to admit anything. It
+        admits nothing today - no deployment serves egress - which is the
+        only reason designation is the sole instance.
+
+        WHAT A CLIENT SHOULD DO ABOUT IT, until it closes: do not pipeline
+        designation asks. Send one, wait for its terminal, send the next.
+        The refusal terminal carries NO designation_id (refused's only
+        argument is the code) so out-of-order terminals cannot be
+        re-paired after the fact, and a signature is immutable forever, so
+        the id cannot be added to that event - a since-gated sibling event
+        would be the only route, and it is not reserved for here. This is
+        recorded so the condition is met as a known one rather than found
+        through a client that pairs positionally.
       </description>
       <arg name="mode" type="uint" enum="mode" summary="the access this ask is for; the human may narrow it, and designated.mode carries what was actually approved"/>
     </request>
@@ -3336,6 +3487,38 @@
         required for the realm's copy to work, and closing it does not
         revoke the realm's.
 
+        THE TWO HALVES SHARE ONE FILE OFFSET, and it is stated here rather
+        than left to be discovered because nothing about the wire suggests
+        it. The core resolves the human's choice ONCE and sends that one
+        descriptor twice; SCM_RIGHTS installs in each receiver a
+        descriptor referring to the SAME OPEN FILE DESCRIPTION, which is
+        what dup(2) produces rather than what a second open would. So the
+        agent's fd and the realm's fd are not two independent handles:
+        they share the file position. A read by either advances the
+        other's cursor, an lseek by either moves the other, and O_APPEND
+        or a truncation seen through one is seen through both. For a
+        DIRECTORY designation the shared position is the getdents cursor,
+        so two receivers that both walk the subtree each see part of it
+        and neither sees all of it - the failure mode most likely to be
+        read as a corrupt filesystem.
+
+        A receiver that must not be disturbed by the other uses positional
+        I/O - pread and pwrite, which do not touch the shared offset - or,
+        for a directory, opens a fresh description from the descriptor it
+        holds (openat(dirfd, ".", O_RDONLY|O_DIRECTORY)), which stays
+        inside the designated subtree. dup and dup2 do NOT help: they
+        produce another descriptor onto the same description, which is the
+        thing being shared.
+
+        THIS IS INHERENT TO THE ONE-RESOLUTION RULE, not a defect to be
+        fixed by opening twice. Two opens would resolve the human's choice
+        twice, and between the two resolutions the name could come to mean
+        a different file - so the agent and the realm could be handed two
+        different files from one confirmation, which is precisely what a
+        core-drawn picker exists to make impossible. A shared cursor is
+        the price of both halves naming the same object, and it is the
+        cheaper of the two costs by a wide margin.
+
         THIS FD OUTLIVES THE GRANT. Revocation and expiry stop future asks
         and kill the grant row; they do not close what this event already
         delivered, on either connection. See the interface description.
@@ -3368,11 +3551,14 @@
     </event>
 
     <event name="refused" since="2">
-      <description summary="the picker was raised and produced no descriptor">
+      <description summary="an admitted ask produced no descriptor">
         The terminal of an ask that the chokepoint ALLOWED and that still
-        yielded nothing - the human's answer, or the core's own refusal to
-        designate what they chose. Exactly one per refused ask, in request
-        order, never coalesced.
+        yielded nothing - the human's answer, the core's own refusal to
+        designate what they chose, or the core's refusal to raise a card
+        for this ask at all ("busy", the only one of the four codes for
+        which nothing reached the human). Exactly one per refused ask, in
+        request order, never coalesced - and see request_file, where that
+        ordering is a normative rule no implementation yet keeps.
 
         NOT A SECOND ENFORCEMENT VOICE. Authority questions are answered by
         vitrin_grant.refused, from the one chokepoint, for every verb; this
@@ -3424,7 +3610,7 @@
     </enum>
 
     <enum name="refusal">
-      <description summary="why a raised picker produced no descriptor">
+      <description summary="why an admitted ask produced no descriptor">
         Answers are exhaustive rather than optional: every ask the
         chokepoint allows gets exactly one terminal, and an ask that
         designated nothing says why. The set is deliberately SMALL and
@@ -3432,10 +3618,23 @@
         event. Each entry is distinguished because it means something
         different to a client deciding whether to ask again, which is the
         only decision this event informs.
+
+        THIS ENUM IS WHERE "NO CARD COULD BE RAISED" IS ANSWERED, and that
+        is the one thing its header sentence would otherwise hide: three
+        of the four codes describe a card that WAS raised, and busy
+        describes an admitted ask for which none was. It belongs here and
+        not in vitrin_grant.refusal because it is discovered after the
+        chokepoint admitted the ask, which is the boundary between the two
+        voices - and because the chokepoint's capacity means the
+        deployment is at its REALM limit, an answer about a different
+        mechanism entirely. A server that voiced capacity for a full
+        picker ledger would tell an agent it could launch no realm.
+        vitrin_grant.refusal now closes designation's reachable set on
+        exactly that argument.
       </description>
       <entry name="cancelled" value="0" summary="the human dismissed the picker without choosing; the ordinary answer, and asking again later is legal"/>
       <entry name="timed_out" value="1" summary="the picker was raised and expired unanswered, on the deployment's own deadline; distinct from cancelled because nobody decided anything"/>
-      <entry name="busy" value="2" summary="a picker for this principal is already up; at most one at a time, because two stacked in front of one human is the consent-fatigue shape the busy petition outcome already names"/>
+      <entry name="busy" value="2" summary="no card could be raised for this principal right now, so nothing was put in front of the human and asking again later is legal. TWO conditions produce it and they are deliberately not distinguished: a card for this principal is already up (at most one at a time, because two stacked in front of one human is the consent-fatigue shape the busy petition outcome already names), or the deployment's designation ledger is at its own resource bound. Merging them keeps the retry advice identical - which it is - and refuses to widen a cross-principal observation, though it does not remove one: an agent with no ask of its own outstanding that hears busy learns that the deployment's designation capacity is exhausted by somebody else, one bit, at whatever rate its max_event_rate allows. That is named here rather than left to be discovered, on vitrin_grant.refusal.capacity's terms; a deployment that cannot afford it bounds its ledger per principal, which the one-card rule already very nearly does"/>
       <entry name="unresolvable" value="3" summary="the human chose, and the core would not designate it: the entry could not be resolved without following a symlink or losing a race between the confirmation and the open, so the core refuses rather than delivering a descriptor that may not name what the human saw; says nothing about whether the entry exists"/>
     </enum>
   </interface>

@@ -59,11 +59,18 @@ chmod 700 "$RUNTIME_DIR"
 export XDG_RUNTIME_DIR="$RUNTIME_DIR"
 unset WAYLAND_DISPLAY DISPLAY
 
+# BY PID, NEVER BY NAME. These were three `pkill -x` lines until a SECOND
+# acceptance script started a mock core; `meson test` runs the two in parallel,
+# and whichever finished first killed the other's processes mid-run -- observed
+# as "the shim never bound a socket" against a core log showing a shim that had
+# come up and served a frame. The same line reaches a developer's unrelated
+# `vitrin-shim` on their own desktop. Killing the mock core is enough: it
+# installs a SIGTERM handler and takes its shim down with it (mock_core.c's
+# shutdown ladder), and the probe has already exited -- it runs in the
+# foreground under `timeout`.
 cleanup() {
 	local rc=$?
-	pkill -x mock-core 2>/dev/null || true
-	pkill -x vitrin-shim 2>/dev/null || true
-	pkill -x idle-probe 2>/dev/null || true
+	[[ -n "${CORE_PID:-}" ]] && kill "$CORE_PID" 2>/dev/null || true
 	rm -rf "$RUNTIME_DIR"
 	exit "$rc"
 }

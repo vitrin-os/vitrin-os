@@ -16,8 +16,10 @@ import vectors
 from vitrin_os import messages, protocol
 from vitrin_os.messages import (
     AttentionEvent,
+    DesignatedEvent,
     FrameReadyEvent,
     LaunchedEvent,
+    PowerboxRefusedEvent,
     decode_event,
 )
 from vitrin_os.wire import HEADER_SIZE, MessageDecoder, fixed_to_float, unpack_header
@@ -121,7 +123,7 @@ def test_golden_get_layout_arrange_is_request_two_on_the_grant() -> None:
     )
 
 
-def test_the_three_structural_mints_differ_only_in_opcode_and_minted_id() -> None:
+def test_the_structural_mints_differ_only_in_opcode_and_minted_id() -> None:
     """The mints are one byte apart, so their ORDER is the whole contract.
 
     Stated as an assertion rather than a comment: if the IDL's request order
@@ -129,6 +131,9 @@ def test_the_three_structural_mints_differ_only_in_opcode_and_minted_id() -> Non
     would silently mint the wrong facet from the right grant — the one drift
     a per-message equality check would still pass, since each encoder would
     have been "fixed" to match its own new vector.
+
+    Four of `vitrin_grant`'s five mints; `get_egress` (request 4) is outside
+    this guard because the SDK has no encoder for it to be checked against.
     """
     opcodes = [
         unpack_header(v)[2]
@@ -136,9 +141,10 @@ def test_the_three_structural_mints_differ_only_in_opcode_and_minted_id() -> Non
             vectors.GOLDEN_GET_LAUNCHER,
             vectors.GOLDEN_GET_LAYOUT_FOCUS,
             vectors.GOLDEN_GET_LAYOUT_ARRANGE,
+            vectors.GOLDEN_GET_POWERBOX,
         )
     ]
-    assert opcodes == [0, 1, 2]
+    assert opcodes == [0, 1, 2, 3]
 
 
 def test_golden_focus_and_launch_are_bare_headers_told_apart_by_object() -> None:
@@ -192,3 +198,100 @@ def test_golden_launched_decodes_the_core_minted_realm_id() -> None:
     # unparsed. `kiosk.1` has the `<template>.<n>` shape the core mints, and
     # nothing here may depend on that shape.
     assert event.realm == "kiosk.1"
+
+
+# ---------------------------------------------------------------------------
+# The version-2 powerbox facet (P2.6.6, #190).
+#
+# Five messages: the fourth structural mint, the two asks (one carrying an
+# enum, one carrying nothing at all), and the two terminals -- one of which
+# declares an fd and the other of which is a second, unrelated `refused`.
+# Encoders are asserted against the written-down bytes; both events are
+# decoded through the SDK's own interface-keyed table, because a vector that
+# only round-tripped through an encoder would pass with a reordered opcode
+# table.
+# ---------------------------------------------------------------------------
+
+def test_golden_get_powerbox_is_request_three_on_the_grant() -> None:
+    assert (
+        messages.encode_get_powerbox(4, facet_id=14) == vectors.GOLDEN_GET_POWERBOX
+    )
+
+
+def test_golden_request_file_carries_the_mode_enum_and_nothing_else() -> None:
+    """One enum argument, and the absence of every other one is the contract.
+
+    `mode` selects the chrome the human sees; there is no filename, filter or
+    starting directory, because each would be an agent-supplied string steering
+    a window the human is meant to trust. Pinning the frame's *size* is what
+    makes that absence a checked property: an argument appended here would
+    change it.
+    """
+    assert (
+        messages.encode_request_file(14, mode=protocol.DesignationMode.READ_WRITE)
+        == vectors.GOLDEN_REQUEST_FILE
+    )
+    read = bytearray(vectors.GOLDEN_REQUEST_FILE)
+    read[8] = 0
+    assert (
+        messages.encode_request_file(14, mode=protocol.DesignationMode.READ)
+        == bytes(read)
+    )
+    assert unpack_header(vectors.GOLDEN_REQUEST_FILE)[1] == 12  # header + one uint
+    # Out of range is fatal `invalid_argument` server-side, so the encoder
+    # refuses it locally rather than costing the caller its connection.
+    with pytest.raises(ValueError):
+        messages.encode_request_file(14, mode=2)
+
+
+def test_golden_request_dir_is_a_bare_header_at_opcode_one() -> None:
+    """No arguments at all, and the opcode is what tells it from `request_file`.
+
+    `request_dir` deliberately takes no mode: a subtree picker has one chrome,
+    so a mode here would steer nothing while putting the widest ask this verb
+    can make in the least visible place.
+    """
+    assert messages.encode_request_dir(14) == vectors.GOLDEN_REQUEST_DIR
+    assert unpack_header(vectors.GOLDEN_REQUEST_DIR) == (14, 8, 1, 0)
+    assert unpack_header(vectors.GOLDEN_REQUEST_FILE)[2] == 0
+
+
+def test_golden_designated_decodes_through_the_fd_bearing_table() -> None:
+    """The one fd-bearing event this SDK hands on rather than consumes.
+
+    Decoded through `decode_event`'s interface-keyed table, so this fails if
+    `designated` is not event 0 on `vitrin_powerbox` — and the table's
+    fd-count check is what pins that the descriptor is never in the body.
+    """
+    object_id, size, opcode, fd_count = unpack_header(vectors.GOLDEN_DESIGNATED)
+    assert (object_id, size, opcode, fd_count) == (14, 36, 0, 1)
+    event = decode_event(
+        "vitrin_powerbox", opcode, vectors.GOLDEN_DESIGNATED[HEADER_SIZE:], fd=99
+    )
+    assert isinstance(event, DesignatedEvent)
+    assert event.fd == 99
+    assert event.designation_id == 7
+    # Two adjacent enums, given different values in the vector so that reading
+    # them in the wrong order cannot pass.
+    assert event.kind == protocol.DesignationKind.FILE
+    assert event.mode == protocol.DesignationMode.READ_WRITE
+    # Display only: a basename, never a path, and nothing here resolves it.
+    assert event.name == "notes.txt"
+
+
+def test_golden_powerbox_refused_is_event_one_and_not_the_grants_refusal() -> None:
+    """The facet's own refusal, which is a different voice from the grant's.
+
+    `vitrin_grant.refused` answers whether the grant may ask at all;
+    this event answers what happened after an ask was allowed. They are
+    different interfaces, different opcodes and different argument lists — one
+    uint here against three there — and the SDK maps them to different types
+    for the same reason.
+    """
+    object_id, size, opcode, fd_count = unpack_header(vectors.GOLDEN_POWERBOX_REFUSED)
+    assert (object_id, size, opcode, fd_count) == (14, 12, 1, 0)
+    event = decode_event(
+        "vitrin_powerbox", opcode, vectors.GOLDEN_POWERBOX_REFUSED[HEADER_SIZE:], fd=None
+    )
+    assert isinstance(event, PowerboxRefusedEvent)
+    assert event.code == protocol.PowerboxRefusal.BUSY

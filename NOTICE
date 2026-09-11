@@ -145,9 +145,24 @@ EVERYTHING NOT NAMED ABOVE
 
 THIRD-PARTY — not ours to license
 
-  - crates/vitrin-core/assets/fonts/ — Liberation Sans, SIL Open Font
-    License 1.1, with the license text alongside it. Vendored, not
-    relicensed by anything in this file.
+  - crates/vitrin-core/assets/fonts/ — two vendored assets under the SIL
+    Open Font License 1.1, each with its own copy of the license text
+    alongside it. Vendored, not relicensed by anything in this file.
+
+      * LiberationSans-Regular.ttf — Liberation Sans, unmodified
+        (LICENSE-OFL-1.1.txt).
+      * kana-atlas-14px.bin — the picker's Japanese glyphs, RASTERIZED
+        from Noto Sans CJK JP (LICENSE-OFL-1.1-NotoSansCJK.txt). Not a
+        copy of that face and not a font at all: coverage bitmaps for
+        3152 declared codepoints at one size, with no outlines and no
+        font tables. It is nonetheless DERIVED from OFL Font Software, so
+        it travels under the OFL with the license text beside it, and it
+        carries no Reserved Font Name in its own name — which is also why
+        the file is called kana-atlas rather than anything Noto-shaped.
+        Its provenance (source face, digests, glyph count) is in
+        kana-atlas.provenance beside it, the codepoints it covers are
+        declared in kana-atlas.codepoints, and `cargo xtask kana-atlas
+        --check` holds all three to each other.
   - crates/vitrin-core/tests/fixtures/keymap-*.xkb — the compiled form of
     xkeyboard-config's `us`, `us+lv3:caps_switch_latch` and `tr` layout
     data (MIT/X11), emitted by

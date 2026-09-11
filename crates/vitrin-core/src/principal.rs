@@ -6183,21 +6183,35 @@ pub(crate) mod tests {
     /// the grant-lifecycle four (not_granted, expired, revoked,
     /// rate_limited) and internal".
     ///
-    /// It arrives at the chokepoint's step 4 for a reason no deployment can
-    /// vary today: `designate_file` is outside `SERVED_VERB_BITS`, so a
-    /// petition naming it resolves `unsupported` whole and no row can carry
-    /// the bit.
+    /// **Why it arrives at step 4 changed at P2.6.6 (issue #190), and the
+    /// answer it produces did not.** It used to be structural: with
+    /// `designate_file` outside `SERVED_VERB_BITS`, a petition naming the
+    /// verb resolved `unsupported` whole and no row could carry the bit at
+    /// all. The verb is served now, so the reason is the ordinary one — this
+    /// rig's grant was petitioned for other verbs, so `designate_file` is
+    /// outside its **effective** set and step 4 refuses it `not_granted`.
+    ///
+    /// The distinction is asserted rather than left implicit, because the two
+    /// readings make the same three refusals and only one of them is still
+    /// true: the guard below now pins that the bit is servable *and* that
+    /// this rig's row does not hold it.
     #[test]
     fn designation_asks_refuse_not_granted_and_leave_the_socket_alive() {
         let _fd = crate::capture::tests::fd_lock();
         let verifier = demo_verifier();
         let (mut server, mut core, mut client, mut shared) = designation_rig(&verifier);
-        assert_eq!(
+        assert_ne!(
             Verb::DESIGNATE_FILE.bits() & crate::grants::SERVED_VERB_BITS,
             0,
-            "SERVED_VERB_BITS gained `designate_file` without the picker \
-             (P2.6.6) or the consent copy (P2.6.8) that would make the \
-             refusal below the wrong assertion"
+            "`designate_file` left SERVED_VERB_BITS: the refusal below would then be \
+             structural again and this test would be asserting something else"
+        );
+        assert_eq!(
+            all_verbs().bits() & Verb::DESIGNATE_FILE.bits(),
+            0,
+            "this rig petitions for the three original facet verbs, so its row must NOT carry \
+             designate_file -- otherwise the asks below would be admitted and the \
+             `not_granted` asserted here would be a lie about why"
         );
         // Both asks, and both of each: a designation ask is reply-bearing,
         // so its refusals are never coalesced (IDL: "EXACTLY ONE terminal

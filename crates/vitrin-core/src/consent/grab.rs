@@ -332,8 +332,10 @@ use vitrin_protocol::generated::vitrin_actuator_pointer::{Axis, ButtonState};
 use vitrin_protocol::generated::vitrin_consent::ConsentState;
 use vitrin_protocol::generated::vitrin_shim_seat::{KeyState, Origin};
 
+use crate::designation::DesignationId;
 use crate::input::{Gate, PreemptionHook, SeatInput, SeatInputKind};
 use crate::petitions::{PetitionId, PetitionRegistry, PromptRoute};
+use crate::picker::keys::{decode as decode_picker_key, PickerStep};
 use crate::recorder::{Event, Recorder};
 
 use super::render::{ChoiceBox, SlotBox};
@@ -360,6 +362,30 @@ use super::{Choice, ConsentSurface};
 /// class of grants that come from a click aimed at something else.
 pub(crate) const GUARD_INTERVAL: Duration = Duration::from_millis(500);
 
+/// **What the raised prompt is about.**
+///
+/// One grab, two subjects, and they are deliberately one type rather than
+/// two parallel `Option` fields. The property that matters is that *at most
+/// one* of them can be up: a designation's picker and a petition's card both
+/// seize the human's whole physical input, and two of those at once is a
+/// human being asked two security questions with one keyboard. An enum makes
+/// that exclusion structural; two fields would make it a rule somebody has to
+/// keep applying.
+///
+/// It is also what turned every "is a prompt up?" call site into a decision.
+/// [`ConsentGrab::raised_petition`] answers "is a *petition's* card up", which
+/// is what a petition queue wants, and
+/// [`ConsentGrab::raised`] answers "is the human's input seized", which is
+/// what a raise guard wants. The single `armed_petition()` this replaced
+/// answered the first question at a site that needed the second, so
+/// `service_consent_round` would have raised a petition card straight over a
+/// live picker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Subject {
+    Petition(PetitionId),
+    Designation(DesignationId),
+}
+
 /// One decision the human took on a prompt, waiting for the embedder to
 /// route it into the petition state machine
 /// ([`PetitionRegistry::resolve_human`]).
@@ -384,16 +410,21 @@ pub(crate) struct Decision {
 /// nothing here can hold a stale position.
 #[derive(Debug)]
 struct ArmedPrompt {
-    petition: PetitionId,
+    subject: Subject,
     /// The rasterized card's size, for the centering computation.
     card: (u32, u32),
     /// When this prompt went up. A press before `raised_at + `
     /// [`GUARD_INTERVAL`] arms nothing (module docs: the guard interval).
     raised_at: Instant,
-    /// The petition's own consent deadline, copied from the registry at
-    /// raise. Past it the grab stops consuming even if nobody lowered the
-    /// prompt — the backstop against a permanent human input lockout
-    /// (module docs).
+    /// The subject's own deadline, copied at raise: a petition's consent
+    /// deadline from the registry, a designation's from its ledger ticket.
+    /// Past it the grab stops consuming even if nobody lowered the prompt —
+    /// the backstop against a permanent human input lockout (module docs).
+    ///
+    /// **One clock for both subjects, deliberately.** A picker could have had
+    /// its own timer; it does not, because the backstop below is written once
+    /// and a second clock would be a second thing that can disagree with the
+    /// ledger about when an obligation died.
     deadline: Instant,
     /// Whether this prompt can still be answered, and the state that only an
     /// unanswered one has.
@@ -501,11 +532,11 @@ impl Panel {
 /// navigation is not a decision, grants nothing, and must not weaken either
 /// property by sharing their type.
 ///
-/// Carries its petition id for [`Decision`]'s own reason: the embedder may
+/// Carries its [`Subject`] for [`Decision`]'s own reason: the embedder may
 /// drain this queue after the prompt was lowered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Navigation {
-    pub petition: PetitionId,
+    pub subject: Subject,
     pub step: Step,
 }
 
@@ -573,6 +604,22 @@ pub(crate) struct ConsentGrab {
     /// one per raised prompt: answering drops the geometry a second decision
     /// would need ([`Answerable`]).
     decisions: VecDeque<Decision>,
+    /// Picker steps a key produced on a raised **designation**, not yet
+    /// drained (FIFO).
+    ///
+    /// A separate queue from `navigations` rather than a third `Step`
+    /// variant, for [`Navigation`]'s own reason one level down: a picker step
+    /// is decoded from a *key*, is meaningful only while a designation is up,
+    /// and is drained by a different round
+    /// ([`crate::session::service_picker_round`]) than the one that folds a
+    /// pointer navigation into panel content. Sharing a queue would let one
+    /// round silently swallow the other's work.
+    ///
+    /// Each entry carries the designation it was typed against, exactly as a
+    /// [`Decision`] carries its petition and for the identical reason: the
+    /// embedder may drain after the picker was lowered, and a step must never
+    /// land on whatever designation happens to be up when it is drained.
+    steps: VecDeque<(DesignationId, PickerStep)>,
     /// Navigations taken and not yet drained (FIFO).
     ///
     /// Bounded by [`MAX_NAVIGATIONS`] rather than by one-per-prompt, because
@@ -592,6 +639,14 @@ pub(crate) struct ConsentGrab {
 /// spare: the embedder drains every round, so reaching this bound means an
 /// embedder that stopped draining while a card is still up.
 const MAX_NAVIGATIONS: usize = 64;
+
+/// How many undrained picker steps the grab will hold.
+///
+/// [`MAX_NAVIGATIONS`]' sibling, and deliberately smaller: these come from
+/// the keyboard, so one round's worth is bounded by autorepeat rather than by
+/// pointer motion, and every one of them is a deliberate act the embedder
+/// should be consuming the same round it was typed.
+const MAX_PICKER_STEPS: usize = 32;
 
 /// One scroll detent, in the kernel's `value120` units.
 const SCROLL_DETENT: i32 = 120;
@@ -614,6 +669,7 @@ impl ConsentGrab {
             armed: None,
             decisions: VecDeque::new(),
             navigations: VecDeque::new(),
+            steps: VecDeque::new(),
         }
     }
 
@@ -691,7 +747,21 @@ impl ConsentGrab {
         surface: &mut ConsentSurface,
         recorder: &mut Recorder,
     ) -> Option<PromptRoute> {
-        if let Some(current) = self.armed_petition() {
+        // **A designation's picker is never replaced by a petition's card.**
+        // The check is on [`Self::raised`] rather than on
+        // [`Self::raised_petition`], and that is the whole point of the
+        // subject enum: with the old petition-only accessor this test read
+        // `None` while a picker held the human's input, and a petition card
+        // would have been raised straight over it.
+        if let Some(Subject::Designation(current)) = self.raised() {
+            tracing::warn!(
+                %current,
+                incoming = %petition,
+                "refusing to replace a raised picker with a consent prompt; lower it first"
+            );
+            return None;
+        }
+        if let Some(current) = self.raised_petition() {
             if petitions.pending_route(current).is_none() {
                 // The armed petition died under us: take its card down and
                 // release the grab before considering the new one.
@@ -734,7 +804,7 @@ impl ConsentGrab {
             return None;
         };
         let armed = ArmedPrompt {
-            petition,
+            subject: Subject::Petition(petition),
             card: (card.width, card.height),
             raised_at: now,
             deadline,
@@ -743,6 +813,12 @@ impl ConsentGrab {
             // navigable because there is a panel on the screen -- never
             // because a flag beside the pixels said so.
             answerable: Answerable::Open(Open {
+                // **`Card::buttons` is already narrowed to petition
+                // decisions** (`ButtonBox::as_choice`, applied in
+                // `draw_card`). A picker card paints Confirm and Cancel;
+                // neither is a `Choice`, so neither can be hit-tested into a
+                // `Decision` -- which names a `PetitionId` a designation does
+                // not have.
                 buttons: card.buttons.clone(),
                 panel: card.panel.clone().map(Panel::new),
             }),
@@ -804,8 +880,20 @@ impl ConsentGrab {
     pub fn lower(&mut self, petitions: &mut PetitionRegistry, surface: &mut ConsentSurface) {
         surface.dismiss();
         if let Some(prompt) = self.prompt.take() {
-            petitions.mark_prompt_hidden(prompt.petition);
-            self.decisions.retain(|d| d.petition != prompt.petition);
+            match prompt.subject {
+                Subject::Petition(petition) => {
+                    petitions.mark_prompt_hidden(petition);
+                    self.decisions.retain(|d| d.petition != petition);
+                }
+                // A designation holds no `prompt_shown` flag in the petition
+                // registry -- there is no petition -- and it can queue no
+                // [`Decision`], because its raised prompt carries no choice
+                // rectangles at all (see [`Self::raise_picker`]). What it can
+                // have queued is picker steps, and those are dropped here for
+                // the decisions' own reason: they are answers to a card that
+                // is no longer on screen.
+                Subject::Designation(id) => self.steps.retain(|(step_id, _)| *step_id != id),
+            }
         }
         self.armed = None;
     }
@@ -824,7 +912,13 @@ impl ConsentGrab {
         petitions: &mut PetitionRegistry,
         surface: &mut ConsentSurface,
     ) -> bool {
-        let Some(current) = self.armed_petition() else {
+        // Petitions only: a designation's liveness is the ledger's answer,
+        // not the petition registry's, and it is
+        // [`crate::session::service_picker_round`] that lowers a picker whose
+        // obligation has gone. `retire_stale` running against a raised picker
+        // must therefore report "nothing to retire" rather than reading a
+        // missing petition route as a dead card.
+        let Some(current) = self.raised_petition() else {
             return false;
         };
         if petitions.pending_route(current).is_some() {
@@ -881,21 +975,211 @@ impl ConsentGrab {
                 // Anything armed under the stale guard is disarmed with it: a
                 // press that landed while the card was hidden must not survive
                 // into the visible round.
+                //
+                // **Both** presses, not just the choice row's. A panel slot
+                // arms `Panel::pressed` (issue #346), and clearing only
+                // `self.armed` left that one to commit on the first release
+                // after the human came back. [`Panel::epoch`] cannot catch it:
+                // its sole writer is the panel-refresh path, and a seat pause
+                // refreshes nothing, so the stale stamp still matches. The
+                // release goes through `disarm_slot` rather than a second
+                // hand-written `pressed = None`, so the two cannot drift apart
+                // again.
                 self.armed = None;
+                self.disarm_slot();
                 true
             }
             None => false,
         }
     }
 
-    /// The petition whose prompt currently holds the grab, if any.
+    /// **What currently holds the grab**, if anything — the question a raise
+    /// guard is actually asking.
     ///
-    /// (This sentence was orphaned onto [`Self::restart_guard`]'s doc block
-    /// when that method was inserted above it in WS-E.2.2, leaving this
-    /// accessor undocumented. Moved back in the same pass that gave
-    /// `restart_guard` its second call site.)
-    pub fn armed_petition(&self) -> Option<PetitionId> {
-        self.prompt.as_ref().map(|p| p.petition)
+    /// (The sentence this doc block grew from was orphaned onto
+    /// [`Self::restart_guard`] when that method was inserted above it in
+    /// WS-E.2.2. Moved back in the same pass that gave `restart_guard` its
+    /// second call site, and rewritten when the accessor split in three.)
+    pub fn raised(&self) -> Option<Subject> {
+        self.prompt.as_ref().map(|p| p.subject)
+    }
+
+    /// The petition whose card holds the grab — `None` while a **picker**
+    /// holds it, which is not the same as `None` meaning nothing is up.
+    ///
+    /// Every caller has to decide which of the two it meant. That is the
+    /// deliberate cost of deleting the single `armed_petition()` these three
+    /// replaced: it answered "is a petition's card up" at sites that were
+    /// asking "is the human's input seized", and the two stopped being the
+    /// same question the moment a second subject existed.
+    pub fn raised_petition(&self) -> Option<PetitionId> {
+        match self.prompt.as_ref()?.subject {
+            Subject::Petition(petition) => Some(petition),
+            Subject::Designation(_) => None,
+        }
+    }
+
+    /// The designation whose picker holds the grab, if one does.
+    pub fn raised_designation(&self) -> Option<DesignationId> {
+        match self.prompt.as_ref()?.subject {
+            Subject::Designation(id) => Some(id),
+            Subject::Petition(_) => None,
+        }
+    }
+
+    /// **Raise a picker for `designation`**: seize physical input for it,
+    /// on the ticket's own deadline.
+    ///
+    /// Refuses (`false`) when any prompt is already up, on
+    /// [`Self::raise`]'s rule and for its reason: one prompt at a time is the
+    /// property, and it is enforced here rather than trusted to the caller.
+    ///
+    /// # This raise composites nothing; [`Self::show_picker`] does
+    ///
+    /// [`Self::raise`] does five things at once so "visible", "input
+    /// grabbed", "`consent_held` holds" and "the log says so" cannot drift
+    /// apart. This one does exactly **one** of them — the grab — and the
+    /// pixels arrive in a second call, because the two have different
+    /// cadences: a designation is raised once and then *redrawn on every
+    /// keystroke*, so folding the card into the raise would have meant a
+    /// second, differently-shaped path for every redraw after the first.
+    ///
+    /// This used to be the whole story rather than half of it: for one
+    /// release a raised picker was a seized keyboard with nothing on screen
+    /// explaining it, because the panel type carried no strings and drawing
+    /// attacker-influenced filenames on the trusted surface was a change that
+    /// had to make its own argument first. [`super::PanelContent`] now makes
+    /// that argument, in the type.
+    ///
+    /// # The second call is not yet made, so the seizure is still blind
+    ///
+    /// **State this plainly rather than let the paragraph above imply
+    /// otherwise.** [`Self::show_picker`] exists, is tested, and is the only
+    /// door to the pixels — and *nothing outside `crate::consent`'s own tests
+    /// calls it*. `crate::session::service_picker_round` calls
+    /// `raise_picker_for`, which calls this and stops; it never reaches for
+    /// the card. So in a shipped binary a raised designation is, still, a
+    /// seized keyboard with nothing behind it.
+    ///
+    /// What bounds that — now as before — is the `deadline` this copies: the
+    /// backstop in [`Self::judge_parts`] stops consuming at it whatever else
+    /// happens. Closing the gap is two calls in `crate::session`: one after
+    /// this returns `true`, and one wherever a step changed what the human
+    /// should be seeing.
+    ///
+    /// # The prompt it arms carries no choice rectangles, and cannot
+    ///
+    /// [`Answerable::Open`] is built with an empty button list and no panel,
+    /// so [`Self::hit_test`] can find nothing and [`Self::commit`] has
+    /// nothing to commit. A designation therefore cannot produce a
+    /// [`Decision`] — not by a check, but because the geometry a decision
+    /// would need does not exist. That matters: `Decision` names a
+    /// `PetitionId`, and a designation has none.
+    ///
+    /// **A picker card really does paint buttons now, and this stays true.**
+    /// They are Confirm and Cancel, and
+    /// [`super::render::ButtonBox::as_choice`] returns `None` for both, so
+    /// the narrowing that fills `Open::buttons` cannot admit them. The
+    /// property is kept by the type rather than by this function continuing
+    /// to pass an empty vector.
+    pub fn raise_picker(
+        &mut self,
+        designation: DesignationId,
+        deadline: Instant,
+        now: Instant,
+    ) -> bool {
+        if let Some(current) = self.raised() {
+            tracing::warn!(
+                ?current,
+                incoming = %designation,
+                "refusing to raise a picker over a prompt that is already up"
+            );
+            return false;
+        }
+        self.prompt = Some(ArmedPrompt {
+            subject: Subject::Designation(designation),
+            // No card, so no centering: the hit tests below derive an origin
+            // from this and every one of them misses, which is the same
+            // fail-closed posture [`Self::new`]'s zero view takes.
+            card: (0, 0),
+            raised_at: now,
+            deadline,
+            answerable: Answerable::Open(Open {
+                buttons: Vec::new(),
+                panel: None,
+            }),
+        });
+        // A press held from before the picker cannot arm anything of its:
+        // arming requires a press this gate consumed.
+        self.armed = None;
+        true
+    }
+
+    /// **Draw (or redraw) the raised picker's card** (P2.6.6, issue #190).
+    ///
+    /// The pixel half of [`Self::raise_picker`], and the one call an embedder
+    /// would make to put a designation on screen: once straight after the
+    /// raise, and again on every round in which a step changed what the human
+    /// should be seeing. **No embedder in this tree makes it yet** — see
+    /// [`Self::raise_picker`] — so every caller below is a test.
+    /// `content` comes from
+    /// [`crate::picker::session::PickerSession::card`], which derives it from
+    /// the same `shown`/`cursor` a confirm settles from — so the highlight on
+    /// screen and the row that would be handed over cannot be different rows.
+    ///
+    /// Refuses, and draws nothing, unless a **picker** holds the grab. A
+    /// petition's card is not redrawable this way and must not be: its
+    /// content is the ask, and an ask that changed under a human mid-decision
+    /// is the hazard [`Self::refresh_panel`] and [`GUARD_INTERVAL`] exist for.
+    ///
+    /// Returns whether anything visible changed, so an embedder can skip a
+    /// recomposite on an inert keystroke.
+    ///
+    /// # It does not re-snapshot geometry, because there is none to snapshot
+    ///
+    /// [`Self::refresh_panel`] pairs content with geometry in one call so the
+    /// rectangles the grab hit-tests are the ones the renderer just painted.
+    /// This deliberately does not, and the difference is
+    /// [`Self::raise_picker`]'s: the armed prompt for a designation holds no
+    /// buttons and no panel, so there is nothing to hit-test and nothing that
+    /// could go stale. A picker is driven by the keyboard
+    /// ([`crate::picker::keys`]) and the card's own rectangles are reported
+    /// for the renderer's tests, not for a pointer.
+    pub fn show_picker(
+        &mut self,
+        content: crate::consent::PickerContent,
+        surface: &mut ConsentSurface,
+    ) -> bool {
+        if self.raised_designation().is_none() {
+            return false;
+        }
+        surface.show_picker(content)
+    }
+
+    /// Take the picker down and release the grab, without touching the
+    /// petition registry.
+    ///
+    /// [`Self::lower`]'s sibling for the subject that has no registry entry.
+    /// Idempotent, and a no-op while a *petition* holds the grab — so a
+    /// picker round cannot take somebody else's card down by accident.
+    pub fn lower_picker(&mut self, surface: &mut ConsentSurface) {
+        let Some(id) = self.raised_designation() else {
+            return;
+        };
+        surface.dismiss();
+        self.prompt = None;
+        self.steps.retain(|(step_id, _)| *step_id != id);
+        self.armed = None;
+    }
+
+    /// Drain the next picker step the human typed, oldest first.
+    ///
+    /// Returns the designation it was typed against beside the step, so the
+    /// caller can refuse one that named a designation which has since been
+    /// redeemed, expired or withdrawn — the fail-closed shape [`Decision`]
+    /// and [`Navigation`] already have.
+    pub fn take_step(&mut self) -> Option<(DesignationId, PickerStep)> {
+        self.steps.pop_front()
     }
 
     /// Drain the next decision the human took, oldest first.
@@ -1010,6 +1294,25 @@ impl ConsentGrab {
         self.decisions.push_back(decision);
     }
 
+    /// **Test seam.** Push a picker step into the queue as if a physical key
+    /// press had produced it.
+    ///
+    /// [`Self::queue_decision`]'s sibling, on identical terms and with the
+    /// identical claim: **enqueuing is all it does.** It decodes nothing,
+    /// decides nothing, opens nothing, and a step naming a designation that
+    /// has since been redeemed or expired is dropped by
+    /// [`crate::session::service_picker_round`] exactly as a slow human's
+    /// keystroke is.
+    ///
+    /// It deliberately takes a [`PickerStep`] rather than a keysym: the
+    /// decode table is layout-invariant and exhaustively unit-tested next
+    /// door, and a channel that spelled keysyms would be a second place to
+    /// get `Escape` wrong.
+    #[cfg(any(test, feature = "consent-injector"))]
+    pub(crate) fn queue_step(&mut self, id: DesignationId, step: PickerStep) {
+        self.push_step(id, step);
+    }
+
     /// Judge one intake event: the whole grab policy, in one place.
     ///
     /// Takes the whole [`SeatInput`] rather than `(origin, kind)`, and that
@@ -1053,21 +1356,26 @@ impl ConsentGrab {
         // Copied out rather than held by reference: everything below may
         // need `&mut self` (arming, committing), and the three facts a
         // judgement needs from the prompt are three `Copy` scalars.
-        let Some((petition, raised_at, deadline)) = self
+        let Some((subject, raised_at, deadline)) = self
             .prompt
             .as_ref()
-            .map(|p| (p.petition, p.raised_at, p.deadline))
+            .map(|p| (p.subject, p.raised_at, p.deadline))
         else {
             return Gate::Deliver;
         };
-        // The deadline backstop (module docs). Past its own consent
-        // timeout the petition is dead or about to be, and no missed
-        // `lower` may cost the human the use of their machine: the grab
-        // stops consuming and stops deciding. `self.prompt` is deliberately
-        // NOT cleared -- `lower` still owes the registry a
-        // `mark_prompt_hidden` for it, and `retire_stale` still owes the
-        // screen a `dismiss`; forgetting which petition is up here would
-        // strand both.
+        // The deadline backstop (module docs). Past its own deadline the
+        // subject is dead or about to be -- a petition past its consent
+        // timeout, a designation past its ticket's -- and no missed `lower`
+        // may cost the human the use of their machine: the grab stops
+        // consuming and stops deciding. `self.prompt` is deliberately NOT
+        // cleared -- `lower` still owes the registry a `mark_prompt_hidden`
+        // for a petition, and `retire_stale` still owes the screen a
+        // `dismiss`; forgetting which subject is up here would strand both.
+        //
+        // **This is also the whole bound on a raised picker's input seizure**
+        // (see [`Self::raise_picker`]), which draws nothing: a picker whose
+        // round stopped running stops eating the human's keyboard here, at
+        // the ledger's own deadline, without any second clock.
         if now >= deadline {
             self.armed = None;
             return Gate::Deliver;
@@ -1094,7 +1402,7 @@ impl ConsentGrab {
                 // Still consumed -- it does not reach the app either.
                 if now.saturating_duration_since(raised_at) < GUARD_INTERVAL {
                     tracing::debug!(
-                        %petition,
+                        ?subject,
                         "press ignored inside the consent prompt's guard interval"
                     );
                     self.armed = None;
@@ -1147,19 +1455,56 @@ impl ConsentGrab {
             // `a_raised_prompt_consumes_every_physical_event_except_releases`
             // holds unedited, and a card with no panel takes neither branch.
             SeatInputKind::Motion { .. } => {
-                self.navigate_hover(petition);
+                self.navigate_hover(subject);
                 Gate::Consume
             }
             SeatInputKind::Scroll { axis, value120 } => {
-                self.navigate_scroll(petition, *axis, *value120);
+                self.navigate_scroll(subject, *axis, *value120);
                 Gate::Consume
             }
-            // Key presses — and text, which physical intake never produces
-            // but which would be human-aimed if it ever did. Relative motion
-            // and a gesture's begin and updates join them: a human answering
-            // a consent card is not driving the app, and a consumed begin
-            // starts nothing, so its updates and its end are dropped by the
-            // router's own pairing rather than needing a rule here.
+            // **A key press drives a picker, and answers no petition.**
+            //
+            // Both halves are load-bearing and both stay true here. The verdict
+            // is `Gate::Consume` in every case, exactly as it was, so
+            // `a_raised_prompt_consumes_every_physical_event_except_releases`
+            // and `no_key_answers_the_prompt` hold unedited: nothing below can
+            // queue a [`Decision`], and a *petition* subject takes no branch at
+            // all.
+            //
+            // The guard interval applies to a picker's confirm exactly as it
+            // applies to a panel press, and for the identical reason: a key
+            // already travelling toward the screen when a card appeared must
+            // not commit a choice the human never read. `Return` is a confirm,
+            // and a confirm mints a descriptor.
+            //
+            // Escape decodes to nothing ([`crate::picker::keys`]) and that is
+            // the decision, not an omission: it belongs to the dead-man chord,
+            // whose watcher rides `observe` and sees it whatever this returns.
+            SeatInputKind::Key {
+                state: KeyState::Pressed,
+                keysym,
+                ..
+            } => {
+                if let Subject::Designation(id) = subject {
+                    if now.saturating_duration_since(raised_at) < GUARD_INTERVAL {
+                        tracing::debug!(
+                            %id,
+                            "key ignored inside the picker's guard interval"
+                        );
+                    } else if let Some(step) = decode_picker_key(*keysym) {
+                        self.push_step(id, step);
+                    }
+                }
+                Gate::Consume
+            }
+            // Text, which physical intake never produces but which would be
+            // human-aimed if it ever did. Relative motion and a gesture's
+            // begin and updates join it: a human answering a consent card is
+            // not driving the app, and a consumed begin starts nothing, so its
+            // updates and its end are dropped by the router's own pairing
+            // rather than needing a rule here. (Key **presses** left this arm
+            // at P2.6.6 and are handled above; key **releases** were always
+            // separate, in the hold-until-release exception.)
             //
             // **No key navigates a panel, and that is settled policy rather
             // than an omission** (module docs: no key answers a prompt, and
@@ -1172,8 +1517,7 @@ impl ConsentGrab {
             //
             // Exhaustive by intent: a new input kind must be classified
             // here rather than defaulting to reaching the app mid-prompt.
-            SeatInputKind::Key { .. }
-            | SeatInputKind::Text { .. }
+            SeatInputKind::Text { .. }
             | SeatInputKind::RelativeMotion { .. }
             | SeatInputKind::GestureBegin { .. }
             | SeatInputKind::GestureSwipeUpdate { .. }
@@ -1266,7 +1610,7 @@ impl ConsentGrab {
         if self.navigations.len() >= MAX_NAVIGATIONS {
             let dropped = self.navigations.pop_front();
             tracing::warn!(
-                petition = %nav.petition,
+                subject = ?nav.subject,
                 ?dropped,
                 "consent navigation queue is full; the embedder is not draining it"
             );
@@ -1274,8 +1618,31 @@ impl ConsentGrab {
         self.navigations.push_back(nav);
     }
 
+    /// Queue a picker step, dropping the oldest if the embedder has stopped
+    /// draining.
+    ///
+    /// Bounded on [`Self::push_navigation`]'s terms and with its warning,
+    /// but the loss is **not** as harmless: unlike a hover, every picker
+    /// step is a deliberate act, and a dropped `Confirm` is a human whose
+    /// keypress did nothing. Reaching this bound means an embedder that
+    /// stopped running [`crate::session::service_picker_round`] while a
+    /// picker is up, which the deadline backstop then ends in refusal — the
+    /// fail-closed direction, and the reason dropping is preferred to
+    /// growing without limit.
+    fn push_step(&mut self, id: DesignationId, step: PickerStep) {
+        if self.steps.len() >= MAX_PICKER_STEPS {
+            let dropped = self.steps.pop_front();
+            tracing::warn!(
+                %id,
+                ?dropped,
+                "picker step queue is full; the embedder is not draining it"
+            );
+        }
+        self.steps.push_back((id, step));
+    }
+
     /// Update the panel's hover from the pointer's current position.
-    fn navigate_hover(&mut self, petition: PetitionId) {
+    fn navigate_hover(&mut self, subject: Subject) {
         let Some(slot) = self.slot_hit_test() else {
             // No panel, or no pointer: nothing to report. A card with no
             // panel takes this path on every motion and does nothing, which
@@ -1286,7 +1653,7 @@ impl ConsentGrab {
             };
             if panel.hover.take().is_some() {
                 self.push_navigation(Navigation {
-                    petition,
+                    subject,
                     step: Step::Hover(None),
                 });
             }
@@ -1301,7 +1668,7 @@ impl ConsentGrab {
         }
         panel.hover = Some(slot);
         self.push_navigation(Navigation {
-            petition,
+            subject,
             step: Step::Hover(Some(slot)),
         });
     }
@@ -1315,7 +1682,7 @@ impl ConsentGrab {
     /// `value120` is the kernel's 120-units-per-detent convention, so the
     /// accumulator is exact integer arithmetic and a high-resolution wheel
     /// emits one step per detent rather than one per fractional event.
-    fn navigate_scroll(&mut self, petition: PetitionId, axis: Axis, value120: i32) {
+    fn navigate_scroll(&mut self, subject: Subject, axis: Axis, value120: i32) {
         if !matches!(axis, Axis::Vertical) {
             return;
         }
@@ -1334,7 +1701,7 @@ impl ConsentGrab {
         panel.accum -= steps * SCROLL_DETENT;
         let steps = steps.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
         self.push_navigation(Navigation {
-            petition,
+            subject,
             step: Step::Scroll(steps),
         });
     }
@@ -1391,8 +1758,17 @@ impl ConsentGrab {
             return;
         }
         prompt.answerable = Answerable::Answered;
+        // Unreachable for a designation, and by construction rather than by
+        // this check: [`Self::raise_picker`] arms an `Open` with no buttons,
+        // so `hit_test` above already returned `None` and `self.armed` could
+        // never have been set. The match is what makes that a compile-time
+        // fact -- a `Decision` names a `PetitionId`, and a designation has
+        // none to give it.
+        let Subject::Petition(petition) = prompt.subject else {
+            return;
+        };
         self.decisions.push_back(Decision {
-            petition: prompt.petition,
+            petition,
             choice: armed_choice,
         });
     }
@@ -1413,8 +1789,8 @@ impl ConsentGrab {
             return;
         };
         let current_epoch = panel.epoch;
-        let petition = match self.prompt.as_ref() {
-            Some(prompt) => prompt.petition,
+        let subject = match self.prompt.as_ref() {
+            Some(prompt) => prompt.subject,
             None => return,
         };
         if armed_button != button || landed != Some(armed_slot) {
@@ -1424,14 +1800,14 @@ impl ConsentGrab {
         }
         if armed_epoch != current_epoch {
             tracing::debug!(
-                %petition,
+                ?subject,
                 slot = armed_slot,
                 "panel press discarded: the listing changed between press and release"
             );
             return;
         }
         self.push_navigation(Navigation {
-            petition,
+            subject,
             step: Step::Activate(armed_slot),
         });
     }
@@ -1858,7 +2234,7 @@ mod tests {
             }
         }
         assert!(grab.take_decision().is_none());
-        assert_eq!(grab.armed_petition(), Some(petition));
+        assert_eq!(grab.raised_petition(), Some(petition));
     }
 
     #[test]
@@ -2364,7 +2740,7 @@ mod tests {
             grab.judge_parts(Origin::Physical, &motion(5.0, 5.0), now),
             Gate::Deliver
         );
-        assert!(grab.armed_petition().is_none());
+        assert!(grab.raised_petition().is_none());
         assert!(surface.prompt().is_none());
     }
 
@@ -2445,7 +2821,7 @@ mod tests {
                 &mut Scratch::new().recorder
             )
             .is_none());
-        assert!(grab.armed_petition().is_none());
+        assert!(grab.raised_petition().is_none());
         assert!(surface.prompt().is_none());
         assert_eq!(
             grab.judge_parts(Origin::Physical, &motion(1.0, 1.0), t0),
@@ -2512,7 +2888,7 @@ mod tests {
             .is_none(),
             "a second petition must not displace a raised prompt"
         );
-        assert_eq!(grab.armed_petition(), Some(first));
+        assert_eq!(grab.raised_petition(), Some(first));
         assert!(registry.prompt_up_for(&identity));
 
         // Re-raising the SAME petition is idempotent, not a refusal.
@@ -2547,7 +2923,7 @@ mod tests {
                 &mut Scratch::new().recorder
             )
             .is_some());
-        assert_eq!(grab.armed_petition(), Some(second));
+        assert_eq!(grab.raised_petition(), Some(second));
         assert!(registry.prompt_up_for(&identity), "the new prompt holds");
     }
 
@@ -2648,7 +3024,7 @@ mod tests {
         registry.expire_due(deadline);
         assert!(grab.retire_stale(&mut registry, &mut surface));
         assert!(surface.prompt().is_none());
-        assert!(grab.armed_petition().is_none());
+        assert!(grab.raised_petition().is_none());
         assert!(
             !grab.retire_stale(&mut registry, &mut surface),
             "idempotent"
@@ -2687,7 +3063,7 @@ mod tests {
 
         // The armed petition times out and the embedder has not lowered.
         registry.expire_due(std::time::Instant::now() + Duration::from_secs(3600));
-        assert_eq!(grab.armed_petition(), Some(first));
+        assert_eq!(grab.raised_petition(), Some(first));
 
         // Raising the next one heals rather than refusing: the dead card
         // comes down, the grab is released, and the queue advances.
@@ -2700,7 +3076,7 @@ mod tests {
                 &mut Scratch::new().recorder
             )
             .is_none());
-        assert!(grab.armed_petition().is_none(), "the dead prompt is gone");
+        assert!(grab.raised_petition().is_none(), "the dead prompt is gone");
         assert!(surface.prompt().is_none());
     }
 
@@ -2750,7 +3126,7 @@ mod tests {
         assert_eq!(route.consent_wire_id, 11);
         assert!(registry.prompt_up_for(&identity));
         assert!(surface.prompt().is_some());
-        assert_eq!(grab.armed_petition(), Some(petition));
+        assert_eq!(grab.raised_petition(), Some(petition));
 
         // The log states that a human was asked, written where the state
         // changed rather than by the separate wire call that can refuse.
@@ -3014,12 +3390,29 @@ mod tests {
     // seam, and it is `#[cfg(test)]` so it cannot become that reach.
 
     /// A panel with eight filled slots out of forty, nothing hovered.
+    ///
+    /// The names are ordinary ASCII, because these tests are about the grab's
+    /// geometry and arming rules rather than about transcription -- what the
+    /// rows *say* is `consent::render`'s subject and is tested there.
     fn panel() -> PanelContent {
+        panel_of(super::super::render::PANEL_ROWS)
+    }
+
+    /// A panel with `filled` rows out of forty.
+    fn panel_of(filled: u16) -> PanelContent {
+        use crate::consent::PanelRow;
+
         PanelContent {
-            filled: super::super::render::PANEL_ROWS,
+            rows: (0..filled)
+                .map(|i| PanelRow {
+                    name: crate::paint::transcript::encode(format!("row-{i}.txt").as_bytes()),
+                    tag: None,
+                })
+                .collect(),
             highlight: None,
             offset: 0,
             total: 40,
+            query: crate::paint::transcript::encode(b""),
         }
     }
 
@@ -3104,7 +3497,7 @@ mod tests {
         assert_eq!(
             grab.take_navigation(),
             Some(Navigation {
-                petition,
+                subject: Subject::Petition(petition),
                 step: Step::Hover(Some(3))
             }),
             "the same prompt, given a painted panel, reports the slot under the pointer"
@@ -3148,7 +3541,7 @@ mod tests {
         grab.judge_parts(Origin::Physical, &release(BTN_LEFT), now);
         let steps: Vec<Step> = std::iter::from_fn(|| grab.take_navigation())
             .map(|n| {
-                assert_eq!(n.petition, petition);
+                assert_eq!(n.subject, Subject::Petition(petition));
                 n.step
             })
             .collect();
@@ -3173,6 +3566,68 @@ mod tests {
         assert!(
             !steps.iter().any(|s| matches!(s, Step::Activate(_))),
             "a press that slid off its slot must activate nothing; got {steps:?}"
+        );
+    }
+
+    /// **A press armed before a seat pause must not commit after it**
+    /// (issue #346).
+    ///
+    /// `restart_guard` runs on every not-visible -> visible transition: a
+    /// lock lowering over a live prompt, and the seat handing the devices
+    /// back after a VT switch. It cleared the choice row's `armed` and left
+    /// the panel's `pressed` behind, so a finger that went down before the
+    /// switch committed on the first release after the human returned.
+    ///
+    /// The epoch stamp is deliberately asserted to be *unchanged* across the
+    /// pause. That is what makes this test non-vacuous: `Panel::epoch`'s only
+    /// writer is the panel-refresh path, so if a future change made a pause
+    /// refresh content, the epoch guard would start catching this on its own
+    /// and the test would keep passing while `restart_guard` silently
+    /// regressed. Pinning the epoch means this test can only be satisfied by
+    /// the disarm it is actually about.
+    #[test]
+    fn a_slot_press_does_not_survive_a_seat_pause() {
+        let (mut grab, _surface, _registry, _petition, t0) = panelled();
+        let now = past_guard(t0);
+        let (x, y) = slot_center(&grab, 4);
+        grab.judge_parts(Origin::Physical, &motion(x, y), now);
+        grab.judge_parts(Origin::Physical, &press(BTN_LEFT), now);
+
+        let epoch_before = grab
+            .open()
+            .and_then(|o| o.panel.as_ref())
+            .expect("the card drew a panel")
+            .epoch;
+
+        // The seat goes away and comes back: a VT switch, or a lock lowering
+        // over the live prompt. Only the guard restarts.
+        assert!(
+            grab.restart_guard(now),
+            "a prompt is up, so the guard restarts"
+        );
+
+        let epoch_after = grab
+            .open()
+            .and_then(|o| o.panel.as_ref())
+            .expect("the panel survives the pause")
+            .epoch;
+        assert_eq!(
+            epoch_before, epoch_after,
+            "a seat pause refreshes no content, so the epoch guard is not what \
+             defends this; if this ever fails, this test has stopped checking \
+             what it was written for"
+        );
+
+        // The human comes back and lifts the finger, on the same slot.
+        let after = past_guard(now);
+        grab.judge_parts(Origin::Physical, &release(BTN_LEFT), after);
+
+        let steps: Vec<Step> = std::iter::from_fn(|| grab.take_navigation())
+            .map(|n| n.step)
+            .collect();
+        assert!(
+            !steps.iter().any(|s| matches!(s, Step::Activate(_))),
+            "a press armed before the pause must activate nothing after it; got {steps:?}"
         );
     }
 
@@ -3248,10 +3703,10 @@ mod tests {
         ] {
             let applied = grab.refresh_panel(
                 PanelContent {
-                    filled,
                     highlight,
                     offset,
                     total,
+                    ..panel_of(filled)
                 },
                 &mut surface,
             );
@@ -3297,7 +3752,7 @@ mod tests {
         assert_eq!(
             grab.take_navigation(),
             Some(Navigation {
-                petition,
+                subject: Subject::Petition(petition),
                 step: Step::Scroll(1)
             }),
             "three thirds of a detent must produce exactly one step"
@@ -3353,5 +3808,355 @@ mod tests {
             f64::from(ox) + f64::from(prompt.card.0) / 2.0,
             f64::from(oy) + f64::from(prompt.card.1) / 2.0,
         )
+    }
+
+    // -- the second subject: a raised picker (issue #190) ------------------
+
+    const XK_DOWN: u32 = 0xff52 + 2;
+    const XK_RETURN: u32 = 0xff0d;
+    const XK_ESCAPE: u32 = 0xff1b;
+
+    fn designation(raw: u32) -> DesignationId {
+        DesignationId::from_u32_for_test(raw)
+    }
+
+    /// A grab holding a picker, with the ticket's own deadline.
+    fn picking(deadline_in: Duration) -> (ConsentGrab, DesignationId, Instant) {
+        let mut grab = ConsentGrab::new();
+        let t0 = t0();
+        grab.set_view(VIEW);
+        let id = designation(1);
+        assert!(grab.raise_picker(id, t0 + deadline_in, t0));
+        (grab, id, t0)
+    }
+
+    /// **The distinction the three accessors exist for.**
+    #[test]
+    fn a_raised_picker_is_raised_but_is_not_a_raised_petition() {
+        let (grab, id, _t0) = picking(Duration::from_secs(90));
+        assert_eq!(grab.raised(), Some(Subject::Designation(id)));
+        assert_eq!(
+            grab.raised_petition(),
+            None,
+            "a picker is not a petition, and the petition queue must not advance past it"
+        );
+        assert_eq!(grab.raised_designation(), Some(id));
+    }
+
+    /// **A petition card is never raised over a live picker.**
+    ///
+    /// The failure this prevents is not hypothetical: with the accessor these
+    /// replaced, `service_consent_round`'s "is a prompt up" guard read `None`
+    /// while a picker held the human's keyboard.
+    #[test]
+    fn a_petition_cannot_be_raised_over_a_picker() {
+        let (mut grab, _id, t0) = picking(Duration::from_secs(90));
+        let (mut registry, petition) = pending_petition(WirePersistence::WhileRunning);
+        let mut surface = ConsentSurface::new(crate::consent::TrustedIndicator::for_test());
+        assert!(
+            grab.raise(
+                petition,
+                t0,
+                &mut registry,
+                &mut surface,
+                &mut Scratch::new().recorder,
+            )
+            .is_none(),
+            "raising a consent card over a picker would put two security questions in front \
+             of one human with one keyboard"
+        );
+        assert_eq!(grab.raised_designation(), Some(designation(1)));
+    }
+
+    /// Keys drive a picker, and every one of them is still consumed.
+    #[test]
+    fn keys_drive_a_raised_picker() {
+        let (mut grab, id, t0) = picking(Duration::from_secs(90));
+        let now = awake(t0);
+        assert_eq!(
+            grab.judge_parts(Origin::Physical, &key(XK_DOWN, KeyState::Pressed), now),
+            Gate::Consume,
+            "a picker holds the keyboard exactly as a card does"
+        );
+        assert_eq!(
+            grab.take_step(),
+            Some((id, PickerStep::Move(crate::picker::keys::Motion::Down))),
+            "the step must name the designation it was typed against"
+        );
+        grab.judge_parts(Origin::Physical, &key(XK_RETURN, KeyState::Pressed), now);
+        assert_eq!(grab.take_step(), Some((id, PickerStep::Confirm)));
+        assert!(grab.take_step().is_none());
+    }
+
+    /// **Escape asks the picker for nothing**, and is still consumed — the
+    /// dead-man chord's key is not a dialog dismissal.
+    #[test]
+    fn escape_queues_no_picker_step() {
+        let (mut grab, _id, t0) = picking(Duration::from_secs(90));
+        let now = awake(t0);
+        assert_eq!(
+            grab.judge_parts(Origin::Physical, &key(XK_ESCAPE, KeyState::Pressed), now),
+            Gate::Consume
+        );
+        assert!(
+            grab.take_step().is_none(),
+            "Escape belongs to the dead-man chord; a picker that decoded it would turn the \
+             key a human reaches for to stop something into a dialog dismissal"
+        );
+    }
+
+    /// **The guard interval covers a picker's confirm exactly as it covers a
+    /// panel press.** A Return already travelling toward the screen when the
+    /// picker appeared must not mint a descriptor.
+    #[test]
+    fn a_key_inside_the_guard_interval_drives_nothing() {
+        let (mut grab, _id, t0) = picking(Duration::from_secs(90));
+        let inside = t0 + GUARD_INTERVAL - Duration::from_millis(1);
+        assert_eq!(
+            grab.judge_parts(Origin::Physical, &key(XK_RETURN, KeyState::Pressed), inside),
+            Gate::Consume,
+            "still consumed: it must not reach the app either"
+        );
+        assert!(
+            grab.take_step().is_none(),
+            "a confirm inside the guard interval mints a descriptor the human never asked for"
+        );
+        grab.judge_parts(
+            Origin::Physical,
+            &key(XK_RETURN, KeyState::Pressed),
+            awake(t0),
+        );
+        assert!(
+            grab.take_step().is_some(),
+            "and past the guard the same key works, or this test proves only that the key is \
+             inert"
+        );
+    }
+
+    /// An agent's own emulated key cannot drive the human's picker.
+    #[test]
+    fn an_emulated_key_cannot_drive_a_picker() {
+        let (mut grab, _id, t0) = picking(Duration::from_secs(90));
+        let now = awake(t0);
+        assert_eq!(
+            grab.judge_parts(Origin::Emulated, &key(XK_DOWN, KeyState::Pressed), now),
+            Gate::Deliver,
+            "agent input is the chokepoint's business, not the grab's"
+        );
+        assert!(grab.take_step().is_none());
+    }
+
+    /// **The deadline backstop bounds a raised picker's input seizure**, which
+    /// is the only bound there is while nothing draws one.
+    #[test]
+    fn a_picker_stops_consuming_at_its_tickets_deadline() {
+        let deadline_in = Duration::from_secs(90);
+        let (mut grab, _id, t0) = picking(deadline_in);
+        let past = t0 + deadline_in;
+        assert_eq!(
+            grab.judge_parts(Origin::Physical, &key(XK_DOWN, KeyState::Pressed), past),
+            Gate::Deliver,
+            "past its own deadline the obligation is dead, and no missed lower may cost the \
+             human the use of their machine"
+        );
+        assert!(grab.take_step().is_none());
+    }
+
+    /// A designation can queue no [`Decision`], on two independent grounds.
+    ///
+    /// **The first is checkable and this test checks it**: the prompt
+    /// `raise_picker` arms holds *no choice rectangles at all*, so there is
+    /// nothing for a click to hit. Asserted on the geometry directly rather
+    /// than only on the outcome, because the outcome alone is guarded by the
+    /// second ground and would stay green even if the buttons came back.
+    ///
+    /// **The second is a type, and is deliberately not testable**:
+    /// [`Decision`] carries a `PetitionId`, and a designation has none to
+    /// give it. There is no constructor for one outside the registry, so a
+    /// breakage that made a picker file a decision does not compile — which
+    /// is a stronger statement than a failing test, and is why the assertion
+    /// below is not the whole of the property.
+    #[test]
+    fn a_picker_can_produce_no_consent_decision() {
+        let (mut grab, _id, t0) = picking(Duration::from_secs(90));
+        let now = awake(t0);
+        assert_eq!(
+            grab.buttons(),
+            Some(&[][..]),
+            "a raised picker must arm no choice rectangles: a click that could hit one would \
+             be a click on a card that grants nothing"
+        );
+        for (x, y) in [(0.0, 0.0), (450.0, 350.0), (899.0, 699.0)] {
+            click(&mut grab, (x, y), now);
+        }
+        assert!(
+            grab.take_decision().is_none(),
+            "a designation has no petition to name, so no click on it may become a consent \
+             decision"
+        );
+    }
+
+    /// Lowering a picker releases the grab and drops its undrained steps.
+    #[test]
+    fn lowering_a_picker_releases_the_grab_and_its_steps() {
+        let (mut grab, _id, t0) = picking(Duration::from_secs(90));
+        let mut surface = ConsentSurface::new(crate::consent::TrustedIndicator::for_test());
+        grab.judge_parts(
+            Origin::Physical,
+            &key(XK_DOWN, KeyState::Pressed),
+            awake(t0),
+        );
+        grab.lower_picker(&mut surface);
+        assert_eq!(grab.raised(), None);
+        assert!(
+            grab.take_step().is_none(),
+            "a step drained after the picker came down would be an answer to a card that is \
+             no longer there"
+        );
+        assert_eq!(
+            grab.judge_parts(
+                Origin::Physical,
+                &key(XK_DOWN, KeyState::Pressed),
+                awake(t0)
+            ),
+            Gate::Deliver,
+            "with nothing raised the keyboard belongs to the app again"
+        );
+    }
+
+    /// `lower_picker` is not a way to take somebody's consent card down.
+    #[test]
+    fn lowering_a_picker_leaves_a_raised_petition_alone() {
+        let (mut grab, mut surface, _registry, petition, _t0) = armed();
+        grab.lower_picker(&mut surface);
+        assert_eq!(grab.raised_petition(), Some(petition));
+    }
+
+    /// The step queue is bounded, and says so when it drops.
+    #[test]
+    fn the_step_queue_is_bounded() {
+        let (mut grab, id, t0) = picking(Duration::from_secs(90));
+        let now = awake(t0);
+        for _ in 0..(MAX_PICKER_STEPS + 8) {
+            grab.judge_parts(Origin::Physical, &key(XK_DOWN, KeyState::Pressed), now);
+        }
+        let drained: Vec<_> = std::iter::from_fn(|| grab.take_step()).collect();
+        assert_eq!(drained.len(), MAX_PICKER_STEPS);
+        assert!(drained.iter().all(|(step_id, _)| *step_id == id));
+    }
+
+    /// **A raised picker really gets pixels** (P2.6.6, issue #190).
+    ///
+    /// `raise_picker` seizes input; `show_picker` is what puts a card behind
+    /// the seizure. This drives the pair the way an embedder does — raise,
+    /// then draw, then redraw as the human navigates — and checks each half.
+    #[test]
+    fn a_raised_picker_can_be_drawn_and_redrawn() {
+        let (mut grab, _id, _t0) = picking(Duration::from_secs(90));
+        let mut surface = ConsentSurface::new(crate::consent::TrustedIndicator::for_test());
+        assert!(surface.prompt().is_none());
+
+        assert!(
+            grab.show_picker(crate::consent::tests::picker_fixture(), &mut surface),
+            "a raised picker must be drawable"
+        );
+        let generation = surface.generation();
+
+        // A redraw with the same content changes nothing visible, so an inert
+        // keystroke does not re-rasterize the card.
+        assert!(!grab.show_picker(crate::consent::tests::picker_fixture(), &mut surface));
+        assert_eq!(surface.generation(), generation);
+
+        // A moved cursor does.
+        let mut moved = crate::consent::tests::picker_fixture();
+        moved.panel.highlight = Some(4);
+        assert!(grab.show_picker(moved, &mut surface));
+        assert_ne!(surface.generation(), generation);
+
+        // Lowering takes it down.
+        grab.lower_picker(&mut surface);
+        assert_eq!(grab.raised(), None);
+        let mut view = vec![0u8; 64 * 48 * 4];
+        let before = view.clone();
+        surface.composite_over(&mut view, 64, 48);
+        assert_eq!(view, before, "a lowered picker leaves nothing composited");
+    }
+
+    /// **Nothing but a raised picker can draw a picker card.**
+    ///
+    /// `show_picker`'s half of the rule `show`/`raise` keep for a petition: a
+    /// surface that could be painted without the grab holding the human's
+    /// input would be a security question an app can act around.
+    #[test]
+    fn a_picker_card_cannot_be_drawn_without_the_grab_holding_one() {
+        let mut grab = ConsentGrab::new();
+        grab.set_view(VIEW);
+        let mut surface = ConsentSurface::new(crate::consent::TrustedIndicator::for_test());
+        assert!(
+            !grab.show_picker(crate::consent::tests::picker_fixture(), &mut surface),
+            "nothing is raised, so there is nothing to draw"
+        );
+        assert_eq!(surface.generation(), 0, "and nothing was drawn");
+
+        // A raised *petition* is not a raised picker either.
+        let (mut registry, petition) = pending_petition(WirePersistence::WhileRunning);
+        let t0 = t0();
+        grab.raise(
+            petition,
+            t0,
+            &mut registry,
+            &mut surface,
+            &mut Scratch::new().recorder,
+        )
+        .expect("the petition is pending");
+        assert!(
+            !grab.show_picker(crate::consent::tests::picker_fixture(), &mut surface),
+            "a consent card must not be replaced by a picker under the human's hand"
+        );
+        assert!(
+            surface.prompt().is_some(),
+            "the petition's card is still up"
+        );
+    }
+
+    /// **A picker card still produces no `Decision`, now that it paints
+    /// buttons.**
+    ///
+    /// `raise_picker` arms an `Open` with no buttons, and the card's Confirm
+    /// and Cancel are not `Choice`s — `ButtonBox::as_choice` returns `None`
+    /// for both, so `Card::buttons` is empty and there is nothing for
+    /// `hit_test` to find. Checked by clicking every pixel of both painted
+    /// buttons, in view coordinates, and finding nothing queued.
+    #[test]
+    fn clicking_a_picker_cards_buttons_resolves_no_petition() {
+        let (mut grab, _id, t0) = picking(Duration::from_secs(90));
+        let mut surface = ConsentSurface::new(crate::consent::TrustedIndicator::for_test());
+        assert!(grab.show_picker(crate::consent::tests::picker_fixture(), &mut surface));
+
+        let card =
+            crate::consent::render::rasterize_picker(&crate::consent::tests::picker_fixture());
+        assert!(
+            card.buttons.is_empty(),
+            "a picker card must offer no petition decision"
+        );
+        assert_eq!(card.controls.len(), 2, "...but it does paint two buttons");
+        let (ox, oy) = crate::paint::centered(card.width, card.height, VIEW.0, VIEW.1);
+        let now = past_guard(t0);
+        for control in &card.controls {
+            let x = f64::from(ox + control.rect.x) + f64::from(control.rect.w) / 2.0;
+            let y = f64::from(oy + control.rect.y) + f64::from(control.rect.h) / 2.0;
+            grab.judge_parts(Origin::Physical, &motion(x, y), now);
+            grab.judge_parts(Origin::Physical, &press(BTN_LEFT), now);
+            grab.judge_parts(Origin::Physical, &release(BTN_LEFT), now);
+        }
+        assert!(
+            grab.take_decision().is_none(),
+            "a click on a picker card produced a petition decision, which names a \
+             PetitionId a designation does not have"
+        );
+        assert!(
+            grab.take_navigation().is_none(),
+            "and it navigated no panel either: a picker is driven by the keyboard"
+        );
     }
 }

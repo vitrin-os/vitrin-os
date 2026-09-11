@@ -1011,7 +1011,10 @@ const READ_EXEC_FILE: u64 = READ_FILE | EXECUTE;
 ///
 /// `RESOLVE_UNIX` travels with every writable hierarchy because a socket the
 /// realm creates for itself must stay connectable to it: the shim's
-/// `wayland-0`, the reserved accessibility-bus path, and whatever an app
+/// `wayland-0`, the shim's `designation.sock` (P2.6.7's relay, which the app
+/// connects to at startup and holds -- a ruleset that let the shim bind it
+/// but not the app reach it would turn every designation into a silent
+/// `no_client`), the reserved accessibility-bus path, and whatever an app
 /// binds in its own `/tmp`.
 const WRITE_TREE: u64 = READ_FILE
     | READ_DIR

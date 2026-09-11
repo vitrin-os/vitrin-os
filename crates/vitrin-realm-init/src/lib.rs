@@ -136,6 +136,32 @@ pub const IN_REALM_WAYLAND_SOCKET: &str = "/run/vitrin/wayland-0";
 /// one realm, and the closure is P2.6.3's shim-side Landlock stack.
 pub const IN_REALM_A11Y_BUS: &str = "/run/vitrin/a11y-bus";
 
+/// **Reserved** (P2.6.7, #191): the path the shim's designation relay binds,
+/// and the only thing that may ever be bound there. The app finds it the way
+/// it finds `wayland-0`: at a fixed name under its `$XDG_RUNTIME_DIR`, which
+/// is [`IN_REALM_RUNTIME_DIR`] at the shipped isolation tier. Nothing
+/// announces it -- no flag, no environment variable, no argv element carries
+/// the path -- so this constant and the shim's own spelling
+/// (`shim/src/designation.c`: `designation.sock` beside the Wayland socket it
+/// was given) are the two ends of one convention, and the test below is what
+/// keeps them one.
+///
+/// Like the bus reservation above it is a name plus an ordering, not a
+/// mount: the directory it sits in is the realm runtime directory bound at
+/// [`IN_REALM_RUNTIME_DIR`], so the relay adds **no bind mount** and re-makes
+/// **no** confinement claim. The ordering is the shim's: it binds the socket
+/// during its own bring-up, before it forks the app, so an app that connects
+/// at startup either finds the node or finds nothing, never a name that
+/// appears later. The core does not create, pass, or unlink the node; it only
+/// guarantees the directory exists, is empty, and is `flock`ed before the
+/// fork.
+///
+/// The same residual applies and is published rather than papered over: the
+/// app can `unlink` and rebind this path as it can `wayland-0` (one uid in a
+/// single-id map, mode bits cannot stop it), the blast radius is that one
+/// realm, and the closure is the same shim-side Landlock stack.
+pub const IN_REALM_DESIGNATION_SOCKET: &str = "/run/vitrin/designation.sock";
+
 /// The directory the core owns inside the realm's root: the shim binary and
 /// the realm's private storage hang off it.
 ///
@@ -1320,6 +1346,27 @@ mod tests {
         assert!(IN_REALM_A11Y_BUS.starts_with(IN_REALM_RUNTIME_DIR));
         assert!(IN_REALM_WAYLAND_SOCKET.starts_with(IN_REALM_RUNTIME_DIR));
         assert_ne!(IN_REALM_A11Y_BUS, IN_REALM_WAYLAND_SOCKET);
+        // P2.6.7's reservation holds by the same argument, and it has a
+        // second end to stay in step with: the shim spells the path as
+        // `dirname(<wayland socket>)/designation.sock`, and the Wayland
+        // socket it is given is `IN_REALM_WAYLAND_SOCKET` (the core hands it
+        // over as `WAYLAND_DISPLAY`, which the shim honours in place of
+        // `--socket`; `vitrin_core::spawn::child_env`), so the two spellings
+        // agree only if this constant is the Wayland socket's directory plus
+        // the shim's fixed basename.
+        assert!(IN_REALM_DESIGNATION_SOCKET.starts_with(IN_REALM_RUNTIME_DIR));
+        assert_ne!(IN_REALM_DESIGNATION_SOCKET, IN_REALM_WAYLAND_SOCKET);
+        assert_ne!(IN_REALM_DESIGNATION_SOCKET, IN_REALM_A11Y_BUS);
+        assert_eq!(
+            IN_REALM_DESIGNATION_SOCKET,
+            format!(
+                "{}/designation.sock",
+                IN_REALM_WAYLAND_SOCKET
+                    .rsplit_once('/')
+                    .expect("absolute")
+                    .0
+            )
+        );
     }
 
     #[test]

@@ -1618,14 +1618,22 @@ jobs:
           # `test_real_confinement.py` (#186).
           #
           # And a THIRD time, found while landing P2.6.6 (#190):
-          # `test_real_seccomp.py`, `test_real_ransomware.py` and
-          # `test_real_powerbox.py` were all in run.sh's array and none of them
-          # here, so three named property gates could have vanished with this
-          # job staying green. Three drifts is enough: the duplication is kept
-          # (it is deliberate -- this job answers in seconds without a build,
-          # a toolchain or the C shim), but the two lists are now COMPARED
-          # below, so a fourth drift is a red build rather than a discovery.
-          for gate in test_real_trust_band.py test_two_realms.py test_layout.py test_input_switch.py test_attention.py test_real_clipboard.py test_screenshot.py test_real_gestures.py test_real_confinement.py test_launch.py test_shell.py test_real_seccomp.py test_real_ransomware.py test_real_powerbox.py; do
+          # `test_real_seccomp.py` and `test_real_powerbox.py` were in
+          # run.sh's array and neither was here, so two named property gates
+          # could have vanished with this job staying green. Three drifts is
+          # enough: the duplication is kept (it is deliberate -- this job
+          # answers in seconds without a build, a toolchain or the C shim),
+          # but the two lists are now COMPARED below, so a fourth drift is a
+          # red build rather than a discovery.
+          #
+          # The comparison's first version read the whole array block,
+          # comments included, and so swept up `test_real_ransomware.py` from
+          # a comment that names it as UNWRITTEN (★P2.6.9, #193) -- and this
+          # list, mirrored from that reading, then failed its own existence
+          # check on a file no one had claimed to write. The extraction below
+          # is anchored to array ENTRIES (two-space indent, then the name) so
+          # a comment can never nominate a gate.
+          for gate in test_real_trust_band.py test_two_realms.py test_layout.py test_input_switch.py test_attention.py test_real_clipboard.py test_screenshot.py test_real_gestures.py test_real_confinement.py test_launch.py test_shell.py test_real_seccomp.py test_real_powerbox.py; do
             if [ ! -f "tests/integration/$gate" ]; then
               echo "::error::named property gate tests/integration/$gate is missing -- unittest discover would not collect it and this job would stay green with that property's evidence contributing nothing. Restore it, or retire it from run.sh's PROPERTY_GATES, this list, and tests/integration/README.md's gate table together."
               missing=1
@@ -1634,14 +1642,18 @@ jobs:
           # The lists must AGREE, not merely both exist. Duplication for
           # independence is only worth its cost while the copies are the same
           # copy; this one had drifted three times before anything compared
-          # them.
+          # them. `LC_ALL=C` because `[a-z]` is a collation range: under
+          # tr_TR it does not contain `i`, and four of these gates would
+          # silently drop out of the comparison on a Turkish developer's
+          # machine -- a false red, found the first time this step was run
+          # locally rather than on the runner.
           runsh_gates=$(awk '/^PROPERTY_GATES=\(/,/^\)/' tests/integration/run.sh \
-            | grep -oE 'test_[a-z_]+\.py' | sort -u)
+            | LC_ALL=C grep -oE '^  test_[a-z_]+\.py' | tr -d ' ' | sort -u)
           ci_gates=$(printf '%s\n' test_real_trust_band.py test_two_realms.py \
             test_layout.py test_input_switch.py test_attention.py \
             test_real_clipboard.py test_screenshot.py test_real_gestures.py \
             test_real_confinement.py test_launch.py test_shell.py \
-            test_real_seccomp.py test_real_ransomware.py test_real_powerbox.py \
+            test_real_seccomp.py test_real_powerbox.py \
             | sort -u)
           if [ "$runsh_gates" != "$ci_gates" ]; then
             echo "::error::this job's copy of run.sh's PROPERTY_GATES has drifted. It has drifted three times before, each time leaving named gates unguarded while this job stayed green. Diff follows; edit run.sh, this list and tests/integration/README.md's gate table together."

@@ -615,9 +615,15 @@
         wire never carries.
         Adding a prefix breaks no client at any version, because an
         unserved prefix already resolves "unsupported" recoverably - which
-        is also what "file:", "dir:" and "net:" resolve to in every
-        deployment today, since no deployment serves designate_file or
-        egress yet. A net: selector that does not parse resolves
+        is what "net:" resolves to in every deployment today, since no
+        deployment serves egress yet, and what "file:" and "dir:" resolved
+        to everywhere until P2.6.6 (#190) landed the core-drawn picker.
+        The reference core has served designate_file since, so those two
+        prefixes now resolve as the deployment does - and a deployment
+        with no picker root it can open admits the petition and answers
+        each ask vitrin_grant.refused(designate_file, "internal") rather
+        than serving a verb with nothing behind it. A net: selector that
+        does not parse resolves
         "unsupported" on the same terms, rather than being widened to
         something that does parse. Whether a
         prefix is SERVED is a property of a deployment, exactly as it is
@@ -831,27 +837,34 @@
 
         THE MINT IS NOT AN ORACLE. A powerbox minted from a grant that does
         not hold designate_file refuses on first use rather than at mint
-        time, and today EVERY deployment's grant is in that position -
-        designate_file is refused "unsupported" at admission until P2.6.8's
-        consent copy exists, so no grant carries the bit and no petition
-        that names it resolves granted. A server that implements this
-        request therefore mints successfully and refuses every use
-        "not_granted", which is the defined-but-unserved staging and not a
-        defect.
+        time, and until P2.6.6 EVERY deployment's grant was in that
+        position - designate_file was refused "unsupported" at admission
+        while no picker could mint a descriptor, so no grant carried the
+        bit and no petition that named it resolved granted. A server that
+        implements this request but not the verb therefore mints
+        successfully and refuses every use "not_granted", which is the
+        defined-but-unserved staging and not a defect - and it is still
+        the shape of every mint from a grant that does not hold the bit.
 
-        THE REFERENCE CORE IS NOW SUCH A SERVER, and what it does is the
-        paragraph above and nothing extra. vitrind dispatches this opcode:
-        the mint succeeds whatever the grant holds and whether or not it
-        has resolved, the facet enters the object table bound to this
-        grant, nothing is put on the wire in answer, and every request_file
-        and request_dir asked through it draws
-        vitrin_grant.refused(designate_file, "not_granted") - recoverable,
-        connection intact. Only the object-graph rules can fail the mint,
-        fatally: a new_id that breaks the id rules, or a per-connection
-        live-object bound. What is still absent is the picker (P2.6.6) and
-        the consent copy (P2.6.8) that would let a petition naming
-        designate_file resolve granted at all, which is an absence in the
-        VERB rather than in this request.
+        THE REFERENCE CORE IS SUCH A SERVER, AND SERVES THE VERB BEHIND
+        IT since P2.6.6 (#190). vitrind dispatches this opcode: the mint
+        succeeds whatever the grant holds and whether or not it has
+        resolved, the facet enters the object table bound to this grant,
+        nothing is put on the wire in answer, and every request_file and
+        request_dir asked through it is judged at the chokepoint -
+        vitrin_grant.refused(designate_file, "not_granted") if the grant
+        does not hold the verb, recoverable, connection intact; the
+        core-drawn picker if it does. Only the object-graph rules can fail
+        the mint, fatally: a new_id that breaks the id rules, or a
+        per-connection live-object bound. Until P2.6.6 the picker was
+        absent, so no petition naming designate_file resolved granted at
+        all - an absence in the VERB rather than in this request - and the
+        human-readable consent copy that names what approving the verb
+        costs was a minimum line until P2.6.8 (#192, D-048) landed the
+        considered one. Whether the verb is served remains a property of
+        the deployment: one with no picker root it can open admits the
+        petition and answers each ask vitrin_grant.refused(designate_file,
+        "internal") rather than serving a verb with nothing behind it.
 
         IT WAS NOT, UNTIL ISSUE #322, AND THAT RECORD IS KEPT BECAUSE THE
         FAILURE MODE IS GENERIC RATHER THAN THIS REQUEST'S. This request
@@ -1005,14 +1018,20 @@
         the durable persistence rungs are. observe_cursor is refused by
         every deployment at version 2, because per-principal cursor
         delivery does not exist. designate_file WAS in this posture and no
-        longer is: the core-drawn picker that mints an fd (P2.6.6) exists,
-        so whether a designate_file petition is answered "unsupported" is
-        now a property of the deployment rather than of the wire - a
-        deployment with no picker root it can open still answers so. Note
-        what has NOT landed with it: the human-readable consent copy that
-        names what approving it costs (P2.6.8, Q13's rule) is a minimum
-        line rather than a considered one, so a human approving this verb
-        today reads a card that names it and does not yet describe it.
+        longer is: the core-drawn picker that mints an fd landed at P2.6.6
+        (#190) and the reference core has served the verb since, so
+        whether a designate_file petition is answered "unsupported" is a
+        property of the deployment rather than of the wire. The reference
+        core does not decline the bit at admission; where it cannot serve
+        an ask it says so at the ask: a deployment with no picker root it
+        can open admits the petition and refuses each ask
+        vitrin_grant.refused(designate_file, "internal"), loudly, rather
+        than serving a verb with nothing behind it. The
+        human-readable consent copy that names what approving it costs
+        (Q13's rule) was a minimum line from P2.6.6 until P2.6.8 (#192,
+        D-048) replaced it with the considered one, so a human approving
+        this verb reads a card that describes it rather than one that
+        merely names it.
         egress is refused by every deployment
         too, and for a reason that is about mechanism rather than about
         policy: the mediating proxy a connection would be made through
@@ -1196,7 +1215,7 @@
       <entry name="observe_cursor" value="8" summary="capture frames that include the human principal's cursor - reading the human's attention, hence a verb and not a display preference; meaningful only alongside observe, and a petition naming it without observe resolves unsupported; another agent principal's cursor is not purchasable by this or any verb; refused unsupported in version 1"/>
       <entry name="layout_arrange" value="16" summary="arrange the granted realm's view, subject to the ordering invariants no grant can purchase; exercised through vitrin_layout_arrange, which defines set_fullscreen and no other request - place, resize, raise and stacking are absent rather than refused, because a scene showing one unstacked realm cannot honour them; at most one holder per output, counting a live grant that carries this verb AND a petition still pending for it, so a second petition while either exists resolves layout_held"/>
       <entry name="layout_focus" value="32" summary="bind the output to a view of the granted realm and direct input there - one act, because routing keys to a realm the human cannot see is focus theft in its sharpest form; exercised through vitrin_layout_focus; separate from layout_arrange because focus theft is at once the sharpest attack and the most legitimate need, so it must be attenuable alone"/>
-      <entry name="designate_file" value="64" summary="designate one file or one directory subtree to the granted realm, through the vitrin_powerbox facet; the human picks in a core-drawn picker and what crosses the wire is a file descriptor, never a path, so this is authority to ASK for a designation rather than authority over any named file; a delivered fd is kernel authority the core cannot recall, so revocation stops future designations and kills the grant row while the payload keeps every fd already handed over until its realm dies - PRD P2's revocation is immediate and transitive is FALSE for designations already made; refused unsupported in version 1, which cannot mint the facet at all; at version 2 whether it is served is a property of the deployment, and the reference core has served it since P2.6.6 landed the core-drawn picker - a deployment with no picker root it can open answers internal rather than serving a verb with nothing behind it, and the human-readable consent copy that names what approving it costs is still owed (P2.6.8, Q13)"/>
+      <entry name="designate_file" value="64" summary="designate one file or one directory subtree to the granted realm, through the vitrin_powerbox facet; the human picks in a core-drawn picker and what crosses the wire is a file descriptor, never a path, so this is authority to ASK for a designation rather than authority over any named file; a delivered fd is kernel authority the core cannot recall, so revocation stops future designations and kills the grant row while the payload keeps every fd already handed over until its realm dies - PRD P2's revocation is immediate and transitive is FALSE for designations already made; refused unsupported in version 1, which cannot mint the facet at all; at version 2 whether it is served is a property of the deployment, and the reference core has served it since P2.6.6 (#190) landed the core-drawn picker - a deployment with no picker root it can open answers internal rather than serving a verb with nothing behind it, and the human-readable consent copy that names what approving it costs landed at P2.6.8 (#192, D-048), replacing the minimum line that had named the verb without describing it"/>
       <entry name="egress" value="128" summary="open one outbound connection to the single host:port named by this grant's net: resource selector, through an out-of-core mediating proxy that asks the enforcement chokepoint per connection and holds no grant of its own; exercised through the vitrin_egress facet, which is a separate interface of its own rather than a request on the filesystem powerbox, since interface/@verb is one value per interface; the selector's grammar is wildcard-free, so a blanket egress grant is inexpressible rather than refused, and one selector covers exactly itself - though not every spelling of one endpoint is one selector, since the host is compared byte-exactly and kept as presented; SPECIFIED BUT NOT IMPLEMENTED ANYWHERE YET: a DNS name is to resolve only in the proxy and the addresses it resolved to at grant time are to be pinned into the grant row, so that a connection to an unpinned address is refused not_granted even under a name-scoped grant - no proxy, no resolver and no pinned column with a value exist today; the dotted SDK name is egress unchanged, the wire name carrying no underscore to replace; refused unsupported in version 1 and by every deployment at version 2 - the facet exists now, so what is missing is the proxy behind it rather than a request to ask through"/>
       <entry name="realm_launch" value="512" summary="launch the realm template this grant addresses into a new realm instance, through the vitrin_launcher facet; the template names the program and no command ever crosses the wire, so this is authority over an operator-written template rather than over an arbitrary command; bit 256 is allocated to a verb not yet defined here and was skipped rather than reused, as 64 was until designate_file landed on it and 128 was until egress did; refused unsupported in version 1, which cannot mint the facet at all, and by any deployment that does not serve it"/>
     </enum>
@@ -3318,28 +3337,39 @@
       match on strings this protocol never sees.
 
       Version 1 does not define this interface's messages at all - it is
-      reachable only through a since="2" mint. The designate_file bit is
+      reachable only through a since="2" mint. The designate_file bit was
       defined ahead of being served, exactly as realm_launch was: EVERY
-      deployment refuses it "unsupported" today, because the core-drawn
-      picker (P2.6.6) and the consent copy that names what approving it
-      costs (P2.6.8) do not exist yet. Defining the verb before serving it
-      is what makes a petition for it an answer rather than a connection
-      death.
+      deployment refused it "unsupported" until P2.6.6 (#190) landed the
+      core-drawn picker, and the reference core has served it since.
+      Defining the verb before serving it is what made a petition for it
+      an answer rather than a connection death for as long as that lasted.
+      Whether it is served is now a property of the deployment: one with
+      no picker root it can open admits the petition and answers each ask
+      vitrin_grant.refused(designate_file, "internal"), loudly, rather
+      than serving a verb with nothing behind it. The consent copy that
+      names what approving the verb costs was the last piece owed, and it
+      landed at P2.6.8 (#192, D-048), replacing the minimum line that had
+      named the verb without describing it.
 
-      THE REFERENCE CORE IMPLEMENTS THESE MESSAGES, which is a different
-      and much weaker claim than serving the verb. vitrind dispatches
-      get_powerbox, request_file and request_dir: the mint is always legal
-      and silent, each ask is decoded (an out-of-range mode is fatal
-      "invalid_argument" from the decoder, as every enum argument is), and
-      each is then refused vitrin_grant.refused(designate_file,
-      "not_granted") - recoverably, connection intact, the answer this
-      interface's inertness is written to produce. No picker is raised and
-      this interface's own refused event is unreachable, because that event
-      belongs to an ask the chokepoint ALLOWED and no ask is allowed
-      anywhere. Until issue #322 there was no dispatch arm for any of the
-      three, so a conformant version-2 client that minted the facet was
-      answered fatal "invalid_opcode" and disconnected; see
-      vitrin_grant.get_powerbox, which carries the record.
+      THE REFERENCE CORE IMPLEMENTS THESE MESSAGES AND SERVES THE VERB
+      BEHIND THEM, two claims that landed apart and are kept apart here.
+      Since issue #322 vitrind dispatches get_powerbox, request_file and
+      request_dir: the mint is always legal and silent, and each ask is
+      decoded (an out-of-range mode is fatal "invalid_argument" from the
+      decoder, as every enum argument is) and judged at the chokepoint.
+      Until P2.6.6 every ask was then refused
+      vitrin_grant.refused(designate_file, "not_granted") - recoverably,
+      connection intact, the answer this interface's inertness is written
+      to produce - because no grant anywhere carried the bit; no picker was
+      raised, and this interface's own refused event was unreachable,
+      since that event belongs to an ask the chokepoint ALLOWED. Since
+      P2.6.6 an ask under a grant whose effective verb set holds
+      designate_file is admitted, the picker is raised, and every terminal
+      this interface defines is reachable. Until issue #322 there was no
+      dispatch arm for any of the three, so a conformant version-2 client
+      that minted the facet was answered fatal "invalid_opcode" and
+      disconnected; see vitrin_grant.get_powerbox, which carries the
+      record.
 
       ONE VERB PER INTERFACE, AND WHERE THAT ALREADY DECIDED THE NEXT
       CHANGE. interface/@verb is one value, which is why this facet
@@ -3409,10 +3439,12 @@
 
         REQUEST-ORDER PAIRING IS NORMATIVE AND IS A KNOWN OPEN GAP HERE.
         The rule above binds every implementation, and the reference
-        core's designation machinery does not meet it - which costs
-        nothing while no deployment serves the verb and costs a mispairing
-        the day one does, which is the reason to record it now rather than
-        then. The shape of the miss is structural rather than a slip. A
+        core's designation machinery does not meet it - a live mispairing
+        now that the core serves the verb (P2.6.6), not a latent one. It
+        was recorded while no deployment served designate_file, when it
+        cost nothing, rather than found after one did, and the
+        do-not-pipeline advice below is what a client acts on. The shape
+        of the miss is structural rather than a slip. A
         first ask that is ADMITTED has its terminal owed across human time
         - seconds, or the whole deadline - while a second ask arriving
         behind it is refused "busy" inside its own dispatch turn and

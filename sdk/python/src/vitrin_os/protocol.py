@@ -150,10 +150,11 @@ VERB_MASK = int(
 # `crates/vitrin-core/src/grants.rs` added the bit to `SERVED_VERB_BITS`; the
 # reference core serves the verb at version 2 today, so a petition naming it is
 # put to the human there instead of being resolved `unsupported` unasked. Two
-# things that did NOT change with it: the considered consent copy for the verb
-# is still owed (P2.6.8, Q13 — the card carries a minimum honest line, which is
-# what let the verb be served at all), and whether any OTHER deployment serves
-# it remains a deployment property no constant in this file can state.
+# things to keep straight about it: the considered consent copy for the verb
+# landed at P2.6.8 (issue #192, D-048 — from P2.6.6 to P2.6.8 the card carried
+# a minimum honest line, which is what let the verb be served at all), and
+# whether any OTHER deployment serves it remains a deployment property no
+# constant in this file can state.
 #
 # `egress` (128, P2.7.2 / issue #196) is out on the same two counts, and its
 # IDL summary carries the same marker phrase for a reason that goes further

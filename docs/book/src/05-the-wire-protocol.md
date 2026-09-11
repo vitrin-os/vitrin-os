@@ -94,7 +94,7 @@ authentication, because the core created both ends itself.
 | `vitrin_launcher` | Realm-launch facet (since wire version 2) — fork a new realm instance from an operator-written template, under a core-minted id; `launch` carries no arguments, so the command never crosses the wire |
 | `vitrin_layout_focus` | Focus facet (since wire version 2) — bind the output to the granted realm and send the human's own input there, one act |
 | `vitrin_layout_arrange` | Arrangement facet (since wire version 2) — fill the output, or compose at the app's own size; `place`, `resize`, `raise` and stacking are absent rather than refused |
-| `vitrin_powerbox` | Designation facet (since wire version 2) — ask the human to pick one file or one directory subtree and have the **descriptor** delivered to the realm; no path crosses the wire in either direction. **Served by `vitrind` since P2.6.6 landed the core-drawn picker** (issue #190); a deployment with no picker root it can open answers `internal` rather than serving a verb with nothing behind it, and the consent copy naming what approving it costs is still owed (P2.6.8) |
+| `vitrin_powerbox` | Designation facet (since wire version 2) — ask the human to pick one file or one directory subtree and have the **descriptor** delivered to the realm; no path crosses the wire in either direction. **Served by `vitrind` since P2.6.6 landed the core-drawn picker** (issue #190); a deployment with no picker root it can open answers `internal` rather than serving a verb with nothing behind it, and the consent copy naming what approving it costs landed at P2.6.8 (issue #192, D-048) |
 | `vitrin_egress` | Egress facet (since wire version 2) — one outbound connection to the single `host:port` the grant names, handed back as a socket fd. **No deployment serves the `egress` verb**: `vitrind` mints the facet and refuses every `request_connect` `not_granted` (issue #322), because the out-of-core mediating proxy does not exist |
 
 Each has a prose page under
@@ -196,7 +196,9 @@ Version 0 is frozen for Phase 1 — **not forever**. The wire integer is now
   `unsupported` by every deployment until P2.6.6 landed the core-drawn picker,
   and **served by this core since**; a deployment with no picker root it can
   open answers `internal` rather than serving a verb with nothing behind it,
-  and the consent copy naming what approving it costs is still owed (P2.6.8).
+  and the consent copy naming what approving it costs landed at P2.6.8 (issue
+  #192, D-048), replacing the minimum line that named the verb without
+  describing it.
   This core **dispatches** the messages as of issue #322 — `get_powerbox`
   mints, and until P2.6.6 both requests on the facet it mints refused
   `not_granted` recoverably. Before #322 it had no arm for any of the three,

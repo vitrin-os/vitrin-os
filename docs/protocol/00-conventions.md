@@ -325,7 +325,8 @@ deployment until P2.6.6 landed the core-drawn picker that mints a descriptor,
 and the reference core has served it since. Whether it is served is now a
 property of the deployment: one with no picker root it can open answers
 `internal` rather than serving a verb with nothing behind it, and the consent
-copy that names what approving it costs is still owed (P2.6.8, Q13). Its
+copy that names what approving it costs landed at P2.6.8 (issue #192, D-048),
+replacing the minimum line that had named the verb without describing it. Its
 facet, [`vitrin_powerbox`](13-vitrin_powerbox.md), landed with the bit.
 
 **`egress`** (128,
@@ -1248,8 +1249,10 @@ deployment until the core-drawn picker existed. P2.6.6 landed that picker, and
 the reference core has served the verb since — a deployment with no picker
 root it can open answers `internal` rather than serving a verb with nothing
 behind it, and the human-readable consent copy that names what approving it
-costs is still owed (P2.6.8, Q13's rule that no verb is served before a human
-can be told what approving it costs). While it was staged the reference core
+costs landed at P2.6.8 (issue #192, D-048; Q13's rule is that no verb is served
+before a human can be told what approving it costs, and between P2.6.6 and
+P2.6.8 the card named the verb without describing it). While it was staged the
+reference core
 made that fail closed rather than by promise: `SERVED_VERB_BITS` did not list
 the bit, and the unserved set is *derived* from the wire mask, so a verb nobody
 classified is refused.
@@ -1548,9 +1551,10 @@ named here so their absence is understood as a decision, not an omission:
   facet with `request_file`/`request_dir`, and
   `vitrin_shim_session.designation`. Serving it is a deployment's property: a
   deployment with no picker root it can open answers `internal` rather than
-  serving a verb with nothing behind it. What is still deferred is the consent
-  copy that tells a human what approving it costs (P2.6.8; the card today
-  names the verb and does not yet describe it). What the wire decided, and would
+  serving a verb with nothing behind it. The consent copy that tells a human
+  what approving it costs landed at P2.6.8 (issue #192, D-048); between P2.6.6
+  and P2.6.8 the card named the verb and did not describe it. What the wire
+  decided, and would
   otherwise be unstateable, is the *shape* — the human picks and **no path
   ever crosses the wire in either direction**, a subtree is one directory fd
   rather than a batch, and the realm is never told which principal asked.

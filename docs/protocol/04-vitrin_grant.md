@@ -196,9 +196,12 @@ does. Only the object-graph rules can fail the mint, fatally: a `new_id` that
 breaks the id rules (`invalid_object`), or the per-connection live-object cap
 (`resource_exhausted`). Until P2.6.6 the picker was absent, so no petition
 naming `designate_file` resolved `granted` at all — an absence in the *verb*,
-not in this request. What is still absent is the consent copy (**P2.6.8**)
-that names what approving the verb costs; a deployment with no picker root it
-can open answers `internal` rather than serving a verb with nothing behind it.
+not in this request. The consent copy that names what approving the verb
+costs was a minimum line until **P2.6.8** (issue #192, D-048) landed the
+considered one. Whether the verb is served remains a deployment's property: a
+deployment with no picker root it can open admits the petition and answers
+each ask `refused(designate_file, internal)` rather than serving a verb with
+nothing behind it.
 
 > **It was not, until issue #322, and the record is kept because the failure
 > mode is generic.** This request reached the wire with no dispatch arm behind
@@ -369,7 +372,7 @@ name unchanged. `egress` is the first such entry.
 | `observe_cursor` | 0x8 | **no** — resolves `unsupported` | capture frames that include the human principal's cursor; meaningful only alongside `observe` |
 | `layout_arrange` | 0x10 | yes | arrange the granted realm's view, through the [`vitrin_layout_arrange`](18-vitrin_layout_arrange.md) facet; **one holder per output** — a live grant carrying it, or a petition still pending for it — so a second petition while either exists resolves `layout_held` |
 | `layout_focus` | 0x20 | yes | bind the output to the granted realm and direct the human's input there, through the [`vitrin_layout_focus`](17-vitrin_layout_focus.md) facet |
-| `designate_file` | 0x40 | yes, since P2.6.6 — a deployment with no picker root it can open answers `internal`; the consent copy naming what approving it costs is still owed (P2.6.8) | designate one file or one directory subtree to the granted realm, through the [`vitrin_powerbox`](13-vitrin_powerbox.md) facet; the human picks in the core-drawn picker and what crosses is a **descriptor, never a path**. **A delivered fd cannot be recalled** — see [that page](13-vitrin_powerbox.md#revocation-cannot-recall-a-delivered-descriptor) |
+| `designate_file` | 0x40 | yes, since P2.6.6 — a deployment with no picker root it can open answers `internal`; the consent copy naming what approving it costs landed at P2.6.8 (D-048) | designate one file or one directory subtree to the granted realm, through the [`vitrin_powerbox`](13-vitrin_powerbox.md) facet; the human picks in the core-drawn picker and what crosses is a **descriptor, never a path**. **A delivered fd cannot be recalled** — see [that page](13-vitrin_powerbox.md#revocation-cannot-recall-a-delivered-descriptor) |
 | `egress` | 0x80 | **no** — resolves `unsupported` everywhere | open one outbound connection to the single `host:port` this grant's [`net:` selector](#the-net-resource-prefix) names, through an out-of-core mediating proxy, using the [`vitrin_egress`](19-vitrin_egress.md) facet. The facet exists; **the proxy does not**, so no deployment serves the verb |
 | `realm_launch` | 0x200 | yes | launch the realm template this grant addresses into a new realm instance, through the [`vitrin_launcher`](16-vitrin_launcher.md) facet |
 
@@ -600,12 +603,14 @@ A verb may be defined on the wire ahead of being served and **refused
 
 Six verbs have been defined this way. `observe_cursor`, `layout_arrange` and
 `layout_focus` were defined from day one; `realm_launch` and `designate_file`
-arrived with version 2, and `egress` at P2.7.2; of those, **three are now
+arrived with version 2, and `egress` at P2.7.2; of those, **four are now
 served** by the reference core — each has
 a facet interface, an enforcement arm and consent copy naming its consequence
-in plain language. `layout_arrange` and `layout_focus` joined at WS-E.1.4, and
+in plain language. `layout_arrange` and `layout_focus` joined at WS-E.1.4,
 `realm_launch` at WS-E.1.1, when the core gained the spawn path, the realm cap
-and the prompt line its refusal had stood for.
+and the prompt line its refusal had stood for, and `designate_file` at P2.6.6,
+when the core-drawn picker landed — its considered prompt line following at
+P2.6.8.
 
 <!-- vitrin-verb-set: unserved-verbs = observe_cursor, egress | count: two -->
 **Two remain**, and for two different missing mechanisms.
@@ -621,9 +626,10 @@ nothing else, and was refused by every deployment on two grounds: no picker
 minted a descriptor (P2.6.6) and no consent copy named what approving it cost
 (P2.6.8 — Q13's rule that no verb is served before a human can be told what it
 means). P2.6.6 closed the first, and the reference core's `SERVED_VERB_BITS`
-now lists the bit. **The second ground is not closed**: the consent card names
-the verb, which is Q13's letter, and the considered copy that would describe
-what it costs is still P2.6.8's. And the bit alone still admits nothing — a
+has listed the bit since. **P2.6.8 closed the second** (issue #192, D-048):
+between the two the consent card named the verb, which is Q13's letter, and
+did not describe it; the considered copy that says what approving it costs is
+now the line the card renders. And the bit alone still admits nothing — a
 deployment with no picker root it can open answers `internal`, loudly, rather
 than serving a verb with no mechanism behind it.
 

@@ -38,8 +38,9 @@ other served verb's, a grant may carry the bit, and an ask through a facet
 minted from such a grant raises the picker. The IDL's sentence on the verb is
 the one this section restates: a deployment with no picker root it can open
 answers `internal` rather than serving a verb with nothing behind it, and the
-human-readable consent copy that names what approving it costs is still owed
-(P2.6.8, Q13).
+human-readable consent copy that names what approving it costs landed at
+P2.6.8 (issue #192, D-048), replacing the minimum line that had named the
+verb without describing it.
 
 **The reference core dispatches the facet's messages, and dispatch is the
 weaker half of that claim.** Since issue #322 `vitrind` dispatches
@@ -68,12 +69,12 @@ picker is raised, and every terminal on this page is reachable.
 [defined-but-unserved](./04-vitrin_grant.md#defined-but-unserved) staging at
 P2.6.6, and unlike `observe_cursor`'s its stay there had a scheduled end.** Two
 things were owed, both named in `docs/plan/02-phase-2-semantic-epochs.md` §2
-E2.6, and one still is:
+E2.6, and both have landed:
 
 | owed | task | status |
 |---|---|---|
 | the core-drawn picker, with `openat2 RESOLVE_NO_SYMLINKS` resolution from a directory fd and `SCM_RIGHTS` delivery | P2.6.6 | **landed** — before it nothing could mint a descriptor, so a granted verb would have had no request the server could carry out |
-| the human-readable consent copy for the verb | P2.6.8 | **still owed** — Q13's rule is that no verb is served before a human can be told, in plain language, what approving it costs; the card today names the verb, which is Q13's letter, and does not yet describe it |
+| the human-readable consent copy for the verb | P2.6.8 | **landed** (P2.6.8, D-048) — Q13's rule is that no verb is served before a human can be told, in plain language, what approving it costs; from P2.6.6 to P2.6.8 the card named the verb, which is Q13's letter, and did not describe it. The line is `VERB_CATALOGUE`'s `designate_file` entry in `crates/vitrin-core/src/consent/render.rs`, deliberately not quoted here: the rendered card is checked against that entry, and a second copy on this page would be checked against nothing |
 
 In the reference core the bit's status is **structural rather than a
 promise**: `designate_file` is in `SERVED_VERB_BITS` since P2.6.6, the unserved

@@ -496,10 +496,22 @@ class HumanScreenshotKey(IntegrationTest):
 
         # (6) NOTHING OUTSIDE THE DIRECTORY. The work tree is inventoried
         # against what this test itself created.
+        #
+        # `<dump>.part` is on the list because the core is STILL RUNNING here
+        # and `--capture-dump` rewrites the dump on every frame: it writes a
+        # sibling temp named target-plus-`.part` and renames it into place
+        # (`session::write_capture_dump`, which appends the suffix precisely so
+        # the temp can never be the target). The inventory can land inside
+        # that write, and did -- one CI run in the P2.6.7 branch caught the
+        # temp and failed this assertion on a file this test's own
+        # `capture_dump=` asked for. The temp is part of what the dump IS, not
+        # something the core wrote elsewhere; the assertion still fails on any
+        # other name.
         expected_tree = {
             "shots",
             "core.log",
             dump.name,
+            dump.name + ".part",
         }
         self.assertLessEqual(
             {p.name for p in self.work.iterdir()},

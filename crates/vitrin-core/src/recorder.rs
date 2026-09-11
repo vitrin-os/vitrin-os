@@ -2265,10 +2265,11 @@ fn write_string_array(out: &mut String, k: &str, values: &[String]) {
 /// next appended bit from re-opening it silently.
 ///
 /// It did exactly that for `designate_file` (P2.6.5): the bit landed in the
-/// IDL and this table went red on the same run. The label is added here even
-/// though **no deployment serves the verb yet** — an admission refusal is
-/// journaled with the verb the petition named, so a bit can reach this
-/// function long before any chokepoint arm exists for it.
+/// IDL and this table went red on the same run. The label was added here
+/// while **no deployment yet served the verb** (the reference core has since
+/// P2.6.6) — an admission refusal is journaled with the verb the petition
+/// named, so a bit can reach this function long before any chokepoint arm
+/// exists for it.
 ///
 /// `"unknown"` survives for a value that is not a single defined bit (a mask, or
 /// zero), which the chokepoint cannot produce — one facet, one verb — but which

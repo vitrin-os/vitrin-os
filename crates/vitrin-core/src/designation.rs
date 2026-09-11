@@ -105,13 +105,16 @@
 //! `UseKind::Designate` stays outside `contends_for_attention`, which is what
 //! `each_use_kind_answers_every_classification_predicate_as_documented` pins.
 //! A raised picker holds the human's *input* through the consent grab, which
-//! is a different mechanism from the chokepoint's `consent_held` gate, and the
-//! IDL leaves `preempted` and `consent_held` open for designation while
-//! forbidding a server to read that silence as licence. Answering it inside an
-//! enforcement change would settle a protocol question in the wrong place.
+//! is a different mechanism from the chokepoint's `consent_held` gate. The
+//! IDL left `preempted` and `consent_held` open for designation until P2.6.6
+//! closed the set: a designation ask is never refused either, and a second
+//! card for one human is answered by `busy` on the facet, after admission.
 //!
 //! **3. Who sends the realm's copy, and under what check** (owner scope call,
-//! 2026-09-07: decided here, implemented by P2.6.7 / issue #191). The IDL
+//! 2026-09-07: decided here, and the core's half implemented by P2.6.6 /
+//! issue #190 -- `session.rs` writes `vitrin_shim_session.designation` to
+//! the realm's shim; P2.6.7 / issue #191 is the shim's relay of that frame
+//! to the app, which is the shim's and not this module's). The IDL
 //! requires the *same* descriptor to reach the realm's shim as
 //! `vitrin_shim_session.designation`, and the agent's copy is the explicitly
 //! optional one. **The decision: one `openat2`, one descriptor, `dup`'d for

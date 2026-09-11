@@ -324,10 +324,11 @@ const EXPIRY_UNBOUNDED: &str = "no time limit - bounded only by the choice below
 /// `unsupported` at admission (D-017/D-018 — `realm_launch` was in that list
 /// until WS-E.1.1 gave it a facet, a chokepoint arm and prompt copy, and it
 /// is served now), and a verb that can never reach a prompt
-/// must not get prompt copy that implies it can. `designate_file` (P2.6.5) is
-/// the standing example alongside `observe_cursor`: the bit is on the wire and
-/// this table names it nowhere, because writing its copy is P2.6.8's whole
-/// deliverable and a verb is not served until that copy exists.
+/// must not get prompt copy that implies it can. `observe_cursor` is the
+/// standing example, and `designate_file` (P2.6.5) was one beside it until
+/// P2.6.6 moved the bit into the served set and put a minimum honest line in
+/// this table; the considered copy that says what approving it costs is still
+/// P2.6.8's deliverable (Q13).
 ///
 /// A served-set pin alone would let a newly appended IDL verb slip past this
 /// module in silence — [`crate::grants::UNSERVED_VERB_BITS`] is *derived* from

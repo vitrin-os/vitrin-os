@@ -31,22 +31,29 @@ no ambient reach for it to be a convenience over.
 
 ## Served status
 
-**No deployment serves `designate_file`, including the reference core.** Every
-petition naming the verb resolves `unsupported`, so no grant carries the bit,
-so a server that implements this facet refuses every use `not_granted`.
+**Whether `designate_file` is served is a property of the deployment, and the
+reference core has served it since P2.6.6 (issue #190) landed the core-drawn
+picker.** A petition naming the verb is admitted on the same terms as any
+other served verb's, a grant may carry the bit, and an ask through a facet
+minted from such a grant raises the picker. The IDL's sentence on the verb is
+the one this section restates: a deployment with no picker root it can open
+answers `internal` rather than serving a verb with nothing behind it, and the
+human-readable consent copy that names what approving it costs is still owed
+(P2.6.8, Q13).
 
-**The reference core implements the facet's messages, which is a different and
-much weaker claim than serving the verb.** Since issue #322 `vitrind`
-dispatches [`get_powerbox`](./04-vitrin_grant.md#get_powerbox),
+**The reference core dispatches the facet's messages, and dispatch is the
+weaker half of that claim.** Since issue #322 `vitrind` dispatches
+[`get_powerbox`](./04-vitrin_grant.md#get_powerbox),
 [`request_file`](#request_file) and [`request_dir`](#request_dir): the mint is
-always legal and puts nothing on the wire, each ask is decoded (an
+always legal and puts nothing on the wire, and each ask is decoded (an
 out-of-range `mode` is fatal `invalid_argument` from the decoder, as every enum
-argument is), and each is then refused
-[`refused(designate_file, not_granted)`](./04-vitrin_grant.md#refused) —
-recoverably, connection intact, which is the answer this interface's inertness
-is written to produce. No picker is raised, and **this interface's own
-[`refused`](#refused) event is unreachable in that build**, because that event
-belongs to an ask the chokepoint *allowed* and no ask is allowed anywhere.
+argument is) and judged at the chokepoint. Until P2.6.6 every ask was then
+refused [`refused(designate_file, not_granted)`](./04-vitrin_grant.md#refused)
+— recoverably, connection intact — because no grant anywhere carried the bit,
+and **this interface's own [`refused`](#refused) event was unreachable**, since
+that event belongs to an ask the chokepoint *allowed*. Since P2.6.6 an ask
+under a grant whose effective verb set holds `designate_file` is admitted, the
+picker is raised, and every terminal on this page is reachable.
 
 > **Until issue #322 there was no arm for any of the three**, so a conformant
 > version-2 client that minted this facet was answered fatal `invalid_opcode`
@@ -57,21 +64,26 @@ belongs to an ask the chokepoint *allowed* and no ask is allowed anywhere.
 > them is structural: a core test derives `vitrin_grant`'s mint opcodes from
 > generated code and fails on any one of them no arm dispatches.
 
-**The verb's refusal** is the
-[defined-but-unserved](./04-vitrin_grant.md#defined-but-unserved)
-staging, and unlike `observe_cursor`'s it has a **scheduled** end. Two things
-are owed, both named in `docs/plan/02-phase-2-semantic-epochs.md` §2 E2.6:
+**The verb left the
+[defined-but-unserved](./04-vitrin_grant.md#defined-but-unserved) staging at
+P2.6.6, and unlike `observe_cursor`'s its stay there had a scheduled end.** Two
+things were owed, both named in `docs/plan/02-phase-2-semantic-epochs.md` §2
+E2.6, and one still is:
 
-| owed | task | why the verb cannot be served without it |
+| owed | task | status |
 |---|---|---|
-| the core-drawn picker, with `openat2 RESOLVE_NO_SYMLINKS` resolution from a directory fd and `SCM_RIGHTS` delivery | P2.6.6 | nothing exists that could mint a descriptor, so a granted verb would have no request the server can carry out |
-| the human-readable consent copy for the verb | P2.6.8 | Q13's rule: no verb is served before a human can be told, in plain language, what approving it costs |
+| the core-drawn picker, with `openat2 RESOLVE_NO_SYMLINKS` resolution from a directory fd and `SCM_RIGHTS` delivery | P2.6.6 | **landed** — before it nothing could mint a descriptor, so a granted verb would have had no request the server could carry out |
+| the human-readable consent copy for the verb | P2.6.8 | **still owed** — Q13's rule is that no verb is served before a human can be told, in plain language, what approving it costs; the card today names the verb, which is Q13's letter, and does not yet describe it |
 
-In the reference core the refusal is **structural rather than a promise**:
-`designate_file` is absent from `SERVED_VERB_BITS`, the unserved set is
-*derived* from the wire's `VALID_MASK`, and admission refuses a petition naming
-an unserved bit **whole** — never narrowed to the served remainder. Forgetting
-the rest of E2.6 therefore produces a refusal, not a grant nothing enforces.
+In the reference core the bit's status is **structural rather than a
+promise**: `designate_file` is in `SERVED_VERB_BITS` since P2.6.6, the unserved
+set is *derived* from the wire's `VALID_MASK`, and admission refuses a petition
+naming an unserved bit **whole** — never narrowed to the served remainder. The
+bit alone still admits nothing: an admitted ask is handed to a sink the
+deployment installs, and a deployment with no picker root it can open answers
+`internal`, loudly, rather than serving a verb with no mechanism behind it.
+Forgetting the rest of E2.6 therefore still produces a refusal, not a grant
+nothing enforces.
 
 This interface's messages are `since="2"`, so they do not exist on a version-1
 connection at all; sending one there is fatal `invalid_opcode`. The verb *bit*
@@ -109,8 +121,9 @@ interface's contract.
 ## What the human sees, and four scripts it will not draw
 
 *This section and [the next](#while-an-ask-is-pending) say what a conformant
-picker does. Whether any deployment has one is a different question, answered
-under [Served status](#served-status): none serves `designate_file` today.*
+picker does. Whether a deployment has one is a different question, answered
+under [Served status](#served-status): the reference core has since P2.6.6,
+and a deployment without one answers `internal` rather than serving the verb.*
 
 The picker is drawn by the core, with the core's own **shaping-free** text
 path. It draws real Unicode where it can, and it draws **Arabic, Hebrew,
@@ -312,10 +325,13 @@ boundary rather than a prefix match on strings this protocol never sees.
 The facet comes into existence when a principal calls
 [`get_powerbox`](./04-vitrin_grant.md#get_powerbox) on a grant, which allocates
 the client-supplied `new_id` and binds it to this interface. Minting is always
-structurally successful and is **not an authority oracle** — and today that is
-doing visible work: since no deployment serves the verb, a server that
-implements the mint mints successfully and refuses every use. No shipped
-server implements it yet; see [Served status](#served-status).
+structurally successful and is **not an authority oracle**: a server mints
+successfully whatever the grant holds and whether or not it has resolved, and
+the *use* is what is judged — so a facet minted from a grant whose effective
+verb set lacks `designate_file`, or that has not resolved `granted`, refuses
+every ask `not_granted`. That is what the reference core does: issue #322
+landed the mint, and P2.6.6 the picker behind the ask; see [Served
+status](#served-status).
 
 It is grant-derived, so it follows the inert-object rule: when its grant dies
 (expiry or revocation) the facet goes **inert**, and requests on it are refused
@@ -378,9 +394,10 @@ same protection.
 
 **Request-order pairing is normative, and it is a named open gap here.** The
 rule above binds every implementation, and **the reference core's designation
-machinery does not meet it** — which costs nothing while no deployment serves
-the verb, and costs a mispairing the day one does; recording it now rather than
-then is the point. The shape of the miss is structural rather than a slip: an
+machinery does not meet it** — a live mispairing now that the core serves the
+verb, not a latent one; it was recorded before P2.6.6 landed rather than found
+afterwards, and the *do not pipeline* advice below is what a client acts on.
+The shape of the miss is structural rather than a slip: an
 ask that is
 *admitted* has its terminal owed across human time — seconds, or the whole
 deadline — while a second ask arriving behind it is refused
@@ -557,10 +574,12 @@ its `max_event_rate` allows, on the same terms
 deployment that cannot afford it bounds its ledger per principal, which the
 one-card rule already very nearly does.
 
-**No SDK typed-exception mapping exists yet**, and that is recorded rather than
-invented: the Python SDK does not implement the powerbox, so naming four
-exceptions a second implementation would then be obliged to transcribe would be
-fiction ([conventions § 5.3](./00-conventions.md#53-recoverable-errors)).
+**No SDK typed-exception mapping exists**, and that is recorded rather than
+invented: the Python SDK returns this event as a value rather than raising it —
+a human declining to hand over a file is the system working, not an error — so
+naming four exceptions a second implementation would then be obliged to
+transcribe would be fiction
+([conventions § 5.3](./00-conventions.md#53-recoverable-errors)).
 
 ## Failure modes
 
@@ -578,11 +597,11 @@ must actually accompany the frame; either disjunct alone failing is
 
 | code | when |
 |---|---|
-| `not_granted` | the grant never held `designate_file`, or has not resolved `granted` — **the answer every deployment gives today** |
+| `not_granted` | the grant never held `designate_file`, or has not resolved `granted` — the answer every ask got before P2.6.6, and still the answer through a facet whose grant lacks the verb |
 | `expired` | the grant's expiry passed |
 | `revoked` | the grant was revoked |
 | `rate_limited` | the grant's token bucket is empty; `retry_after_ms` > 0 |
-| `internal` | a server-side failure while carrying the ask out |
+| `internal` | a server-side failure while carrying the ask out — including a deployment with no picker root it can open, which answers this rather than serving a verb with nothing behind it |
 
 **That set is now closed**, and the four codes it excludes are excluded for
 three different reasons rather than one. `no_surface` is never produced: a
@@ -617,18 +636,18 @@ silence as licence" is what the closure discharges.
 
 Direction key: **A→C** agent→core, **C→A** core→agent, **C→S** core→shim.
 
-### 1. What every deployment does today
+### 1. A deployment that does not serve the verb
 
 ```
 1. A→C  vitrin_realm.request_grant(…, verbs=designate_file, …)
 2. C→A  vitrin_grant.resolved(unsupported, 0, once, 0)
 ```
 
-No deployment serves the verb, so this is the whole interaction. A petition
-mixing `designate_file` with a served verb is refused **whole**, never narrowed
-to the served remainder.
+Every deployment before P2.6.6, and any deployment that declines the verb now:
+this is the whole interaction. A petition mixing `designate_file` with a
+served verb is refused **whole**, never narrowed to the served remainder.
 
-### 2. The shape the wire decides (not yet reachable)
+### 2. The served path (the reference core since P2.6.6)
 
 ```
 1. [grant resolved granted with verbs=designate_file]
@@ -666,9 +685,11 @@ The mint succeeds and the *use* refuses. Refusing at mint time would turn the
 mint into an oracle for what a grant holds.
 
 Since issue #322 this is exactly what the reference core does, rather than the
-shape a conforming server would have — and it is the answer for **every** verb
-set, not only `observe`, because no grant anywhere carries `designate_file`.
-The same four lines against a still-**pending** grant give the same answer:
+shape a conforming server would have — and until P2.6.6 it was the answer for
+**every** verb set, not only `observe`, because no grant anywhere carried
+`designate_file`; now it is the answer for every grant whose effective verb set
+lacks the bit. The same four lines against a still-**pending** grant give the
+same answer:
 minting before resolution is legal, and "use while pending, through an
 ungranted facet" is one of the things
 [`not_granted`](./04-vitrin_grant.md#refusal) names.

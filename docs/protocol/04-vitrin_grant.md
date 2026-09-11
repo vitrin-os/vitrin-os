@@ -174,25 +174,31 @@ conferring nothing extra, bounded by the per-connection live-object cap whose
 breach is fatal `resource_exhausted`, and `since="2"` so the opcode does not
 exist on a version-1 connection.
 
-**The mint is not an oracle, and today that is doing visible work.** No
-deployment serves [`designate_file`](#defined-but-unserved), so no grant
-carries the bit and no petition naming it resolves `granted`. A server that
-implements this request therefore mints successfully *everywhere* and refuses
-every use of the facet *everywhere* — the defined-but-unserved staging
-behaving exactly as designed, not a defect. Refusing at mint time would leak
-what a grant holds; that is why the mint never answers an authority question.
+**The mint is not an oracle, and until P2.6.6 that was doing visible work.**
+While no deployment served [`designate_file`](#defined-but-unserved), no grant
+carried the bit and no petition naming it resolved `granted`, so a server that
+implemented this request minted successfully *everywhere* and refused every
+use of the facet *everywhere* — the defined-but-unserved staging behaving
+exactly as designed, not a defect. The rule outlives the staging: a facet
+minted from a grant whose effective verb set lacks the bit still mints and
+still refuses on use. Refusing at mint time would leak what a grant holds;
+that is why the mint never answers an authority question.
 
-**The reference core is now such a server** (issue #322). `vitrind`
-dispatches this opcode: the mint succeeds, the facet enters the object table
-bound to this grant, nothing is put on the wire in answer, and every
+**The reference core is such a server** (issue #322), **and serves the verb
+behind it** (P2.6.6, issue #190). `vitrind` dispatches this opcode: the mint
+succeeds, the facet enters the object table bound to this grant, nothing is
+put on the wire in answer, and every
 [`request_file`](13-vitrin_powerbox.md#request_file) and
-[`request_dir`](13-vitrin_powerbox.md#request_dir) asked through it draws
-`refused(designate_file, not_granted)` — recoverable, connection intact. Only
-the object-graph rules can fail the mint, fatally: a `new_id` that breaks the
-id rules (`invalid_object`), or the per-connection live-object cap
-(`resource_exhausted`). What is still absent is the picker (**P2.6.6**) and the
-consent copy (**P2.6.8**) that would let a petition naming `designate_file`
-resolve `granted` at all — an absence in the *verb*, not in this request.
+[`request_dir`](13-vitrin_powerbox.md#request_dir) asked through it is judged
+at the chokepoint — `refused(designate_file, not_granted)` if the grant does
+not hold the verb, recoverable, connection intact; the core-drawn picker if it
+does. Only the object-graph rules can fail the mint, fatally: a `new_id` that
+breaks the id rules (`invalid_object`), or the per-connection live-object cap
+(`resource_exhausted`). Until P2.6.6 the picker was absent, so no petition
+naming `designate_file` resolved `granted` at all — an absence in the *verb*,
+not in this request. What is still absent is the consent copy (**P2.6.8**)
+that names what approving the verb costs; a deployment with no picker root it
+can open answers `internal` rather than serving a verb with nothing behind it.
 
 > **It was not, until issue #322, and the record is kept because the failure
 > mode is generic.** This request reached the wire with no dispatch arm behind
@@ -363,7 +369,7 @@ name unchanged. `egress` is the first such entry.
 | `observe_cursor` | 0x8 | **no** — resolves `unsupported` | capture frames that include the human principal's cursor; meaningful only alongside `observe` |
 | `layout_arrange` | 0x10 | yes | arrange the granted realm's view, through the [`vitrin_layout_arrange`](18-vitrin_layout_arrange.md) facet; **one holder per output** — a live grant carrying it, or a petition still pending for it — so a second petition while either exists resolves `layout_held` |
 | `layout_focus` | 0x20 | yes | bind the output to the granted realm and direct the human's input there, through the [`vitrin_layout_focus`](17-vitrin_layout_focus.md) facet |
-| `designate_file` | 0x40 | **no** — resolves `unsupported` everywhere | designate one file or one directory subtree to the granted realm, through the [`vitrin_powerbox`](13-vitrin_powerbox.md) facet; the human picks and what crosses is a **descriptor, never a path**. **A delivered fd cannot be recalled** — see [that page](13-vitrin_powerbox.md#revocation-cannot-recall-a-delivered-descriptor) |
+| `designate_file` | 0x40 | yes, since P2.6.6 — a deployment with no picker root it can open answers `internal`; the consent copy naming what approving it costs is still owed (P2.6.8) | designate one file or one directory subtree to the granted realm, through the [`vitrin_powerbox`](13-vitrin_powerbox.md) facet; the human picks in the core-drawn picker and what crosses is a **descriptor, never a path**. **A delivered fd cannot be recalled** — see [that page](13-vitrin_powerbox.md#revocation-cannot-recall-a-delivered-descriptor) |
 | `egress` | 0x80 | **no** — resolves `unsupported` everywhere | open one outbound connection to the single `host:port` this grant's [`net:` selector](#the-net-resource-prefix) names, through an out-of-core mediating proxy, using the [`vitrin_egress`](19-vitrin_egress.md) facet. The facet exists; **the proxy does not**, so no deployment serves the verb |
 | `realm_launch` | 0x200 | yes | launch the realm template this grant addresses into a new realm instance, through the [`vitrin_launcher`](16-vitrin_launcher.md) facet |
 
@@ -1192,10 +1198,11 @@ rules](00-conventions.md) guarantee.
   exactly and adds two things to the pattern that the earlier rows did not
   need. First, **two newly *defined* resource prefixes** — `file:` and `dir:`
   in [`request_grant`](03-vitrin_realm.md#request_grant)'s type-prefixed
-  vocabulary, defined and **not** served: they resolve `unsupported` in every
-  deployment today, exactly as the verb they select for does. That is why they
-  break no existing client — an unserved prefix already resolves `unsupported`
-  recoverably. Second, a **limitation that does not go away when the verb is
+  vocabulary, defined at P2.6.5 and refused `unsupported` by every deployment
+  until P2.6.6 — served by the reference core since, exactly as the verb they
+  select for is. That is why they broke no existing client — an unserved
+  prefix already resolves `unsupported` recoverably. Second, a **limitation
+  that does not go away when the verb is
   served**: a delivered file descriptor is kernel authority the core cannot
   recall, so revocation stops future designations and kills the grant row
   while every descriptor already handed over keeps working until its realm
@@ -1227,11 +1234,12 @@ rules](00-conventions.md) guarantee.
   than made silently, because this row was the record.
   **What this row must not be read as saying:** the verb is *still* unserved
   everywhere. Its refusal reason moved from "no request exercises it" to "no
-  proxy answers it", and a facet is not a mechanism. This is also the first
-  row in this table where the reference core implements *nothing* of what
-  landed — see [`get_egress`](#get_egress)'s implementation-status note. The
-  powerbox row above is the second: `get_powerbox` is unimplemented too, and
-  the two gaps are separately owned (P2.6.6 and P2.7.3).
+  proxy answers it", and a facet is not a mechanism. This was also the first
+  row in this table where the reference core implemented *nothing* of what
+  landed — see [`get_egress`](#get_egress)'s implementation-status note for
+  what issue #322 changed. The powerbox row above was the second, with
+  `get_powerbox` unimplemented too; the two gaps were separately owned
+  (P2.6.6 and P2.7.3), and P2.6.6 has closed its half.
 - **A third terminal on a reply-bearing request — new at version 2, and the
   SECOND request family to need three rather than the first.**
   [`vitrin_egress.request_connect`](19-vitrin_egress.md) is

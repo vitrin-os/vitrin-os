@@ -839,9 +839,13 @@ enum ObjectKind {
     /// The designation facet (see [`ObjectKind::Launcher`]), minted on the
     /// grant by `get_powerbox`. Carries its grant's wire id and nothing
     /// else, and the chokepoint judges every `request_file` and
-    /// `request_dir` -- refusing all of them `not_granted` in this build,
-    /// because `designate_file` is outside
-    /// [`SERVED_VERB_BITS`](crate::grants::SERVED_VERB_BITS).
+    /// `request_dir` -- refusing them all `not_granted` until P2.6.6
+    /// (issue #190) put `designate_file` in
+    /// [`SERVED_VERB_BITS`](crate::grants::SERVED_VERB_BITS) and the
+    /// core-drawn picker behind the ask, and since then admitting an ask
+    /// whose grant holds the verb; a deployment with no picker root it can
+    /// open answers `internal` rather than serving a verb with nothing
+    /// behind it.
     Powerbox { grant: u32 },
     /// The egress facet (see [`ObjectKind::Powerbox`]), minted on the grant
     /// by `get_egress`.
@@ -1270,9 +1274,9 @@ impl PrincipalServer {
                         // `invalid_opcode`, so its connection died for
                         // sending a documented request of the version this
                         // core negotiates. It was harmless-looking, because
-                        // `designate_file` and `egress` are both outside
-                        // `SERVED_VERB_BITS` and a minted facet confers
-                        // nothing -- but "confers nothing" and "kills the
+                        // `designate_file` and `egress` were both outside
+                        // `SERVED_VERB_BITS` at the time and a minted facet
+                        // confers nothing -- but "confers nothing" and "kills the
                         // socket" are not the same answer, and only the
                         // second is a conformance defect. The structural
                         // test `every_since_2_mint_on_a_grant_has_a_dispatch_arm`
@@ -2051,9 +2055,13 @@ impl PrincipalServer {
     /// an authority oracle, telling a petitioner something about its own
     /// pending petition that only `resolved` may say. The authority question
     /// is asked once, at the single enforcement chokepoint, when
-    /// `request_file` or `request_dir` is used -- and this build answers
-    /// every one of those `not_granted`, because `designate_file` is outside
-    /// [`SERVED_VERB_BITS`](crate::grants::SERVED_VERB_BITS).
+    /// `request_file` or `request_dir` is used. Until P2.6.6 (issue #190)
+    /// this build answered every one of those `not_granted`, because
+    /// `designate_file` was outside
+    /// [`SERVED_VERB_BITS`](crate::grants::SERVED_VERB_BITS); the bit is in
+    /// it now, so the answer is the ordinary one -- `not_granted` for a
+    /// grant that lacks the verb, the core-drawn picker for one that holds
+    /// it.
     ///
     /// [`handle_get_launcher`]: PrincipalServer::handle_get_launcher
     fn handle_get_powerbox(&mut self, msg: Message) -> Result<(), PrincipalFault> {
@@ -3014,9 +3022,11 @@ pub(crate) mod tests {
                         height: *height,
                     })
             };
-            // No picker in the harness, matching every shipped deployment:
-            // an admitted designation is answered `internal` here, which is
-            // what `a_designation_with_no_picker_is_refused_internal` reads.
+            // No picker in the harness -- the shipped core has one since
+            // P2.6.6 (issue #190); this rig models a deployment with no picker
+            // root it can open, so an admitted designation is answered
+            // `internal` here, which is what
+            // `a_designation_with_no_picker_is_refused_internal` reads.
             let mut designate_sink = |_ask: crate::enforcement::DesignateAsk<'_>| {
                 Err(crate::enforcement::DesignateRefusal::Unavailable)
             };

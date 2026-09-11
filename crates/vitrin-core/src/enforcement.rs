@@ -22,17 +22,22 @@
 //! Since issue #322 the same funnel carries the last two use classes the
 //! IDL defines -- `vitrin_powerbox`'s `request_file`/`request_dir`
 //! ([`UseKind::Designate`]) and `vitrin_egress.request_connect`
-//! ([`UseKind::Egress`]) -- and neither can *succeed*: `designate_file` and
-//! `egress` are both outside
-//! [`SERVED_VERB_BITS`](crate::grants::SERVED_VERB_BITS), so no row carries
-//! either bit and step 4 refuses `not_granted`. That is the point of routing
+//! ([`UseKind::Egress`]) -- and at first neither could *succeed*:
+//! `designate_file` and `egress` were both outside
+//! [`SERVED_VERB_BITS`](crate::grants::SERVED_VERB_BITS), so no row carried
+//! either bit and step 4 refused `not_granted`. That was the point of routing
 //! them here rather than leaving them undispatched. An undispatched request
 //! of the negotiated version is answered fatal `invalid_opcode` and the
 //! connection dies -- a *grammar* answer to an *authority* question, which
 //! is the fatal-vs-recoverable razor inverted. Routed here, "this deployment
 //! serves no picker / no proxy" is an answer the client survives and can act
 //! on, which is what every staged verb in this protocol is defined ahead of
-//! its mechanism in order to buy.
+//! its mechanism in order to buy. `designate_file` has since left that
+//! posture: P2.6.6 (issue #190) put the bit in `SERVED_VERB_BITS` and the
+//! core-drawn picker behind the `Designate` arm, so an admitted ask is handed
+//! to `UseEnv::designate`, and a deployment with no picker root it can open
+//! answers `internal` there rather than serving a verb with nothing behind
+//! it. `egress` is still where it was.
 //!
 //! # The one-path property (grep-provable)
 //!
@@ -360,10 +365,14 @@ pub(crate) enum UseKind {
     /// verb and the code, and terminals pair in request order so the client
     /// already knows which ask it answered.
     ///
-    /// **Its use is never admitted by this build.** `designate_file` is
-    /// outside [`SERVED_VERB_BITS`](crate::grants::SERVED_VERB_BITS), so no
-    /// petition naming it resolves `granted`, so no row carries the bit and
-    /// step 4 refuses `not_granted` before any use-context gate is reached.
+    /// **Its use is admitted since P2.6.6 (issue #190).** `designate_file`
+    /// is inside [`SERVED_VERB_BITS`](crate::grants::SERVED_VERB_BITS), so a
+    /// petition naming it may resolve `granted` and a row may carry the bit;
+    /// an ask through a facet whose grant lacks the bit is still refused
+    /// `not_granted` at step 4 before any use-context gate is reached, and an
+    /// admitted ask goes to [`UseEnv::designate`], where a deployment with no
+    /// picker root it can open answers `internal` rather than serving a verb
+    /// with nothing behind it. Until P2.6.6 every ask took the first path.
     /// The mint that produces the facet
     /// ([`vitrin_grant.get_powerbox`](crate::principal)) is structural and
     /// always legal, and the *ask* is what is judged -- the launcher's shape
@@ -374,11 +383,10 @@ pub(crate) enum UseKind {
     /// and neither is a claim about *what* may be designated -- that is the
     /// human's to say at the card.
     ///
-    /// Still open, and deliberately not settled here: the two use-context
-    /// questions the IDL's `refusal` enum leaves open for designation
-    /// (`preempted` and `consent_held`; see
-    /// [`Self::contends_for_attention`]). This variant stays out of that
-    /// set, so the silence is preserved rather than read as licence.
+    /// Settled by P2.6.6 in the IDL rather than here: a designation ask is
+    /// never refused `preempted` or `consent_held` (see
+    /// [`Self::contends_for_attention`]), so this variant stays out of that
+    /// set normatively, where it once stayed out to preserve a silence.
     Designate(AskedFor),
     /// `vitrin_egress.request_connect` (reply-bearing, since version 2):
     /// open one outbound connection to the single endpoint this grant's
@@ -512,21 +520,25 @@ impl UseKind {
     /// predicate selects for. A free rename then; a permanent reading hazard
     /// in the one function where misreading it is most expensive.
     ///
-    /// **Egress is excluded normatively; designation is excluded
-    /// vacuously, and the difference matters.** The IDL settles egress --
-    /// "It is never refused preempted or consent_held either ... an
-    /// outbound socket neither reaches the human's realm nor is visible to
-    /// the human". For designation it says the opposite: "WHAT IS NOT
-    /// SETTLED is preempted and consent_held ... P2.6.6 answers it when it
-    /// builds the picker; nothing here forecloses either answer, and a
-    /// server must not read the silence as licence to give either code a
-    /// third meaning." No answer is observable from this build either way,
-    /// because `designate_file` is unserved, so step 4 refuses
-    /// `not_granted` before any use of a powerbox facet reaches step 5 --
-    /// so excluding it here decides nothing and P2.6.6 still owns the
-    /// decision. Leaving it *in* would have been the choice that decides
-    /// something: it would put a code on the wire that the IDL says nobody
-    /// may assume yet.
+    /// **Egress is excluded normatively, and so is designation since
+    /// P2.6.6.** The IDL settles egress -- "It is never refused preempted
+    /// or consent_held either ... an outbound socket neither reaches the
+    /// human's realm nor is visible to the human". For designation it once
+    /// left both codes open ("a server must not read the silence as licence
+    /// to give either code a third meaning"), and this predicate excluded
+    /// `Designate` so as to decide nothing while `designate_file` was
+    /// unserved and no answer was observable. P2.6.6 closed the set in the
+    /// IDL: a designation ask is NEVER refused `preempted` (that code
+    /// exists for something delivered into the human's realm past the
+    /// human, and an ask whose purpose is to put a card in front of that
+    /// human is refused by their presence only if presence is read
+    /// backwards) and NEVER `consent_held` (a second card in front of one
+    /// human is answered where the card is, by `vitrin_powerbox.refusal`
+    /// `busy`, after admission). The verb is served, so the exclusion is
+    /// observable now, and it is normative rather than vacuous. What
+    /// `consent_held` names for designation is the reverse direction: while
+    /// a designation of this principal's own is pending, its ACTUATION is
+    /// refused `consent_held` and its observation continues.
     pub(crate) fn contends_for_attention(&self) -> bool {
         matches!(
             self,
@@ -549,13 +561,16 @@ impl UseKind {
     /// the verb became servable. A **capture** is still excluded, which is
     /// what keeps the high-rate path free of the realm-name clone.
     ///
-    /// A **designation** and an **egress** connection are excluded for the
+    /// A **designation** is in the set since P2.6.6 (issue #190), for the
+    /// reason a launch is: a designated descriptor is delivered *into* the
+    /// realm's shim, so the obligation records which realm and the
+    /// redemption re-asks whether it is still the same live realm -- the
+    /// realm name is resolved at admission, from the grant row, exactly as
+    /// a launch's template is. An **egress** connection is excluded for the
     /// same reason the clone is skipped for a capture and for no other:
-    /// nothing in this build reads a realm for them. Neither can be
-    /// admitted (both verbs are unserved), so the arm that would need the
-    /// realm does not exist yet. It will: a designation is delivered to the
-    /// realm's shim, so P2.6.6 moves `Designate` into this set in the same
-    /// change that gives it somewhere to deliver.
+    /// nothing in this build reads a realm for it. It cannot be admitted
+    /// (the verb is unserved), so the arm that would need the realm does
+    /// not exist yet.
     pub(crate) fn names_a_realm(&self) -> bool {
         self.contends_for_attention() || matches!(self, UseKind::Launch | UseKind::Designate(_))
     }
@@ -1510,10 +1525,9 @@ impl Chokepoint {
                     }
                 }
             }
-            // **Unreachable, and refused rather than asserted.** Neither
-            // `designate_file` nor `egress` is in
-            // [`SERVED_VERB_BITS`](crate::grants::SERVED_VERB_BITS), so no
-            // petition naming either resolves `granted`, so no row carries
+            // **Unreachable, and refused rather than asserted.** `egress` is
+            // not in [`SERVED_VERB_BITS`](crate::grants::SERVED_VERB_BITS),
+            // so no petition naming it resolves `granted`, so no row carries
             // the bit and step 4 refused `not_granted` long before here.
             // Reaching this arm would mean a verb was served without the
             // mechanism behind it -- the exact condition the IDL forbids
@@ -1523,9 +1537,10 @@ impl Chokepoint {
             // unreachable readback failure does: fail closed, never a
             // panic, and never a fabricated success.
             //
-            // This is the arm P2.6.6 (the core-drawn picker) and P2.7.3
-            // (the out-of-core mediating proxy) replace with a mechanism.
-            // Written out rather than left to a wildcard so that neither can
+            // This is the arm P2.7.3 (the out-of-core mediating proxy)
+            // replaces with a mechanism, as P2.6.6 (the core-drawn picker,
+            // issue #190) replaced the `Designate` arm that stood beside it.
+            // Written out rather than left to a wildcard so that it cannot
             // land by widening `SERVED_VERB_BITS` alone: the verb becomes
             // servable and this arm still refuses, loudly, in the log.
             UseKind::Egress => {
@@ -1676,14 +1691,16 @@ impl Chokepoint {
     /// that: both mints and all three facet requests dispatch, and their
     /// authority answer arrives through this one voice like every other.
     ///
-    /// What a designation or an egress refusal can *say* is still narrow,
-    /// and narrow for a reason that is not this function's: both verbs are
-    /// outside [`SERVED_VERB_BITS`](crate::grants::SERVED_VERB_BITS), so
-    /// every such use is refused `not_granted` at step 4 -- an authority
-    /// answer, recoverable, with the connection intact. The mechanisms
-    /// behind the two verbs (P2.6.6's core-drawn picker, P2.7.3's
-    /// out-of-core mediating proxy) are what widen that; a facet is a
-    /// request to ask through, never a mechanism to answer with.
+    /// What an egress refusal can *say* is still narrow, and narrow for a
+    /// reason that is not this function's: `egress` is outside
+    /// [`SERVED_VERB_BITS`](crate::grants::SERVED_VERB_BITS), so every such
+    /// use is refused `not_granted` at step 4 -- an authority answer,
+    /// recoverable, with the connection intact. The mechanism behind the
+    /// verb (P2.7.3's out-of-core mediating proxy) is what widens that; a
+    /// facet is a request to ask through, never a mechanism to answer with.
+    /// A designation refusal was narrow on the same terms until P2.6.6's
+    /// core-drawn picker put `designate_file` in `SERVED_VERB_BITS`; it now
+    /// says whatever the IDL's closed set for designation allows.
     ///
     /// That count read **four** until issue #322 and **five** before that,
     /// and why is worth keeping: the five was written here on the egress
@@ -1861,21 +1878,22 @@ mod tests {
 
     /// **The direct check the exemptions have no other way to get.**
     ///
-    /// Each of these predicates is a `matches!` over the variants, and their
-    /// newest entries -- the `Designate` and `Egress` exemptions -- are
-    /// **unreachable end to end in this build**: `designate_file` and
-    /// `egress` are outside
+    /// Each of these predicates is a `matches!` over the variants, and the
+    /// `Egress` exemptions among them are **unreachable end to end in this
+    /// build**: `egress` is outside
     /// [`SERVED_VERB_BITS`](crate::grants::SERVED_VERB_BITS), so step 4
-    /// refuses `not_granted` before any use of a powerbox or egress facet
-    /// reaches step 5's vacant-realm gate or the realm-name resolution.
-    /// Before this test existed, deleting both from
+    /// refuses `not_granted` before any use of an egress facet reaches
+    /// step 5's vacant-realm gate or the realm-name resolution. The
+    /// `Designate` rows were in the same position until P2.6.6 (issue #190)
+    /// served the verb, and are on a live path now. Before this test
+    /// existed, deleting both from
     /// [`UseKind::refused_by_a_vacant_realm`] was measured to leave every
     /// test in `principal` and in this module green -- documented behaviour
     /// with zero detection, which is the defect class issue #322 is about.
     ///
     /// So the predicate's answer is asserted **per variant, directly**: the
-    /// only reachable check while the verbs are unserved, and the one that
-    /// stays exact when they are served. Each row lists EXACTLY the
+    /// only reachable check while a verb is unserved, and the one that
+    /// stays exact when it is served. Each row lists EXACTLY the
     /// predicates that hold; a predicate absent from a row must answer
     /// false. The values restate the doc comment on each predicate, which
     /// is what makes them worth asserting -- a mutation to the `matches!`
@@ -1936,11 +1954,10 @@ mod tests {
             // row, exactly as a launch's template is -- and the cost is the
             // one realm-name clone this predicate exists to ration.
             //
-            // `contends_for_attention` stays FALSE, deliberately. The IDL
-            // leaves `preempted` and `consent_held` open for designation and
-            // says a server must not read the silence as licence to give
-            // either code a meaning; answering it here would settle a
-            // protocol question inside an enforcement change.
+            // `contends_for_attention` stays FALSE, and since P2.6.6 that is
+            // the IDL's answer rather than a silence preserved: a designation
+            // ask is never refused `preempted` or `consent_held`; a second
+            // card is answered where the card is, by `busy` on the facet.
             (UseKind::Designate(AskedFor::Dir), vec!["names_a_realm"]),
             // An egress connection: unchanged, and exempt from all four --
             // a connection is not made to a window.

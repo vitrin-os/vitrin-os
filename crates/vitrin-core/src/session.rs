@@ -3932,14 +3932,6 @@ fn dispatch_principal<H: RuntimeHost>(
                 // reachable from both.
                 let registry = &kernel.realms;
                 let shim_bin = shim.as_path();
-                // **No picker exists in any deployment yet** (P2.6.6 /
-                // issue #190), so every admitted designation is answered
-                // `internal` here and says so in the log. Written as a real
-                // sink returning `Unavailable` rather than as an absent one,
-                // because the chokepoint's arm must be reachable and exercised
-                // -- a verb that is served with no mechanism behind it is a
-                // condition the IDL names, and it should be visible in the
-                // journal of any deployment that somehow serves the bit.
                 // **The designation sink** (P2.6.6, issue #190): the one
                 // closure through which a wire request can put a picker in
                 // front of the human.
@@ -12865,11 +12857,13 @@ mod tests {
         // the first time this comment has
         // had to write that. Invariant 2 survives it for a reason that is
         // stated rather than assumed: the verb adds no request that arranges,
-        // stacks, or routes anything. It hands out file descriptors. It is
+        // stacks, or routes anything. It hands out file descriptors. It was
         // also refused `unsupported` by every deployment until P2.6.6's picker
-        // and P2.6.8's consent copy exist, so no grant can carry it today --
-        // and `SERVED_VERB_BITS` deliberately does not list it, which is what
-        // makes that fail closed rather than by promise.
+        // landed, so no grant could carry it then -- `SERVED_VERB_BITS`
+        // deliberately did not list it, which is what made that fail closed
+        // rather than by promise. The reference core serves it since P2.6.6
+        // (issue #190), and invariant 2 survives that on the same terms: a
+        // served designation still arranges, stacks and routes nothing.
         //
         // Re-pinned 54 -> 58 by P2.7.2's second half (issue #196), and the
         // decision was taken rather than waved through because this addition

@@ -406,6 +406,60 @@ D-047 reads as the enumeration it was, not as a claim of completeness.
 | **P2.6.11** *(added 2026-08-25 as an in-place correction: a published residual whose named closure went unowned. **Not one of D-047's enumerated changes** — it stands on the two shipped source comments quoted in the next cell, not on a decision entry, and the next entry to touch E2.6 should adopt or reject it.)* | Build the shim-side Landlock stack that two shipped source files already name as the closure of a published residual, and that P2.6.3's closure left with no owner: a second Landlock domain applied by the shim around the app, narrow enough that the app cannot `unlink` and rebind the sockets in `/run/vitrin` that the shim and the core own. **It is a prerequisite of E2.1**: one of the paths it protects is `IN_REALM_A11Y_BUS`, which P2.1.3 will bind, and a bus socket an app can replace is a bus an app can impersonate to the collector. | The residual is published in the code rather than inferred: `crates/vitrin-core/src/spawn.rs` lists it among the three that "travel with" the confinement — "**Within one realm, the app can unlink and rebind any socket in `/run/vitrin`**, including `wayland-0` and the reserved a11y bus path … Blast radius is that one realm; the closure is P2.6.3's shim-side Landlock stack" — and `crates/vitrin-realm-init/src/lib.rs` states it in the same terms at `IN_REALM_A11Y_BUS`, down to naming "P2.6.3's shim-side Landlock stack" as the closure. **P2.6.3 is accepted (Correction 7 below), so the named closure now points at a closed task**, which is how a residual stops being owned by anyone. Mode bits cannot substitute: the shim and the app are one uid inside a single-id map. | P2.6.3, A5 | The app, run inside a realm, cannot `unlink`, `rename` or rebind `/run/vitrin/wayland-0` or `/run/vitrin/a11y-bus` — asserted from inside the realm with the same run proving both operations succeed with the shim-side domain disabled (positive control). Both source comments above are updated to name what closed them, or the residual is republished with its new closure named. | `c-shim` |
 | **P2.6.12** *(added 2026-08-25 by D-047; see §3's realignment of the inversion)* | Re-run both confinement policies against a realm that is actually running the accessibility stack: bring `crates/vitrin-realm-init/src/seccomp.rs`'s deny-list and `crates/vitrin-realm-init/src/landlock.rs`'s ruleset up against a realm running `dbus-daemon` plus the dconf/gsettings machinery Firefox drags in with a11y enabled, and publish what each policy had to widen. | **This is the inversion's second stated benefit, and it was not collected.** §3 put Track C first partly so that both policies would be "brought up against a realm that already runs `dbus-daemon` plus the dconf/gsettings machinery Firefox drags in with accessibility enabled". The inversion ran; both policies shipped against a realm with accessibility **off** — `GTK_A11Y=none`/`NO_AT_BRIDGE=1` are still pinned at every site §3 enumerates, and neither `seccomp.rs` nor `landlock.rs` mentions dbus, dconf, gsettings or AT-SPI anywhere. **It reopens E2.6 rather than belonging to P2.1.3**, on `CLAUDE.md`'s owner-of-the-deliverable rule: the deliverables are P2.6.3's ruleset and P2.6.4's deny-list, not the shim's bus. P2.1.3 is a *precondition* of running it, not its owner. | P2.6.3, P2.6.4, P2.1.3, P2.1.4 | The seccomp table's per-row probe suite (P2.6.4) and the Landlock behavioural rungs both re-run with the private bus and the a11y bridge live, and **every widening is a named row with the escape class it reopens**, not a mask edit. A widening that lands with no row fails the test. If neither policy needs widening, that is the result and it is published as a measurement with the run's evidence — never asserted from the fact that nothing crashed. | `rust-core` |
 
+> **EXECUTED 2026-09-11 BY P2.6.8
+> ([#192](https://github.com/vitrin-os/vitrin-os/issues/192), recorded as
+> [D-048](20-decision-log.md#d-048--the-durable-rungs-stay-unreachable-by-construction-through-the-change-that-will-one-day-inhabit-provenanceref-designate_file-gets-the-consent-copy-it-was-served-without-egresss-copy-is-staged-rather-than-rendered-and-publish_trees-waits-for-a-bit-that-does-not-exist)) — the row's staging rule was overtaken for one of its three
+> verbs, one acceptance criterion was met by a different instrument, and the
+> row above stands as the plan it was.** Appended rather than rewritten, on
+> the convention every block in this document follows.
+>
+> **The Q9 half landed as the row says**, as execution of a decided posture:
+> `provenance = []` in `crates/vitrin-core/Cargo.toml`, enabled by no default,
+> no CI job and no script; a `cfg`-gated proof beside the still-uninhabited
+> `ProvenanceRef` that turns every build red the day a constructor is added
+> outside the gate; and `durable_rungs_are_absent_not_hidden` driven off the
+> generated `WirePersistence::ALL`, which is the row's first criterion met as
+> written. **The second criterion — "a CI feature-matrix check" — is met by a
+> `cargo xtask limits-check` claim** (`durable-rungs-need-a-provenance-value`)
+> holding that nothing under `.github/workflows/`, the integration runner or
+> the xtask entry point enables the feature, **citing the per-feature-set
+> matrix that already exists** (`CI_TEST_RUNS` in
+> `crates/xtask/src/test_census.rs`) rather than building a second one beside
+> it. A second enumerating check is the class of thing this repository has
+> found stops checking.
+>
+> **The Q13 half met the three verbs in three states, and the row's "each
+> shipping admitted-but-refused `unsupported` until its copy exists" held for
+> one of them.** `designate_file` was **already served** when the task started
+> — P2.6.6 ([#190](https://github.com/vitrin-os/vitrin-os/issues/190)) landed
+> the picker first and, because the catalogue test refuses a served verb with
+> no line, carried a minimum line with a comment naming this task as the
+> fuller review's owner; the considered copy now replaces it, with a golden
+> and a fit test, and the staging was never applied to it. That is the
+> exception, recorded here and at §5's Q13 row. `egress` is admitted-but-
+> refused exactly as the row says, and its copy is **staged** in D-048 and on
+> [`19-vitrin_egress.md`](../protocol/19-vitrin_egress.md) for P2.7.3 to land
+> with the proxy and P2.7.4 to amend with the pin. `publish_tree` has **no
+> bit** — P2.4.1 is unlanded — and is deferred to it, with the derived
+> unserved set and the catalogue pin as the fail-closed path when the bit
+> appears; the row's dependency on P2.4.1 and P2.7.2 was the soft coupling
+> #192 recorded it as, and it behaved as one.
+>
+> **The two strings are DERIVED and unsigned.** D-048 records the review's
+> method and carries an owner-sign-off-pending clause; nothing here is an
+> owner decision. **One thing the review found is out of scope and filed:**
+> [#350](https://github.com/vitrin-os/vitrin-os/issues/350) — `designate_file`
+> is admitted at every isolation tier, against the IDL's "a deployment MUST NOT
+> grant a verb it does not enforce", which #192's own "Key decisions" section
+> tied to P2.6.1 and which nothing has built. The copy was
+> written to state the grant's reach rather than the sandbox's so it stays
+> true on every tier. **#348** closes with the same branch's protocol commit,
+> which rewrites the IDL's "still owed" and served-status clauses and sweeps
+> the protocol prose restating them. The §1 block above ("still owed
+> (P2.6.8, Q13)") and the §5 block ("the considered consent copy is still
+> P2.6.8's") are **not** swept: they are dated records and stand, and this
+> block is what supersedes them.
+
 #### P2.6.3, corrected
 
 The row above is the plan as written before the work started. Landing it found
@@ -1323,7 +1377,7 @@ gap below it stays reserved.
 | Q4 delegation depth | before spec 1.0-candidate | P2.3.5 |
 | Q9 standing-grant ergonomics | v0 at E2.6 | P2.6.8 (negative half) + P2.6.10 (positive half) |
 | Q12 egress ergonomics | v0 at E2.7; full by M3 | P2.7.5 |
-| Q13 consent-ladder human factors | review at E2.6 | P2.6.8, widened to **every verb Phase 2 serves** — each new verb ships admitted-but-refused `unsupported` until its copy exists, the staging `observe_cursor` still uses and `layout_*` used until WS-E.1.4 served both |
+| Q13 consent-ladder human factors | review at E2.6 | P2.6.8, widened to **every verb Phase 2 serves** — each new verb ships admitted-but-refused `unsupported` until its copy exists, the staging `observe_cursor` still uses and `layout_*` used until WS-E.1.4 served both. **NOTE 2026-09-11 ([D-048](20-decision-log.md#d-048--the-durable-rungs-stay-unreachable-by-construction-through-the-change-that-will-one-day-inhabit-provenanceref-designate_file-gets-the-consent-copy-it-was-served-without-egresss-copy-is-staged-rather-than-rendered-and-publish_trees-waits-for-a-bit-that-does-not-exist)):** first review done, DERIVED, owner sign-off pending. **The staging rule was not applied to `designate_file`**: P2.6.6 served it before its considered copy existed, under a minimum line the catalogue test forced, and the exception is recorded rather than the rule rewritten. `egress` rode the rule and its copy is staged for P2.7.3; `publish_tree` has no bit and waits for P2.4.1 |
 | Q6 network codec | evaluated during Phase 2 | P2.9.5 |
 
 ---

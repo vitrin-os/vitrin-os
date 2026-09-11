@@ -1169,6 +1169,102 @@ pub(crate) mod tests {
         );
     }
 
+    /// The fixture behind [`consent_prompt_designate_golden`]: one verb,
+    /// `designate_file`, at the `once` rung -- otherwise the same identity,
+    /// realm and expiry as [`prompt_fixture`], so the only thing the two
+    /// goldens differ in is the thing under review.
+    ///
+    /// A separate fixture rather than a flag on `prompt_fixture`, because that
+    /// fixture backs `consent_prompt_golden` and the four goldens already
+    /// committed must not move for this work (D-048): the considered copy
+    /// changes what a `designate_file` card says, and nothing else on any
+    /// card.
+    pub(crate) fn designate_fixture() -> PromptContent {
+        PromptContent {
+            principal: PrincipalIdentity::parse(PROMPT_IDENTITY).expect("fixture identity parses"),
+            realm: RealmId::new(PROMPT_REALM),
+            verbs: Verb::DESIGNATE_FILE,
+            persistence: PersistenceRung::Once,
+            expiry_ms: 60_000,
+            command: None,
+            panel: None,
+        }
+    }
+
+    /// **The P2.6.8 visual golden: a `designate_file` card with the
+    /// considered copy, pinned exactly** (issue #192, D-048; Q13's first
+    /// prompt-design review).
+    ///
+    /// Same harness as [`consent_prompt_golden`], same determinism argument,
+    /// and a separate file: the consent-prompt golden's fixture does not ask
+    /// for `designate_file`, so that golden cannot witness the copy at all,
+    /// and widening its fixture would move a committed artifact for a change
+    /// that is not about it. This one exists so the three-line consequence
+    /// a human actually reads is pinned as pixels, not only as a string --
+    /// `render::every_catalogue_line_fits_untruncated` holds that the line
+    /// is not cut; this holds what it looks like once it is drawn.
+    ///
+    /// Regeneration, only when the copy or the card's design deliberately
+    /// changes, goes through the single documented flow
+    /// (`tests/golden/README.md`):
+    ///
+    /// ```sh
+    /// cargo xtask bless --filter designate
+    /// ```
+    ///
+    /// which drives this test with `VITRIN_REGEN_GOLDEN=1`. The `designate`
+    /// filter matches no other golden test (it also runs two picker-session
+    /// tests that write nothing), so blessing it cannot touch the other four
+    /// goldens by accident.
+    #[test]
+    fn consent_prompt_designate_golden() {
+        let card = render::rasterize(&designate_fixture());
+        let rendered = format!(
+            "# vitrind consent prompt, designate_file -- P2.6.8 visual golden\n\
+             # Regenerate: VITRIN_REGEN_GOLDEN=1 cargo test -p vitrin-core consent_prompt_designate_golden\n\
+             # One character per 8x8 block of the rasterized card, by mean luminance.\n\
+             size {}x{}\n\
+             blake3 {}\n\
+             buttons {}\n\
+             {}",
+            card.width,
+            card.height,
+            ObservationDigest::of(&card.rgba).to_hex(),
+            card.buttons
+                .iter()
+                .map(|b| format!(
+                    "{}@{},{},{}x{}",
+                    b.choice.label().replace(' ', "-"),
+                    b.rect.x,
+                    b.rect.y,
+                    b.rect.w,
+                    b.rect.h
+                ))
+                .collect::<Vec<_>>()
+                .join(" "),
+            ink_map(&card)
+        );
+
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/golden/consent_prompt_designate.txt"
+        );
+        if std::env::var_os("VITRIN_REGEN_GOLDEN").is_some() {
+            std::fs::create_dir_all(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden"))
+                .expect("golden directory");
+            std::fs::write(path, &rendered).expect("golden regeneration must be writable");
+        }
+        let committed = std::fs::read_to_string(path)
+            .expect("committed designate golden exists (regenerate: VITRIN_REGEN_GOLDEN=1)");
+        assert_eq!(
+            committed, rendered,
+            "the rendered designate_file consent prompt no longer matches \
+             crates/vitrin-core/tests/golden/consent_prompt_designate.txt; if the copy or the \
+             prompt's design changed deliberately, regenerate with `cargo xtask bless --filter \
+             designate` and check the ink-map diff"
+        );
+    }
+
     /// **The P2.6.6 visual golden: the picker card, pinned exactly** (issue
     /// #190).
     ///

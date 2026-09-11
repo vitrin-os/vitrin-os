@@ -62,6 +62,57 @@ mechanism is still owed. A client asking for authority nobody serves must get
 an *answer* rather than a dead socket, which is the whole of what defining a
 bit ahead of serving it buys.
 
+## The consent copy, staged and not rendered
+
+This section is the **reference core's** staged rendering of the verb on a
+consent card, not part of the wire contract: what a human is told when a
+petition names `egress` is a property of the server drawing the card, and the
+protocol governs none of it. It is recorded here because the review that
+wrote it (P2.6.8, Q13's first prompt-design review) covered this verb, and
+the record of that review — the method, the facts each clause traces to, and
+the clauses it refused — is
+[D-048](../plan/20-decision-log.md#d-048--the-durable-rungs-stay-unreachable-by-construction-through-the-change-that-will-one-day-inhabit-provenanceref-designate_file-gets-the-consent-copy-it-was-served-without-egresss-copy-is-staged-rather-than-rendered-and-publish_trees-waits-for-a-bit-that-does-not-exist),
+which this section restates and does not override.
+
+**Nothing renders these lines today, and the reason is structural rather than
+a matter of waiting.** The reference core names a verb on a card only from
+its catalogue of served verbs, and a test pins that catalogue to exactly the
+served set: an entry for an unserved verb turns the build red. The verb is
+unserved (the section above), so the copy is staged in prose and lands in
+code in the same change that serves the verb — the first line at P2.7.3, the
+amendment at P2.7.4.
+
+The P2.7.3 line, rendered after the verb's name:
+
+> connect to the host and port named above as often as its rate limit allows, without asking you again - revoking this grant stops new connections but cannot undo what it already sent or received
+
+The P2.7.4 amendment, appended once addresses are pinned into the grant row
+(the `pinned_addrs` column the verb's IDL entry marks *specified but not
+implemented*):
+
+> ` - it reaches only the addresses that name pointed to when you approved`
+
+Three things P2.7.3 owes with the line, named here so the line is not landed
+without them:
+
+- **The revocation clause is to be verified against what the proxy actually
+  does.** [What an egress grant does not bound](#what-an-egress-grant-does-not-bound)
+  says live connections are torn down on revocation *by design*, and that
+  nothing implements either half. If the proxy closes live connections,
+  "stops new connections" may become "cuts it off"; if it does not, the
+  staged wording stays. What may never change is the last clause: revocation
+  does not reach bytes already exchanged.
+- **"named above" is a field, not a wording.** The card must show the
+  grant's single `net:` endpoint, and the core's card content has no slot for
+  it. The precedent is `realm_launch`, whose per-grant program is a separate
+  labelled field on the card — never a format string and never a free-text
+  path — and the endpoint gets a labelled field the same way, in the same
+  change.
+- **Not said, deliberately: "nothing else on the network".** That is a claim
+  about the realm's network namespace, which is a property of the sandbox
+  rather than of the grant, and it is false at the `--isolation=off` tier. The
+  line states what the grant confers and stays true on every tier.
+
 ## A separate interface from the filesystem powerbox
 
 `interface/@verb` is **one value per interface**. An interface declaring

@@ -1362,31 +1362,34 @@ mod tests {
         // the ones it does not implement. The failure this guards is the
         // silent one: accepting the bit and enforcing nothing.
         //
-        // **Three bits now**, and every movement in either direction was a
-        // decision rather than a subtraction: WS-E.1.4 (issue #210) served the
-        // layout pair, and WS-E.1.1 (issue #207) served `realm_launch` once
-        // the core gained the spawn path, the realm cap and the consent copy
-        // its absence used to stand for. `observe_cursor` stays, because
-        // per-principal cursor delivery is still M2's. `designate_file`
-        // JOINED at P2.6.5 (issue #189): the bit is on the wire so a petition
-        // for it is an answer rather than a connection death, and it is
-        // refused here until P2.6.6's picker and P2.6.8's consent copy exist.
-        // `egress` **joined**
-        // at P2.7.2 (issue #196) on the same terms: the bit is on the wire so
-        // a petition for
-        // it is answered rather than killed, and this core enforces nothing
-        // by it — the mediating proxy is P2.7.3's — so admission refuses it,
-        // whole.
+        // **Two bits now -- `observe_cursor` and `egress`** -- and every
+        // movement in either direction was a decision rather than a
+        // subtraction: WS-E.1.4 (issue #210) served the layout pair, and
+        // WS-E.1.1 (issue #207) served `realm_launch` once the core gained
+        // the spawn path, the realm cap and the consent copy its absence used
+        // to stand for. `observe_cursor` stays, because per-principal cursor
+        // delivery is still M2's. `designate_file` JOINED at P2.6.5 (issue
+        // #189) -- the bit was on the wire so a petition for it was an answer
+        // rather than a connection death -- and LEFT at P2.6.6 (issue #190)
+        // when the core-drawn picker gave the chokepoint a sink; its
+        // considered consent copy landed at P2.6.8 (issue #192, D-048), so
+        // the verb is served on both of Q13's grounds. `egress` **joined** at
+        // P2.7.2 (issue #196) on the same terms as the P2.6.5 join: the bit
+        // is on the wire so a petition for it is answered rather than
+        // killed, and this core enforces nothing by it — the mediating proxy
+        // is P2.7.3's — so admission refuses it, whole.
         //
-        // Both joins are the fail-closed default working rather than a
+        // Both joins were the fail-closed default working rather than a
         // separate rule: `UNSERVED_VERB_BITS` is derived from
         // `Verb::VALID_MASK`, so each new bit was unserved the moment the IDL
         // defined it, and `SERVED_VERB_BITS` was not touched by either task.
+        // (The P2.6.6 leave is the opposite move and had to be made by hand,
+        // which is the point: a bit joins the served set only when a human
+        // adds it to that constant.)
         //
-        // This is also the whole of those tasks' core-side behaviour, so it is
-        // asserted rather than assumed: a petition naming either bit
-        // resolves `unsupported`, alone and mixed, on the same terms
-        // `observe_cursor` does.
+        // This is also the whole of the unserved verbs' core-side behaviour,
+        // so it is asserted rather than assumed: a petition naming either bit
+        // resolves `unsupported`, alone and mixed, on identical terms.
         let t0 = t0();
         let mut reg = registry(ConsentPolicy::AutoApprove);
         let conn = reg.register_connection();

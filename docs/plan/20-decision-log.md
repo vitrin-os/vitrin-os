@@ -1655,6 +1655,51 @@ Three findings from that run carry the reasoning below, and they have three diff
 > D-038's own status is unchanged by it: still decided and unbuilt, with the
 > confinement clause discharged by this entry on 2026-08-24.
 
+> **CORRECTED 2026-09-11 BY P2.6.7
+> ([#191](https://github.com/vitrin-os/vitrin-os/issues/191)): FINDING 1'S
+> COUNT IS NOW TWO, AND THE MEASUREMENT ABOVE IS LEFT AS THE DATED RECORD IT
+> IS.** Everything above stands as written; this block corrects the reading
+> of exactly one number, appended rather than edited in place for the reason
+> the two amendments above give.
+>
+> **What was measured is unchanged and still true of its date.** Finding 1
+> says a walk of the realm's whole filesystem *"found exactly **one** AF_UNIX
+> inode, the shim's own `/run/vitrin/wayland-0`"*, and decision 1 leans on it:
+> *"after it, finding 1 above is still true — a walk of the realm's tree finds
+> exactly one AF_UNIX inode, the shim's — because the connection never becomes
+> an inode at all."* On 2026-08-23 that was the count, and the reasoning that
+> follows from it — a descriptor route adds **no** inode, a bind-mount route
+> would — is untouched.
+>
+> **What changed the count is not this decision.** P2.6.7 landed the shim's
+> designation relay: `vitrin-shim` now binds a **second** socket beside the
+> Wayland one, `/run/vitrin/designation.sock`, before the app is forked, and
+> hands each `vitrin_shim_session.designation` down it over `SCM_RIGHTS`. It
+> is the shim's own, it lives in the same runtime directory under the same
+> Landlock grant, and it is announced by nothing — so a walk of the realm's
+> tree now finds **exactly the shim's two sockets**, and the standing
+> statement of what an app realm is handed is *its own shim's two sockets and
+> nothing else*. `tests/integration/p311_principal_socket_reach.py` allow-lists
+> both by derivation from `$WAYLAND_DISPLAY` and refuses a run in which the
+> second was not found — or was found but not answered by the kernel as a live
+> `SOCK_SEQPACKET` socket (`EPROTOTYPE` to its `SOCK_STREAM` probe, which the
+> kernel returns only after locating a live socket by inode) — so the
+> instrument asserts the new count rather than tolerating it. The measurement
+> table in
+> `tests/integration/README.md` is **not re-run** by this correction: its
+> `1 socket` cells are the 2026-08-23 reading and say so.
+>
+> **Decision 1's argument survives with the number replaced.** The property
+> it needs is *"the principal connection adds no inode"*, not *"there is one
+> inode"*; two sockets the shim binds itself are as consistent with an
+> inherited-descriptor route as one was, and the refusal of the bind-mount
+> route (a socket that *would* become an inode the ruleset governs) reads the
+> same against either count. What a shell realm may reach that an app realm
+> may not is still exactly one thing. `docs/book/src/limits.md` states the
+> corrected count as current fact and `cargo xtask limits-check`
+> (`app-realm-is-handed-the-shims-two-sockets`) holds this entry to keeping
+> **both** numbers — the measured one above, unedited, and this block.
+
 
 ---
 

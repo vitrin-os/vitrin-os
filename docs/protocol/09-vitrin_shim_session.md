@@ -603,25 +603,172 @@ The core's half of a completed designation: an agent holding
 [`designate_file`](./04-vitrin_grant.md#verb) asked, the human chose in the
 core-drawn picker, and this event delivers the resulting descriptor into the
 realm. The shim relays it to its app over the realm's own designation socket
-(P2.6.7); it is the app, not the shim, that the descriptor is for.
+(`designation.sock`, P2.6.7 — [what the app connects to](#what-the-app-connects-to)
+is below); it is the app, not the shim, that the descriptor is for.
 
-**The shipped shim receives this event as of P2.6.6.** It was the first
+**The shipped shim receives this event and relays it, as of P2.6.7
+(#191).** The receive side landed at P2.6.6: `designation` was the first
 fd-bearing core→shim event this protocol ever defined, and until it landed the
 shim's transport carried `SCM_RIGHTS` on the send side only — an arriving
 descriptor was a violation, closed immediately, and then fatal. That is no
-longer true: `shim/include/wire.h` now carries a pending-fd queue, and a
-handler claims the descriptor by writing `-1` through its `int *fd`. A handler
-that does not claim one still closes it, so the transport leaks nothing when a
-message it does not serve arrives bearing a descriptor.
+longer true: `shim/include/wire.h` carries a pending-fd queue, a handler claims
+the descriptor by writing `-1` through its `int *fd`, and one that does not
+claim it has it closed by the transport the moment the handler returns. The
+relay (`shim/src/designation.c`) deliberately **never claims**. The
+descriptor's lifetime in the shim is the handler's stack frame: `sendmsg` with
+`SCM_RIGHTS` takes its own reference to the open file before queueing and keeps
+none on any failure, so the transport's unconditional close is correct on every
+outcome — the IDL's *"close it once relayed, or immediately on any path that
+does not relay it"* made structural rather than a habit the relay has to keep.
+A `designation` sent to the shipped shim is therefore received, decoded,
+relayed to the app if one is connected, and closed in the shim either way.
 
-What the shim does **not** yet have is the relay: the per-realm
-`designation.sock` that hands the descriptor on to the app is P2.6.7 (#191),
-and until it lands the shim receives the descriptor and closes it. A
-`designation` sent to today's shim is therefore received and accounted for,
-and does not reach the app
-rather than delivering it. Nothing is lost by it today — no deployment serves
-`designate_file`, so the core never sends the event — and the receive-side
-machinery is part of what **P2.6.7** owes alongside the designation socket.
+#### What the app connects to
+
+**This is the reference shim's contract, not the protocol's.** Nothing below
+is in the IDL: the wire between core and shim is unchanged by it, and the IDL
+already says only that the shim relays over *"the realm's own designation
+socket"*. `vitrin-shim` fixes what that socket is; an alternate shim MAY relay
+differently, and an app written against this socket is written against
+`vitrin-shim`. It is stated here rather than in a shim-internal comment
+because it is the one thing a powerbox-aware app has to know, and it is
+decodable with the Apache-2.0 generated header alone — no copyleft code is
+needed to receive a designation.
+
+- **Where.** `$XDG_RUNTIME_DIR/designation.sock` — a sibling of the Wayland
+  socket, `dirname(<wayland socket>)/designation.sock` (the shim takes that
+  name from `--socket` or from the `WAYLAND_DISPLAY` the core sets; the core
+  passes no flag), which at `--isolation=default`
+  is the constant `/run/vitrin/designation.sock`
+  (`crates/vitrin-realm-init`'s `IN_REALM_DESIGNATION_SOCKET`). **Announced by
+  nothing**: no flag, no environment variable and no argv element carries the
+  path; the app finds it by the same convention that finds `wayland-0`. The
+  socket is bound, verified and listening before the app is forked, so it is
+  there from the app's first instruction.
+- **What.** `AF_UNIX`, **`SOCK_SEQPACKET`**, node mode `0700` (set by `fchmod`
+  before `bind` and verified after it, or the shim refuses to start). That is
+  stricter than `wayland-0`, whose node mode is umask-derived and whose
+  protection is the `0700` directory around it. `SEQPACKET` so that *one
+  message = one designation frame + one descriptor* is enforced by the kernel
+  rather than by a shim habit: a message lands whole or not at all, and the app
+  never reassembles a stream. Listen backlog 8.
+- **One connection at a time, and the first holds until it closes.** A second
+  connection while one is held is accepted and closed at once — the connector
+  sees EOF, never a hang — and the shim's ledger records `refused_occupied`.
+  Every process in the realm is one trust domain, so no rule about *which*
+  connection receives changes any authority; first-holds is chosen because
+  the loser finds out. **Connect at startup and hold the connection for the
+  app's lifetime: there is no signal that a designation is coming.**
+- **No queue in the shim.** A designation arriving while no connection is
+  held is closed, not held (`no_client`): any shim-side hold would pin a file
+  for a time the app controls, which is exactly the residue the core cannot
+  take back. The only queue is the kernel's, owned by the held connection,
+  and it is bounded by the **shim's send buffer**, not by a message count: a
+  connected app that does not read pins designations — each with its
+  descriptor — in the kernel until the shim socket's `SO_SNDBUF`
+  (`net.core.wmem_default`, 212992 bytes on a default-tuned kernel; a few
+  hundred messages at these frame sizes, 278 measured) is full, then the next
+  send fails `EAGAIN`, the shim drops that connection and the slot is free
+  again. `net.unix.max_dgram_qlen` does **not** apply: the kernel skips that
+  per-message check for a peer connected back to the sender, which a
+  `SEQPACKET` connection is.
+- **One message per designation.** The byte-identical
+  `vitrin_shim_session.designation` frame the core sent — header included
+  (`object_id` 1, opcode 4, `fd_count` 1), so 8 + 12 bytes plus the `name`
+  string with its 4-byte length prefix, padded to a multiple of 4: 40 bytes
+  for a 14-byte name, at most 280 — as one iov, plus exactly one `SCM_RIGHTS`
+  descriptor. On
+  the shim side it is one `sendmsg(MSG_NOSIGNAL | MSG_DONTWAIT)`; any failure
+  (`EAGAIN`, `EPIPE`, `ECONNRESET`, `ETOOMANYREFS`, …) drops the held
+  connection, and nothing was queued and no reference was kept, so the
+  transport's close is the only one owed.
+- **It accepts nothing.** It is a delivery endpoint, not a request channel:
+  a designation originates at the human's gesture, and an app cannot ask for
+  a file over it. Anything the app writes is read once, discarded, and the
+  connection closed (`wrote_and_closed`). Descriptors an app attaches to such
+  a write are dropped by the kernel and never installed in the shim, because
+  the drain is a `recv(2)` with no control buffer (`MSG_TRUNC`, so the
+  recorded `bytes=N` is the message's real length). A zero-length message
+  counts as a write too, and is told apart from EOF with `POLLRDHUP`.
+
+**Version pin.** What crosses this socket is the `designation` event **at
+protocol version 2, verbatim**. The app never negotiated a version — it has no
+connection to the core and no handshake of its own — so if this event ever grows
+(a `since="3"` sibling with more arguments, per
+[§7.4](./00-conventions.md#74-growth-rules-wayland-style)), the shim owes a
+re-encode at version 2 on this socket rather than a verbatim relay of the
+newer frame. `object_id` is always `1` (`VITRIN_SESSION_ID`) and the app
+ignores it; `VITRIN_SHIM_SESSION_EVT_DESIGNATION_SINCE` is `2`.
+
+**Receive contract.** One `recvmsg` with an iov of at least 280 bytes and
+`CMSG_SPACE(sizeof(int))` of control space, with `MSG_CMSG_CLOEXEC`, receives
+exactly one designation. A smaller iov sets `MSG_TRUNC` and the rest of that
+message is gone — there is no re-read on `SEQPACKET`. A control buffer too
+small for the descriptor sets `MSG_CTRUNC` and means the kernel has **already
+closed** the descriptor (lost, not leaked): the generated decoder is then
+handed `-1` and reports `VITRIN_DECODE_ERR_FD_MISMATCH`. The decoder takes the
+whole frame, header included, validates opcode, size and `fd_count == 1`
+against the descriptor it was given, and rejects trailing bytes. The decoded
+`name` is a borrowed view into the receive buffer. Ownership of the descriptor
+transfers to the app, which MUST close it — and it shares its file offset with
+the asking agent's copy (below), so positional I/O or a fresh `openat` are the
+app's tools, never `dup`.
+
+```c
+/* Receive one designation from $XDG_RUNTIME_DIR/designation.sock.
+ * Needs only shim/include/vitrin-protocol.h (Apache-2.0). `frame` must
+ * outlive `out`: out->name borrows it. Returns 0 and a descriptor the caller
+ * owns in out->fd; -1 with the descriptor closed on any failure. */
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#include "vitrin-protocol.h"
+
+static int receive_designation(int sock, uint8_t frame[280],
+                               vitrin_shim_session_evt_designation_t *out)
+{
+    union { struct cmsghdr h; uint8_t buf[CMSG_SPACE(sizeof(int))]; } ctl;
+    struct iovec iov = { .iov_base = frame, .iov_len = 280 };
+    struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1,
+                          .msg_control = ctl.buf,
+                          .msg_controllen = sizeof ctl.buf };
+    ssize_t n = recvmsg(sock, &msg, MSG_CMSG_CLOEXEC);
+    if (n <= 0)                 /* 0: the shim dropped this connection (EOF); */
+        return -1;              /* <0: EINTR/EAGAIN retry, anything else is gone */
+    int fd = -1;                /* MSG_CTRUNC leaves it -1: the kernel closed it */
+    for (struct cmsghdr *c = CMSG_FIRSTHDR(&msg); c; c = CMSG_NXTHDR(&msg, c))
+        if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS)
+            memcpy(&fd, CMSG_DATA(c), sizeof fd);
+    uint32_t object_id;         /* always VITRIN_SESSION_ID (1); ignore it */
+    vitrin_decode_status_t st = vitrin_shim_session_evt_designation_decode(
+        frame, (size_t)n, fd, &object_id, out);
+    if (st != VITRIN_DECODE_OK) {   /* MSG_TRUNC lands here as size_mismatch, */
+        if (fd >= 0)                /* MSG_CTRUNC as fd_mismatch                */
+            close(fd);
+        return -1;
+    }
+    return 0;   /* out->fd, out->designation_id, out->kind, out->mode, out->name */
+}
+```
+
+**Reachability at `--isolation=off`, stated because the bullet above says
+"announced by nothing" and not "unreachable from outside".** At
+`--isolation=default` the socket lives in the realm's private runtime
+directory, which the realm's mount namespace presents at `/run/vitrin`; the
+host spelling of that directory names the same inode, so the honest claim is
+that nothing announces it, not that nothing outside the realm can name it. At
+`--isolation=off` there is no namespace: the socket is at
+`$XDG_RUNTIME_DIR/vitrin-0/<realm_id>/designation.sock` on the host, under a
+`0700` directory of the operator's uid, and **any process of that uid can
+connect first** and receive the realm's designations — the same standing the
+Wayland socket beside it already has in that mode. The shim's ledger records
+which case a run was in (`designation-sock: … tier=in-realm` or
+`tier=host-path`), and the limits page carries it as a published limit.
+
+**What this socket is not.** It carries no path-expecting compatibility layer:
+a legacy application that wants a filename gets no designation in v0, and the
+FUSE synthetic-path view that would give it one (PRD Doc 2 §12) is E3.6's.
+The v0 audience is a powerbox-aware app that connects here at startup.
 
 **Exactly one fd per event**, which is the framing invariant rather than a
 property of this signature ([conventions § 2.4](./00-conventions.md)). A

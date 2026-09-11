@@ -90,17 +90,24 @@ here rather than left to be discovered:
    on the two that did not, plus the mode, the grant row, the principal and the
    realm.
 
-# The realm's half ends at the shim today, and that is disclosed
+# The realm's half ends at the shim in THIS gate, and that is disclosed
 
 The core sends the same descriptor twice: once to the asking agent, once to the
 realm's shim as `vitrin_shim_session.designation`. The shim's half is real here
 -- a real `vitrin-shim` decodes the event and its own log says so, which this
 gate asserts, because that is the only witness available on the far side of
-that wire. What the shim then does is **close it**: the per-realm
-`designation.sock` is P2.6.7 (issue #191) and does not exist, so the app never
-receives it. The assertion below therefore greps for the shim's decode --
-designation id, kind, mode and name length -- and not for the disposition,
-which #191 will change.
+that wire. The per-realm `designation.sock` exists as of P2.6.7 (issue #191):
+the shim binds it before the app is forked and relays each designation to
+whichever app holds a connection on it. The realm's app in this gate is
+`click-target`, which never connects, so the disposition the shim logs for
+every designation here is `CLOSED, not relayed: no app is connected` -- the
+app's choice, not the shim's -- and the app never receives it. The assertion
+below greps for the shim's decode -- designation id, kind, mode and name
+length -- and not for the disposition, so it stays a witness of the wire and
+not of which app this gate happens to spawn. The app-side proof that a
+powerbox-aware app receives over `designation.sock` under a real core is
+P2.6.9's (`test_real_ransomware.py`, unwritten); the component-level proof
+against `shim/tests/mock_core.c` is `shim/tests/acceptance/designation_relay.sh`.
 
 # What this gate does NOT prove
 
@@ -1418,8 +1425,11 @@ class RealPowerboxDesignation(IntegrationTest):
 
         # The far side of the second SCM_RIGHTS half: a REAL C shim decoded the
         # event. The needle is the decode -- id, kind, mode, name length -- and
-        # not the disposition, which P2.6.7 (#191) will change from "closed" to
-        # "relayed".
+        # not the disposition. Since P2.6.7 (#191) the line continues with one
+        # of three dispositions, and here it is "CLOSED, not relayed: no app is
+        # connected", because click-target never connects to designation.sock;
+        # pinning that suffix would make this gate a witness of which app it
+        # spawns rather than of the wire.
         realm_log = core.app_output("realm-0")
         want = (
             f"designation {designated.designation_id} arrived "

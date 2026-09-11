@@ -176,6 +176,33 @@ tree, it exports a name space.
   an fd, and E3.7 must not read it as evidence that the residue has been
   observed.
 
+> **CORRECTED 2026-09-11 BY P2.6.7
+> ([#191](https://github.com/vitrin-os/vitrin-os/issues/191)) — one item of
+> the "does not exist" list exists, and the block above stands as the dated
+> record it is.** The **shim's per-realm relay** is in the tree this block
+> ships in — #191 closes when the branch carrying it merges, which a block
+> here cannot record in advance: `shim/src/designation.c` serves
+> `$XDG_RUNTIME_DIR/designation.sock` (`/run/vitrin/designation.sock` at
+> `--isolation=default`, reserved as `IN_REALM_DESIGNATION_SOCKET` in
+> `crates/vitrin-realm-init`), one `SOCK_SEQPACKET` connection at a time, and
+> relays each `vitrin_shim_session.designation` verbatim with its descriptor
+> over `SCM_RIGHTS`; the app-facing contract is on
+> [`09-vitrin_shim_session.md`](../protocol/09-vitrin_shim_session.md#what-the-app-connects-to).
+> Its evidence is a **component test** against `shim/tests/mock_core.c`
+> (`shim/tests/acceptance/designation_relay.sh`), labelled as such wherever it
+> is listed, and never gate evidence: the mock-free rung that reaches an app
+> through a real core is ★P2.6.9's. The **core-drawn picker** on the same
+> list is P2.6.6's ([#190](https://github.com/vitrin-os/vitrin-os/issues/190));
+> its code is in the tree this block ships in, and its status is P2.6.6's
+> own row's to record, not this block's. **The last sentence of the third bullet
+> is the one this block reaches:** "the fd/socket delivery path" is no longer a
+> dependency on open issues on the designation side — the picker mints, the
+> chokepoint arm carries, the shim relays — and E3.5/E3.6 may name it as
+> landed for *designation*, while the egress half (#197, #198) is as open as
+> the bullet says. C5's exported limitation is now a statement about a
+> mechanism that **has** delivered an fd; E3.7 still must not read that as the
+> residue having been *observed* outliving a grant, which no test has done.
+
 ---
 
 ## 2. Epics and tasks

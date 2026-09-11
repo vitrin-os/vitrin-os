@@ -223,24 +223,46 @@ correlate, in the one direction this protocol otherwise keeps closed: the app
 is the least-trusted process in the system, with no petition, no grant, and no
 name for any principal.
 
+**One residual survives that, and it is published rather than fixed.**
+`designation_id` is a session-global counter minted when an ask is *admitted*,
+not when it is answered, and it is the same number on both halves. So an app
+that receives ids 7 and 12 learns that four asks — by any principal, for any
+realm — were admitted between its two designations: not who asked, not what
+for, not whether the human approved any of them, but that they happened and
+how many. It is one low-bandwidth cross-principal observation, of the same
+family as [`vitrin_grant.refusal.capacity`](./04-vitrin_grant.md#refusal)'s,
+and it is core-side: no shim can remove it, since the id is the correlation
+key the journal and the agent's `designated` both carry, and the IDL says an
+app must treat it as opaque and *"must not be parsed or predicted"*. A
+deployment that cannot afford it needs a per-realm id space, which is not
+this core's.
+
 The shim relays rather than the core serving the app directly (P2.6.7): giving
 the least-trusted process a socket into the TCB would add an attacker-facing
 surface to the core for no gain, while the shim is already the app's
 confinement peer and holds nothing it did not already hold.
 
-**The shipped shim receives the second half as of P2.6.6.** `designation` is
-the first fd-bearing core→shim event this protocol ever defined, and until it
-landed the shim's transport implemented `SCM_RIGHTS` on the send side only: an
-arriving descriptor was a violation, closed immediately, and then fatal. The
-transport now carries a pending-fd queue and a handler claims a descriptor by
-writing `-1` through its `int *fd`; one that does not claim it closes it, so
-nothing leaks. What is still owed is the **relay** — the per-realm
-`designation.sock` that hands the descriptor to the app is P2.6.7 (#191), so
-today's shim receives the descriptor and closes it rather than passing it on.
-It costs
-nothing today — no deployment serves the verb, so the core never sends the
-event — and the receive-side machinery, along with the per-realm designation
-socket, is what **P2.6.7** owes.
+**The shipped shim receives the second half and relays it, as of P2.6.7
+(#191).** `designation` was the first fd-bearing core→shim event this protocol
+ever defined; P2.6.6 gave the shim's transport a receive-side pending-fd queue
+(a handler claims a descriptor by writing `-1` through its `int *fd`, and one
+that does not claim it has it closed the moment it returns), and P2.6.7 built
+the relay on top of it. The reference shim serves one `AF_UNIX`
+`SOCK_SEQPACKET` socket at `$XDG_RUNTIME_DIR/designation.sock` — a sibling of
+`wayland-0`, announced by nothing, mode `0700`, bound before the app is forked
+— holds **one** connection at a time (the first holds until it closes; a
+second is accepted and closed with EOF), queues nothing itself (a designation
+with no connected app is closed, and a connected app that does not read pins
+them in the kernel only until the shim socket's send buffer is full — a few
+hundred — before the connection is dropped), and relays each designation as
+**one message**: the byte-identical
+`vitrin_shim_session.designation` frame at protocol version 2, plus exactly one
+`SCM_RIGHTS` descriptor. The socket accepts nothing back. The full app-facing
+contract — the version pin, the receive contract and a C snippet decodable
+with the Apache-2.0 header alone — is on the shim-session page under
+[*What the app connects to*](./09-vitrin_shim_session.md#what-the-app-connects-to);
+that is the reference shim's contract and not this protocol's, and an
+alternate shim MAY relay differently.
 
 ## Revocation cannot recall a delivered descriptor
 

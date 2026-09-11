@@ -51,9 +51,12 @@
  * soon as the handler returns. A handler that forgets the argument entirely
  * therefore cannot leak, and neither can the fatal paths, which close the
  * pending queue as they poison the connection. Relaying the descriptor onward
- * to the app, over the realm's own designation socket, is P2.6.7's (issue
- * #191); until that lands the shim logs the arrival and lets this transport
- * close the fd, so the app never sees it.
+ * to the app, over the realm's own designation socket, is designation.c's
+ * (P2.6.7, issue #191) -- and it, too, never claims: `sendmsg` with
+ * SCM_RIGHTS takes the kernel's own reference or none, so this transport's
+ * close after the handler returns is the right close on success and failure
+ * alike, and the shim never holds a designated descriptor past the handler's
+ * stack frame.
  *
  * BLOCKING MODE. The descriptor is non-blocking from the moment it is
  * adopted, and stays that way. The one synchronous read the protocol

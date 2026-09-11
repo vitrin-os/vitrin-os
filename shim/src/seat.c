@@ -117,8 +117,10 @@ _Static_assert(VITRIN_SHIM_SEAT_EVT_GESTURE_END_OPCODE < VITRIN_SEAT_EVENT_SLOTS
  *
  * One of the six IS a core -> shim event carrying an fd -- `designation`, the
  * first in this protocol. It does not reach this file (it is addressed to
- * VITRIN_SESSION_ID, not to the seat), and this transport does not implement
- * receiving an fd at all; see `wire.h` for what P2.6.7 owes there.
+ * VITRIN_SESSION_ID, not to the seat): the transport receives it (wire.c's
+ * pending-fd queue, landed by P2.6.6 for the event P2.6.5 defined) and
+ * upstream.c hands it to designation.c, which
+ * relays it to the app over the realm's own socket (P2.6.7).
  *
  * Re-pinned 54 -> 58 by P2.7.2 (issue #196), with the same check made against
  * all four added messages: `vitrin_grant.get_egress` is a REQUEST on the grant

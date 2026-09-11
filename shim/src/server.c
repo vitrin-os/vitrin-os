@@ -111,6 +111,18 @@ void vitrin_shim_finish(struct vitrin_shim *s) {
 	 * gives the core its EOF -- the shim-death signal its lifecycle layer
 	 * (P1.5.3) reads -- as early as we can honestly send it. */
 	vitrin_upstream_finish(s);
+	/* The designation relay AFTER the upstream link and BEFORE the display
+	 * goes. After the upstream, because the wire is the only thing that hands
+	 * this relay a designation, and once its source is gone nothing can
+	 * dispatch into a relay that has closed its connection -- the ordering
+	 * that would have to be defended otherwise is "a batched frame arrives
+	 * between the relay closing and the wire closing", and this makes it
+	 * unwritable. Before the display, because the listener, the held
+	 * connection and the retry timer are sources on the display's event
+	 * loop, and removing them after `wl_display_destroy` would touch freed
+	 * memory. It closes descriptors only and never unlinks the node
+	 * (designation.h). */
+	vitrin_designation_finish(s);
 	if (s->display != NULL) {
 		wl_display_destroy_clients(s->display);
 		/* The globals ledger dumps between the two: its client-destroy

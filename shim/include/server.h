@@ -24,6 +24,7 @@
 #include "ledger.h"
 #include "clipboard.h"
 #include "constraint.h"
+#include "designation.h"
 #include "idle.h"
 #include "seat.h"
 #include "upstream.h"
@@ -106,6 +107,14 @@ struct vitrin_shim {
 	 * bound, because all the interesting traffic is a client's first
 	 * roundtrip. */
 	struct vitrin_ledger ledger;
+
+	/* The per-realm designation relay (P2.6.7, designation.h): the
+	 * `designation.sock` listener, the one held app connection, and the
+	 * retry timer. Brought up right after the ledger and before the Wayland
+	 * socket is bound, so a designation the core batched behind `configure`
+	 * meets an initialised relay. Nothing here speaks upstream at all: the
+	 * flow is core -> shim -> app only, and the socket accepts nothing. */
+	struct vitrin_designation designation;
 
 	/* Phase A -- core. */
 	struct wl_display *display;

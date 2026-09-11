@@ -22,9 +22,13 @@
  * to catch. It also sees the version the client ASKED for, which the bind
  * callback does not: libwayland clamps before calling it.
  */
-#define _POSIX_C_SOURCE 200809L
+/* _GNU_SOURCE rather than _POSIX_C_SOURCE: `strerrorname_np`, the fallback
+ * in `vitrin_ledger_errno_name`, is a GNU extension. */
+#define _GNU_SOURCE
 
+#include <errno.h>
 #include <stdarg.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -67,16 +71,20 @@
  * worth diagnosing are the ones that die moments later, so those are flushed
  * immediately. Routine INFO/DEBUG records are not: a flush per record meant a
  * write(2) per bind, and bind rate is the client's to choose. Teardown
- * flushes and closes, so nothing is lost on any ordinary exit. */
-static void record(struct vitrin_shim *s, enum wlr_log_importance level,
-		const char *fmt, ...) __attribute__((format(printf, 3, 4)));
-static void record(struct vitrin_shim *s, enum wlr_log_importance level,
-		const char *fmt, ...) {
+ * flushes and closes, so nothing is lost on any ordinary exit.
+ *
+ * ...AND FOR EVERY `designation-*` RECORD, at any level (`record_live` below).
+ * The bind-rate argument does not apply to them: `designation-relay` is paced
+ * by a human choosing in the picker, and `designation-client` is capped at
+ * VITRIN_LEDGER_DEMAND_RECORDS per event kind (ledger.h), so the most an app
+ * can extract is a few dozen write(2)s per run. Flushing them is what lets the
+ * relay's acceptance script read the ledger LIVE and sequence "the shim
+ * relayed it" against the client's own account, instead of waiting for a
+ * teardown that a stalled or lingering client controls the timing of. */
+static void record_v(struct vitrin_shim *s, enum wlr_log_importance level,
+		bool flush, const char *fmt, va_list ap) {
 	char line[512];
-	va_list ap;
-	va_start(ap, fmt);
 	vsnprintf(line, sizeof(line), fmt, ap);
-	va_end(ap);
 
 	for (char *p = line; *p != '\0'; p++) {
 		unsigned char c = (unsigned char)*p;
@@ -88,10 +96,32 @@ static void record(struct vitrin_shim *s, enum wlr_log_importance level,
 	wlr_log(level, "%s", line);
 	if (s->ledger.sink != NULL) {
 		fprintf(s->ledger.sink, "%s\n", line);
-		if (level <= WLR_ERROR) {
+		if (flush || level <= WLR_ERROR) {
 			fflush(s->ledger.sink);
 		}
 	}
+}
+
+static void record(struct vitrin_shim *s, enum wlr_log_importance level,
+		const char *fmt, ...) __attribute__((format(printf, 3, 4)));
+static void record(struct vitrin_shim *s, enum wlr_log_importance level,
+		const char *fmt, ...) {
+	va_list ap;
+	va_start(ap, fmt);
+	record_v(s, level, false, fmt, ap);
+	va_end(ap);
+}
+
+/* `record`, flushed regardless of level. Reserved for the `designation-*`
+ * records; see the flush policy above for why those and no others. */
+static void record_live(struct vitrin_shim *s, enum wlr_log_importance level,
+		const char *fmt, ...) __attribute__((format(printf, 3, 4)));
+static void record_live(struct vitrin_shim *s, enum wlr_log_importance level,
+		const char *fmt, ...) {
+	va_list ap;
+	va_start(ap, fmt);
+	record_v(s, level, true, fmt, ap);
+	va_end(ap);
 }
 
 /* The Wayland interface-name grammar. Names come from two places: our own
@@ -711,6 +741,190 @@ static void on_client_created(struct wl_listener *listener, void *data) {
 	}
 }
 
+/* ---- the designation relay's records (P2.6.7, issue #191) --------------
+ *
+ * Emitted from designation.c through these, so `record()` stays static and
+ * the grammar (ledger.h) stays in one file. Every one of them is flushed
+ * (`record_live`), for the reason given at the flush policy above. */
+
+/* The errnos this relay can meet, by name. A hand-written table rather than
+ * `strerrorname_np` alone because the ledger is a parser contract and the
+ * spelling of `errno=NAME` must not depend on the C library the shim was built
+ * against; glibc's function is the fallback for anything not listed, and a
+ * bare `E<number>` the fallback for a libc without it -- which is why the
+ * guard below spells the version test out with object-like macros rather
+ * than `__GLIBC_PREREQ`: a function-like macro a libc does not define is a
+ * preprocessor ERROR inside `#if`, not a false, so the promised fallback
+ * would never have compiled where it was needed. The list is every
+ * errno the comments in designation.c name plus the ones a socket syscall
+ * can plausibly return. */
+const char *vitrin_ledger_errno_name(int err) {
+	static const struct {
+		int err;
+		const char *name;
+	} names[] = {
+		{ EAGAIN, "EAGAIN" },
+		{ EPIPE, "EPIPE" },
+		{ ECONNRESET, "ECONNRESET" },
+		{ ETOOMANYREFS, "ETOOMANYREFS" },
+		{ EIO, "EIO" },
+		{ EINTR, "EINTR" },
+		{ EMFILE, "EMFILE" },
+		{ ENFILE, "ENFILE" },
+		{ ENOBUFS, "ENOBUFS" },
+		{ ENOMEM, "ENOMEM" },
+		{ ENOTCONN, "ENOTCONN" },
+		{ EBADF, "EBADF" },
+		{ EMSGSIZE, "EMSGSIZE" },
+		{ ECONNABORTED, "ECONNABORTED" },
+		{ ECONNREFUSED, "ECONNREFUSED" },
+		{ EINVAL, "EINVAL" },
+		{ EACCES, "EACCES" },
+		{ ENOENT, "ENOENT" },
+	};
+	for (size_t i = 0; i < sizeof(names) / sizeof(*names); i++) {
+		if (names[i].err == err) {
+			return names[i].name;
+		}
+	}
+#if defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 32))
+	const char *np = strerrorname_np(err);
+	if (np != NULL) {
+		return np;
+	}
+#endif
+	/* Not thread-safe and not meant to be: the ledger is written by the one
+	 * event-loop thread, and a caller keeps the pointer only for the length
+	 * of the record it is formatting. */
+	static char fallback[16];
+	snprintf(fallback, sizeof(fallback), "E%d", err);
+	return fallback;
+}
+
+void vitrin_ledger_designation_sock(struct vitrin_shim *s, const char *path, bool in_realm) {
+	/* `mode=0700` is a statement of fact, not of intent: designation.c emits
+	 * this only after its post-bind fstatat has shown exactly that mode. */
+	record_live(s, WLR_INFO, "designation-sock: path=%s mode=0700 tier=%s",
+		path, in_realm ? "in-realm" : "host-path");
+}
+
+void vitrin_ledger_designation_client(struct vitrin_shim *s,
+		enum vitrin_ledger_designation_client_event event,
+		pid_t peer_pid, bool app, size_t bytes, int err) {
+	struct vitrin_ledger *l = &s->ledger;
+	const char *name;
+	uint64_t *suppressed;
+	switch (event) {
+	case VITRIN_LEDGER_DESIGNATION_CONNECTED:
+		name = "connected";
+		l->designation_clients++;
+		suppressed = &l->designation_suppressed_clients;
+		break;
+	case VITRIN_LEDGER_DESIGNATION_GONE:
+		name = "gone";
+		l->designation_gone++;
+		suppressed = &l->designation_suppressed_clients;
+		break;
+	case VITRIN_LEDGER_DESIGNATION_REFUSED_OCCUPIED:
+		name = "refused_occupied";
+		l->designation_refused++;
+		suppressed = &l->designation_suppressed_refused;
+		break;
+	case VITRIN_LEDGER_DESIGNATION_WROTE_AND_CLOSED:
+		name = "wrote_and_closed";
+		l->designation_writes++;
+		suppressed = &l->designation_suppressed_writes;
+		break;
+	default:
+		return;
+	}
+
+	/* THE CAP. These records are paced by the app -- it chooses when to
+	 * connect, reconnect and write -- so they fall under "no record is
+	 * unbounded" (ledger.h) exactly as a bind loop does. Per KIND rather than
+	 * one shared budget, so an app that reconnects in a loop cannot silence
+	 * the one `wrote_and_closed` a reader is looking for. The seq is still
+	 * consumed for a suppressed record, so gaps in the sequence are visible
+	 * evidence that something was suppressed, not an artefact. */
+	uint64_t seq = ++l->seq;
+	if (l->designation_client_printed[event] >= VITRIN_LEDGER_DEMAND_RECORDS) {
+		(*suppressed)++;
+		return;
+	}
+	l->designation_client_printed[event]++;
+
+	switch (event) {
+	case VITRIN_LEDGER_DESIGNATION_CONNECTED:
+		record_live(s, WLR_INFO,
+			"designation-client: seq=%llu event=%s peer_pid=%lld app=%d",
+			(unsigned long long)seq, name, (long long)peer_pid, app ? 1 : 0);
+		break;
+	case VITRIN_LEDGER_DESIGNATION_WROTE_AND_CLOSED:
+		record_live(s, WLR_INFO,
+			"designation-client: seq=%llu event=%s bytes=%zu",
+			(unsigned long long)seq, name, bytes);
+		break;
+	case VITRIN_LEDGER_DESIGNATION_GONE:
+		/* `errno=` only when the connection ended in an error: a plain EOF
+		 * is the app closing its socket, which needs no explanation. */
+		if (err != 0) {
+			record_live(s, WLR_INFO,
+				"designation-client: seq=%llu event=%s errno=%s",
+				(unsigned long long)seq, name, vitrin_ledger_errno_name(err));
+		} else {
+			record_live(s, WLR_INFO, "designation-client: seq=%llu event=%s",
+				(unsigned long long)seq, name);
+		}
+		break;
+	case VITRIN_LEDGER_DESIGNATION_REFUSED_OCCUPIED:
+	default:
+		record_live(s, WLR_INFO, "designation-client: seq=%llu event=%s",
+			(unsigned long long)seq, name);
+		break;
+	}
+}
+
+void vitrin_ledger_designation_relay(struct vitrin_shim *s, uint32_t designation_id,
+		bool directory, bool read_write, uint32_t name_len,
+		enum vitrin_ledger_designation_outcome outcome, int err) {
+	struct vitrin_ledger *l = &s->ledger;
+	/* UNCAPPED, on purpose: one record per completed human decision is a
+	 * rate no app can drive, and each is the line a reader of one
+	 * designation's journey (core journal -> this -> the app) needs. The
+	 * basename is not a parameter of this function, which is how "never
+	 * recorded" is enforced rather than remembered. */
+	uint64_t seq = ++l->seq;
+	const char *kind = directory ? "directory" : "file";
+	const char *mode = read_write ? "read_write" : "read";
+	switch (outcome) {
+	case VITRIN_LEDGER_DESIGNATION_RELAYED:
+		l->designations_relayed++;
+		record_live(s, WLR_INFO,
+			"designation-relay: seq=%llu designation_id=%u kind=%s mode=%s "
+			"name_len=%u outcome=relayed",
+			(unsigned long long)seq, designation_id, kind, mode, name_len);
+		break;
+	case VITRIN_LEDGER_DESIGNATION_NO_CLIENT:
+		l->designations_no_client++;
+		record_live(s, WLR_INFO,
+			"designation-relay: seq=%llu designation_id=%u kind=%s mode=%s "
+			"name_len=%u outcome=no_client",
+			(unsigned long long)seq, designation_id, kind, mode, name_len);
+		break;
+	case VITRIN_LEDGER_DESIGNATION_SEND_FAILED:
+		l->designations_send_failed++;
+		/* ERROR, not INFO: a designation the human made and the app will not
+		 * get is the run a reader is diagnosing, and EIO here is the
+		 * defensive branch for a partial SEQPACKET send that cannot happen. */
+		record_live(s, WLR_ERROR,
+			"designation-relay: seq=%llu designation_id=%u kind=%s mode=%s "
+			"name_len=%u outcome=send_failed errno=%s",
+			(unsigned long long)seq, designation_id, kind, mode, name_len,
+			vitrin_ledger_errno_name(err));
+		break;
+	}
+}
+
 /* ---- lifecycle -------------------------------------------------------- */
 
 void vitrin_ledger_init(struct vitrin_shim *s) {
@@ -820,6 +1034,26 @@ void vitrin_ledger_finish(struct vitrin_shim *s) {
 		(unsigned long long)l->offers_suppressed,
 		(unsigned long long)l->binds_suppressed,
 		(unsigned long long)l->demands_suppressed);
+
+	/* The relay's totals, emitted even for a run that relayed nothing: a
+	 * summary that only appears when something happened cannot be told apart
+	 * from a summary that was never written, and the acceptance script checks
+	 * these against the per-record counts. `clients` is `connected` events;
+	 * `gone` is not reported separately because every connection ends, so it
+	 * is `clients` minus whatever was still held at teardown. */
+	record_live(s, WLR_INFO,
+		"designation-summary: relayed=%llu no_client=%llu send_failed=%llu "
+		"clients=%llu refused=%llu writes=%llu suppressed_clients=%llu "
+		"suppressed_refused=%llu suppressed_writes=%llu",
+		(unsigned long long)l->designations_relayed,
+		(unsigned long long)l->designations_no_client,
+		(unsigned long long)l->designations_send_failed,
+		(unsigned long long)l->designation_clients,
+		(unsigned long long)l->designation_refused,
+		(unsigned long long)l->designation_writes,
+		(unsigned long long)l->designation_suppressed_clients,
+		(unsigned long long)l->designation_suppressed_refused,
+		(unsigned long long)l->designation_suppressed_writes);
 
 	if (l->logger != NULL) {
 		wl_protocol_logger_destroy(l->logger);

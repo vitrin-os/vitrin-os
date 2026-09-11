@@ -1020,7 +1020,15 @@ jobs:
     # (Dockerfile in-repo, rebuilt when it changes) -- decision recorded in
     # P1.9.1, deferred until P1.6.1 fixes the version.
     container: ubuntu:24.04
-    timeout-minutes: 15
+    # 25, not the 15 this job ran under for its first year. The healthy
+    # runtime is ~5 minutes, of which the dependency install is ~1; but the
+    # install is the one step whose duration the repo does not control, and
+    # through a degraded archive it has taken 14 (2026-09-11, with
+    # shim/ci/install-deps.sh's retries -- without them it never finished at
+    # all). A budget that is 3x the healthy runtime and 1x the slow-mirror one
+    # cancels exactly the runs whose evidence would have said "the mirror,
+    # not the shim". The rust job already runs under 30.
+    timeout-minutes: 25
     steps:
       - name: Install C toolchain and git
         # git first, so the checkout step clones instead of falling back to

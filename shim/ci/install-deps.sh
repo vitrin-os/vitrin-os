@@ -44,8 +44,19 @@
 set -euo pipefail
 
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get install -y -qq \
+# A stalled archive connection must FAIL, not wait. apt's default has no
+# read timeout worth the name, so a backend that accepts the request and
+# never answers holds the download open until the JOB's timeout cancels it
+# -- 15 minutes, with `-qq` printing nothing, so the log says only "context
+# canceled". Measured 2026-09-11: four consecutive runs cancelled that way
+# while archive.ubuntu.com was degraded; the same install with a 30 s
+# read timeout and retries (each retry reconnects, and the archive is
+# several backends) completed in 828 s. So: time out a silent connection
+# in 30 s, retry it five times, and let a real outage name the file it
+# failed on instead of the budget it consumed.
+APT_ACQUIRE=(-o Acquire::http::Timeout=30 -o Acquire::Retries=5)
+apt-get "${APT_ACQUIRE[@]}" update -qq
+apt-get "${APT_ACQUIRE[@]}" install -y -qq \
   meson ninja-build pkg-config binutils \
   libwayland-dev wayland-protocols \
   libpixman-1-dev libxkbcommon-dev \

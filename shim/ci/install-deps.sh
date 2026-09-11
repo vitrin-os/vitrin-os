@@ -55,6 +55,22 @@ export DEBIAN_FRONTEND=noninteractive
 # in 30 s, retry it five times, and let a real outage name the file it
 # failed on instead of the budget it consumed.
 APT_ACQUIRE=(-o Acquire::http::Timeout=30 -o Acquire::Retries=5)
+# On a hosted runner, fetch from the runner's OWN mirror. The stock
+# ubuntu:24.04 image points at archive.ubuntu.com because it does not know
+# where it runs; the hosted runner image itself uses azure.archive.ubuntu.com,
+# the same archive served from inside the runner's cloud. Measured 2026-09-11,
+# the day the timeouts above were added: archive.ubuntu.com delivered
+# libgtk-3-dev at 34 KB/s -- two hours for this list, so even a 25-minute
+# job budget with retries ran out -- while azure.archive.ubuntu.com delivered
+# it at 1.9 MB/s. Keyed on GITHUB_ACTIONS so a developer's own container run
+# keeps the distro default; security.ubuntu.com is left alone either way.
+# deb822 (`ubuntu.sources`) is the 24.04 format; the legacy sources.list is
+# handled too in case the base image ever changes shape.
+if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+  sed -i 's|http://archive.ubuntu.com/ubuntu|http://azure.archive.ubuntu.com/ubuntu|g' \
+    /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list 2>/dev/null || true
+  echo "install-deps: on a hosted runner; apt points at azure.archive.ubuntu.com"
+fi
 apt-get "${APT_ACQUIRE[@]}" update -qq
 apt-get "${APT_ACQUIRE[@]}" install -y -qq \
   meson ninja-build pkg-config binutils \

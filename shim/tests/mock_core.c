@@ -6,8 +6,9 @@
  * THIS IS A MOCK, NOT THE REAL CORE (emphasis added by P1.6.6, issue #106).
  * It is a strict hand-written stand-in that lets the shim be exercised on its
  * own, and every acceptance script that drives it (shim_globals_and_client.sh,
- * upstream_frame_path.sh, seat_input_replay.sh, firefox_bringup.sh) is a
- * shim-only unit check, NOT a milestone integration proof. The milestone
+ * upstream_frame_path.sh, seat_input_replay.sh, firefox_bringup.sh,
+ * designation_receive.sh, designation_relay.sh) is a shim-only unit check,
+ * NOT a milestone integration proof. The milestone
  * proofs run the shipped Rust `vitrind` against this same shim with no mock on
  * any seam -- tests/integration/test_real_app.py (weston, M1.2 exit gate),
  * test_real_gtk.py (GTK), and test_real_firefox.py (Firefox render + globals
@@ -97,6 +98,20 @@
  * frames, because a commit is the first observable proof that the app has
  * mapped a window: firing input at a realm with nothing in it would test
  * the drop path, not the delivery path.
+ *
+ * DESIGNATIONS (P2.6.5 / P2.6.7). `--designate PATH` sends the realm
+ * `vitrin_shim_session.designation` carrying a descriptor on PATH -- the one
+ * core -> shim event that carries an fd -- and the P2.6.7 flags turn it into a
+ * schedule: `--designate-count N` of them, `--designate-interval-ms MS` apart,
+ * in `--designate-mode read|read_write` on a `--designate-kind file|dir`, the
+ * first (and any send with a `--designate-when-exists PATH` of its own) held
+ * back until a trigger file the script creates exists. Each send opens PATH
+ * afresh and prints an `EV designation ...` line naming the id, kind, mode,
+ * basename and the subject's `(st_dev, st_ino)`, which is what the relay's
+ * acceptance script matches against the receiving client's own fstat. The
+ * send is blocking (see the struct comment), so a stalled shim stalls this
+ * process rather than losing a designation. `--smuggle-fd` is the hostile
+ * variant: the same descriptor on a frame whose signature declares none.
  */
 #define _GNU_SOURCE
 
@@ -125,6 +140,9 @@
 /* `vitrin_shim_seat.text` is capped at 4096 bytes by the IDL; the encoder
  * refuses more, so the script parser refuses more too. */
 #define MAX_INPUT_TEXT 4096
+/* `--designate-when-exists` may be repeated once per send it gates; more
+ * triggers than this is a script that should be two runs. */
+#define MAX_DESIGNATION_TRIGGERS 8
 
 enum input_kind {
 	INPUT_DELAY = 0,
@@ -232,8 +250,12 @@ struct core {
 	uint64_t dump_at;
 
 	/* --designate (P2.6.5, issue #189): the one core -> shim event that
-	 * carries a descriptor. `designate_fd` is opened before the fork and sent
-	 * once, `designate_at_ms` after the run starts.
+	 * carries a descriptor. `designate_fd` is opened before the fork as the
+	 * run's proof that the path is openable at all; the descriptor each
+	 * `designation` actually carries is opened AFRESH per send (P2.6.7,
+	 * issue #191, `send_designation`), so N designations of one path are N
+	 * distinct open file descriptions, each with its own offset -- which is
+	 * what the real core produces, one `open()` per human choice.
 	 *
 	 * THE DELAY SELECTS WHICH RECEIVE PATH IS EXERCISED, and no longer avoids
 	 * a broken one. The shim reads `configure` SYNCHRONOUSLY and only then
@@ -244,11 +266,43 @@ struct core {
 	 * (see the comment there), so `--designate-after-ms 0` is a legitimate run
 	 * that exercises the DRAIN path. The 500 ms default exercises the ordinary
 	 * ARMED path instead, which is the steady state a real designation lands
-	 * in -- a human has to look at a picker first. */
+	 * in -- a human has to look at a picker first.
+	 *
+	 * THE SEND IS BLOCKING. `core_send_with_fd` writes to the shim's socketpair
+	 * with no MSG_DONTWAIT and no timeout, so a shim that has stopped reading
+	 * its core link stalls THIS process in `sendmsg` rather than losing a
+	 * designation: backpressure from a wedged shim shows up in a test as a mock
+	 * core that never reaches its next `EV designation` line (and then its
+	 * `--run-ms` deadline), never as a `SUMMARY` whose `designated=` is short
+	 * with no failure named. That is the honest shape -- the real core's send
+	 * is bounded too, and a shim that blocks it is the bug, not the count. */
 	const char *designate_path;
 	int designate_fd;
+	/* The schedule (P2.6.7, issue #191). `designate_count` sends in total,
+	 * `designate_interval_ms` apart once the first is due; `designate_at_ms` is
+	 * when the NEXT one is due, or -1 while nothing is armed. The first send
+	 * (and any send whose index has a `--designate-when-exists` trigger of its
+	 * own) is armed only once its trigger path exists, plus
+	 * `designate_after_ms`; a send with no trigger of its own is due
+	 * `designate_interval_ms` after the previous one, measured from that one's
+	 * DUE time rather than from its send time, so a run that fell behind
+	 * catches up instead of drifting. */
+	uint64_t designate_count;
+	int64_t designate_interval_ms;
+	int64_t designate_after_ms;
 	int64_t designate_at_ms;
-	bool designated;
+	uint64_t designated;
+	uint32_t next_designation_id;
+	vitrin_powerbox_mode_t designate_mode;
+	vitrin_powerbox_kind_t designate_kind;
+	/* `--designate-when-exists PATH`, repeatable: trigger i gates send i. A
+	 * script creates the path only after it has taken whatever measurement
+	 * must precede the send (the relay acceptance script's baseline census),
+	 * which turns "before the mock core sends" from a sleep into a fact. It is
+	 * polled once per loop iteration, so the trigger latency is bounded by the
+	 * poll timeout (50 ms) and nothing else. */
+	const char *designate_trigger[MAX_DESIGNATION_TRIGGERS];
+	int designate_triggers;
 
 	/* --smuggle-fd: send the descriptor on a frame whose SIGNATURE has none,
 	 * with the header's own `fd_count` set to 1 so the transport hands it up
@@ -375,39 +429,131 @@ static void send_configure(struct core *c, const char *realm, uint32_t w, uint32
 
 /* `vitrin_shim_session.designation`: hand the realm one designated descriptor.
  *
- * The values are fixed rather than configurable because the acceptance script
- * greps the shim's log for them; `designation_id` in particular is what ties
- * "the shim logged an arrival" to "this is the one we sent". The name is a
- * BASENAME, never a path -- the IDL is explicit that no path crosses this wire
- * -- so it is deliberately not derived from `--designate`'s argument. */
+ * The name is fixed rather than configurable because the acceptance scripts
+ * grep the shim's log and the client's account for it; it is a BASENAME, never
+ * a path -- the IDL is explicit that no path crosses this wire -- so it is
+ * deliberately not derived from `--designate`'s argument. `designation_id`
+ * starts at MOCK_DESIGNATION_ID and counts up by one per send (P2.6.7), the
+ * way the real core's session-global counter does, so a run of N designations
+ * hands the relay N ids a script can match one-to-one against the client's
+ * `RX` lines; the first id is the constant designation_receive.sh has always
+ * grepped for.
+ *
+ * Each send opens the path AFRESH with the flags the mode and kind imply
+ * (O_RDONLY or O_RDWR; O_DIRECTORY for a directory, always O_RDONLY because a
+ * directory cannot be opened for writing and `read_write` on a directory is a
+ * statement about what may be created UNDER it), fstats it, and prints the
+ * `(st_dev, st_ino)` pair BEFORE sending -- the identity the client on the far
+ * side of the relay reports from its own fstat of what it received, which is
+ * how "the app got the file the core designated" becomes a comparison of two
+ * inode numbers rather than of two log lines that agree by construction. */
 #define MOCK_DESIGNATION_ID 4242u
 #define MOCK_DESIGNATION_NAME "designated.txt"
 
+static const char *designate_kind_name(vitrin_powerbox_kind_t kind) {
+	return kind == VITRIN_POWERBOX_KIND_DIRECTORY ? "directory" : "file";
+}
+
+static const char *designate_mode_name(vitrin_powerbox_mode_t mode) {
+	return mode == VITRIN_POWERBOX_MODE_READ_WRITE ? "read_write" : "read";
+}
+
+/* The one `open()` the mode and kind imply, shared by the pre-fork check and
+ * every send so the two cannot disagree about what "openable" means. */
+static int open_designate_subject(const struct core *c) {
+	int flags = O_CLOEXEC;
+	if (c->designate_kind == VITRIN_POWERBOX_KIND_DIRECTORY) {
+		flags |= O_RDONLY | O_DIRECTORY;
+	} else if (c->designate_mode == VITRIN_POWERBOX_MODE_READ_WRITE) {
+		flags |= O_RDWR;
+	} else {
+		flags |= O_RDONLY;
+	}
+	return open(c->designate_path, flags);
+}
+
 static void send_designation(struct core *c) {
+	int fd = open_designate_subject(c);
+	if (fd < 0) {
+		fail(c, "cannot open %s to designate: %s", c->designate_path, strerror(errno));
+		return;
+	}
+	struct stat st;
+	if (fstat(fd, &st) != 0) {
+		fail(c, "cannot fstat %s: %s", c->designate_path, strerror(errno));
+		close(fd);
+		return;
+	}
+	uint32_t id = c->next_designation_id++;
 	uint8_t buf[512];
 	vitrin_shim_session_evt_designation_t ev = {
 		.fd = -1, /* rides SCM_RIGHTS; never written to the byte buffer */
-		.designation_id = MOCK_DESIGNATION_ID,
-		.kind = VITRIN_POWERBOX_KIND_FILE,
-		.mode = VITRIN_POWERBOX_MODE_READ,
+		.designation_id = id,
+		.kind = c->designate_kind,
+		.mode = c->designate_mode,
 		.name = {
 			.len = (uint32_t)strlen(MOCK_DESIGNATION_NAME),
 			.data = (const uint8_t *)MOCK_DESIGNATION_NAME,
 		},
 	};
+	/* Printed BEFORE the send, so a send that blocks (a shim that stopped
+	 * reading, see the struct comment) leaves this line as the last thing the
+	 * core said, which is the diagnosis. */
+	trace("EV designation designation_id=%u kind=%s mode=%s name=%s st_dev=%llu st_ino=%llu",
+		id, designate_kind_name(c->designate_kind), designate_mode_name(c->designate_mode),
+		MOCK_DESIGNATION_NAME, (unsigned long long)st.st_dev, (unsigned long long)st.st_ino);
 	int32_t n = vitrin_shim_session_evt_designation_encode(&ev, 1u, buf, sizeof(buf));
-	if (n < 0 || !core_send_with_fd(c, buf, (size_t)n, c->designate_fd)) {
-		fail(c, "cannot send designation");
+	if (n < 0 || !core_send_with_fd(c, buf, (size_t)n, fd)) {
+		fail(c, "cannot send designation %u", id);
+		close(fd);
 		return;
 	}
 	/* Closed the instant the kernel has it: the receiver holds its own now, and
 	 * a copy kept here would make the acceptance script's descriptor census
 	 * count this process's leak as the shim's. */
-	close(c->designate_fd);
-	c->designate_fd = -1;
-	c->designated = true;
-	trace("EV designation designation_id=%u kind=file mode=read name=%s",
-		MOCK_DESIGNATION_ID, MOCK_DESIGNATION_NAME);
+	close(fd);
+	c->designated++;
+}
+
+/* The schedule, evaluated once per loop iteration. Arms the next send when
+ * its trigger (if it has one) exists, then sends every designation that is
+ * due -- in a loop, so an interval shorter than the poll granularity still
+ * delivers the count asked for rather than one per iteration. Returns the
+ * milliseconds until the next armed send is due, or -1 when nothing is armed,
+ * which is what clamps the main loop's poll timeout: a send due in 1 ms must
+ * not wait behind a 50 ms poll. */
+static int64_t pump_designations(struct core *c) {
+	if (c->designate_path == NULL || c->smuggle_fd || c->designated >= c->designate_count) {
+		return -1;
+	}
+	if (c->designate_at_ms < 0) {
+		int idx = (int)c->designated;
+		if (idx < c->designate_triggers) {
+			if (access(c->designate_trigger[idx], F_OK) != 0) {
+				return -1; /* not yet; polled again next iteration */
+			}
+			trace("EV designation_trigger index=%d path=%s", idx, c->designate_trigger[idx]);
+		}
+		c->designate_at_ms = now_ms() + c->designate_after_ms;
+	}
+	while (c->designated < c->designate_count && now_ms() >= c->designate_at_ms) {
+		send_designation(c);
+		if (c->failures > 0) {
+			return -1;
+		}
+		int idx = (int)c->designated;
+		if (idx < c->designate_triggers) {
+			/* The next send has its own trigger: disarm and wait for it. */
+			c->designate_at_ms = -1;
+			return -1;
+		}
+		c->designate_at_ms += c->designate_interval_ms;
+	}
+	if (c->designated >= c->designate_count) {
+		return -1;
+	}
+	int64_t due_in = c->designate_at_ms - now_ms();
+	return due_in < 0 ? 0 : due_in;
 }
 
 /* --smuggle-fd: a `frame_done` -- an event whose signature declares NO
@@ -1370,6 +1516,10 @@ static void usage(void) {
 		"                 [--input SCRIPT] [--input-after-commits N]\n"
 		"                 [--dump-frame N:PATH]\n"
 		"                 [--designate PATH] [--designate-after-ms MS]\n"
+		"                 [--designate-count N] [--designate-interval-ms MS]\n"
+		"                 [--designate-mode read|read_write]\n"
+		"                 [--designate-kind file|dir]\n"
+		"                 [--designate-when-exists PATH]...\n"
 		"                 [--smuggle-fd]\n"
 		"                 -- SHIM_ARGV...\n");
 	exit(2);
@@ -1379,6 +1529,12 @@ int main(int argc, char **argv) {
 	const char *realm = "realm-0";
 	const char *designate_path = NULL;
 	int designate_after_ms = 500;
+	uint64_t designate_count = 1;
+	int designate_interval_ms = 0;
+	vitrin_powerbox_mode_t designate_mode = VITRIN_POWERBOX_MODE_READ;
+	vitrin_powerbox_kind_t designate_kind = VITRIN_POWERBOX_KIND_FILE;
+	const char *designate_trigger[MAX_DESIGNATION_TRIGGERS];
+	int designate_triggers = 0;
 	bool smuggle_fd = false;
 	uint32_t width = 800, height = 600;
 	uint64_t want_frames = 0;
@@ -1414,6 +1570,37 @@ int main(int argc, char **argv) {
 			designate_path = argv[++i];
 		} else if (strcmp(argv[i], "--designate-after-ms") == 0 && i + 1 < argc) {
 			designate_after_ms = atoi(argv[++i]);
+		} else if (strcmp(argv[i], "--designate-count") == 0 && i + 1 < argc) {
+			designate_count = strtoull(argv[++i], NULL, 10);
+		} else if (strcmp(argv[i], "--designate-interval-ms") == 0 && i + 1 < argc) {
+			designate_interval_ms = atoi(argv[++i]);
+		} else if (strcmp(argv[i], "--designate-mode") == 0 && i + 1 < argc) {
+			const char *m = argv[++i];
+			if (strcmp(m, "read") == 0) {
+				designate_mode = VITRIN_POWERBOX_MODE_READ;
+			} else if (strcmp(m, "read_write") == 0) {
+				designate_mode = VITRIN_POWERBOX_MODE_READ_WRITE;
+			} else {
+				fprintf(stderr, "mock-core: --designate-mode wants read|read_write\n");
+				usage();
+			}
+		} else if (strcmp(argv[i], "--designate-kind") == 0 && i + 1 < argc) {
+			const char *k = argv[++i];
+			if (strcmp(k, "file") == 0) {
+				designate_kind = VITRIN_POWERBOX_KIND_FILE;
+			} else if (strcmp(k, "dir") == 0) {
+				designate_kind = VITRIN_POWERBOX_KIND_DIRECTORY;
+			} else {
+				fprintf(stderr, "mock-core: --designate-kind wants file|dir\n");
+				usage();
+			}
+		} else if (strcmp(argv[i], "--designate-when-exists") == 0 && i + 1 < argc) {
+			if (designate_triggers >= MAX_DESIGNATION_TRIGGERS) {
+				fprintf(stderr, "mock-core: at most %d --designate-when-exists triggers\n",
+					MAX_DESIGNATION_TRIGGERS);
+				usage();
+			}
+			designate_trigger[designate_triggers++] = argv[++i];
 		} else if (strcmp(argv[i], "--smuggle-fd") == 0) {
 			smuggle_fd = true;
 		} else if (strcmp(argv[i], "--dump-frame") == 0 && i + 1 < argc) {
@@ -1461,13 +1648,38 @@ int main(int argc, char **argv) {
 			"descriptor it smuggles\n");
 		return 2;
 	}
+	if (designate_count == 0 || designate_interval_ms < 0 || designate_after_ms < 0) {
+		fprintf(stderr, "mock-core: --designate-count must be >= 1 and the two "
+			"--designate-*-ms delays non-negative\n");
+		return 2;
+	}
+	if (designate_triggers > 0 && (uint64_t)designate_triggers > designate_count) {
+		fprintf(stderr, "mock-core: more --designate-when-exists triggers (%d) than "
+			"designations (%llu); a trigger gates the send of its own index\n",
+			designate_triggers, (unsigned long long)designate_count);
+		return 2;
+	}
+	/* The mode and kind are needed by the pre-fork open below, which is the
+	 * same open every send performs (open_designate_subject). */
+	g_core.designate_path = designate_path;
+	g_core.designate_mode = designate_mode;
+	g_core.designate_kind = designate_kind;
 	int designate_fd = -1;
 	if (designate_path != NULL) {
-		designate_fd = open(designate_path, O_RDONLY | O_CLOEXEC);
+		designate_fd = open_designate_subject(&g_core);
 		if (designate_fd < 0) {
 			fprintf(stderr, "mock-core: cannot open %s to designate: %s\n",
 				designate_path, strerror(errno));
 			return 2;
+		}
+		if (!smuggle_fd) {
+			/* Only --smuggle-fd sends THIS descriptor; a designation opens its
+			 * own per send. Closed now rather than at exit so this process's
+			 * table holds nothing on the subject while the shim's is being
+			 * counted -- a reader comparing the two must not have to explain
+			 * one away. */
+			close(designate_fd);
+			designate_fd = -1;
 		}
 	}
 
@@ -1497,6 +1709,14 @@ int main(int argc, char **argv) {
 	c->designate_path = designate_path;
 	c->designate_fd = designate_fd;
 	c->smuggle_fd = smuggle_fd;
+	c->designate_count = designate_count;
+	c->designate_interval_ms = designate_interval_ms;
+	c->designate_after_ms = designate_after_ms;
+	c->next_designation_id = MOCK_DESIGNATION_ID;
+	for (int i = 0; i < designate_triggers; i++) {
+		c->designate_trigger[i] = designate_trigger[i];
+	}
+	c->designate_triggers = designate_triggers;
 	c->designate_at_ms = -1; /* armed below, once the run's clock exists */
 	c->input_due_ms = -1; /* armed by the Nth commit, not by the clock */
 
@@ -1507,7 +1727,10 @@ int main(int argc, char **argv) {
 	trace("EV configure realm=%s width=%u height=%u", realm, width, height);
 
 	int64_t deadline = now_ms() + run_ms;
-	if (designate_path != NULL) {
+	if (designate_path != NULL && smuggle_fd) {
+		/* The smuggled frame keeps P2.6.5's one fixed timer. Designations are
+		 * scheduled by pump_designations, which arms the first one at the
+		 * same delay -- or, with a trigger, only once the trigger exists. */
 		c->designate_at_ms = now_ms() + designate_after_ms;
 	}
 	int exit_code = 0;
@@ -1525,7 +1748,17 @@ int main(int argc, char **argv) {
 			break;
 		}
 
+		/* Designations first, so a send that is already due goes out before
+		 * this iteration sleeps; then the poll timeout is CLAMPED to whichever
+		 * comes first of 50 ms, the run's deadline and the next send's due
+		 * time. Without the clamp `--designate-interval-ms 1` would deliver
+		 * one designation per 50 ms poll and a 1000-count run would take 50 s
+		 * instead of one. */
+		int64_t due_in = pump_designations(c);
 		int timeout = remaining > 50 ? 50 : (int)remaining;
+		if (due_in >= 0 && due_in < timeout) {
+			timeout = (int)due_in;
+		}
 		struct pollfd pfd = {.fd = c->fd, .events = POLLIN};
 		int pr = poll(&pfd, 1, timeout);
 		if (pr < 0 && errno != EINTR) {
@@ -1544,17 +1777,14 @@ int main(int argc, char **argv) {
 				break;
 			}
 		}
-		if (c->designate_at_ms >= 0 && !c->designated && !c->smuggled &&
+		if (c->smuggle_fd && c->designate_at_ms >= 0 && !c->smuggled &&
 				now_ms() >= c->designate_at_ms) {
 			/* `frame_done` is addressed to the surface, so the smuggling
-			 * variant waits for the shim to have minted one; the designation
-			 * is on the session object and needs no such wait. */
-			if (c->smuggle_fd) {
-				if (c->surface_created) {
-					send_smuggled_fd(c);
-				}
-			} else {
-				send_designation(c);
+			 * variant waits for the shim to have minted one; a designation
+			 * is on the session object and needs no such wait (it is sent
+			 * from pump_designations above, on its own schedule). */
+			if (c->surface_created) {
+				send_smuggled_fd(c);
 			}
 		}
 		if (c->frame_due) {
@@ -1571,21 +1801,27 @@ int main(int argc, char **argv) {
 
 	trace("SUMMARY commits=%llu frame_dones=%llu buffer_dones=%llu max_inflight=%d "
 		"last_damage_area=%llu last_damage_rects=%d seat_sends=%llu "
-		"idle_edges=%llu idle_held=%d designated=%d smuggled=%d failures=%d",
+		"idle_edges=%llu idle_held=%d designated=%llu smuggled=%d failures=%d",
 		(unsigned long long)c->commits, (unsigned long long)c->frame_dones,
 		(unsigned long long)c->buffer_dones, c->max_inflight,
 		(unsigned long long)c->last_damage_area, c->last_damage_rects,
 		(unsigned long long)c->seat_sends, c->idle_edges, c->idle_held ? 1 : 0,
-		c->designated ? 1 : 0, c->smuggled ? 1 : 0, c->failures);
+		(unsigned long long)c->designated, c->smuggled ? 1 : 0, c->failures);
 
-	/* A run that asked for a designation and never sent one proved nothing;
-	 * say so rather than letting the script assert against an event that was
-	 * never emitted. */
-	if (c->designate_path != NULL && !c->designated && !c->smuggled) {
-		fail(c, "the run ended before the %s was sent -- raise --run-ms above "
-		        "--designate-after-ms (and, with --smuggle-fd, the shim must "
-		        "have created its surface by then)",
-			c->smuggle_fd ? "smuggled descriptor" : "designation");
+	/* A run that asked for designations and sent fewer than that proved
+	 * nothing about the rest; say so rather than letting the script assert
+	 * against events that were never emitted. `designated=` is a COUNT since
+	 * P2.6.7, so a short run is visible in the summary too. */
+	if (c->designate_path != NULL && !c->smuggle_fd && c->designated < c->designate_count) {
+		fail(c, "the run ended after %llu of %llu designations -- raise --run-ms "
+		        "above --designate-after-ms plus count x interval, or create the "
+		        "--designate-when-exists trigger the next send is waiting for",
+			(unsigned long long)c->designated, (unsigned long long)c->designate_count);
+	}
+	if (c->smuggle_fd && !c->smuggled) {
+		fail(c, "the run ended before the smuggled descriptor was sent -- raise "
+		        "--run-ms above --designate-after-ms, and the shim must have "
+		        "created its surface by then");
 	}
 
 	/* Hang up: socketpair EOF is how the core tells a shim to go away, and

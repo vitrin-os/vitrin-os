@@ -771,6 +771,53 @@ test(
   timeout: 60,
 )
 
+# --- P2.6.7 (#191): the shim relays a designation to its app --------------
+# A COMPONENT test, not milestone acceptance, for the same reason as the one
+# above: the core is `tests/mock_core.c`, so nothing here is evidence about
+# `vitrind`'s picker or about any human's choice. The mock-free rung -- a real
+# core, a real picker, a real app on `designation.sock` -- is P2.6.9's.
+#
+# What only this can settle: the LAST hop. designation-receive proves the shim
+# survives a designation and holds nothing when no app is connected; this one
+# spawns an app THROUGH THE SHIM (so it runs with the app's real environment
+# and the app's real inherited descriptor table, fd 3 included), has it
+# connect to `$XDG_RUNTIME_DIR/designation.sock`, and then checks the four
+# things a relay can get wrong that no unit test observes: that the app got
+# the same inode the core opened (two fstats compared, not two log lines);
+# that the shim's own descriptor table is the same size after a thousand
+# relays as before the first (counted through /proc while everything is still
+# alive, which is the only moment a leak is visible); that an app which
+# misbehaves on the socket -- writes to it, attaches a descriptor to what it
+# writes, connects twice, stops reading -- is answered the way the design says
+# (closed, dropped without installing, refused with EOF, dropped when the
+# kernel queue fills) and that each answer is in the ledger; and that the
+# ledger's per-kind record cap actually caps. The client is
+# `tests/designation_client.c`, a test instrument; the app-facing contract it
+# exercises is the prose page's ~30-line snippet, not this fixture.
+designation_client = executable(
+  'designation-client',
+  files('tests/designation_client.c'),
+  include_directories: inc,
+)
+
+test(
+  'designation-relay',
+  find_program('bash'),
+  args: [
+    files('tests/acceptance/designation_relay.sh'),
+  ],
+  env: {
+    'BUILD_DIR': meson.current_build_dir(),
+  },
+  depends: [shim_exe, mock_core, designation_client],
+  # Eight runs, each a shim bring-up the script polls for plus a teardown the
+  # mock core's shutdown ladder bounds at about a second; the thousand-count
+  # run adds count x interval (1000 x 1 ms) and the backpressure run a few
+  # hundred sends more. Measured under 20 s on a laptop; the budget is for a
+  # CI runner at a fraction of that speed, not for the body.
+  timeout: 120,
+)
+
 # --- xdg-shell conformance, from the app's side ------------------------
 # Three facts about src/xdg.c that only a client can observe: the initial
 # `xdg_surface.configure` is sent on the client's initial commit and NOT

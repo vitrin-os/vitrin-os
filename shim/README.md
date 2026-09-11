@@ -335,7 +335,7 @@ meson setup build            # uses system wlroots-0.19 if available
 ninja -C build
 meson test -C build          # header-compiles, loader-independence, idle-inhibit,
                              # xdg-conformance, focus-succession, wire-designation,
-                             # designation-receive, inventories
+                             # designation-receive, designation-relay, inventories
 
 # Build the vendored wlroots from source (e.g. CI, or no system wlroots-0.19),
 # taking wlroots' own dependencies from the system:
@@ -424,17 +424,28 @@ that provoked it are annotated in
 [`wlcs/README.md`](wlcs/README.md). It and
 [`tests/acceptance/focus_succession.sh`](tests/acceptance/focus_succession.sh),
 [`tests/acceptance/idle_inhibit.sh`](tests/acceptance/idle_inhibit.sh),
-[`tests/acceptance/loader_independence.sh`](tests/acceptance/loader_independence.sh)
-and
+[`tests/acceptance/loader_independence.sh`](tests/acceptance/loader_independence.sh),
 [`tests/acceptance/designation_receive.sh`](tests/acceptance/designation_receive.sh)
-are the five scripts in `tests/acceptance/` wired into `meson test`, because
+and
+[`tests/acceptance/designation_relay.sh`](tests/acceptance/designation_relay.sh)
+are the six scripts in `tests/acceptance/` wired into `meson test`, because
 they are the ones that need nothing but this tree's own binaries —
 `idle_inhibit.sh` only where
 `wayland-protocols` ships the idle-inhibit XML `idle-probe` is generated from
 (`meson.build` gates it on its own `fs.exists`, so a moved XML costs the test
 rather than the shim), and only against
 [`tests/mock_core.c`](tests/mock_core.c), which makes it a **component** test of
-what the shim sends upstream and never milestone acceptance.
+what the shim sends upstream and never milestone acceptance. The two
+designation scripts are component tests against that same mock core:
+`designation_receive.sh` (P2.6.5) proves the shim survives a designation and
+holds nothing when no app is connected; `designation_relay.sh` (P2.6.7) spawns
+[`tests/designation_client.c`](tests/designation_client.c) through the shim as
+its app and proves the last hop — the descriptor the app receives over
+`$XDG_RUNTIME_DIR/designation.sock` is the inode the core opened, the shim's
+descriptor table is flat across a thousand relays, and an app that writes on,
+attaches to, double-connects to or stops reading that socket is answered the
+way `src/designation.c` says. Neither is milestone acceptance; the mock-free
+rung is P2.6.9's.
 That number and that list are the only ones stated anywhere in this file, and
 neither is typed twice: `meson test inventories`
 ([`tests/inventories.sh`](tests/inventories.sh)) derives both from

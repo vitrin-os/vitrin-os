@@ -1943,6 +1943,90 @@ The card renders it as `- designate_file: ` followed by that text. Four facts it
 #### What this entry does not do
 
 It does not touch the ADR split or the D-031 collision, both flagged above as owed. It **decides nothing the owner had not already decided** and **reverses no owner clause**: Q9's posture is the IDL's, the PRD's and plan 02's, executed; Q13's strings are derived and unsigned. It does not serve `egress`, does not build the proxy, does not fill `pinned_addrs`, and does not put an egress line on any card. It does not allocate `publish_tree`. It does not gate `designate_file` on the isolation tier — that is #350, filed. It does not build the "remember me" control D-046 asks for, and it does not build P2.6.10's standing-grant object. It does not close Q9 or Q13: Q9's full answer is E3.7's, and Q13's mandatory re-review before durable rungs ship stands with D-046's per-session shell card added to its scope, exactly as that entry recorded. And it does not make the maintainer's sign-off on the two strings anything other than pending.
+### D-049 — P2.6.9 (the ransomware gate) landed four deviations from issue #193's own text, recorded on D-045's precedent; and the gate asserts the write set against the enforced eight-hierarchy set, not the plan row's flattering two-element phrasing
+
+**Status:** accepted (2026-09-12), append-only. **Executes** the P2.6.9 row of
+[02-phase-2-semantic-epochs.md](02-phase-2-semantic-epochs.md) §2 E2.6; does not
+reverse a decision. #193 is [#193](https://github.com/vitrin-os/vitrin-os/issues/193),
+`tests/integration/test_real_ransomware.py` + `shim/tests/ransom_payload.c`.
+
+An issue body is a plan, and a plan a landing quietly contradicts is the same
+defect class as a stale published count (D-045). Four of #193's written asks
+were not executed as written; each departure is upheld, and what is logged is
+that it happened, why, and what the tree carries instead. The closed issue is
+not edited to match what shipped — this entry is the record.
+
+1. **`--isolation=none` → `--isolation=off`.** #193's acceptance says each
+   unreachable path is "shown reachable under `--isolation=none`". The shipped
+   selector is `--isolation=default | off`; `none` was retired before it shipped
+   ([D-037](#d-037--isolation-is-a-two-value-selector-default--off-applied-is-read-from-the-kernel-not-the-flag-and-a-realm-keeps-its-invokers-supplementary-groups)(4),
+   because `Tier::None` is also what an *unmeasured* probe yields). The
+   home-reach positive control therefore runs at `--isolation=off`.
+
+2. **"Landlock ruleset not applied → the payload reaches `$HOME`" is not a
+   constructible breakage, and the home-reach control is the mount namespace,
+   not Landlock.** `$HOME` is `ENOENT` inside a confined realm because the
+   *mount namespace* never binds it (the writable set is
+   `{/run/vitrin, /vitrin/home, /tmp, /dev/shm}`, and `/vitrin/home` — not the
+   host home — is what `HOME` points at), **not** because Landlock denied it.
+   Dropping Landlock alone (`--landlock=off`) leaves the host home `ENOENT` at
+   both settings. So the breakage that grows the write set toward the host home
+   is "the mount namespace is not built" (`--isolation=off`), which is watched-
+   failing item 1, and it reddens the write-set equality's `host_home` row.
+
+3. **The path-race rung's "racer runs against the live picker … shown to WIN in
+   a control run without `RESOLVE_NO_SYMLINKS`" is realised as an in-process
+   control, not a live racer.** No shipped flag, env var or cargo feature drops
+   `RESOLVE_NO_SYMLINKS` (it is a compile-time `const` in
+   `crates/vitrin-core/src/picker/resolve.rs`), and the confirm→open window is
+   sub-millisecond and unsynchronisable from a test process — the finding
+   `test_real_powerbox.py` already recorded when it proved the guarded resolve
+   in-crate rather than over the socket. The gate's live half asserts the
+   delivered fd's `(st_dev, st_ino)` equals the displayed row and that an
+   inside-pointing symlink row is refused `unresolvable`; the "racer wins"
+   control is an in-process resolve the gate authors itself (a symlink-following
+   `open` against a thread-flipped component, which must deliver the decoy at
+   least once, or the guarded green proves only that the racer was too slow);
+   and "`RESOLVE_NO_SYMLINKS` dropped" is watched-failing item 4, a source edit
+   to the `const`.
+
+4. **The picker-spoofing rung runs on DRM on an isolated VT, not headless.**
+   "The replica receives no input grab" is provable only on a backend that
+   stacks the consent grab. The headless backend does not — its hook stack is
+   `NoopHook` (or attention-only under the injector feature), stated in as many
+   words in `crates/vitrin-core/src/backend/headless.rs` — so a physical key
+   while a picker is up would reach the realm there, the opposite of the claim.
+   The rung therefore runs on the DRM backend on an isolated VT
+   (`VITRIN_RANSOM_DRM=1`) and **skips** otherwise. Nested-winit was rejected as
+   the venue: its physical input comes from the parent compositor, i.e. the
+   operator's live session, and driving it would mean injecting into that
+   session — forbidden (the one shared cursor). The rung's execution is a
+   hardware-run step, like WS-E's DRM rungs; **M2.5 does not close until it and
+   ★P2.7.6 ([#200](https://github.com/vitrin-os/vitrin-os/issues/200)) pass.**
+
+**And one correction to the plan row's own wording, not to the issue.** The
+row's acceptance says the write set equals "{designated fds} ∪ {realm private
+storage}". Read literally as two elements that is wrong "in the flattering
+direction" — the phrase `docs/book/src/limits.md` already retired: the realm's
+enforced write set is the **eight** hierarchies
+`crates/vitrin-realm-init/src/landlock.rs`'s `grants` publishes (full write on
+`/run/vitrin`, `/vitrin/home`, `/tmp`, `/dev/shm`; `WRITE_FILE` on `/proc`,
+`/dev`, `/dev/pts` and each render node). The gate reads "realm private storage"
+as those hierarchies, from `grants`, not from the row's two-element set, and
+asserts a write outside them fails. #193's key-decision line "a designated
+read-only fd is still truncatable to zero" is the framing
+[Correction 1](02-phase-2-semantic-epochs.md) already retired as vacuous
+(`ftruncate`/`pwrite` on an `O_RDONLY` descriptor is `EINVAL`/`EBADF` at every
+rung); the honest per-rung sentence is Correction 2's, about `truncate(2)` on a
+read-granted *path* below Landlock ABI 3, which the gate states as a tier
+qualification rather than tests.
+
+**What the gate does NOT rule out, stated in its own docstring (R2.7):** a
+payload *bug* that under-reports its own attempts against *undesignated* paths
+in a way the journal also misses — the journal only ever sees designations. The
+mitigation is the same-run positive control (each undesignated target shown
+reachable at `--isolation=off`) and the per-tier pin, not the payload's word.
+
 ---
 
 ## Part B — Open questions (PRD §20), with owners and decide-by gates

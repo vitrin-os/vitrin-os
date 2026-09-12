@@ -582,13 +582,25 @@ inferred from the word "Landlock":
   to a path outside the granted set — with its positive control in the same
   run — is measured only by `a_realm_can_write_where_it_was_granted_and_nowhere_else`
   in `vitrin-realm-init`'s own suite, at rung 1, in a forked child. That is a
-  component test and this page will not cite it as anything else. **Where the
-  write half is scheduled to be measured mock-free is
+  component test and this page will not cite it as anything else. **The write
+  half's mock-free measurement landed in
   [#193](https://github.com/vitrin-os/vitrin-os/issues/193)** (P2.6.9, the
-  ransomware gate), whose payload reports every write it attempted with the
-  errno each got; nothing before that gate lands closes this, and giving
-  `test_real_confinement.py`'s own probe a write verb was considered here and
-  deliberately left to it rather than done in a review-fix branch.
+  ransomware gate, 2026-09-12): its repo-authored payload realm reports every
+  write it attempted with the errno each got, and
+  `tests/integration/test_real_ransomware.py` asserts the measured write set
+  equals exactly the realm's private storage plus the descriptors it was
+  designated, cross-checked against the core's designation journal by
+  `(dev, ino)`. Two things that does **not** become: it is the payload's own
+  self-report — mitigated by a same-run positive control that shows each
+  undesignated target reachable at `--isolation=off`, and by the journal as an
+  independent witness, not eliminated — and it is a measurement of what the
+  payload *reached*, not the per-rung write *denial* against a capped domain,
+  which stays the component test named above. Nor does it close M2.5: the
+  gate's picker-spoofing rung runs on the DRM backend on an isolated VT and is
+  executed in a hardware run, so the milestone stays open until it and ★P2.7.6
+  ([#200](https://github.com/vitrin-os/vitrin-os/issues/200)) pass.
+  `test_real_confinement.py`'s own probe was deliberately left read-only rather
+  than given a write verb.
 - **There is a ladder table now, and it is a table about this build — not
   about kernels. P2.6.3 was accepted on 2026-08-19, on its *corrected* criteria
   and not on the ones its plan row first wrote, and this page will not round

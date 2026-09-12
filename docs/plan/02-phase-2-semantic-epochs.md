@@ -460,6 +460,42 @@ D-047 reads as the enumeration it was, not as a claim of completeness.
 > P2.6.8's") are **not** swept: they are dated records and stand, and this
 > block is what supersedes them.
 
+> **EXECUTED 2026-09-12 BY P2.6.9
+> ([#193](https://github.com/vitrin-os/vitrin-os/issues/193), recorded as
+> [D-049](20-decision-log.md#d-049--p269-the-ransomware-gate-landed-four-deviations-from-issue-193s-own-text-recorded-on-d-045s-precedent-and-the-gate-asserts-the-write-set-against-the-enforced-eight-hierarchy-set-not-the-plan-rows-flattering-two-element-phrasing))
+> — the gate landed green and mock-free on the headless-portable half; the row
+> above stands as the plan it was.** Appended rather than rewritten.
+>
+> **What landed:** `tests/integration/test_real_ransomware.py` +
+> `shim/tests/ransom_payload.c`, driving shipped `vitrind` → real
+> `vitrin-realm-init` → real `vitrin-shim` → the real payload → the real SDK.
+> The payload holds the per-realm `designation.sock`, so the app-side receipt
+> P2.6.6/P2.6.7 owed this gate is the shim disposition `relayed`, not
+> `no app is connected`. Rungs green: the write set outside the grant is empty
+> confined (host home, `/`, `/etc`, `/run`, the core.sock dir refused; the four
+> private hierarchies succeed) with the host home shown reachable at
+> `--isolation=off` as the same-run positive control; the designated fds are the
+> only writable authority (read-write succeeds, read-only `EBADF`), cross-checked
+> against the `designation_settled` journal by `(dev,ino)` and by delivered
+> count; a symlink row is refused `unresolvable`; the kernel and measured tier
+> are printed. Registered in `run.sh`'s `MILESTONE_GATES`, the README gate table
+> and `ci.yml`'s drift guard in the same commit. Watched failing on five
+> constructed breakages, each red on a different assertion (PR body).
+>
+> **Four deviations from the issue text and one wording correction to the row
+> above are recorded as [D-049](20-decision-log.md#d-049--p269-the-ransomware-gate-landed-four-deviations-from-issue-193s-own-text-recorded-on-d-045s-precedent-and-the-gate-asserts-the-write-set-against-the-enforced-eight-hierarchy-set-not-the-plan-rows-flattering-two-element-phrasing)**,
+> on D-045's precedent: `--isolation=none`→`off`; the home-reach breakage is the
+> mount namespace, not Landlock; the path-race control is in-process, not a live
+> racer; and the picker-spoofing rung runs on DRM on an isolated VT. The
+> row's "{designated fds} ∪ {realm private storage}" is asserted against the
+> enforced eight-hierarchy set from `landlock.rs`'s `grants`, not read as two
+> elements.
+>
+> **NOT closed by this landing.** The picker-spoofing rung
+> (`--replica-picker` + the trust-band witness) is written but **skips off an
+> isolated VT** and is executed in a hardware run; **M2.5 stays open until it
+> and ★P2.7.6 ([#200](https://github.com/vitrin-os/vitrin-os/issues/200)) pass.**
+
 #### P2.6.3, corrected
 
 The row above is the plan as written before the work started. Landing it found

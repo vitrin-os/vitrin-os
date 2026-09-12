@@ -106,7 +106,7 @@ below greps for the shim's decode -- designation id, kind, mode and name
 length -- and not for the disposition, so it stays a witness of the wire and
 not of which app this gate happens to spawn. The app-side proof that a
 powerbox-aware app receives over `designation.sock` under a real core is
-P2.6.9's (`test_real_ransomware.py`, unwritten); the component-level proof
+P2.6.9's (`test_real_ransomware.py`); the component-level proof
 against `shim/tests/mock_core.c` is `shim/tests/acceptance/designation_relay.sh`.
 
 # What this gate does NOT prove

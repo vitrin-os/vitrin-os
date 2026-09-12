@@ -2599,11 +2599,15 @@ mod tests {
         // discharge this criterion. The write denial is measured HERE and
         // nowhere else: in a forked child, at rung 1, which makes it a
         // component test and never milestone evidence. Module docs above.
-        // **Where the write half is owed:** P2.6.9 (issue #193), the
-        // ransomware gate, whose payload realm reports every write it
-        // attempted with the errno each got. Nothing before that gate closes
-        // it, and this comment says so rather than letting the reader assume
-        // the pair above is the whole story.
+        // **The write half's mock-free measurement landed in P2.6.9** (issue
+        // #193, 2026-09-12): `tests/integration/test_real_ransomware.py`'s
+        // repo-authored payload realm reports every write it attempted with the
+        // errno each got and the gate asserts the set equality, cross-checked
+        // against the core's designation journal. This component test stays
+        // what measures the per-rung write *denial* against a capped domain --
+        // the gate measures what the payload *reached* and is its self-report,
+        // mitigated by a same-run positive control and the journal, not a
+        // capped-domain denial. So the pair above is still not the whole story.
         vitrin_skip::skip_unless!(
             vitrin_skip::LANDLOCK_ABI,
             landlock_abi_at_least(1, "the write-set floor")

@@ -640,6 +640,27 @@ click_target = executable(
   dependencies: [wayland_client],
 )
 
+# The P2.6.9 ransomware-containment gate's payload (issue #193): a realm app
+# that enumerates every write it attempts against undesignated host paths and
+# reports the errno each got, receives designations over the per-realm
+# designation.sock and writes through the descriptors it was handed, and -- on
+# request -- paints a counterfeit picker into its own surface. It combines
+# solid-client's write/errno probe shape, designation-client's app-side
+# receive, and click-target's surface skeleton into the one app that lets the
+# mock-free gate measure a payload's write set as a set equality. Repo-authored
+# for the reason the gate's docstring states (R2.7); writes are self-cleaning
+# O_EXCL canaries so the --isolation=off positive control never overwrites the
+# operator's real home. Co-built with vitrin-shim so the gate resolves it as a
+# sibling, exactly as click-target and form-target are.
+ransom_payload = executable(
+  'ransom-payload',
+  files('tests/ransom_payload.c'),
+  xdg_shell_client_header,
+  xdg_shell_code,
+  include_directories: inc,
+  dependencies: [wayland_client],
+)
+
 # The M1.5 demo's headless app (issue #110, goal-directed rewrite): a two-field
 # form with a locatable marker colour per field and per button, which
 # accumulates typed text into the focused field and, on a click landing on its

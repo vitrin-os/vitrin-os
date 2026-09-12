@@ -53,6 +53,7 @@ MILESTONE_GATES=(
   test_real_deadman.py          # M1.4, dead-man half (#109)
   test_real_consent.py          # M1.4, consent half (#138)
   test_demo.py                  # M1.5 exit gate (#110)
+  test_real_ransomware.py       # M2.5, ransomware half (#193, ★P2.6.9; with ★P2.7.6 #200)
 )
 # Named PROPERTY gates: mock-free, real-app, and equally invisible if they
 # vanish -- but deliberately NOT milestone gates. Kept in a second list rather

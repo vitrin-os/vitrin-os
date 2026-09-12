@@ -1611,7 +1611,7 @@ jobs:
         if: hashFiles('tests/integration/run.sh') != ''
         run: |
           missing=0
-          for gate in test_real_app.py test_real_capture_fidelity.py test_real_actuation.py test_real_deadman.py test_real_consent.py test_demo.py; do
+          for gate in test_real_app.py test_real_capture_fidelity.py test_real_actuation.py test_real_deadman.py test_real_consent.py test_demo.py test_real_ransomware.py; do
             if [ ! -f "tests/integration/$gate" ]; then
               echo "::error::named milestone gate tests/integration/$gate is missing -- unittest discover would not collect it and this job would stay green with that milestone's evidence contributing nothing. Restore it, or retire it from run.sh's MILESTONE_GATES, this list, and tests/integration/README.md's gate table together."
               missing=1

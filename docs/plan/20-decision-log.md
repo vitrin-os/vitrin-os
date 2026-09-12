@@ -2024,8 +2024,10 @@ qualification rather than tests.
 **What the gate does NOT rule out, stated in its own docstring (R2.7):** a
 payload *bug* that under-reports its own attempts against *undesignated* paths
 in a way the journal also misses — the journal only ever sees designations. The
-mitigation is the same-run positive control (each undesignated target shown
-reachable at `--isolation=off`) and the per-tier pin, not the payload's word.
+mitigation is the same-run positive control (each confinement-dependent target
+-- the host home and the session runtime dir -- shown reachable at
+`--isolation=off`; `/`, `/etc`, `/run` are DAC-refused at both settings and
+claim no confinement) and the per-tier pin, not the payload's word.
 
 ---
 

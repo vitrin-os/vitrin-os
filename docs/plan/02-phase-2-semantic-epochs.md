@@ -493,7 +493,8 @@ D-047 reads as the enumeration it was, not as a claim of completeness.
 >
 > **NOT closed by this landing.** The picker-spoofing rung
 > (`--replica-picker` + the trust-band witness) is written but **skips off an
-> isolated VT** and is executed in a hardware run; **M2.5 stays open until it
+> isolated VT** and is intended to be executed in a hardware run (its DRM
+> assertion body is not yet implemented); **M2.5 stays open until it
 > and ★P2.7.6 ([#200](https://github.com/vitrin-os/vitrin-os/issues/200)) pass.**
 
 #### P2.6.3, corrected

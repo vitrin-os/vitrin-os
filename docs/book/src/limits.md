@@ -592,8 +592,9 @@ inferred from the word "Landlock":
   designated, cross-checked against the core's designation journal by
   `(dev, ino)`. Two things that does **not** become: it is the payload's own
   self-report — mitigated by a same-run positive control that shows each
-  undesignated target reachable at `--isolation=off`, and by the journal as an
-  independent witness, not eliminated — and it is a measurement of what the
+  confinement-dependent target (the host home and the session runtime dir)
+  reachable at `--isolation=off`, and by the journal as an independent witness,
+  not eliminated — and it is a measurement of what the
   payload *reached*, not the per-rung write *denial* against a capped domain,
   which stays the component test named above. Nor does it close M2.5: the
   gate's picker-spoofing rung runs on the DRM backend on an isolated VT and is

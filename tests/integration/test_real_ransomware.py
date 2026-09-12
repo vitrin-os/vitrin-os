@@ -44,9 +44,13 @@ mitigations, in the same breath:
 attempts against *undesignated* paths in a way the journal also misses: the
 journal only ever sees designations, never the writes this payload aims at
 paths it was never granted. The write-set-outside-the-grant half rests on the
-payload's own report, mitigated by the positive control (each undesignated
-target is shown *reachable* under `--isolation=off`, so an absence is never
-satisfied by no path at all) and pinned per tier below.
+payload's own report, mitigated by the positive control -- each *confinement-
+dependent* target (the host home and the session runtime dir) is shown
+*reachable* under `--isolation=off`, so its "refused confined" is never
+satisfied by a path that was never reachable at all. (`/`, `/etc`, `/run` are
+refused by ordinary DAC at both settings, so they are outside the write set but
+carry no confinement claim and no reachability control -- and none is claimed
+for them.) The claim is also pinned per tier below.
 
 # Per tier, and the gate says which tier it ran on
 
@@ -100,7 +104,6 @@ import unittest
 from harness import (
     ConsentInjector,
     CoreFailed,
-    DEMO_IDENTITY,
     IntegrationTest,
     comm_of,
     descendant_named,
@@ -360,33 +363,60 @@ class RealRansomwareContainment(IntegrationTest):
     # Rung 1: the write set outside the grant is empty, confined.
     # ======================================================================
 
-    def _write_targets(self) -> list[tuple[str, str, bool]]:
-        """(label, dir, expect_reachable_confined). The host home and the paths
-        outside the realm's private storage must be UNREACHABLE confined; the
-        private-storage hierarchies must be reachable (they are the realm's own
-        and IN the set the equality asserts)."""
+    def _session_runtime(self) -> str:
+        """The operator's own `$XDG_RUNTIME_DIR` on the host (the session bus /
+        `/run/user/<uid>` tree). Confinement-dependent: writable by the operator
+        unconfined, but never bound into a confined realm's mount namespace, so
+        `ENOENT` there -- the "mount namespace not built -> /run/user/<uid>
+        reachable" property the issue names."""
+        return os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+
+    def _write_targets(self) -> list[tuple[str, str, bool, bool]]:
+        """`(label, dir, in_set, confinement_dependent)`.
+
+        `in_set` is True for the realm's own private storage (the eight-hierarchy
+        write set `landlock.rs`'s `grants` publishes; the four writable roots
+        cover it) -- a create there must succeed and is IN the set the equality
+        asserts. False elsewhere -- a create must be refused.
+
+        `confinement_dependent` marks the targets whose refusal is CONFINEMENT,
+        not ordinary DAC: reachable by this uid unconfined, refused only because
+        the realm has no mount namespace binding them. Those are the ones the
+        `--isolation=off` positive control must show reachable, or their
+        "refused confined" is satisfied by a path that was never reachable at
+        all (the #138 lesson). `/`, `/etc`, `/run` are root-owned and refused by
+        DAC at BOTH settings, so they are genuinely outside the write set but
+        carry NO reachability control and none is claimed for them."""
         host_home = os.path.expanduser("~")
+        session_runtime = self._session_runtime()
         return [
-            ("host_home", host_home, False),
-            ("root", "/", False),
-            ("etc", "/etc", False),
-            ("run", "/run", False),
-            ("core_sock_dir", "/run", False),  # dirname(/run/vitrin) -- ../core.sock's dir
-            ("private_run_vitrin", "/run/vitrin", True),
-            ("private_home", "/vitrin/home", True),
-            ("private_tmp", "/tmp", True),
-            ("private_shm", "/dev/shm", True),
-        ]
+            # label, dir, in_set, confinement_dependent
+            ("host_home", host_home, False, True),
+            ("session_runtime", session_runtime, False, True),
+            ("root", "/", False, False),
+            ("etc", "/etc", False, False),
+            ("run", "/run", False, False),  # dirname(/run/vitrin) -- ../core.sock's dir
+        ] + [(f"private_{p.strip('/').replace('/', '_')}", p, True, False) for p in PRIVATE_STORAGE]
 
     def test_the_write_set_outside_the_grant_is_empty_confined(self):
         targets = self._write_targets()
         args = ["--out", REPORT_NAME]
-        for label, directory, _ in targets:
+        for label, directory, _, _ in targets:
             args += ["--write-target", f"{label}={directory}"]
         core = self._core(args)
         self._assert_instrumented(core)
         self._spine(core)
         text = self._await_report_line(core, "WRITE-SET-END")
+        # The confinement-gone canary: fd 3 is the shim's core link, and a copy
+        # of it in the app would be the confinement undone. The payload probes it
+        # before opening anything and reports it on its START line.
+        start = self._report_lines(text, "START")
+        self.assertTrue(start, "the payload emitted no START line")
+        self.assertEqual(
+            start[0].get("fd3"), "closed",
+            "fd 3 (the shim's core link) must be CLOSED in the app: an inherited copy is the "
+            f"confinement gone. START reported {start[0]!r}",
+        )
         creates = {
             f["target"]: f
             for f in self._report_lines(text, "WRITE")
@@ -394,10 +424,10 @@ class RealRansomwareContainment(IntegrationTest):
         }
         core.terminate()
 
-        for label, directory, reachable in targets:
+        for label, directory, in_set, _ in targets:
             self.assertIn(label, creates, f"the payload reported no create attempt for {label}")
             row = creates[label]
-            if reachable:
+            if in_set:
                 self.assertEqual(
                     row["rc"], "0",
                     f"{label} ({directory}) is the realm's own private storage and a create "
@@ -414,21 +444,27 @@ class RealRansomwareContainment(IntegrationTest):
                     f"{label} refused with an unexpected errno {row.get('errno')}",
                 )
 
-    def test_the_host_home_is_reachable_uncontrolled_positive_control(self):
-        """The non-vacuity counterweight: at `--isolation=off` (no namespaces),
-        the host home the confined run could not reach IS reachable. Without
-        this, "home unreachable" confined is satisfied by a home that was never
-        reachable at all (the #138 lesson). The payload writes only a
+    def test_the_confinement_dependent_targets_are_reachable_uncontrolled(self):
+        """The non-vacuity counterweight for EACH confinement-dependent target
+        (the host home and the session runtime dir): at `--isolation=off` (no
+        mount namespace) they ARE reachable. Without this, their "refused
+        confined" above would be satisfied by paths that were never reachable at
+        all (the #138 lesson). `/`, `/etc`, `/run` are excluded here on purpose:
+        they are refused by ordinary DAC at both settings, so they carry no
+        confinement claim and need no control. The payload writes only a
         self-cleaning O_EXCL canary, so this never touches a real file."""
-        host_home = os.path.expanduser("~")
-        core = self._core(
-            ["--out", REPORT_NAME, "--write-target", f"host_home={host_home}"],
-            isolation="off",
-        )
+        controls = [
+            (label, directory)
+            for label, directory, _, dep in self._write_targets()
+            if dep
+        ]
+        self.assertTrue(controls, "there must be at least one confinement-dependent target")
+        args = ["--out", REPORT_NAME]
+        for label, directory in controls:
+            args += ["--write-target", f"{label}={directory}"]
+        core = self._core(args, isolation="off")
         self._assert_instrumented(core)
         self._spine(core)
-        # At --isolation=off there is no mount namespace, so the report lands in
-        # the off-mode runtime dir; read it wherever it is.
         text = self._await_report_line(core, "WRITE-SET-END")
         core.terminate()
         creates = {
@@ -436,13 +472,14 @@ class RealRansomwareContainment(IntegrationTest):
             for f in self._report_lines(text, "WRITE")
             if f.get("op") == "create"
         }
-        self.assertIn("host_home", creates)
-        self.assertEqual(
-            creates["host_home"]["rc"], "0",
-            "with no mount namespace the host home MUST be reachable; if it is not, the "
-            "confined run's 'home unreachable' proves nothing. The payload created and "
-            "unlinked a single O_EXCL canary there.",
-        )
+        for label, directory in controls:
+            self.assertIn(label, creates, f"no create attempt reported for {label}")
+            self.assertEqual(
+                creates[label]["rc"], "0",
+                f"with no mount namespace {label} ({directory}) MUST be reachable; if it is "
+                "not, the confined run's 'refused' for it proves nothing. The payload created "
+                f"and unlinked a single O_EXCL canary there. Got errno={creates[label].get('errno')}",
+            )
 
     # ======================================================================
     # Rung 2: the designated fds are the only writable authority, and the
@@ -484,7 +521,7 @@ class RealRansomwareContainment(IntegrationTest):
         self._spine(core)
         # The payload connects to designation.sock at startup and drops --ready
         # once connected; only then can the agent's ask land `relayed`.
-        self._await_report_line(core, "READY")
+        self._await_report_line(core, "READY path=")
 
         actor = core.connect()
         # Ask 1: the read-write file -- writing through it must succeed.
@@ -551,7 +588,7 @@ class RealRansomwareContainment(IntegrationTest):
         )
         # The shim relayed rather than closing `no_client` (the app connected).
         self.assertIn(
-            "relayed",
+            "and was relayed to the connected app",
             core.app_output(),
             "the shim must have RELAYED the designation to the connected payload -- the "
             "app-side mock-free receipt this gate owns; `no app is connected` would mean the "
@@ -614,8 +651,7 @@ class RealRansomwareContainment(IntegrationTest):
             while not stop.is_set():
                 src = a if toggle else b
                 os.rename(src, swap)
-                # re-mint the consumed name
-                (base / (".swap-a" if toggle else ".swap-b"))
+                # re-mint the consumed name (the os.symlink below is the re-mint)
                 target = good if toggle else decoy
                 try:
                     os.symlink(target, a if toggle else b)

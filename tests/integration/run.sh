@@ -207,7 +207,7 @@ PROPERTY_GATES=(
                                 # channel independently reported and moving
                                 # exactly one slot when the cursor does.
                                 # Deliberately NOT a milestone gate: M2.5's is
-                                # ★P2.6.9 (test_real_ransomware.py), unwritten.
+                                # ★P2.6.9 (test_real_ransomware.py), the milestone gate above.
 )
 # The rest of the suite: modules that are neither a milestone gate nor a named
 # property gate, but that `unittest discover` collects and this run is cited

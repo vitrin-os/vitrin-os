@@ -687,6 +687,10 @@ const PROVENANCE_ROOTS: &[&str] = &[
     "crates/xtask/src/main.rs",
     "crates/xtask/src/kana_atlas.rs",
     "shim/ci",
+    // The offline security-review image (docs/security-review.md). Its
+    // Dockerfile runs `cargo build`, `cargo test` and `cargo fuzz build`, so
+    // it is a place a feature could be switched on like any other.
+    ".github/security-review",
 ];
 
 /// Directories whose contents are third-party and must never satisfy or break

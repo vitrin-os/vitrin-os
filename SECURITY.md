@@ -48,6 +48,23 @@ the attacker is assumed to control at the start, and a reproduction —
 a failing test under [`tests/integration/`](tests/integration/) is the
 gold standard, but a prose walkthrough is fine.
 
+### Automated and AI-generated reports
+
+Reports found by automated tools, AI models included, are welcome through
+the same advisory form. Three things apply to them:
+
+- They must carry a reproducer: a test, a fuzz input with its target, or
+  commands against the shipped binary. For these reports a prose argument
+  is not enough on its own.
+- They count as unverified until the maintainer has reproduced them on
+  `main`.
+- The [Scope](#scope) section below applies unchanged. A tool's severity
+  rating is a suggestion, not the triage.
+
+[`docs/security-review.md`](docs/security-review.md) is the guide written
+for such reviewers: where untrusted input enters, how to build and exercise
+the tree offline, and a proposed severity scale.
+
 ## What to expect, honestly
 
 This is an unfunded single-maintainer project — governance is stated

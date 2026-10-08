@@ -27,6 +27,7 @@ vitrin-os/
 │   ├── plan/          # phase/epic/task breakdown, decision log, roadmap
 │   ├── book/          # the published mdBook; `src/limits.md` is the honesty surface this page cites throughout
 │   ├── drm-bringup.md # the bare-metal runbook and its DATED per-run records
+│   ├── security-review.md # the guide for security reviewers, people or tools: inputs, offline build, a PROPOSED severity scale
 │   └── demo/          # demo screencast: the recording plan and the published artifact (recorded 2026-07-26)
 ├── crates/            # the Cargo workspace — see §2 below
 ├── shim/              # the Wayland shim, C + wlroots, OUTSIDE the Cargo workspace — see §3
@@ -49,7 +50,8 @@ vitrin-os/
 │                      #   parse untrusted bytes before any identity or grant check (P1.9.3, #46)
 ├── site/              # the hand-written landing page `.github/workflows/pages.yml` publishes, no build step
 ├── .github/           # CI workflows (`ci.yml`, `dco.yml`, `pages.yml`, `kernel-matrix.yml`,
-│                      #   `honesty-tracker.yml`), issue/PR templates, and the ADVISORY vkms rung (#220)
+│                      #   `honesty-tracker.yml`, `security-review-image.yml`), issue/PR templates, the
+│                      #   ADVISORY vkms rung (#220), and `security-review/Dockerfile`, the offline review image
 └── assets/            # the project's marks — TRADEMARKS, deliberately outside the license map (`TRADEMARK.md`)
 ```
 

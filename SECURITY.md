@@ -35,9 +35,7 @@ Use **GitHub private security advisories**:
 
 <https://github.com/vitrin-os/vitrin-os/security/advisories/new>
 
-That is the only private channel. The project deliberately publishes no
-security email address and no PGP key: an unmonitored inbox or a key
-nobody rotates is worse than not having one at all. If the advisory form
+That is the only private channel this policy offers. If the advisory form
 is unavailable to you, open an ordinary public issue saying that you have
 a report and asking for a channel — and put **no details in it**.
 
@@ -51,7 +49,11 @@ gold standard, but a prose walkthrough is fine.
 ### Automated and AI-generated reports
 
 Reports found by automated tools, AI models included, are welcome through
-the same advisory form. Three things apply to them:
+the same advisory form. The one exception is an automated scanning service
+the project has enrolled in
+([D-050](docs/plan/20-decision-log.md#d-050--vitrin-enrols-in-an-opt-in-automated-vulnerability-scanner-with-a-public-contact-address-the-no-security-email-address-sentence-had-no-decision-behind-it-and-is-withdrawn-the-private-advisory-form-stays-the-reporting-channel)),
+which delivers its reports to the contact its enrolment names. Three things
+apply to every automated report, wherever it arrives:
 
 - They must carry a reproducer: a test, a fuzz input with its target, or
   commands against the shipped binary. For these reports a prose argument

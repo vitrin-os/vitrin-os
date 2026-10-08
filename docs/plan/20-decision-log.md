@@ -2029,6 +2029,48 @@ mitigation is the same-run positive control (each confinement-dependent target
 `--isolation=off`; `/`, `/etc`, `/run` are DAC-refused at both settings and
 claim no confinement) and the per-tier pin, not the payload's word.
 
+### D-050 — Vitrin enrols in an opt-in automated vulnerability scanner with a public contact address; the "no security email address" sentence had no decision behind it and is withdrawn; the private advisory form stays the reporting channel
+
+**Status:** accepted (2026-10-08, the owner's decision), append-only. Reverses no
+recorded decision: the sentence it withdraws never had one.
+
+1. **Enrolment.** The owner decided on 2026-10-08 to enrol this repository in
+   an opt-in automated vulnerability-scanning service, Anthropic's OSS Scanner
+   (announced that day). Its enrolment file is public and names a contact
+   address. The scanner builds the tree from
+   [`.github/security-review/Dockerfile`](../../.github/security-review/Dockerfile)
+   in an isolated VM, reviews it with no network, reads
+   [`docs/security-review.md`](../security-review.md) as the project's threat
+   model, and emails its reports to that address. Its reports are
+   model-generated and not reviewed by a human before they are sent. The
+   enrolment itself is a pull request to the service's own repository, not a
+   change to this tree.
+
+2. **The sentence is withdrawn.** `SECURITY.md` said: "The project
+   deliberately publishes no security email address and no PGP key: an
+   unmonitored inbox or a key nobody rotates is worse than not having one at
+   all." It arrived in commit `b648485`, part of the licensing PR #141. No
+   entry in this log and no plan document records that decision, and the owner
+   states he never made it. Once the enrolment file publishes an address the
+   sentence is false, so it is removed rather than left to contradict the tree.
+
+3. **The reporting channel does not change.** The private advisory form stays
+   the one channel `SECURITY.md` offers a reporter. The address is not added to
+   `SECURITY.md`: it exists for the scanner's delivery. A report that arrives
+   there is handled under `SECURITY.md`'s terms for automated reports: it
+   carries a reproducer, it is unverified until reproduced on `main`, and the
+   Scope section applies unchanged.
+
+**Costs, stated:**
+- An address now appears in a public file outside this repository. It can
+  receive mail that is not a scanner report, and nothing here promises how such
+  mail is answered.
+- The scanner's reports arrive unreviewed, and triage lands on one unfunded
+  maintainer (`SECURITY.md`, "What to expect, honestly"). The enrolment can be
+  paused with `disabled: true` in its file, without removing it.
+- The severity scale in `docs/security-review.md` is still a proposal. This
+  entry does not sign it off.
+
 ---
 
 ## Part B — Open questions (PRD §20), with owners and decide-by gates

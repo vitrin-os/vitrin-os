@@ -122,6 +122,14 @@ would stop being a good one.
 tests. Remember that the shim is outside the TCB; what matters is what it can
 do to the core.
 
+One of those suites, `designation-relay`, fails where CPU is scarce, for
+example in a container capped at two CPUs. Its bulk arm sends a thousand
+designations a millisecond apart, and a reader that falls a few hundred
+behind fills the socket's send buffer. The shim then drops the connection on
+`EAGAIN`. That drop is a deliberate rule, which the same script's arm (G)
+proves. The failure is a test that depends on host speed, tracked in
+[#354](https://github.com/vitrin-os/vitrin-os/issues/354). It is not a finding.
+
 **The Python SDK.** `python -m pytest sdk/python/tests` runs its unit tests
 against a scripted mock server. The SDK trusts the core it connects to, so
 its bugs are ordinary issues, not TCB findings.

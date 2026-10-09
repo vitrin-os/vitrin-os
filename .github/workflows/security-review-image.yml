@@ -1,0 +1,90 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Build the security-review image (.github/security-review/Dockerfile) and
+# hold it to its one promise: a reviewer can build, test and fuzz this tree
+# inside it with NO network.
+#
+# WHY THIS IS NOT IN ci.yml
+# -------------------------
+# The image installs everything from scratch -- the pinned Rust toolchain,
+# cargo-fuzz, the shim's wlroots subproject, the Python SDK's test dependency
+# -- and compiles the whole workspace. That is far slower than any ci.yml job,
+# and it proves nothing about the shipped binaries that ci.yml does not already
+# prove. What it proves is narrower: the Dockerfile still builds, and the image
+# still works offline.
+#
+# That goes stale when a toolchain pin, a lockfile, the shim's subprojects or
+# its dependency script moves, so a pull request touching one of those runs it.
+# A weekly run catches what no pull request touches: a mirror that moved, an
+# upstream tag that vanished.
+#
+# Keeping it out of ci.yml also keeps ci.yml's censuses honest. `cargo xtask
+# test-census` and `cargo xtask skip-scan` read ci.yml and nothing else, so the
+# `cargo test` below is not a claim about which tests CI runs, and must not be
+# read as one.
+#
+# WHAT A FAILURE HERE MEANS
+# -------------------------
+# Read the failing STEP first.
+#
+#   * `build` red: the image no longer builds, so a reviewer who depends on it
+#     cannot start. It says nothing about vitrind.
+#   * `offline` red: something the review needs is still fetched at run time,
+#     which is the exact failure this workflow exists to catch. Fix the
+#     Dockerfile so it is fetched at build time; do not give the step a
+#     network.
+name: security-review-image
+
+on:
+  pull_request:
+    paths:
+      - ".github/security-review/**"
+      - ".github/workflows/security-review-image.yml"
+      - "rust-toolchain.toml"
+      - "Cargo.lock"
+      - "fuzz/Cargo.lock"
+      - "shim/meson.build"
+      - "shim/subprojects/**"
+      - "shim/ci/install-deps.sh"
+      - "sdk/python/pyproject.toml"
+  # Weekly. The things that break this image without a commit here -- package
+  # mirrors, upstream tags, a crates.io yank -- do not move nightly.
+  schedule:
+    - cron: "41 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  image:
+    name: build the review image, then use it with no network
+    runs-on: ubuntu-latest
+    # The build compiles the whole workspace, the fuzz targets and wlroots
+    # from cold. The bound is here so a wedged build fails the job instead of
+    # holding a runner for six hours.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free runner disk (the image holds a debug build, a fuzz build and wlroots)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: build
+        run: docker build -f .github/security-review/Dockerfile -t vitrin-review:ci .
+
+      # `--network none` is the whole point of this step. CARGO_NET_OFFLINE
+      # makes cargo say so plainly instead of timing out on a fetch.
+      - name: offline
+        run: |
+          docker run --rm --network none -e CARGO_NET_OFFLINE=true vitrin-review:ci \
+            bash -euo pipefail -c '
+              cargo test -p vitrin-protocol
+              scratch="$(mktemp -d)"
+              cargo fuzz run --sanitizer none protocol_decode "$scratch" fuzz/corpus/protocol_decode -- \
+                -max_total_time=10 -print_final_stats=1
+              python -m pytest -q sdk/python/tests
+              test -x shim/build/vitrin-shim
+            '

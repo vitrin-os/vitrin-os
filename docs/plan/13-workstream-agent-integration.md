@@ -114,10 +114,14 @@ how much an agent should trust a synthesized tree.
 The SDK's typed exceptions are correct and useless to a model, which needs to
 be told what to *do*. Each refusal has one right behaviour:
 
-All **eight** entries of the IDL's `refusal` enum, with the SDK class each maps
+All **nine** entries of the IDL's `refusal` enum, with the SDK class each maps
 to. The enum is exhaustive and the SDK pins one class per wire value with no
-gaps, so any table that omits one — as an earlier revision of this one did,
-dropping `internal` — will fail a test that checks it against the IDL:
+gaps. The SDK carries the third column as each class's `guidance`, with a
+`retryable` flag beside it, and `sdk/python/tests/test_refusal_guidance.py`
+checks both against the IDL, so an appended entry fails it. **This table is
+not checked by anything**: an earlier revision of it dropped `internal`, and a
+later one still said "eight" after `capacity` landed. Where the wording here
+and the SDK's differ, the SDK's is what an agent actually receives:
 
 | `refusal` (IDL) | SDK class | What the agent must be told |
 |---|---|---|

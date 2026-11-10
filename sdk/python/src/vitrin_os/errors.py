@@ -14,6 +14,13 @@ mapping is normative and exhaustive per docs/protocol/00-conventions.md:
 Exhaustiveness is asserted at import time at the bottom of this module, so
 a protocol enum growing without a matching exception class fails loudly.
 
+Every :class:`GrantRefused` subclass also says what to *do* about it, for a
+caller that is a language model rather than a programmer: ``guidance`` is a
+short imperative instruction and ``retryable`` says whether retrying the same
+use is the right next step. ``tests/test_refusal_guidance.py`` holds every
+entry of the IDL's ``vitrin_grant.refusal`` enum to both, so an appended code
+cannot ship without them.
+
 Client-side *programming* errors (a string over its documented bound, a
 forbidden control character in ``type()``, zero verbs in a petition) raise
 plain :class:`ValueError` before any bytes hit the wire: a correct client
@@ -22,6 +29,8 @@ conditions.
 """
 
 from __future__ import annotations
+
+from typing import ClassVar
 
 __all__ = [
     "VitrinError",
@@ -318,9 +327,30 @@ class GrantRefused(VitrinError):
     dispatched on), ``verb`` (which authority was exercised), ``code`` (the
     numeric reason, mirrored 1:1 by this exception's *type* — the human-readable
     reason), and ``retry_after_ms`` (nonzero only for :class:`RateLimited`).
+
+    Two class attributes say what to do next, readable on the class or on a
+    caught instance alike:
+
+    ``guidance``
+        One or two imperative sentences addressed to the agent, written to be
+        handed to a language model verbatim (in a tool result, say). The type
+        tells a programmer *why*; this tells a model *what to do*.
+    ``retryable``
+        ``True`` when repeating the same use — after whatever wait
+        ``guidance`` names — is the right next step. ``False`` means do not
+        loop: stop, yield, petition again, or report, as ``guidance`` says.
+        It is advice about behaviour, not a claim that the core would refuse
+        a retry: :class:`Preempted` is ``False`` because racing a human is
+        wrong even when it would land.
+
+    Both are set on every subclass and deliberately **not** on this base
+    class, so a new subclass that forgets them raises ``AttributeError``
+    instead of silently inheriting someone else's advice.
     """
 
     REFUSAL: int  # set on each subclass
+    guidance: ClassVar[str]  # set on each subclass
+    retryable: ClassVar[bool]  # set on each subclass
 
     def __init__(self, verb: int, retry_after_ms: int = 0, *, grant_id: int = 0) -> None:
         super().__init__(
@@ -338,48 +368,73 @@ class NotGranted(GrantRefused):
     """The grant is not (or not yet) active, or the verb is outside its set."""
 
     REFUSAL = 0
+    guidance = "You do not have this verb. Do not retry; petition for it or stop."
+    retryable = False
 
 
 class GrantExpired(GrantRefused):
     """The grant's expiry passed."""
 
     REFUSAL = 1
+    guidance = "Your authority ran out. Petition again if the task still stands."
+    retryable = False
 
 
 class Revoked(GrantRefused):
     """Revoked by hold-Esc, panel, or policy."""
 
     REFUSAL = 2
+    guidance = "A human revoked you. Stop. Do not petition again in this session."
+    retryable = False
 
 
 class RateLimited(GrantRefused):
     """The token bucket is empty; ``retry_after_ms`` hints the refill."""
 
     REFUSAL = 3
+    guidance = "You are too fast. Wait retry_after_ms milliseconds, then retry."
+    retryable = True
 
 
 class Preempted(GrantRefused):
     """Physical human input owns the target right now."""
 
     REFUSAL = 4
+    guidance = (
+        "A human is working in the realm you are acting on. Yield, back off, "
+        "do not race. This is per realm, not per session."
+    )
+    retryable = False
 
 
 class ConsentHeld(GrantRefused):
     """The principal's own pending petition has a prompt up."""
 
     REFUSAL = 5
+    guidance = (
+        "A prompt of yours is up; a human is deciding. Wait, do not act. This "
+        "means wait, not no: once your pending request is answered, retry."
+    )
+    retryable = True
 
 
 class NoSurface(GrantRefused):
     """The realm has no surface (its shim crashed or exited)."""
 
     REFUSAL = 6
+    guidance = "Nothing to act on yet. Cheap to retry."
+    retryable = True
 
 
 class OperationFailed(GrantRefused):
     """Server-side failure during this use (renderer, memfd, delivery)."""
 
     REFUSAL = 7
+    guidance = (
+        "The core failed on its own side. Not your fault, not a permission "
+        "problem; retry once, then report rather than loop."
+    )
+    retryable = True
 
 
 class AtCapacity(GrantRefused):
@@ -394,6 +449,12 @@ class AtCapacity(GrantRefused):
     """
 
     REFUSAL = 8
+    guidance = (
+        "The deployment is at its realm capacity. Nothing broke, and this is "
+        "not a rate limit: retry_after_ms is 0, so retrying on a timer spins. "
+        "Wait until one of your realms exits, or report."
+    )
+    retryable = False
 
 
 _REFUSAL_BY_CODE: dict[int, type[GrantRefused]] = {

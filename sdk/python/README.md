@@ -137,6 +137,14 @@ socket. That is not hypothetical: the SDK could not decode
 caught in review before it reached `main` (`docs/plan/20-decision-log.md`), so
 the near-miss is the evidence, not an outage.
 
+Every `GrantRefused` subclass also says what to *do*, for an agent that is a
+language model: `guidance` is one or two imperative sentences to hand the
+model verbatim, and `retryable` says whether retrying the same use is the
+right next step. `Revoked` and `Preempted` (a human intervened) and
+`AtCapacity` (only a realm exiting clears it) are not retryable.
+`tests/test_refusal_guidance.py` reads `vitrin_grant.refusal` from the IDL and
+fails if any entry lacks either attribute.
+
 ## Layout and launching (wire version 2)
 
 Three of the four facets this SDK mints structurally on a resolved grant —

@@ -251,10 +251,17 @@ from vitrin_os import (NotGranted, GrantExpired, Revoked, RateLimited,
 | `GrantExpired` | `expiry_ms` elapsed. | No — petition again. |
 | `Revoked` | Someone revoked it. Often the dead-man switch. | No. A human meant this. |
 | `RateLimited` | Over the event-rate ceiling. | Yes, after `retry_after_ms`. |
-| `Preempted` | A human touched the input device. | Yes, but back off — a person is using the machine. |
+| `Preempted` | A human touched the input device. | No — yield and back off. A person is using that realm. |
 | `ConsentHeld` | A consent prompt is up; actuation is frozen. | Yes, once it resolves. |
 | `NoSurface` | Nothing to act on yet. | Yes, cheaply. |
-| `OperationFailed` | The core tried and could not. | Maybe. |
+| `OperationFailed` | The core tried and could not. | Once, then report. |
+
+Each exception also carries this advice itself, for an agent that is a
+language model: `e.guidance` is one or two imperative sentences you can hand
+the model verbatim, and `e.retryable` is the last column as a `bool`. The
+one row that is not a plain yes or no is `OperationFailed`: its `retryable`
+is `False`, so a loop that reads only the flag reports instead of retrying a
+broken core forever, and the one retry lives in its `guidance`.
 
 There is a ninth, `AtCapacity`, and it is missing from the list above on
 purpose: it is only ever produced by `realm.launch`, so an actuation can never

@@ -258,7 +258,10 @@ from vitrin_os import (NotGranted, GrantExpired, Revoked, RateLimited,
 
 Each exception also carries this advice itself, for an agent that is a
 language model: `e.guidance` is one or two imperative sentences you can hand
-the model verbatim, and `e.retryable` is the last column as a `bool`.
+the model verbatim, and `e.retryable` is the last column as a `bool`. The
+one row that is not a plain yes or no is `OperationFailed`: its `retryable`
+is `False`, so a loop that reads only the flag reports instead of retrying a
+broken core forever, and the one retry lives in its `guidance`.
 
 There is a ninth, `AtCapacity`, and it is missing from the list above on
 purpose: it is only ever produced by `realm.launch`, so an actuation can never

@@ -16,8 +16,8 @@ a protocol enum growing without a matching exception class fails loudly.
 
 Every :class:`GrantRefused` subclass also says what to *do* about it, for a
 caller that is a language model rather than a programmer: ``guidance`` is a
-short imperative instruction and ``retryable`` says whether retrying the same
-use is the right next step. ``tests/test_refusal_guidance.py`` holds every
+short imperative instruction and ``retryable`` says whether a program may
+retry the same use on its own. ``tests/test_refusal_guidance.py`` holds every
 entry of the IDL's ``vitrin_grant.refusal`` enum to both, so an appended code
 cannot ship without them.
 
@@ -336,12 +336,16 @@ class GrantRefused(VitrinError):
         handed to a language model verbatim (in a tool result, say). The type
         tells a programmer *why*; this tells a model *what to do*.
     ``retryable``
-        ``True`` when repeating the same use — after whatever wait
-        ``guidance`` names — is the right next step. ``False`` means do not
-        loop: stop, yield, petition again, or report, as ``guidance`` says.
-        It is advice about behaviour, not a claim that the core would refuse
-        a retry: :class:`Preempted` is ``False`` because racing a human is
-        wrong even when it would land.
+        ``True`` when a program may repeat the same use on its own, as often
+        as it takes, after whatever wait ``guidance`` names. ``False`` means
+        do not retry automatically: stop, yield, petition again, or report,
+        as ``guidance`` says. A loop that reads only this flag must never
+        spin, so the flag is the conservative half of the advice:
+        :class:`OperationFailed` is ``False`` although its ``guidance``
+        allows one retry, because a core that keeps failing has to be
+        reported, not retried forever. It is advice about behaviour, not a
+        claim that the core would refuse a retry: :class:`Preempted` is
+        ``False`` because racing a human is wrong even when it would land.
 
     Both are set on every subclass and deliberately **not** on this base
     class, so a new subclass that forgets them raises ``AttributeError``
@@ -427,14 +431,19 @@ class NoSurface(GrantRefused):
 
 
 class OperationFailed(GrantRefused):
-    """Server-side failure during this use (renderer, memfd, delivery)."""
+    """Server-side failure during this use (renderer, memfd, delivery).
+
+    ``retryable`` is ``False`` even though ``guidance`` allows one retry: the
+    single retry is a judgement for whoever reads the sentence, and a loop
+    that reads only the flag would otherwise retry a broken core forever.
+    """
 
     REFUSAL = 7
     guidance = (
         "The core failed on its own side. Not your fault, not a permission "
         "problem; retry once, then report rather than loop."
     )
-    retryable = True
+    retryable = False
 
 
 class AtCapacity(GrantRefused):

@@ -139,9 +139,11 @@ the near-miss is the evidence, not an outage.
 
 Every `GrantRefused` subclass also says what to *do*, for an agent that is a
 language model: `guidance` is one or two imperative sentences to hand the
-model verbatim, and `retryable` says whether retrying the same use is the
-right next step. `Revoked` and `Preempted` (a human intervened) and
-`AtCapacity` (only a realm exiting clears it) are not retryable.
+model verbatim, and `retryable` says whether a program may retry the same
+use on its own. `Revoked` and `Preempted` (a human intervened) and
+`AtCapacity` (only a realm exiting clears it) are not retryable. Neither is
+`OperationFailed`: its `guidance` allows one retry, but a loop that reads
+only the flag must not retry a failing core forever.
 `tests/test_refusal_guidance.py` reads `vitrin_grant.refusal` from the IDL and
 fails if any entry lacks either attribute.
 

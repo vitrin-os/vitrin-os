@@ -3,7 +3,7 @@
 
 Every :class:`vitrin_os.errors.GrantRefused` subclass carries ``guidance``
 (what to do next, in words a language model can act on) and ``retryable``
-(whether retrying the same use is the right next step). A refusal with no
+(whether a program may retry the same use on its own). A refusal with no
 guidance is one no agent understands, and the way that ships is an appended
 enum entry nobody wrote advice for.
 
@@ -119,7 +119,9 @@ def test_an_appended_refusal_fails_the_guidance_check() -> None:
 # `revoked` and `preempted` are the two that matter: a human intervened, and
 # an agent that retries through either is hammering through a human's
 # override. `capacity` is False because asking again is only right after one
-# of the agent's realms exits, never on a timer.
+# of the agent's realms exits, never on a timer. `internal` is False although
+# its guidance allows one retry: a loop that reads only the flag must not
+# retry a failing core forever.
 EXPECTED_RETRYABLE = {
     "not_granted": False,
     "expired": False,
@@ -128,7 +130,7 @@ EXPECTED_RETRYABLE = {
     "preempted": False,
     "consent_held": True,
     "no_surface": True,
-    "internal": True,
+    "internal": False,
     "capacity": False,
 }
 
